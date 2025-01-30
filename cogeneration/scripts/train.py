@@ -9,6 +9,7 @@ import wandb
 from omegaconf import OmegaConf
 from pytorch_lightning import LightningDataModule, LightningModule
 from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.loggers.wandb import WandbLogger
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.utilities import rank_zero_only
@@ -108,15 +109,24 @@ class Experiment:
     @print_timing
     def train(self):
         callbacks = []
+
         if self.cfg.experiment.debug:
-            log.info("Debug mode.")
-            logger = None
-            # self._train_device_ids = [self._train_device_ids[0]]
+            # Debug mode uses only one device and no workers
+            self._train_device_ids = [self._train_device_ids[0]]
             self.cfg.data.loader.num_workers = 0
+
+        if self.cfg.local:
+            # If local, use tensorboard logger
+            log.info(
+                f"Local mode. Using Tensorboard logger @ {self.cfg.experiment.trainer.tensorboard_logdir}"
+            )
+            logger = TensorBoardLogger(
+                save_dir=self.cfg.experiment.trainer.tensorboard_logdir,
+                name=self.cfg.experiment.wandb.name,
+            )
         else:
             # Set up w&b logging
             logger = WandbLogger(**asdict(self.cfg.experiment.wandb))
-
             # Model checkpoints
             callbacks.append(
                 ModelCheckpoint(**asdict(self.cfg.experiment.checkpointer))

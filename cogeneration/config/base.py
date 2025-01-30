@@ -2,6 +2,7 @@ import datetime
 import os
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import List, Optional
 
 import hydra
@@ -212,9 +213,7 @@ class ModelIPAConfig:
 class ModelConfig:
     symmetric: bool = False
 
-    hyper_params: ModelHyperParamsConfig = field(
-        default_factory=ModelHyperParamsConfig.tiny
-    )
+    hyper_params: ModelHyperParamsConfig = field(default_factory=ModelHyperParamsConfig)
     node_features: ModelNodeFeaturesConfig = field(
         default_factory=ModelNodeFeaturesConfig
     )
@@ -382,8 +381,8 @@ class DatasetFilterConfig:
 
 
 # metadata_dir is the root directory for dataset / metadata files
-metadata_dir = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "datasets/metadata")
+metadata_dir_path = Path(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "datasets/metadata"))
 )
 
 
@@ -406,9 +405,9 @@ class DatasetConfig:
     """
 
     seed: int = 123
-    processed_data_path: str = os.path.dirname(metadata_dir)
-    csv_path: str = f"{metadata_dir}/pdb_metadata.csv"
-    cluster_path: Optional[str] = f"{metadata_dir}/pdb.clusters"
+    processed_data_path: str = os.path.dirname(metadata_dir_path)
+    csv_path: Path = metadata_dir_path / "pdb_metadata.csv"
+    cluster_path: Optional[Path] = metadata_dir_path / "pdb.clusters"
     max_cache_size: int = 100_000
     cache_num_res: int = 0  # min size to enable caching
     inpainting_percent: float = 1.0
@@ -419,15 +418,15 @@ class DatasetConfig:
 
     # Redesigned, i.e. use ProteinMPNN to generate sequences for a structure
     use_redesigned: bool = True
-    redesigned_csv_path: Optional[str] = f"{metadata_dir}/pdb_redesigned.csv"
+    redesigned_csv_path: Optional[Path] = metadata_dir_path / "pdb_redesigned.csv"
 
     # Synthetic, e.g. AlphaFold structures?
     use_synthetic: bool = True
-    synthetic_csv_path: Optional[str] = f"{metadata_dir}/distillation_metadata.csv"
-    synthetic_cluster_path: Optional[str] = f"{metadata_dir}/distillation.clusters"
+    synthetic_csv_path: Optional[Path] = metadata_dir_path / "distillation_metadata.csv"
+    synthetic_cluster_path: Optional[Path] = metadata_dir_path / "distillation.clusters"
 
     # Eval parameters
-    test_set_pdb_ids_path: Optional[str] = None
+    test_set_pdb_ids_path: Optional[Path] = None
     max_eval_length: int = 256
     samples_per_eval_length: int = 5
     num_eval_lengths: int = 8
@@ -438,8 +437,8 @@ class DatasetConfig:
     @classmethod
     def PDBPost2021(cls):
         return cls(
-            csv_path=f"{metadata_dir}/test_set_metadata.csv",
-            cluster_path=f"{metadata_dir}/test_set_clusters.csv",
+            csv_path=metadata_dir_path / "test_set_metadata.csv",
+            cluster_path=metadata_dir_path / "test_set_clusters.csv",
             cache_num_res=0,
             add_plddt_mask=False,
             # disable Redesigned and Synthetic for test set
@@ -449,7 +448,7 @@ class DatasetConfig:
             synthetic_csv_path=None,
             synthetic_cluster_path=None,
             # Eval parameters
-            test_set_pdb_ids_path=f"{metadata_dir}/test_set_pdb_ids.csv",
+            test_set_pdb_ids_path=metadata_dir_path / "test_set_pdb_ids.csv",
             # slightly relaxed filters to match original multiflow parameters
             filter=DatasetFilterConfig(
                 max_num_res=400,
@@ -505,10 +504,13 @@ class ExperimentTrainerConfig:
     overfit_batches: int = 0
     min_epochs: int = 1  # prevents early stopping
     max_epochs: int = 200
-    log_every_n_steps: int = 1
     deterministic: bool = False
     check_val_every_n_epoch: int = 4
     accumulate_grad_batches: int = 2
+    # logging
+    log_every_n_steps: int = 1
+    # if experiment.debug, use tensorboard logger
+    tensorboard_logdir: Path = Path("./lightning_logs/")
 
     def __post_init__(self):
         # distributed training (ddp) not currently supported with MPS
@@ -532,7 +534,9 @@ class ExperimentCheckpointerConfig:
 class ExperimentConfig:
     """Training Experiment configuration."""
 
-    debug: bool = False  # False to enable W&B, saving outputs etc
+    debug: bool = (
+        False  # True for local tensorboard logger, False to enable W&B, saving outputs etc
+    )
     seed: int = 123
     # num GPU devices TODO support more than one, esp for GPUs
     num_devices: int = 1
@@ -591,7 +595,7 @@ class InferenceConfig:
     seed: int = 123
     use_gpu: bool = True
     num_gpus: int = 1
-    predict_dir: str = "./inference_outputs/"
+    predict_dir: Path = Path("./inference_outputs/")
     inference_subdir: str = "${metadata.now}"
 
     # checkpoints
@@ -617,9 +621,11 @@ class FoldingConfig:
     folding_model: str = "esmf"
     # dedicated device for folding. decrement other devices by 1 if True
     own_device: bool = False
-    pmpnn_path: str = "./ProteinMPNN/"
-    pt_hub_dir: str = "./.cache/torch/"
-    colabfold_path: str = "path/to/colabfold-conda/bin/colabfold_batch"  # for AF2
+    pmpnn_path: Path = Path("./ProteinMPNN/")
+    pt_hub_dir: Path = Path("./.cache/torch/")
+    colabfold_path: Path = Path(
+        "path/to/colabfold-conda/bin/colabfold_batch"
+    )  # for AF2
 
 
 @dataclass
