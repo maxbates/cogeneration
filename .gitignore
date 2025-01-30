@@ -1,0 +1,7 @@
+.idea
+.cache
+ckpt
+lightning_logs
+outputs
+wandb
+.DS_Store

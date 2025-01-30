@@ -1,0 +1,82 @@
+import torch
+from torch import nn
+
+from cogeneration.config.base import ModelNodeFeaturesConfig
+from cogeneration.models.embed import get_index_embedding, get_time_embedding
+
+
+class NodeFeatureNet(nn.Module):
+    """
+    Simple network to embed nodes, with position and timestep embeddings.
+    """
+
+    def __init__(self, cfg: ModelNodeFeaturesConfig):
+        super(NodeFeatureNet, self).__init__()
+        self.cfg = cfg
+
+        # determine input embedding size
+        embed_size = self.cfg.c_pos_emb + self.cfg.c_timestep_emb * 2 + 1
+        if self.cfg.embed_aatype:
+            # Always 21 because of 20 amino acids + 1 for unk
+            num_embeddings = 21
+            self.aatype_embedding = nn.Embedding(num_embeddings, self.cfg.c_s)
+            embed_size += (
+                self.cfg.c_s + self.cfg.c_timestep_emb + self.cfg.aatype_pred_num_tokens
+            )
+        if self.cfg.embed_chain:
+            embed_size += self.cfg.c_pos_emb
+
+        if self.cfg.use_mlp:
+            self.linear = nn.Sequential(
+                nn.Linear(embed_size, self.cfg.c_s),
+                nn.ReLU(),
+                nn.Linear(self.cfg.c_s, self.cfg.c_s),
+                nn.ReLU(),
+                nn.Linear(self.cfg.c_s, self.cfg.c_s),
+                nn.LayerNorm(self.cfg.c_s),
+            )
+        else:
+            self.linear = nn.Linear(embed_size, self.cfg.c_s)
+
+    def embed_t(self, timesteps, mask):
+        timestep_emb = get_time_embedding(
+            timesteps=timesteps[:, 0],
+            embedding_dim=self.cfg.c_timestep_emb,
+            max_positions=2056,
+        )[:, None, :].repeat(1, mask.shape[1], 1)
+        return timestep_emb * mask.unsqueeze(-1)
+
+    def forward(
+        self,
+        so3_t,
+        r3_t,
+        cat_t,
+        res_mask,
+        diffuse_mask,
+        chain_index,
+        res_index,
+        aatypes,
+        aatypes_sc,
+    ):
+        # s: [b]
+
+        # [b, n_res, c_pos_emb]
+        pos_emb = get_index_embedding(res_index, self.cfg.c_pos_emb, max_len=2056)
+        pos_emb = pos_emb * res_mask.unsqueeze(-1)
+
+        # [b, n_res, c_timestep_emb]
+        input_feats = [
+            pos_emb,
+            diffuse_mask[..., None],
+            self.embed_t(so3_t, res_mask),
+            self.embed_t(r3_t, res_mask),
+        ]
+        if self.cfg.embed_aatype:
+            input_feats.append(self.aatype_embedding(aatypes))
+            input_feats.append(self.embed_t(cat_t, res_mask))
+            input_feats.append(aatypes_sc)
+        if self.cfg.embed_chain:
+            input_feats.append(
+                get_index_embedding(chain_index, self.cfg.c_pos_emb, max_len=100)
+            )
+        return self.linear(torch.cat(input_feats, dim=-1))

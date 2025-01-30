@@ -1,0 +1,7 @@
+# untarred artifacts
+test_set
+train_set
+# downloaded artifacts
+real_train_set.tar
+synthetic_train_set.tar
+test_set.tar
