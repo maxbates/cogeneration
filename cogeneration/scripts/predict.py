@@ -1,19 +1,23 @@
 import os
+from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import asdict
+from typing import Dict, Union
 
 import hydra
 import numpy as np
 import pandas as pd
 import torch
-from config.base import Config, InferenceTaskEnum
-from dataset.datasets import DatasetConstructor, LengthSamplingDataset
-from models.module import FlowModule
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning.utilities.model_summary import ModelSummary
-from scripts.utils import get_available_device, print_timing
-from scripts.utils_ddp import DDPInfo, setup_ddp
-from util.log import rank_zero_logger
+
+from cogeneration.config.base import Config, InferenceTaskEnum
+from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingDataset
+from cogeneration.models.module import FlowModule
+from cogeneration.scripts.utils import flatten_dict, get_available_device, print_timing
+from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
+from cogeneration.util.log import rank_zero_logger
 
 torch.set_float32_matmul_precision("high")
 log = rank_zero_logger(__name__)
@@ -23,7 +27,7 @@ class EvalRunner:
     def __init__(self, cfg: Config):
         self._input_cfg = cfg
 
-        # Read in checkpoint and config
+        # Read in checkpoint config
         if cfg.inference.task == InferenceTaskEnum.unconditional:
             ckpt_path = cfg.inference.unconditional_ckpt_path
         elif cfg.inference.task == InferenceTaskEnum.forward_folding:
@@ -32,16 +36,8 @@ class EvalRunner:
             ckpt_path = cfg.inference.inverse_folding_ckpt_path
         else:
             raise ValueError(f"Unknown task {cfg.inference.task}")
-        ckpt_dir = os.path.dirname(ckpt_path)
-        ckpt_cfg = OmegaConf.load(os.path.join(ckpt_dir, "config.yaml"))
-        self._original_cfg = cfg.copy()
-
-        # Merge configs
-        OmegaConf.set_struct(cfg, False)
-        OmegaConf.set_struct(ckpt_cfg, False)
-        cfg = OmegaConf.merge(cfg, ckpt_cfg)
-        cfg.experiment.checkpointer.dirpath = "./"
-        self.cfg = cfg
+        # Merge the checkpoint config into the current config
+        ckpt_path = self.merge_checkpoint_cfg(cfg=cfg, ckpt_path=ckpt_path)
 
         # Ensure DDP is set up for scenarios were pytorch lightning doesn't handle it
         # (e.g. debugging on Mac laptop)
@@ -86,6 +82,85 @@ class EvalRunner:
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
 
+    def merge_checkpoint_cfg(
+        self,
+        cfg: Config,
+        ckpt_path: str,
+    ) -> str:
+        """
+        Load and merge checkpoint config from `ckpt_path` into current Config `cfg`.
+        Returns ckpt_path, which may be the same as input, or a new path if the checkpoint was modified.
+
+        Maintain some important behavior configuration specified in `cfg`, i.e. for the current run,
+        and avoid being overwritten by however the checkpoint was configured.
+
+        To support using Multiflow, we need to:
+        1) Rename the keys in the state_dict to match new network module names.
+        We attempt to map the state_dict to the new module names, and save a new checkpoint, which we then load.
+        This requires that the model architecture matches MultiFlow, i.e. the same modules and shapes.
+
+        2) Support merging a YAML-style config with a structured config.
+        Since structured configs are dataclasses, and the MultiFlow config has some different fields,
+        we need to merge into a DictConfig. So, in this file, we lose the "type-safety" of the structured config.
+
+        We may have to deprecate this backwards compatibility in the future,
+        but it's nice to support inference from the public checkpoint.
+        """
+        self._original_cfg = cfg.copy()
+
+        assert os.path.exists(ckpt_path), f"Checkpoint {ckpt_path} does not exist."
+
+        ckpt_dir = os.path.dirname(ckpt_path)
+        log.info(f"Loading checkpoint from {ckpt_dir}")
+        ckpt_cfg = OmegaConf.load(os.path.join(ckpt_dir, "config.yaml"))
+
+        OmegaConf.set_struct(cfg, False)
+        OmegaConf.set_struct(ckpt_cfg, False)
+
+        # TODO - better support for merging structured configs
+        #   We should merge `ckpt_cfg` into `cfg`.
+        #   However, some fields, which determine behavior (like run `local`), should not be overridden.
+        #   To merge into a dataclass, all fields must exist. Or we merge into a base DictConfig.
+        cfg = OmegaConf.merge(ckpt_cfg, cfg, ckpt_cfg)
+        # Overwrite certain fields from the checkpoint config
+        cfg.experiment.checkpointer.dirpath = "./"
+        # Maintain important behavior specified in `cfg`
+        cfg.experiment.trainer.strategy = "auto"
+        # Save the new cfg
+        self.cfg = cfg
+
+        # In an attempt (that probably won't last) to support MultiFlow,
+        # if we got a config from MultiFlow, we need to map to our new module names.
+        # We'll map, and save a new checkpoint, and then load that checkpoint.
+        if "interpolant" in ckpt_cfg and "twisting" in ckpt_cfg.interpolant:
+            log.info("Mapping MultiFlow state dict")
+            ckpt = torch.load(ckpt_path, map_location=torch.device("cpu"))
+
+            # Define new checkpoint directory
+            ckpt_dir = ckpt_dir + "_mapped"
+            ckpt_path = os.path.join(ckpt_dir, "mapped.ckpt")
+
+            # Map modules in state_dict
+            # Assumes that these modules are active in the network, i.e. network shape is the same as MultiFlow.
+            state_dict = ckpt["state_dict"]
+            new_state_dict = OrderedDict()
+            replacements = {
+                "model.trunk.": "model.attention_ipa_trunk.trunk.",
+                "model.aatype_pred_net.": "model.aa_pred_net.aatype_pred_net.",
+            }
+            for key, value in state_dict.items():
+                for old, new in replacements.items():
+                    key = key.replace(old, new)
+                new_state_dict[key] = value
+
+            # Save new checkpoint
+            os.makedirs(ckpt_dir, exist_ok=True)
+            ckpt["state_dict"] = new_state_dict
+            torch.save(ckpt, ckpt_path)
+            log.info(f"Saved mapped checkpoint to {ckpt_path}")
+
+        return ckpt_path
+
     @print_timing
     def run_sampling(self):
         devices = get_available_device(device_limit=self.cfg.experiment.num_devices)
@@ -93,7 +168,7 @@ class EvalRunner:
         log.info(f"Evaluating {self.cfg.inference.task}")
 
         if self.cfg.inference.task == InferenceTaskEnum.unconditional:
-            eval_dataset = LengthSamplingDataset(self.cfg.samples)
+            eval_dataset = LengthSamplingDataset(self.cfg.inference.samples)
         elif (
             self.cfg.inference.task == InferenceTaskEnum.forward_folding
             or self.cfg.inference.task == InferenceTaskEnum.inverse_folding
@@ -113,8 +188,14 @@ class EvalRunner:
             drop_last=False,
         )
 
+        # Due to cfg merge above, cfg may be a structured config (dataclass) or a DictConfig
+        trainer_cfg = (
+            asdict(self.cfg.experiment.trainer)
+            if hasattr(self.cfg.experiment.trainer, "__dataclass_fields__")
+            else self.cfg.experiment.trainer
+        )
         trainer = Trainer(
-            **asdict(self.cfg.experiment.trainer),
+            **trainer_cfg,
             devices=devices,
         )
         trainer.predict(self._flow_module, dataloaders=dataloader)

@@ -3,7 +3,7 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import hydra
 from hydra.core.config_store import ConfigStore
@@ -497,8 +497,7 @@ class ExperimentTrainerConfig:
 
     # probably want "gpu" if not on a Mac, "mps" for Mac M# GPU
     # `accelerator` is argument name to Trainer()
-    # TODO - default to GPU, with flagset for local development, and ddp
-    accelerator: str = "gpu"
+    accelerator: str = "${ternary:${equals: ${local}, True}, 'mps', 'gpu'}"
     # `strategy` is argument name to Trainer(), ddp = distributed data parallel
     strategy: Optional[str] = "ddp"
     overfit_batches: int = 0
@@ -509,8 +508,6 @@ class ExperimentTrainerConfig:
     accumulate_grad_batches: int = 2
     # logging
     log_every_n_steps: int = 1
-    # if experiment.debug, use tensorboard logger
-    tensorboard_logdir: Path = Path("./lightning_logs/")
 
     def __post_init__(self):
         # distributed training (ddp) not currently supported with MPS
@@ -525,7 +522,8 @@ class ExperimentCheckpointerConfig:
     )
     save_last: bool = True
     save_top_k: int = 3
-    every_n_epochs: int = 50
+    # recommend checkpoint on some multiple of validation epoch interval. too frequent will eat up disk.
+    every_n_epochs: int = 8
     monitor: str = "valid/codesign_bb_rmsd"
     mode: str = "min"
 

@@ -5,3 +5,6 @@ lightning_logs
 outputs
 wandb
 .DS_Store
+inference_outputs
+multiflow_weights
+multiflow_weights_mapped

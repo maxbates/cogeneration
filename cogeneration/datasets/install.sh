@@ -11,12 +11,19 @@ wget https://zenodo.org/records/10714631/files/test_set.tar.gz
 
 # Uncompress training data
 mkdir train_set
-tar -xzvf real_train_set.tar.gz -C train_set/
-tar -xzvf synthetic_train_set.tar.gz -C train_set/
+tar -xzf real_train_set.tar.gz -C train_set/
+tar -xzf synthetic_train_set.tar.gz -C train_set/
 
 # Uncompress test data
 mkdir test_set
-tar -xzvf test_set.tar.gz -C test_set/
+tar -xzf test_set.tar.gz -C test_set/
 
 # Get multiflow weights
 wget https://zenodo.org/records/10714631/files/weights.tar.gz
+
+# Uncompress weights
+# creates a directory `weights` containing `config.yaml` and `last.ckpt`
+tar -xzf weights.tar.gz
+
+# Clean up tarballs
+rm *.tar.gz

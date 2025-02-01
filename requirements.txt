@@ -59,7 +59,8 @@ sympy==1.13.3
 threadpoolctl==3.5.0
 tomli==2.0.2
 torch==2.4.1
-torch-scatter @ https://data.pyg.org/whl/torch-2.4.1+cu124.html
+torch-scatter==2.1.2
+-f https://data.pyg.org/whl/torch-2.4.1+cu124.html
 torchmetrics==1.4.2
 tqdm==4.66.5
 typing_extensions==4.12.2
