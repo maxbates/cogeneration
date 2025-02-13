@@ -53,12 +53,22 @@ class DatasetEnum(ConfEnum):
 
 
 @dataclass
-class MetadataConfig:
-    """shared metadata"""
+class SharedConfig:
+    """
+    shared config, system "flags", metadata
+    """
 
+    # `local` to train locally on a Mac. use `mps` not `gpu` with `ddp`, etc.
+    local: bool = False
+    # now timestamp
     now: str = field(
         default_factory=lambda: datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     )
+    # random seed
+    seed: int = 123
+
+    # TODO - `size` argument to determine model hyperparameters
+    # TODO - gpu size argument to determine batch size, etc.
 
 
 @dataclass
@@ -69,6 +79,7 @@ class ModelHyperParamsConfig:
     Default values match those from Multiflow. Use factory methods for different configurations.
 
     TODO centralize other hyperparameters here, like transformer depth, heads, etc.
+    (assuming we really want to share them, i.e. different transformers should be the same size)
 
     TODO register hydra config group to enable easy switching
     https://hydra.cc/docs/tutorials/structured_config/defaults/
@@ -188,6 +199,35 @@ class ModelAAPredConfig:
 
 
 @dataclass
+class ModelSequenceNetConfig:
+    """
+    TODO - support a transformer architecture to predict sequence
+
+    Public MultiFlow code uses minimal AAPred network, but can probably do better
+    The public config alludes to a `sequence_net` not in code, with fields:
+
+    'model:sequence_net:init_edge_embed',
+    'model:sequence_net:init_node_embed',
+    'model:sequence_net:ipa:c_hidden',
+    'model:sequence_net:ipa:c_s',
+    'model:sequence_net:ipa:c_z',
+    'model:sequence_net:ipa:dropout',
+    'model:sequence_net:ipa:no_heads',
+    'model:sequence_net:ipa:no_qk_points',
+    'model:sequence_net:ipa:no_v_points',
+    'model:sequence_net:num_layers',
+    'model:sequence_net:use_init_embed',
+    'model:sequence_net:use_init_rigid',
+    'model:sequence_net:use_local_attention',
+    'model:use_sequence_net',
+
+    This module should pass through the initial node and edge embeddings
+    """
+
+    pass
+
+
+@dataclass
 class ModelIPAConfig:
     """
     Invariant Point Attention configuration.
@@ -266,7 +306,7 @@ class InterpolantTranslationsConfig:
     vpsde_bmin: float = 0.1
     # vpsde_bmax: variance-preserving SDE maximum
     vpsde_bmax: float = 20.0
-    # potentials and radius of gyration not used in public multiflow code
+    # potentials and radius of gyration (rog) not used in public multiflow code (but in config)
     # potential: str = 'null'
     # potential_t_scaling: bool = False
     # rog:
@@ -380,8 +420,8 @@ class DatasetFilterConfig:
     num_chains: List[int] = field(default_factory=lambda: [1])
 
 
-# metadata_dir is the root directory for dataset / metadata files
-metadata_dir_path = Path(
+# dataset_metadata_dir_path is the root directory for dataset / metadata files
+dataset_metadata_dir_path = Path(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "datasets/metadata"))
 )
 
@@ -402,28 +442,37 @@ class DatasetConfig:
     Default dataset is PDB training dataset.
 
     use PDBPost2021() for test dataset
+
+    # TODO - support scope and swissprot datasets
+    # MultiFlow public config lists: `pdb`, `pdb_mixed`, `pdb_post2021`, `scope`, `scope_mixed`, `swissprot`
     """
 
-    seed: int = 123
-    processed_data_path: str = os.path.dirname(metadata_dir_path)
-    csv_path: Path = metadata_dir_path / "pdb_metadata.csv"
-    cluster_path: Optional[Path] = metadata_dir_path / "pdb.clusters"
+    seed: int = "${shared.seed}"
+    processed_data_path: str = os.path.dirname(dataset_metadata_dir_path)
+    csv_path: Path = dataset_metadata_dir_path / "pdb_metadata.csv"
+    cluster_path: Optional[Path] = dataset_metadata_dir_path / "pdb.clusters"
     max_cache_size: int = 100_000
     cache_num_res: int = 0  # min size to enable caching
     inpainting_percent: float = 1.0
     add_plddt_mask: bool = False
-    min_plddt_threshold: float = (
-        0.0  # [0, 100]. Minimum threshold, masked if below and add_plddt_mask=True
-    )
+    # plddt [0, 100]. Minimum threshold, masked if below and add_plddt_mask=True
+    min_plddt_threshold: float = 0.0
+    # TODO - min/max motif percent threshold (avoid loopy things)
 
     # Redesigned, i.e. use ProteinMPNN to generate sequences for a structure
     use_redesigned: bool = True
-    redesigned_csv_path: Optional[Path] = metadata_dir_path / "pdb_redesigned.csv"
+    redesigned_csv_path: Optional[Path] = (
+        dataset_metadata_dir_path / "pdb_redesigned.csv"
+    )
 
     # Synthetic, e.g. AlphaFold structures?
     use_synthetic: bool = True
-    synthetic_csv_path: Optional[Path] = metadata_dir_path / "distillation_metadata.csv"
-    synthetic_cluster_path: Optional[Path] = metadata_dir_path / "distillation.clusters"
+    synthetic_csv_path: Optional[Path] = (
+        dataset_metadata_dir_path / "distillation_metadata.csv"
+    )
+    synthetic_cluster_path: Optional[Path] = (
+        dataset_metadata_dir_path / "distillation.clusters"
+    )
 
     # Eval parameters
     test_set_pdb_ids_path: Optional[Path] = None
@@ -437,8 +486,8 @@ class DatasetConfig:
     @classmethod
     def PDBPost2021(cls):
         return cls(
-            csv_path=metadata_dir_path / "test_set_metadata.csv",
-            cluster_path=metadata_dir_path / "test_set_clusters.csv",
+            csv_path=dataset_metadata_dir_path / "test_set_metadata.csv",
+            cluster_path=dataset_metadata_dir_path / "test_set_clusters.csv",
             cache_num_res=0,
             add_plddt_mask=False,
             # disable Redesigned and Synthetic for test set
@@ -448,7 +497,7 @@ class DatasetConfig:
             synthetic_csv_path=None,
             synthetic_cluster_path=None,
             # Eval parameters
-            test_set_pdb_ids_path=metadata_dir_path / "test_set_pdb_ids.csv",
+            test_set_pdb_ids_path=dataset_metadata_dir_path / "test_set_pdb_ids.csv",
             # slightly relaxed filters to match original multiflow parameters
             filter=DatasetFilterConfig(
                 max_num_res=400,
@@ -479,9 +528,10 @@ class ExperimentTrainingConfig:
 class ExperimentWandbConfig:
     """W&B configuration. Some properties are kwargs to logger"""
 
-    name: str = "${data.task}_${data.dataset}_${metadata.now}"
-    offline: bool = False
+    name: str = "${data.task}_${data.dataset}_${shared.now}"
     project: str = "cogeneration"
+    # offline if `local` (not copied to W&B)
+    offline: bool = "${ternary:${equals: ${shared.local}, True}, True, False}"
 
 
 @dataclass
@@ -497,9 +547,11 @@ class ExperimentTrainerConfig:
 
     # probably want "gpu" if not on a Mac, "mps" for Mac M# GPU
     # `accelerator` is argument name to Trainer()
-    accelerator: str = "${ternary:${equals: ${local}, True}, 'mps', 'gpu'}"
+    accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'gpu'}"
     # `strategy` is argument name to Trainer(), ddp = distributed data parallel
-    strategy: Optional[str] = "ddp"
+    strategy: Optional[str] = (
+        "${ternary:${equals: ${shared.local}, True}, 'auto', 'ddp'}"
+    )
     overfit_batches: int = 0
     min_epochs: int = 1  # prevents early stopping
     max_epochs: int = 200
@@ -508,6 +560,7 @@ class ExperimentTrainerConfig:
     accumulate_grad_batches: int = 2
     # logging
     log_every_n_steps: int = 1
+    local_tensorboard_logdir: str = "./tensorboard_logs"
 
     def __post_init__(self):
         # distributed training (ddp) not currently supported with MPS
@@ -518,7 +571,7 @@ class ExperimentTrainerConfig:
 @dataclass
 class ExperimentCheckpointerConfig:
     dirpath: str = (
-        "ckpt/${experiment.wandb.project}/${experiment.wandb.name}/${metadata.now}"
+        "ckpt/${experiment.wandb.project}/${experiment.wandb.name}/${shared.now}"
     )
     save_last: bool = True
     save_top_k: int = 3
@@ -532,10 +585,9 @@ class ExperimentCheckpointerConfig:
 class ExperimentConfig:
     """Training Experiment configuration."""
 
-    debug: bool = (
-        False  # True for local tensorboard logger, False to enable W&B, saving outputs etc
-    )
-    seed: int = 123
+    # debug True for local tensorboard logger, False to enable W&B, saving outputs etc
+    debug: bool = False
+    seed: int = "${shared.seed}"
     # num GPU devices TODO support more than one, esp for GPUs
     num_devices: int = 1
     # directory, checkpoint path
@@ -590,11 +642,11 @@ class InferenceSamplesConfig:
 class InferenceConfig:
     task: InferenceTaskEnum = InferenceTaskEnum.unconditional
 
-    seed: int = 123
+    seed: int = "${shared.seed}"
     use_gpu: bool = True
     num_gpus: int = 1
     predict_dir: Path = Path("./inference_outputs/")
-    inference_subdir: str = "${metadata.now}"
+    inference_subdir: str = "${shared.now}"
 
     # checkpoints
     saved_ckpt_dir: str = "./ckpt/${experiment.wandb.project}"
@@ -633,13 +685,14 @@ class Config:
     This is the base class and default config.
     """
 
+    shared: SharedConfig = field(default_factory=SharedConfig)
+
     data: DataConfig = field(default_factory=DataConfig)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     experiment: ExperimentConfig = field(default_factory=ExperimentConfig)
     folding: FoldingConfig = field(default_factory=FoldingConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     interpolant: InterpolantConfig = field(default_factory=InterpolantConfig)
-    metadata: MetadataConfig = field(default_factory=MetadataConfig)  # shared
     model: ModelConfig = field(default_factory=ModelConfig)
 
 

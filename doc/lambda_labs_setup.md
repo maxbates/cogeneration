@@ -46,7 +46,7 @@ view results at [wandb.ai](https://wandb.ai/)
 
 #### Copy desired results
 
-note the timestamp (`metadata.now`, e.g. "20250130_204335") and W&B run id (e.g. `maxbates-org/cogeneration/6jo9519l`) 
+note the timestamp (`shared.now`, e.g. "20250130_204335") and W&B run id (e.g. `maxbates-org/cogeneration/6jo9519l`) 
 
 copy log to local:
 ```

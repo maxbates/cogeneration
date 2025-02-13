@@ -19,7 +19,7 @@ from cogeneration.dataset.datasets import BaseDataset, DatasetConstructor, PdbDa
 from cogeneration.dataset.protein_dataloader import ProteinData
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.utils import flatten_dict, get_available_device, print_timing
-from cogeneration.scripts.utils_ddp import setup_ddp
+from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
 from cogeneration.util.log import rank_zero_logger
 
 log = rank_zero_logger(__name__)
@@ -115,13 +115,13 @@ class Experiment:
             self._train_device_ids = [self._train_device_ids[0]]
             self.cfg.data.loader.num_workers = 0
 
-        if self.cfg.local:
+        if self.cfg.shared.local:
             # If local, use tensorboard logger
             log.info(
-                f"Local mode. Using Tensorboard logger @ {self.cfg.experiment.trainer.tensorboard_logdir}"
+                f"Local mode. Using Tensorboard logger @ {self.cfg.experiment.trainer.local_tensorboard_logdir}"
             )
             logger = TensorBoardLogger(
-                save_dir=self.cfg.experiment.trainer.tensorboard_logdir,
+                save_dir=self.cfg.experiment.trainer.local_tensorboard_logdir,
                 name=self.cfg.experiment.wandb.name,
             )
         else:
@@ -132,8 +132,8 @@ class Experiment:
                 ModelCheckpoint(**asdict(self.cfg.experiment.checkpointer))
             )
 
-        # Save config only for main process.
-        local_rank = os.environ.get("LOCAL_RANK", 0)
+        # Save config, only for main process.
+        local_rank = DDPInfo.from_env().local_rank
         if local_rank == 0:
             # write locally
             ckpt_dir = self.cfg.experiment.checkpointer.dirpath
