@@ -408,6 +408,9 @@ class DatasetFilterConfig:
     max_num_res: int = 384
     min_num_res: int = 60
     max_coil_percent: float = 0.5
+    min_num_confident_plddt: float = 40
+    # TODO - support filter on low pLDDT percentage
+    # TODO - min/max motif percent threshold (avoid loopy things)
     rog_quantile: float = 0.96
     oligomeric: List[str] = field(
         default_factory=lambda: [
@@ -454,10 +457,11 @@ class DatasetConfig:
     max_cache_size: int = 100_000
     cache_num_res: int = 0  # min size to enable caching
     inpainting_percent: float = 1.0
+    # plddt [0, 100]. Minimum threshold, per residue, masked if below and add_plddt_mask=True
     add_plddt_mask: bool = False
-    # plddt [0, 100]. Minimum threshold, masked if below and add_plddt_mask=True
     min_plddt_threshold: float = 0.0
-    # TODO - min/max motif percent threshold (avoid loopy things)
+    # add gaussian noise to atom positions
+    noise_atom_positions_angstroms: float = 0.1
 
     # Redesigned, i.e. use ProteinMPNN to generate sequences for a structure
     use_redesigned: bool = True

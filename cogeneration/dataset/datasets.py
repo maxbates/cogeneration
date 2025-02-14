@@ -30,124 +30,6 @@ from cogeneration.data.io import read_pkl
 from cogeneration.dataset.data_utils import parse_chain_feats
 
 
-def _rog_filter(df, quantile):
-    """
-    Filter by radius of gyration.
-    """
-    y_quant = pd.pivot_table(
-        df,
-        values=dc.radius_gyration,
-        index=dc.modeled_seq_len,
-        aggfunc=lambda x: np.quantile(x, quantile),
-    )
-    x_quant = y_quant.index.to_numpy()
-    y_quant = y_quant.radius_gyration.to_numpy()
-
-    # Fit polynomial regressor
-    poly = PolynomialFeatures(degree=4, include_bias=True)
-    poly_features = poly.fit_transform(x_quant[:, None])
-    poly_reg_model = LinearRegression()
-    poly_reg_model.fit(poly_features, y_quant)
-
-    # Calculate cutoff for all sequence lengths
-    max_len = df[dc.modeled_seq_len].max()
-    pred_poly_features = poly.fit_transform(np.arange(max_len)[:, None])
-    # Add a little more.
-    pred_y = poly_reg_model.predict(pred_poly_features) + 0.1
-
-    row_rog_cutoffs = df[dc.modeled_seq_len].map(lambda x: pred_y[x - 1])
-    return df[df[dc.radius_gyration] < row_rog_cutoffs]
-
-
-def _length_filter(data_csv, min_res, max_res):
-    """Filter by sequence length."""
-    return data_csv[
-        (data_csv[dc.modeled_seq_len] >= min_res)
-        & (data_csv[dc.modeled_seq_len] <= max_res)
-    ]
-
-
-def _plddt_percent_filter(data_csv, min_plddt_percent):
-    """Filter proteins which do not have the required minimum pLDDT."""
-    # TODO - compute this property, use the filter
-    # It is not used in the multiflow codebase
-    return data_csv[data_csv.num_confident_plddt > min_plddt_percent]
-
-
-def _max_coil_filter(data_csv, max_coil_percent):
-    """Filter proteins which exceed max_coil_percent."""
-    return data_csv[data_csv[dc.coil_percent] <= max_coil_percent]
-
-
-def _process_csv_row(processed_file_path) -> Dict[str, Any]:
-    processed_feats = read_pkl(processed_file_path)
-    processed_feats = parse_chain_feats(processed_feats)
-
-    # Only take modeled residues.
-    modeled_idx = processed_feats[dpc.modeled_idx]
-    min_idx = np.min(modeled_idx)
-    max_idx = np.max(modeled_idx)
-    del processed_feats[dpc.modeled_idx]
-    processed_feats = tree.map_structure(
-        lambda x: x[min_idx : (max_idx + 1)], processed_feats
-    )
-
-    # Run through OpenFold data transforms.
-    chain_feats = {
-        "aatype": torch.tensor(processed_feats[dpc.aatype]).long(),
-        "all_atom_positions": torch.tensor(
-            processed_feats[dpc.atom_positions]
-        ).double(),
-        "all_atom_mask": torch.tensor(processed_feats[dpc.atom_mask]).double(),
-    }
-    chain_feats = data_transforms.atom37_to_frames(chain_feats)
-    rigids_1 = rigid_utils.Rigid.from_tensor_4x4(
-        chain_feats[dtc.rigidgroups_gt_frames]
-    )[:, 0]
-    rotmats_1 = rigids_1.get_rots().get_rot_mats()
-    trans_1 = rigids_1.get_trans()
-    res_plddt = processed_feats[dpc.b_factors][:, 1]
-    res_mask = torch.tensor(processed_feats[dpc.bb_mask]).int()
-
-    # Re-number residue indices for each chain such that it starts from 1.
-    # Randomize chain indices.
-    chain_idx = processed_feats[dpc.chain_index]
-    res_idx = processed_feats[dpc.residue_index]
-    new_res_idx = np.zeros_like(res_idx)
-    new_chain_idx = np.zeros_like(res_idx)
-    all_chain_idx = np.unique(chain_idx).tolist()
-    shuffled_chain_idx = (
-        np.array(random.sample(all_chain_idx, len(all_chain_idx)))
-        - np.min(all_chain_idx)
-        + 1
-    )
-    for i, chain_id in enumerate(all_chain_idx):
-        chain_mask = (chain_idx == chain_id).astype(int)
-        chain_min_idx = np.min(res_idx + (1 - chain_mask) * 1e3).astype(int)
-        new_res_idx = new_res_idx + (res_idx - chain_min_idx + 1) * chain_mask
-
-        # Shuffle chain_index
-        replacement_chain_id = shuffled_chain_idx[i]
-        new_chain_idx = new_chain_idx + replacement_chain_id * chain_mask
-
-    if torch.isnan(trans_1).any() or torch.isnan(rotmats_1).any():
-        raise ValueError(f"Found NaNs in {processed_file_path}")
-
-    return {
-        bp.res_plddt: res_plddt,
-        bp.aatypes_1: chain_feats[dpc.aatype],
-        bp.rotmats_1: rotmats_1,
-        bp.trans_1: trans_1,
-        bp.res_mask: res_mask,
-        bp.chain_idx: new_chain_idx,
-        bp.res_idx: new_res_idx,
-    }
-
-
-def _add_plddt_mask(feats, plddt_threshold):
-    feats[bp.plddt_mask] = torch.tensor(feats[bp.res_plddt] > plddt_threshold).int()
-
-
 def _read_clusters(cluster_path, synthetic=False):
     pdb_to_cluster = {}
     with open(cluster_path, "r") as f:
@@ -159,6 +41,116 @@ def _read_clusters(cluster_path, synthetic=False):
                     pdb = chain.strip()
                 pdb_to_cluster[pdb.upper()] = i
     return pdb_to_cluster
+
+
+class DatasetFilterer:
+    def __init__(self, dataset_cfg: DatasetConfig):
+        self.dataset_cfg = dataset_cfg
+        self._log = logging.getLogger("DatasetFilterer")
+
+    def _rog_filter(self, data_csv: pd.DataFrame) -> pd.DataFrame:
+        """
+        Filter by radius of gyration.
+        """
+        y_quant = pd.pivot_table(
+            data_csv,
+            values=dc.radius_gyration,
+            index=dc.modeled_seq_len,
+            aggfunc=lambda x: np.quantile(x, self.dataset_cfg.filter.rog_quantile),
+        )
+        x_quant = y_quant.index.to_numpy()
+        y_quant = y_quant.radius_gyration.to_numpy()
+
+        # Fit polynomial regressor
+        poly = PolynomialFeatures(degree=4, include_bias=True)
+        poly_features = poly.fit_transform(x_quant[:, None])
+        poly_reg_model = LinearRegression()
+        poly_reg_model.fit(poly_features, y_quant)
+
+        # Calculate cutoff for all sequence lengths
+        max_len = data_csv[dc.modeled_seq_len].max()
+        pred_poly_features = poly.fit_transform(np.arange(max_len)[:, None])
+        # Add a little more.
+        pred_y = poly_reg_model.predict(pred_poly_features) + 0.1
+
+        row_rog_cutoffs = data_csv[dc.modeled_seq_len].map(lambda x: pred_y[x - 1])
+        return data_csv[data_csv[dc.radius_gyration] < row_rog_cutoffs]
+
+    def _length_filter(self, data_csv: pd.DataFrame) -> pd.DataFrame:
+        """Filter by sequence length."""
+        return data_csv[
+            (data_csv[dc.modeled_seq_len] >= self.dataset_cfg.filter.min_num_res)
+            & (data_csv[dc.modeled_seq_len] <= self.dataset_cfg.filter.max_num_res)
+        ]
+
+    def _plddt_filter(self, data_csv: pd.DataFrame) -> pd.DataFrame:
+        """Filter proteins which do not have the required minimum pLDDT."""
+        # not used in the public multiflow codebase
+        return data_csv[
+            data_csv.num_confident_plddt
+            > self.dataset_cfg.filter.min_num_confident_plddt
+        ]
+
+    def _max_coil_filter(self, data_csv: pd.DataFrame) -> pd.DataFrame:
+        """Filter proteins which exceed max_coil_percent."""
+        return data_csv[
+            data_csv[dc.coil_percent] <= self.dataset_cfg.filter.max_coil_percent
+        ]
+
+    def filter_metadata(self, raw_csv: pd.DataFrame) -> pd.DataFrame:
+        """
+        Initial filtering of dataset.
+        Does not filter redesigned / synthetic datasets.
+        """
+        filter_cfg = self.dataset_cfg.filter
+        running_length = len(raw_csv)
+        data_csv = raw_csv.copy()
+
+        # monomer / oligomer
+        data_csv = data_csv[data_csv[dc.oligomeric_detail].isin(filter_cfg.oligomeric)]
+        if len(data_csv) < running_length:
+            self._log.debug(
+                f"{running_length} -> {len(data_csv)} examples after oligomeric filter"
+            )
+            running_length = len(data_csv)
+
+        # number of chains
+        data_csv = data_csv[data_csv[dc.num_chains].isin(filter_cfg.num_chains)]
+        if len(data_csv) < running_length:
+            self._log.debug(
+                f"{running_length} ->{len(data_csv)} examples after num_chains filter"
+            )
+            running_length = len(data_csv)
+
+        data_csv = self._length_filter(data_csv=data_csv)
+        if len(data_csv) < running_length:
+            self._log.debug(
+                f"{running_length} ->{len(data_csv)} examples after length filter"
+            )
+            running_length = len(data_csv)
+
+        data_csv = self._max_coil_filter(data_csv=data_csv)
+        if len(data_csv) < running_length:
+            self._log.debug(
+                f"{running_length} ->{len(data_csv)} examples after max coil filter"
+            )
+            running_length = len(data_csv)
+
+        data_csv = self._rog_filter(data_csv=data_csv)
+        if len(data_csv) < running_length:
+            self._log.debug(
+                f"{running_length} -> {len(data_csv)} examples after rog filter"
+            )
+            running_length = len(data_csv)
+
+        data_csv = self._plddt_filter(data_csv=data_csv)
+        if len(data_csv) < running_length:
+            self._log.debug(
+                f"{running_length} -> {len(data_csv)} examples after pLDDT filter"
+            )
+            running_length = len(data_csv)
+
+        return data_csv
 
 
 class BaseDataset(Dataset):
@@ -186,7 +178,8 @@ class BaseDataset(Dataset):
         )
 
         # Initial filtering
-        metadata_csv = self._filter_metadata(self.raw_csv)
+        dataset_filterer = DatasetFilterer(dataset_cfg)
+        metadata_csv = dataset_filterer.filter_metadata(self.raw_csv)
         metadata_csv = metadata_csv.sort_values(dc.modeled_seq_len, ascending=False)
 
         # Concat redesigned data, if provided
@@ -263,6 +256,8 @@ class BaseDataset(Dataset):
             # concat synthetic data to metadata_csv
             metadata_csv = pd.concat([metadata_csv, self.synthetic_csv])
 
+        # TODO - consider filtering synthetic and redesigned data, not just initial data
+
         self._create_split(metadata_csv)
 
         # If test set IDs defined, remove from training set
@@ -278,62 +273,6 @@ class BaseDataset(Dataset):
 
     def __len__(self):
         return len(self.csv)
-
-    def _filter_metadata(self, raw_csv: pd.DataFrame) -> pd.DataFrame:
-        """
-        Initial filtering of dataset.
-        Does not filter redesigned / synthetic datasets.
-        """
-        filter_cfg = self.dataset_cfg.filter
-        running_length = len(raw_csv)
-        data_csv = raw_csv.copy()
-
-        data_csv = data_csv[data_csv[dc.oligomeric_detail].isin(filter_cfg.oligomeric)]
-        if len(data_csv) < running_length:
-            self._log.debug(
-                f"{running_length} -> {len(data_csv)} examples after oligomeric filter"
-            )
-            running_length = len(data_csv)
-
-        data_csv = data_csv[data_csv[dc.num_chains].isin(filter_cfg.num_chains)]
-        if len(data_csv) < running_length:
-            self._log.debug(
-                f"{running_length} ->{len(data_csv)} examples after num_chains filter"
-            )
-            running_length = len(data_csv)
-
-        data_csv = _length_filter(
-            data_csv=data_csv,
-            min_res=filter_cfg.min_num_res,
-            max_res=filter_cfg.max_num_res,
-        )
-        if len(data_csv) < running_length:
-            self._log.debug(
-                f"{running_length} ->{len(data_csv)} examples after length filter"
-            )
-            running_length = len(data_csv)
-
-        data_csv = _max_coil_filter(
-            data_csv=data_csv,
-            max_coil_percent=filter_cfg.max_coil_percent,
-        )
-        if len(data_csv) < running_length:
-            self._log.debug(
-                f"{running_length} ->{len(data_csv)} examples after max coil filter"
-            )
-            running_length = len(data_csv)
-
-        data_csv = _rog_filter(
-            df=data_csv,
-            quantile=filter_cfg.rog_quantile,
-        )
-        if len(data_csv) < running_length:
-            self._log.debug(
-                f"{running_length} -> {len(data_csv)} examples after rog filter"
-            )
-            running_length = len(data_csv)
-
-        return data_csv
 
     def _create_split(self, data_csv):
         # Training or validation specific logic.
@@ -366,7 +305,96 @@ class BaseDataset(Dataset):
             )
         self.csv[dc.index] = list(range(len(self.csv)))
 
+    def _process_processed_path(self, processed_file_path: str) -> Dict[str, Any]:
+        """
+        Processes a single structurs + metadata pickled at `processed_file_path`.
+        """
+        processed_feats = read_pkl(processed_file_path)
+        processed_feats = parse_chain_feats(processed_feats)
+
+        # Only take modeled residues.
+        modeled_idx = processed_feats[dpc.modeled_idx]
+        min_idx = np.min(modeled_idx)
+        max_idx = np.max(modeled_idx)
+        del processed_feats[dpc.modeled_idx]
+        processed_feats = tree.map_structure(
+            lambda x: x[min_idx : (max_idx + 1)], processed_feats
+        )
+
+        # Construct an intermediate `chain_feats` for OpenFold pipeline
+        chain_feats = {
+            "aatype": torch.tensor(processed_feats[dpc.aatype]).long(),
+            "all_atom_positions": torch.tensor(
+                processed_feats[dpc.atom_positions]
+            ).double(),
+            "all_atom_mask": torch.tensor(processed_feats[dpc.atom_mask]).double(),
+        }
+
+        # Add noise to atom positions.
+        # TODO - confirm angstroms vs nm here
+        if self.dataset_cfg.noise_atom_positions_angstroms > 0:
+            atom_position_noise = (
+                torch.randn_like(chain_feats["all_atom_positions"])
+                * self.dataset_cfg.noise_atom_positions_angstroms
+            )
+            chain_feats["all_atom_positions"] += atom_position_noise
+
+        # Run through OpenFold data transforms.
+        chain_feats = data_transforms.atom37_to_frames(chain_feats)
+        rigids_1 = rigid_utils.Rigid.from_tensor_4x4(
+            chain_feats[dtc.rigidgroups_gt_frames]
+        )[:, 0]
+        rotmats_1 = rigids_1.get_rots().get_rot_mats()
+        trans_1 = rigids_1.get_trans()
+        res_plddt = processed_feats[dpc.b_factors][:, 1]
+        res_mask = torch.tensor(processed_feats[dpc.bb_mask]).int()
+
+        # Re-number residue indices for each chain such that it starts from 1.
+        # Randomize chain indices.
+        chain_idx = processed_feats[dpc.chain_index]
+        res_idx = processed_feats[dpc.residue_index]
+        new_res_idx = np.zeros_like(res_idx)
+        new_chain_idx = np.zeros_like(res_idx)
+        all_chain_idx = np.unique(chain_idx).tolist()
+        shuffled_chain_idx = (
+            np.array(random.sample(all_chain_idx, len(all_chain_idx)))
+            - np.min(all_chain_idx)
+            + 1
+        )
+        for i, chain_id in enumerate(all_chain_idx):
+            chain_mask = (chain_idx == chain_id).astype(int)
+            chain_min_idx = np.min(res_idx + (1 - chain_mask) * 1e3).astype(int)
+            new_res_idx = new_res_idx + (res_idx - chain_min_idx + 1) * chain_mask
+
+            # Shuffle chain_index
+            replacement_chain_id = shuffled_chain_idx[i]
+            new_chain_idx = new_chain_idx + replacement_chain_id * chain_mask
+
+        if torch.isnan(trans_1).any() or torch.isnan(rotmats_1).any():
+            raise ValueError(f"Found NaNs in {processed_file_path}")
+
+        # Mask low pLDDT residues
+        plddt_mask = torch.ones_like(res_mask)
+        if self.dataset_cfg.add_plddt_mask:
+            plddt_mask = torch.tensor(
+                res_plddt > self.dataset_cfg.min_plddt_threshold
+            ).int()
+
+        return {
+            bp.res_plddt: res_plddt,
+            bp.aatypes_1: chain_feats[dpc.aatype],
+            bp.rotmats_1: rotmats_1,
+            bp.trans_1: trans_1,
+            bp.res_mask: res_mask,
+            bp.plddt_mask: plddt_mask,
+            bp.chain_idx: new_chain_idx,
+            bp.res_idx: new_res_idx,
+        }
+
     def process_csv_row(self, csv_row):
+        """
+        Process a single row of the CSV file, with caching.
+        """
         path = os.path.join(
             self.dataset_cfg.processed_data_path, csv_row[dc.processed_path]
         )
@@ -377,7 +405,7 @@ class BaseDataset(Dataset):
         if use_cache and path in self._cache:
             return self._cache[path]
 
-        processed_row = _process_csv_row(path)
+        processed_row = self._process_processed_path(path)
         processed_row[dc.pdb_name] = csv_row[dc.pdb_name]
 
         if self.dataset_cfg.use_redesigned:
@@ -399,12 +427,7 @@ class BaseDataset(Dataset):
     def __getitem__(self, row_idx):
         # Process data example.
         csv_row = self.csv.iloc[row_idx]
-        feats = self.process_csv_row(csv_row)  # process on the fly
-
-        if self.dataset_cfg.add_plddt_mask:
-            _add_plddt_mask(feats, self.dataset_cfg.min_plddt_threshold)
-        else:
-            feats[bp.plddt_mask] = torch.ones_like(feats[bp.res_mask])
+        feats = self.process_csv_row(csv_row)  # process on the fly (with caching)
 
         if self.task == DataTaskEnum.hallucination:
             feats[bp.diffuse_mask] = torch.ones_like(feats[bp.res_mask]).bool()

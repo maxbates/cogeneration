@@ -26,8 +26,6 @@ def rigids_nm_to_ang(x: torch.tensor):
 PDB_CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 PDB_MAX_CHAINS = len(PDB_CHAIN_IDS)  # := 62.
 
-CHAIN_FEATS = ["atom_positions", "aatype", "atom_mask", "residue_index", "b_factors"]
-
 NUM_TOKENS = residue_constants.restype_num  # := 20.
 MASK_TOKEN_INDEX = residue_constants.restypes_with_x.index("X")  # := 21.
 

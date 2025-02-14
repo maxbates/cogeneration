@@ -24,7 +24,7 @@ class DatasetColumns(str, Enum):
 
     # redesign columns
     example = "example"
-    best_seq = "best_seq"
+    best_seq = "best_seq"  # best 1 redesign per structure
     best_rmsd = "best_rmsd"
 
     # added during load
@@ -55,7 +55,7 @@ class DatasetProteinColumns(str, Enum):
     residue_index = "residue_index"  # residue index (N, )
     chain_index = "chain_index"  # chain index (N, )
     b_factors = "b_factors"  # b factors (N, 37)
-    modeled_idx = "modeled_idx"  # index of modeled residues, i.e. in mask (N, )
+    modeled_idx = "modeled_idx"  # index of modeled residues (dropped in processing) i.e. in mask (N, )
 
 
 class DatasetTransformColumns(str, Enum):
