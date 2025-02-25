@@ -222,7 +222,10 @@ class FlowModule(LightningModule):
         else:
             cat_norm_scale = 1.0
 
-        # Model output predictions.
+        # Model output predictions
+        # Basically, predict translations, rotations, and sequence and compare to ground truth.
+        # Also compute the vector field, from the sampled `t` to predicted trans + rots.
+        # To learn/refine vector field at t (for trans and rots) for init_rigids -> pred_rigids.
         model_output = self.model(noisy_batch)
         pred_trans_1 = model_output[pbp.pred_trans]
         pred_rotmats_1 = model_output[pbp.pred_rotmats]
@@ -255,7 +258,10 @@ class FlowModule(LightningModule):
             / loss_denom
         )
 
-        # Translation VF loss
+        # TODO - translation vector field loss
+        #   requires calculating and emitting from model. See FoldFlow2
+
+        # Translation loss
         trans_error = (
             (gt_trans_1 - pred_trans_1) / r3_norm_scale * training_cfg.trans_scale
         )
@@ -273,6 +279,8 @@ class FlowModule(LightningModule):
             * torch.sum(rots_vf_error**2 * loss_mask[..., None], dim=(-1, -2))
             / loss_denom
         )
+
+        # TODO consider explicit rotation loss (see FoldFlow2)
 
         # Pairwise distance loss
         gt_flat_atoms = gt_bb_atoms.reshape([num_batch, num_res * 3, 3])
@@ -293,22 +301,30 @@ class FlowModule(LightningModule):
         pred_pair_dists = pred_pair_dists * flat_loss_mask[..., None]
         pair_dist_mask = flat_loss_mask[..., None] * flat_res_mask[:, None, :]
 
+        # TODO - enable proximity mask, or weighting, add distance + weight to cfg
+        # # No loss on anything >6A
+        # proximity_mask = gt_pair_dists < 6
+        # pair_dist_mask = pair_dist_mask * proximity_mask
+
         dist_mat_loss = torch.sum(
             (gt_pair_dists - pred_pair_dists) ** 2 * pair_dist_mask, dim=(1, 2)
         )
         dist_mat_loss /= torch.sum(pair_dist_mask, dim=(1, 2)) + 1
 
-        se3_vf_loss = trans_loss + rots_vf_loss
+        # Auxiliary loss
         auxiliary_loss = (
             bb_atom_loss * training_cfg.aux_loss_use_bb_loss
             + dist_mat_loss * training_cfg.aux_loss_use_pair_loss
         )
+        # TODO consider separate t threshold for dist loss vs bb atom loss, add to config
         auxiliary_loss *= (r3_t[:, 0] > training_cfg.aux_loss_t_pass) & (
             so3_t[:, 0] > training_cfg.aux_loss_t_pass
         )
         auxiliary_loss *= training_cfg.aux_loss_weight
         auxiliary_loss = torch.clamp(auxiliary_loss, max=5)
 
+        # Total loss
+        # se3_vf_loss = trans_loss + rots_vf_loss
         train_loss = trans_loss + rots_vf_loss + auxiliary_loss + aatypes_loss
 
         if torch.any(torch.isnan(train_loss)):

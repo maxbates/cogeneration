@@ -1,21 +1,23 @@
-from dataclasses import asdict
-
 import numpy as np
-from Bio import PDB
 
 from cogeneration.data.const import CA_IDX
-from cogeneration.data.protein import process_chain
+from cogeneration.data.csv import DatasetProteinColumns as dpc
 
 
 def parse_chain_feats(chain_feats, scale_factor: float = 1.0, center: bool = True):
-    chain_feats["bb_mask"] = chain_feats["atom_mask"][:, CA_IDX]
-    bb_pos = chain_feats["atom_positions"][:, CA_IDX]
+    """
+    Parse loaded chain features. Add position information and mask for backbone atoms.
+
+    Note that positions are expected in angstroms (PDB style).
+    """
+    chain_feats[dpc.bb_mask] = chain_feats[dpc.atom_mask][:, CA_IDX]
+    bb_pos = chain_feats[dpc.atom_positions][:, CA_IDX]
     if center:
-        bb_center = np.sum(bb_pos, axis=0) / (np.sum(chain_feats["bb_mask"]) + 1e-5)
-        centered_pos = chain_feats["atom_positions"] - bb_center[None, None, :]
+        bb_center = np.sum(bb_pos, axis=0) / (np.sum(chain_feats[dpc.bb_mask]) + 1e-5)
+        centered_pos = chain_feats[dpc.atom_positions] - bb_center[None, None, :]
         scaled_pos = centered_pos / scale_factor
     else:
-        scaled_pos = chain_feats["atom_positions"] / scale_factor
-    chain_feats["atom_positions"] = scaled_pos * chain_feats["atom_mask"][..., None]
-    chain_feats["bb_positions"] = chain_feats["atom_positions"][:, CA_IDX]
+        scaled_pos = chain_feats[dpc.atom_positions] / scale_factor
+    chain_feats[dpc.atom_positions] = scaled_pos * chain_feats[dpc.atom_mask][..., None]
+    chain_feats[dpc.bb_positions] = chain_feats[dpc.atom_positions][:, CA_IDX]
     return chain_feats

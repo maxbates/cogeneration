@@ -1,15 +1,16 @@
 from typing import Dict, Union
 
 import torch
+from models.sequence_ipa_net import SequenceIPANet
 from torch import nn
 
-from cogeneration.config.base import ModelConfig
+from cogeneration.config.base import ModelConfig, ModelSequencePredictionEnum
 from cogeneration.data.batch_props import BatchProps as bp
 from cogeneration.data.batch_props import NoisyBatchProps as nbp
 from cogeneration.data.batch_props import PredBatchProps as pbp
 from cogeneration.data.const import rigids_ang_to_nm, rigids_nm_to_ang
 from cogeneration.data.rigid import create_rigid
-from cogeneration.models.aa_pred import AminoAcidPredictionNet
+from cogeneration.models.aa_pred import AminoAcidNOOPNet, AminoAcidPredictionNet
 from cogeneration.models.edge_feature_net import EdgeFeatureNet
 from cogeneration.models.ipa_attention import AttentionIPATrunk
 from cogeneration.models.node_feature_net import NodeFeatureNet
@@ -18,16 +19,22 @@ from cogeneration.models.node_feature_net import NodeFeatureNet
 class FlowModel(nn.Module):
     """
     Primary model that co-generates sequence and structure.
+    Learns a vector field to generate both structure (frames, i.e. rotations and translations) and sequence
 
     Takes as input:
-    - a partially masked sequence
-    - a protein structure (frames - translations and rotations)
+    - a (partially masked) sequence
+    - a protein structure, represented as frames (i.e. translations and rotations)
 
-    Sequence is embedding using a language model like ESM
-    Structure is embedded using IPA
-    Trunk of the model merges representations, runs through folding blocks
+    Structure (and sequence) is embedded to get a linear representation (NodeFeatureNet)
+    Structure residue distances (edges) are embedded to get a pair representation (EdgeFeatureNet)
+    These representations + structure is embedded using IPA (AttentionIPATrunk)
+        Trunk of the model merges representations, runs through folding blocks
+        Returns a new node embedding, edge embedding, and updated structure
 
-    Learns a vector field to generate both structure (frames, i.e. rotations and translations) and sequence
+    Specifically, it predicts translations, rotations, and amino acid logits.
+    Comparing the predicted translations and rotations to the ground truth structure is main loss.
+    Also, the translation and rotation vector field is computed and compared to the ground truth trajectory.
+    The ground truth trajectory is (~simply) a linear interpolation from start (noise) to end (structure).
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -38,7 +45,21 @@ class FlowModel(nn.Module):
         self.node_feature_net = NodeFeatureNet(cfg.node_features)
         self.edge_feature_net = EdgeFeatureNet(cfg.edge_features)
         self.attention_ipa_trunk = AttentionIPATrunk(cfg.ipa)
-        self.aa_pred_net = AminoAcidPredictionNet(cfg.aa_pred)
+
+        # sequence prediction sub-module
+
+        if self.cfg.sequence_pred_type == ModelSequencePredictionEnum.NOOP:
+            self.aa_pred_net = AminoAcidNOOPNet(cfg.aa_pred)
+        elif self.cfg.sequence_pred_type == ModelSequencePredictionEnum.aa_pred:
+            self.aa_pred_net = AminoAcidPredictionNet(cfg.aa_pred)
+        elif (
+            self.cfg.sequence_pred_type == ModelSequencePredictionEnum.sequence_ipa_net
+        ):
+            self.aa_pred_net = SequenceIPANet(cfg.sequence_ipa_net)
+        else:
+            raise ValueError(
+                f"Invalid sequence prediction type: {self.cfg.sequence_pred_type}"
+            )
 
     def forward(self, input_feats) -> Dict[Union[bp, pbp], torch.Tensor]:
         node_mask = input_feats[bp.res_mask]
@@ -80,7 +101,7 @@ class FlowModel(nn.Module):
         curr_rigids_ang = create_rigid(rotmats_t, trans_t)
 
         # Main trunk
-        # TODO - clean up angstrom vs nm... can we just abstract it away?
+        # Note that IPA trunk works in nm scale, rather than angstroms
         node_embed, edge_embed, curr_rigids_nm = self.attention_ipa_trunk(
             init_node_embed=init_node_embed,
             init_edge_embed=init_edge_embed,
@@ -97,6 +118,12 @@ class FlowModel(nn.Module):
         # Amino acid prediction
         pred_logits, pred_aatypes = self.aa_pred_net(
             node_embed=node_embed,
+            edge_embed=edge_embed,
+            node_mask=node_mask,
+            edge_mask=edge_mask,
+            curr_rigids_nm=curr_rigids_nm,
+            diffuse_mask=diffuse_mask,
+            chain_index=chain_index,
             aatypes_t=aatypes_t,
         )
 

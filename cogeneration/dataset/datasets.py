@@ -331,7 +331,7 @@ class BaseDataset(Dataset):
         }
 
         # Add noise to atom positions.
-        # TODO - confirm angstroms vs nm here
+        # Features are in angstrom-scale.
         if self.dataset_cfg.noise_atom_positions_angstroms > 0:
             atom_position_noise = (
                 torch.randn_like(chain_feats["all_atom_positions"])

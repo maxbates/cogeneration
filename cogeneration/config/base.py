@@ -185,13 +185,37 @@ class ModelEdgeFeaturesConfig:
 
 
 @dataclass
+class ModelIPAConfig:
+    """
+    Invariant Point Attention configuration.
+    Keys match ported OpenFold's IPA module.
+    """
+
+    # IPA parameters
+    # s channel. `s` is the single representation, i.e. node embedding
+    c_s: int = "${model.hyper_params.node_embed_size}"
+    # z channel. `z` is the pair representation, i.e. edge embedding
+    c_z: int = "${model.hyper_params.edge_embed_size}"
+    c_hidden: int = 16
+    no_heads: int = 8
+    no_qk_points: int = 8
+    no_v_points: int = 12
+    # Attention trunk parameters
+    num_blocks: int = 8
+    dropout: float = 0.0
+    seq_tfmr_num_heads: int = 4
+    seq_tfmr_num_layers: int = 4
+    transformer_dropout: float = 0.2
+
+
+@dataclass
 class ModelAAPredConfig:
     """
-    Amino acid prediction configuration.
+    Amino acid prediction configuration using simple linear layers.
     """
 
     # aatype_pred: whether to predict amino acid types, i.e. enable this network
-    aatype_pred: bool = True
+    aatype_pred: bool = True  # TODO drop (deprecated, use NOOP network)
     # c_s: node embedding size (input)
     c_s: int = "${model.hyper_params.node_embed_size}"
     # aatype_pred_num_tokens: number of amino acid types => logits / rate-matrix shape
@@ -199,12 +223,12 @@ class ModelAAPredConfig:
 
 
 @dataclass
-class ModelSequenceNetConfig:
+class ModelSequenceIPANetConfig:
     """
-    TODO - support a transformer architecture to predict sequence
+    IPA style transformer, predicting logits instead of backbone update.
 
-    Public MultiFlow code uses minimal AAPred network, but can probably do better
-    The public config alludes to a `sequence_net` not in code, with fields:
+    Public MultiFlow code uses minimal AAPred linear network.
+    The public MultiFlow config alludes to a `sequence_net` not in code, with fields:
 
     'model:sequence_net:init_edge_embed',
     'model:sequence_net:init_node_embed',
@@ -220,33 +244,23 @@ class ModelSequenceNetConfig:
     'model:sequence_net:use_init_rigid',
     'model:sequence_net:use_local_attention',
     'model:use_sequence_net',
-
-    This module should pass through the initial node and edge embeddings
     """
 
-    pass
-
-
-@dataclass
-class ModelIPAConfig:
-    """
-    Invariant Point Attention configuration.
-    Keys match ported OpenFold's IPA module.
-    """
-
+    # aatype_pred_num_tokens: number of amino acid types => logits / rate-matrix shape
+    aatype_pred_num_tokens: int = "${model.hyper_params.aa_num_tokens}"
     # IPA parameters
-    c_s: int = "${model.hyper_params.node_embed_size}"
-    c_z: int = "${model.hyper_params.edge_embed_size}"
-    c_hidden: int = 16
-    no_heads: int = 8
-    no_qk_points: int = 8
-    no_v_points: int = 12
-    # Attention trunk parameters
-    num_blocks: int = 8
-    dropout: float = 0.0
-    seq_tfmr_num_heads: int = 4
-    seq_tfmr_num_layers: int = 4
-    transformer_dropout: float = 0.2
+    # We use fewer blocks, because no backbone updates are performed
+    ipa: ModelIPAConfig = field(
+        default_factory=lambda: ModelIPAConfig(
+            num_blocks=2,
+        )
+    )
+
+
+class ModelSequencePredictionEnum(str, Enum):
+    NOOP = "noop"  # simply emit aatypes
+    aa_pred = "aa_pred"  # public MultiFlow. Simple MLP.
+    sequence_ipa_net = "sequence_ipa_net"  # IPA transformer architecture
 
 
 @dataclass
@@ -261,7 +275,15 @@ class ModelConfig:
         default_factory=ModelEdgeFeaturesConfig
     )
     ipa: ModelIPAConfig = field(default_factory=ModelIPAConfig)
+
+    # sequence prediction, default is simple aa_pred matching MultiFlow
+    sequence_pred_type: ModelSequencePredictionEnum = (
+        ModelSequencePredictionEnum.aa_pred
+    )
     aa_pred: ModelAAPredConfig = field(default_factory=ModelAAPredConfig)
+    sequence_ipa_net: ModelSequenceIPANetConfig = field(
+        default_factory=ModelSequenceIPANetConfig
+    )
 
 
 class InterpolantRotationsScheduleEnum(str, Enum):
@@ -461,6 +483,7 @@ class DatasetConfig:
     add_plddt_mask: bool = False
     min_plddt_threshold: float = 0.0
     # add gaussian noise to atom positions
+    # TODO only add noise if t below some threshold
     noise_atom_positions_angstroms: float = 0.1
 
     # Redesigned, i.e. use ProteinMPNN to generate sequences for a structure
@@ -525,7 +548,7 @@ class ExperimentTrainingConfig:
     aux_loss_weight: float = 0.25  # default 0.0 in multiflow
     aux_loss_use_bb_loss: bool = True
     aux_loss_use_pair_loss: bool = True
-    aux_loss_t_pass: float = 0.5
+    aux_loss_t_pass: float = 0.5  # minimum t for aux loss
 
 
 @dataclass
