@@ -3,11 +3,11 @@ from typing import Tuple
 import torch
 from data.rigid_utils import Rigid
 from models.aa_pred import BaseSequencePredictionNet
+from models.ipa_attention import AttentionIPATrunk
 from torch import nn
 
 from cogeneration.config.base import ModelSequenceIPANetConfig
 from cogeneration.data.const import MASK_TOKEN_INDEX, NUM_TOKENS
-from cogeneration.models import ipa_pytorch
 
 # TODO - consider a backwards predictor too, see Discrete Flow Matching
 # in practice, this will predict masks, but allow for "correction"
@@ -32,47 +32,22 @@ class SequenceIPANet(BaseSequencePredictionNet):
         super(SequenceIPANet, self).__init__()
         self.cfg = cfg
 
-        self.trunk = nn.ModuleDict()
-        for b in range(self.cfg.ipa.num_blocks):
-            self.trunk[f"ipa_{b}"] = ipa_pytorch.InvariantPointAttention(self.cfg.ipa)
-            self.trunk[f"ipa_ln_{b}"] = nn.LayerNorm(self.cfg.ipa.c_s)
-
-            tfmr_in = self.cfg.ipa.c_s
-            tfmr_layer = torch.nn.TransformerEncoderLayer(
-                d_model=tfmr_in,
-                nhead=self.cfg.ipa.seq_tfmr_num_heads,
-                dim_feedforward=tfmr_in,
-                batch_first=True,
-                dropout=self.cfg.ipa.transformer_dropout,
-                norm_first=False,
-            )
-            self.trunk[f"seq_tfmr_{b}"] = nn.TransformerEncoder(
-                encoder_layer=tfmr_layer,
-                num_layers=self.cfg.ipa.seq_tfmr_num_layers,
-                enable_nested_tensor=False,
-            )
-            self.trunk[f"post_tfmr_{b}"] = ipa_pytorch.Linear(
-                tfmr_in, self.cfg.ipa.c_s, init="final"
-            )
-            self.trunk[f"node_transition_{b}"] = ipa_pytorch.StructureModuleTransition(
-                c=self.cfg.ipa.c_s
-            )
-
-            # no backbone update
-
-            if b < self.cfg.ipa.num_blocks - 1:
-                # No edge update on the last block.
-                self.trunk[f"edge_transition_{b}"] = ipa_pytorch.EdgeTransition(
-                    node_embed_size=self.cfg.ipa.c_s,
-                    edge_embed_in=self.cfg.ipa.c_z,
-                    edge_embed_out=self.cfg.ipa.c_z,
-                )
+        self.ipa_trunk = AttentionIPATrunk(
+            cfg=cfg.ipa,
+            perform_backbone_update=False,  # no backbone update
+            perform_final_edge_update=False,  # no edge update on last block, not used further
+        )
 
         # Use final representation to predict amino acid tokens
-        self.trunk[f"logits"] = nn.Linear(
+        # TODO - consider also using edge features to predict logits.
+        self.aatype_pred_net = nn.Linear(
             self.cfg.ipa.c_s,
             self.cfg.aatype_pred_num_tokens,
         )
+
+    @property
+    def uses_edge_embed(self) -> bool:
+        return True
 
     def forward(
         self,
@@ -88,31 +63,18 @@ class SequenceIPANet(BaseSequencePredictionNet):
         node_embed = node_embed * node_mask[..., None]
         edge_embed = edge_embed * edge_mask[..., None]
 
-        for b in range(self.cfg.ipa.num_blocks):
-            ipa_embed = self.trunk[f"ipa_{b}"](
-                node_embed,  # s, single repr
-                edge_embed,  # z, pair repr
-                curr_rigids_nm,  # r, rigid
-                node_mask,
-            )
-            ipa_embed *= node_mask[..., None]
-            node_embed = self.trunk[f"ipa_ln_{b}"](node_embed + ipa_embed)
-
-            seq_tfmr_out = self.trunk[f"seq_tfmr_{b}"](
-                node_embed, src_key_padding_mask=(1 - node_mask).to(torch.bool)
-            )
-            node_embed = node_embed + self.trunk[f"post_tfmr_{b}"](seq_tfmr_out)
-            node_embed = self.trunk[f"node_transition_{b}"](node_embed)
-            node_embed = node_embed * node_mask[..., None]
-
-            # no backbone update
-
-            if b < self.cfg.ipa.num_blocks - 1:
-                edge_embed = self.trunk[f"edge_transition_{b}"](node_embed, edge_embed)
-                edge_embed *= edge_mask[..., None]
+        # run through IPA trunk
+        node_embed, edge_embed, curr_rigids_nm = self.ipa_trunk(
+            init_node_embed=node_embed,
+            init_edge_embed=edge_embed,
+            node_mask=node_mask,
+            edge_mask=edge_mask,
+            diffuse_mask=diffuse_mask,
+            curr_rigids_nm=curr_rigids_nm,
+        )
 
         # predict logits from updated representation
-        pred_logits = self.trunk["logits"](node_embed)
+        pred_logits = self.aatype_pred_net(node_embed)
 
         # num_tokens can include mask or not. If it does, "mask" the mask logits
         if self.cfg.aatype_pred_num_tokens == NUM_TOKENS + 1:

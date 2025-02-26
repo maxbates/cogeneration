@@ -41,13 +41,10 @@ class FlowModel(nn.Module):
         super(FlowModel, self).__init__()
         self.cfg = cfg
 
-        # sub-modules
         self.node_feature_net = NodeFeatureNet(cfg.node_features)
         self.edge_feature_net = EdgeFeatureNet(cfg.edge_features)
-        self.attention_ipa_trunk = AttentionIPATrunk(cfg.ipa)
 
         # sequence prediction sub-module
-
         if self.cfg.sequence_pred_type == ModelSequencePredictionEnum.NOOP:
             self.aa_pred_net = AminoAcidNOOPNet(cfg.aa_pred)
         elif self.cfg.sequence_pred_type == ModelSequencePredictionEnum.aa_pred:
@@ -60,6 +57,13 @@ class FlowModel(nn.Module):
             raise ValueError(
                 f"Invalid sequence prediction type: {self.cfg.sequence_pred_type}"
             )
+
+        # IPA trunk
+        # Whether we perform final edge update depends on if used by aa_pred_net
+        self.attention_ipa_trunk = AttentionIPATrunk(
+            cfg=cfg.ipa,
+            perform_final_edge_update=self.aa_pred_net.uses_edge_embed,
+        )
 
     def forward(self, input_feats) -> Dict[Union[bp, pbp], torch.Tensor]:
         node_mask = input_feats[bp.res_mask]

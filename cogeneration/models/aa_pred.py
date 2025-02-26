@@ -17,6 +17,15 @@ class BaseSequencePredictionNet(nn.Module):
     def __init__(self):
         super(BaseSequencePredictionNet, self).__init__()
 
+    @property
+    def uses_edge_embed(self) -> bool:
+        """
+        Returns whether the model uses edge embeddings.
+        If True, upstream IPA module should update them (i.e. not skip in final block)
+        In general, used by IPA transformer, not simple MLPs.
+        """
+        return False
+
     def forward(
         self,
         node_embed: torch.Tensor,

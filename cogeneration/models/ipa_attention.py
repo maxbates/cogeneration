@@ -9,6 +9,18 @@ from cogeneration.models import ipa_pytorch
 class AttentionIPATrunk(nn.Module):
     """
     IPA-based Attention Trunk
+    Performs Invariant Point Attention, which considers trans/rots between points (residues),
+    followed by a transformer block, and linear-ish layers for updating node and edge embeddings.
+
+    The default network matches the public MultiFlow model, and AlphaFold/OpenFold models.
+
+    Performing Backbone Update is optional but on by default.
+    Specify `perform_backbone_update=False` to avoid changing backbone coordinates,
+    and only update node and edge embeddings.
+
+    Performing Final Edge Update is optional but off by default.
+    Specify `perform_final_edge_update=True` to update edge embeddings in the final block.
+    You may want to do this if you have downstream models that use edge embeddings.
 
     Works in nanometer scale, not angstroms.
     """
@@ -16,9 +28,13 @@ class AttentionIPATrunk(nn.Module):
     def __init__(
         self,
         cfg: ModelIPAConfig,
+        perform_final_edge_update: bool = False,
+        perform_backbone_update: bool = True,
     ):
         super(AttentionIPATrunk, self).__init__()
         self.cfg = cfg
+        self.perform_final_edge_update = perform_final_edge_update
+        self.perform_backbone_update = perform_backbone_update
 
         self.trunk = nn.ModuleDict()
         for b in range(self.cfg.num_blocks):
@@ -45,13 +61,15 @@ class AttentionIPATrunk(nn.Module):
             self.trunk[f"node_transition_{b}"] = ipa_pytorch.StructureModuleTransition(
                 c=self.cfg.c_s
             )
-            self.trunk[f"bb_update_{b}"] = ipa_pytorch.BackboneUpdate(
-                self.cfg.c_s,
-                use_rot_updates=True,
-            )
 
-            if b < self.cfg.num_blocks - 1:
-                # No edge update on the last block.
+            if self.perform_backbone_update:
+                self.trunk[f"bb_update_{b}"] = ipa_pytorch.BackboneUpdate(
+                    self.cfg.c_s,
+                    use_rot_updates=True,
+                )
+
+            # No edge update on the last block, unless specified.
+            if b < self.cfg.num_blocks - 1 or self.perform_final_edge_update:
                 edge_in = self.cfg.c_z
                 self.trunk[f"edge_transition_{b}"] = ipa_pytorch.EdgeTransition(
                     node_embed_size=self.cfg.c_s,
@@ -89,16 +107,17 @@ class AttentionIPATrunk(nn.Module):
             node_embed = self.trunk[f"node_transition_{b}"](node_embed)
             node_embed = node_embed * node_mask[..., None]
 
-            rigid_update = self.trunk[f"bb_update_{b}"](
-                node_embed * node_mask[..., None]
-            )
+            if self.perform_backbone_update:
+                rigid_update = self.trunk[f"bb_update_{b}"](
+                    node_embed * node_mask[..., None]
+                )
 
-            update_mask = (node_mask * diffuse_mask)[..., None]
-            curr_rigids_nm = curr_rigids_nm.compose_q_update_vec(
-                rigid_update, update_mask
-            )
+                update_mask = (node_mask * diffuse_mask)[..., None]
+                curr_rigids_nm = curr_rigids_nm.compose_q_update_vec(
+                    rigid_update, update_mask
+                )
 
-            if b < self.cfg.num_blocks - 1:
+            if b < self.cfg.num_blocks - 1 or self.perform_final_edge_update:
                 edge_embed = self.trunk[f"edge_transition_{b}"](node_embed, edge_embed)
                 edge_embed *= edge_mask[..., None]
 
