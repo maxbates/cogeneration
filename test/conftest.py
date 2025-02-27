@@ -32,7 +32,9 @@ def mock_cfg():
 
 @pytest.fixture
 def pdb_noisy_batch(mock_cfg):
-    dataset_constructor = DatasetConstructor.pdb_train_validation()
+    dataset_constructor = DatasetConstructor.pdb_train_validation(
+        dataset_cfg=mock_cfg.dataset,
+    )
     train_dataset, valid_dataset = dataset_constructor.create_datasets()
 
     dataloader = DataLoader(train_dataset, batch_size=1)
@@ -68,10 +70,10 @@ class MockDataset(Dataset):
         input_feats[bp.csv_idx] = torch.tensor([0])
 
         # generate corrupted noisy values for input_feats
-        input_feats[nbp.t] = torch.rand(1)
-        input_feats[nbp.so3_t] = torch.rand(1)
-        input_feats[nbp.r3_t] = torch.rand(1)
-        input_feats[nbp.cat_t] = torch.rand(1)
+        t = torch.rand(1)  # use same value but really they are independent
+        input_feats[nbp.so3_t] = t
+        input_feats[nbp.r3_t] = t
+        input_feats[nbp.cat_t] = t
         input_feats[nbp.trans_t] = torch.rand(N, 3)
         input_feats[nbp.rotmats_t] = torch.rand(N, 3, 3)
         input_feats[nbp.aatypes_t] = torch.rand(N) * 20  # amino acid sequence as floats
@@ -108,8 +110,10 @@ def mock_pred_unconditional_dataloader():
 
 
 @pytest.fixture
-def mock_pred_conditional_dataloader():
-    dataset_constructor = DatasetConstructor.pdb_test()
+def mock_pred_conditional_dataloader(mock_cfg):
+    dataset_constructor = DatasetConstructor.pdb_test(
+        dataset_cfg=mock_cfg.dataset,
+    )
     eval_dataset, _ = dataset_constructor.create_datasets()
 
     dataloader = DataLoader(eval_dataset, batch_size=1)

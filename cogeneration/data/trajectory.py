@@ -24,7 +24,7 @@ def save_traj(
             i.e. bb_prot_traj[0] is the final sample after reverse diffusion.
             N is number of residues.
         x0_traj: [clean_T, N, 37, 3] atom37 predictions of clean data at each time step.
-        res_mask: [N] residue mask.
+        res_mask: [N] residue mask.  # TODO add argument
         diffuse_mask: [N] which residues are diffused.
         output_dir: where to save samples.
         aa_traj: [noisy_T, N] amino acids (0 - 20 inclusive).

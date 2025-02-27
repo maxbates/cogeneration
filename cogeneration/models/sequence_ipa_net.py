@@ -1,13 +1,13 @@
 from typing import Tuple
 
 import torch
-from data.rigid_utils import Rigid
-from models.aa_pred import BaseSequencePredictionNet
-from models.ipa_attention import AttentionIPATrunk
 from torch import nn
 
 from cogeneration.config.base import ModelSequenceIPANetConfig
 from cogeneration.data.const import MASK_TOKEN_INDEX, NUM_TOKENS
+from cogeneration.data.rigid_utils import Rigid
+from cogeneration.models.aa_pred import BaseSequencePredictionNet
+from cogeneration.models.ipa_attention import AttentionIPATrunk
 
 # TODO - consider a backwards predictor too, see Discrete Flow Matching
 # in practice, this will predict masks, but allow for "correction"

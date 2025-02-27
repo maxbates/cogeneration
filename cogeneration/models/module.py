@@ -12,10 +12,10 @@ import torch
 import torch.distributed as dist
 import wandb
 from lightning_utilities.core.apply_func import apply_to_collection
-from omegaconf import OmegaConf
 from pytorch_lightning import LightningModule
 from pytorch_lightning.loggers.wandb import WandbLogger
 
+import wandb
 from cogeneration.config.base import Config, DataTaskEnum, InferenceTaskEnum
 from cogeneration.data import all_atom, so3_utils
 from cogeneration.data.batch_props import BatchProps as bp

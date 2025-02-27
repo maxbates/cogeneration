@@ -1,8 +1,8 @@
 import torch
-from config.base import Config, ModelConfig
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
+from cogeneration.config.base import Config, ModelConfig, ModelSequencePredictionEnum
 from cogeneration.models.model import FlowModel
 
 
@@ -20,10 +20,15 @@ class TestFlowModel:
         model = FlowModel(mock_cfg.model)
         input_feats = next(iter(mock_dataloader))
         output = model(input_feats)
-
         assert output is not None
 
     def test_model_torch_compiles(self, mock_cfg, pdb_noisy_batch):
         model = FlowModel(mock_cfg.model)
         compiled_model = torch.compile(model)
         output = compiled_model(pdb_noisy_batch)
+
+    def test_model_sequence_ipa_net(self, mock_cfg, pdb_noisy_batch):
+        mock_cfg.model.sequence_pred_type = ModelSequencePredictionEnum.sequence_ipa_net
+        model = FlowModel(mock_cfg.model)
+        output = model(pdb_noisy_batch)
+        assert output is not None

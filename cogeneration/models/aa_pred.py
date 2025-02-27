@@ -1,11 +1,11 @@
 from typing import Tuple
 
 import torch
-from data.rigid_utils import Rigid
 from torch import nn
 
 from cogeneration.config.base import ModelAAPredConfig
 from cogeneration.data.const import MASK_TOKEN_INDEX, NUM_TOKENS
+from cogeneration.data.rigid_utils import Rigid
 
 
 class BaseSequencePredictionNet(nn.Module):

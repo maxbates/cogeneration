@@ -1,6 +1,5 @@
 import os
 from dataclasses import asdict
-from typing import Tuple
 
 import hydra
 import torch
@@ -12,7 +11,6 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.loggers.wandb import WandbLogger
 from pytorch_lightning.trainer import Trainer
-from pytorch_lightning.utilities import rank_zero_only
 
 from cogeneration.config.base import Config
 from cogeneration.dataset.datasets import BaseDataset, DatasetConstructor, PdbDataset

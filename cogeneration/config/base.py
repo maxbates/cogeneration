@@ -3,9 +3,8 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
-import hydra
 from hydra.core.config_store import ConfigStore
 
 """
@@ -29,6 +28,9 @@ class ConfEnum(str, Enum):
     """
 
     def __str__(self):
+        return str(self.value)
+
+    def __repr__(self):
         return str(self.value)
 
 
@@ -227,6 +229,8 @@ class ModelSequenceIPANetConfig:
     """
     IPA style transformer, predicting logits instead of backbone update.
 
+    TODO - consider centralizing on AAPredConfig, and just use this for IPA, without duplicate fields
+
     Public MultiFlow code uses minimal AAPred linear network.
     The public MultiFlow config alludes to a `sequence_net` not in code, with fields:
 
@@ -257,7 +261,7 @@ class ModelSequenceIPANetConfig:
     )
 
 
-class ModelSequencePredictionEnum(str, Enum):
+class ModelSequencePredictionEnum(ConfEnum):
     NOOP = "noop"  # simply emit aatypes
     aa_pred = "aa_pred"  # public MultiFlow. Simple MLP.
     sequence_ipa_net = "sequence_ipa_net"  # IPA transformer architecture
@@ -286,7 +290,7 @@ class ModelConfig:
     )
 
 
-class InterpolantRotationsScheduleEnum(str, Enum):
+class InterpolantRotationsScheduleEnum(ConfEnum):
     linear = "linear"
     exp = "exp"
 
@@ -303,7 +307,7 @@ class InterpolantRotationsConfig:
     exp_rate: float = 10
 
 
-class InterpolantTranslationsScheduleEnum(str, Enum):
+class InterpolantTranslationsScheduleEnum(ConfEnum):
     linear = "linear"
     vpsde = "vpsde"  # variance-preserving SDE
 
@@ -336,18 +340,26 @@ class InterpolantTranslationsConfig:
     #   cutoff: 5.0
 
 
-class InterpolantAATypesScheduleEnum(str, Enum):
+class InterpolantAATypesScheduleEnum(ConfEnum):
     linear = "linear"
     exp = "exp"  # TODO re-introduce, 'exp' not used in public MultiFlow code
 
 
-class InterpolantAATypesInterpolantTypeEnum(str, Enum):
+class InterpolantAATypesInterpolantTypeEnum(ConfEnum):
     masking = "masking"
     uniform = "uniform"
 
 
 @dataclass
 class InterpolantAATypesConfig:
+    """
+    Interpolant for amino acids.
+
+    Note that there are two interpolants: one for training and one for inference
+    TODO reconsider ternary use to differentiate training and inference interpolants
+        or, consider a subclass which handles default arguments accordingly
+    """
+
     # corrupt: corrupt amino acid types
     corrupt: bool = True
     # schedule: training schedule for interpolant

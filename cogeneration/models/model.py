@@ -1,7 +1,6 @@
 from typing import Dict, Union
 
 import torch
-from models.sequence_ipa_net import SequenceIPANet
 from torch import nn
 
 from cogeneration.config.base import ModelConfig, ModelSequencePredictionEnum
@@ -14,6 +13,7 @@ from cogeneration.models.aa_pred import AminoAcidNOOPNet, AminoAcidPredictionNet
 from cogeneration.models.edge_feature_net import EdgeFeatureNet
 from cogeneration.models.ipa_attention import AttentionIPATrunk
 from cogeneration.models.node_feature_net import NodeFeatureNet
+from cogeneration.models.sequence_ipa_net import SequenceIPANet
 
 
 class FlowModel(nn.Module):

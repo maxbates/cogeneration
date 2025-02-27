@@ -1,4 +1,3 @@
-import abc
 import logging
 import os
 import random
@@ -15,7 +14,6 @@ from torch.utils.data import Dataset
 
 from cogeneration.config.base import (
     Config,
-    DataConfig,
     DatasetConfig,
     DataTaskEnum,
     InferenceSamplesConfig,
@@ -86,10 +84,12 @@ class DatasetFilterer:
     def _plddt_filter(self, data_csv: pd.DataFrame) -> pd.DataFrame:
         """Filter proteins which do not have the required minimum pLDDT."""
         # not used in the public multiflow codebase
-        return data_csv[
-            data_csv.num_confident_plddt
-            > self.dataset_cfg.filter.min_num_confident_plddt
-        ]
+        # TODO - pull out pLDDTs from structure, not available in current CSV
+        # return data_csv[
+        #     dc.num_confident_plddt
+        #     > self.dataset_cfg.filter.min_num_confident_plddt
+        # ]
+        return data_csv
 
     def _max_coil_filter(self, data_csv: pd.DataFrame) -> pd.DataFrame:
         """Filter proteins which exceed max_coil_percent."""
@@ -122,6 +122,7 @@ class DatasetFilterer:
             )
             running_length = len(data_csv)
 
+        # length
         data_csv = self._length_filter(data_csv=data_csv)
         if len(data_csv) < running_length:
             self._log.debug(
@@ -129,6 +130,7 @@ class DatasetFilterer:
             )
             running_length = len(data_csv)
 
+        # max coil percent
         data_csv = self._max_coil_filter(data_csv=data_csv)
         if len(data_csv) < running_length:
             self._log.debug(
@@ -136,6 +138,7 @@ class DatasetFilterer:
             )
             running_length = len(data_csv)
 
+        # radius of gyration
         data_csv = self._rog_filter(data_csv=data_csv)
         if len(data_csv) < running_length:
             self._log.debug(
@@ -143,6 +146,7 @@ class DatasetFilterer:
             )
             running_length = len(data_csv)
 
+        # pLDDT
         data_csv = self._plddt_filter(data_csv=data_csv)
         if len(data_csv) < running_length:
             self._log.debug(
@@ -533,20 +537,20 @@ class DatasetConstructor:
         return train_dataset, eval_dataset
 
     @classmethod
-    def pdb_train_validation(cls, dataset_cfg: Optional[DatasetConfig] = None):
+    def pdb_train_validation(cls, dataset_cfg: DatasetConfig):
         """Generates default training and evaluation datasets"""
         return cls(
             dataset_class=PdbDataset,
-            cfg=dataset_cfg or DatasetConfig(),
+            cfg=dataset_cfg,
             task=DataTaskEnum.hallucination,
         )
 
     @classmethod
-    def pdb_test(cls, dataset_cfg: Optional[DatasetConfig] = None):
+    def pdb_test(cls, dataset_cfg: DatasetConfig):
         """Generates default eval dataset"""
         return cls(
             dataset_class=PdbDataset,
-            cfg=dataset_cfg or DatasetConfig.PDBPost2021(),
+            cfg=dataset_cfg,
             task=DataTaskEnum.hallucination,
         )
 

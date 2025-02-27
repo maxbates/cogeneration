@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, Optional, Sequence, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
@@ -1045,7 +1045,7 @@ class Rigid:
         translation.
 
         Args:
-            q_vec: The quaternion update vector.
+            q_update_vec: The quaternion update vector.
         Returns:
             The composed transformation.
         """
@@ -1069,7 +1069,7 @@ class Rigid:
         shape [*, 3], where columns represent a 3D translation.
 
         Args:
-            q_vec: The quaternion update vector.
+            t_vec: The translation update vector.
         Returns:
             The composed transformation.
         """
@@ -1102,7 +1102,7 @@ class Rigid:
         Composes the current rigid object with another.
 
         Args:
-            r:
+            rot:
                 Another Rigid object
             order:
                 Order in which to perform rotation multiplication.

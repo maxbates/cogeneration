@@ -260,21 +260,6 @@ class InvariantPointAttention(nn.Module):
         inf: float = 1e5,
         eps: float = 1e-8,
     ):
-        """
-        Args:
-            c_s:
-                Single representation channel dimension
-            c_z:
-                Pair representation channel dimension
-            c_hidden:
-                Hidden channel dimension
-            no_heads:
-                Number of attention heads
-            no_qk_points:
-                Number of query/key points to generate
-            no_v_points:
-                Number of value points to generate
-        """
         super(InvariantPointAttention, self).__init__()
         self._ipa_conf = ipa_conf
 

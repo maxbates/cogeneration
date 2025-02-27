@@ -1,11 +1,9 @@
 import copy
 from collections import defaultdict
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
-from scipy.spatial.transform import Rotation
 
 from cogeneration.config.base import (
     InterpolantAATypesInterpolantTypeEnum,
@@ -645,7 +643,7 @@ class Interpolant:
 
         if forward_folding:
             assert aatypes_1 is not None
-            assert self.cfg.aatypes.noise == 0  # cfg sanity check
+            assert self.cfg.aatypes.noise == 0.0  # cfg sanity check
         if forward_folding and separate_t:
             aatypes_0 = aatypes_1
         if inverse_folding:

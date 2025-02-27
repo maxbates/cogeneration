@@ -48,11 +48,10 @@ class TestFlowModule:
     def test_predict_step_forward_folding_works(
         self, mock_cfg, mock_pred_conditional_dataloader
     ):
-        mock_cfg.inference.task = InferenceTaskEnum.forward_folding
-
         # modify config for forward folding
-        mock_cfg.interpolant.aatypes.noise = 0.0
-        mock_cfg.interpolant.aatypes.do_purity = False
+        mock_cfg.inference.task = InferenceTaskEnum.forward_folding
+        mock_cfg.inference.interpolant.aatypes.noise = 0.0
+        mock_cfg.inference.interpolant.aatypes.do_purity = False
 
         module = FlowModule(mock_cfg)
 
