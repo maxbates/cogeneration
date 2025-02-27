@@ -1,10 +1,12 @@
+import copy
 import os
 from collections import OrderedDict
 from dataclasses import asdict
+from typing import Tuple
 
 import hydra
 import torch
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning.utilities.model_summary import ModelSummary
 
@@ -21,7 +23,7 @@ log = rank_zero_logger(__name__)
 
 class EvalRunner:
     def __init__(self, cfg: Config):
-        self._input_cfg = cfg
+        self._input_cfg: Config = copy.deepcopy(cfg)
 
         # Read in checkpoint config
         if cfg.inference.task == InferenceTaskEnum.unconditional:
@@ -32,8 +34,12 @@ class EvalRunner:
             ckpt_path = cfg.inference.inverse_folding_ckpt_path
         else:
             raise ValueError(f"Unknown task {cfg.inference.task}")
+
         # Merge the checkpoint config into the current config
-        ckpt_path = self.merge_checkpoint_cfg(cfg=cfg, ckpt_path=ckpt_path)
+        merged_cfg, ckpt_path = self.merge_checkpoint_cfg(cfg=cfg, ckpt_path=ckpt_path)
+        # Save the merged cfg
+        # Note that it is a DictConfig, because it may contain keys not defined in the Config dataclass
+        self.cfg: DictConfig = merged_cfg
 
         # Ensure DDP is set up for scenarios were pytorch lightning doesn't handle it
         # (e.g. debugging on Mac laptop)
@@ -78,14 +84,17 @@ class EvalRunner:
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
 
+    @staticmethod
     def merge_checkpoint_cfg(
-        self,
         cfg: Config,
         ckpt_path: str,
-    ) -> str:
+    ) -> Tuple[DictConfig, str]:
         """
         Load and merge checkpoint config from `ckpt_path` into current Config `cfg`.
-        Returns ckpt_path, which may be the same as input, or a new path if the checkpoint was modified.
+        Also maps state_dict to new module names for public MultiFlow compatibility.
+        Returns:
+            merged config, which must be a DictConfig, not Config dataclass, to handle new keys from MultiFlow
+            ckpt_path, which may be the same as input, or a new path if the checkpoint was modified.
 
         Maintain some important behavior configuration specified in `cfg`, i.e. for the current run,
         and avoid being overwritten by however the checkpoint was configured.
@@ -102,15 +111,18 @@ class EvalRunner:
         We may have to deprecate this backwards compatibility in the future,
         but it's nice to support inference from the public checkpoint.
         """
-        self._original_cfg = cfg.copy()
-
+        if not ckpt_path.endswith(".ckpt"):
+            raise ValueError(
+                f"Invalid checkpoint path {ckpt_path}, should end with .ckpt"
+            )
         assert os.path.exists(ckpt_path), f"Checkpoint {ckpt_path} does not exist."
 
         ckpt_dir = os.path.dirname(ckpt_path)
         log.info(f"Loading checkpoint from {ckpt_dir}")
         ckpt_cfg = OmegaConf.load(os.path.join(ckpt_dir, "config.yaml"))
 
-        OmegaConf.set_struct(cfg, False)
+        # Use `set_struct` to prevent creation of fields not defined in the configs
+        OmegaConf.set_struct(OmegaConf.structured(cfg), False)
         OmegaConf.set_struct(ckpt_cfg, False)
 
         # TODO - better support for merging structured configs
@@ -122,8 +134,6 @@ class EvalRunner:
         cfg.experiment.checkpointer.dirpath = "./"
         # Maintain important behavior specified in `cfg`
         cfg.experiment.trainer.strategy = "auto"
-        # Save the new cfg
-        self.cfg = cfg
 
         # In an attempt (that probably won't last) to support MultiFlow,
         # if we got a config from MultiFlow, we need to map to our new module names.
@@ -155,7 +165,7 @@ class EvalRunner:
             torch.save(ckpt, ckpt_path)
             log.info(f"Saved mapped checkpoint to {ckpt_path}")
 
-        return ckpt_path
+        return cfg, ckpt_path
 
     @print_timing
     def run_sampling(self):
@@ -171,7 +181,7 @@ class EvalRunner:
         ):
             # We want to use the inference settings for the pdb dataset, not what was in the ckpt config
             dataset_constructor = DatasetConstructor.pdb_test(
-                dataset_cfg=self._original_cfg.pdb_post2021_dataset
+                dataset_cfg=self._input_cfg.pdb_post2021_dataset
             )
             eval_dataset, _ = dataset_constructor.create_datasets()
         else:
