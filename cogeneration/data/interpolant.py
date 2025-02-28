@@ -255,7 +255,9 @@ class Interpolant:
 
         # [B, 1]
         if self.cfg.codesign_separate_t:
+            # Generate random values `u` to determine the type of corruption
             u = torch.rand((num_batch,), device=self._device)
+            # Assign the type of corruption based on `u` and proportion for forward/inverse folding
             forward_fold_mask = (u < self.cfg.codesign_forward_fold_prop).float()
             inverse_fold_mask = (
                 u
@@ -263,19 +265,20 @@ class Interpolant:
                 + self.cfg.codesign_forward_fold_prop
             ).float() * (u >= self.cfg.codesign_forward_fold_prop).float()
 
+            # Sample t values for normal structure and categorical corruption
             normal_structure_t = self.sample_t(num_batch)
             inverse_fold_structure_t = torch.ones((num_batch,), device=self._device)
             normal_cat_t = self.sample_t(num_batch)
             forward_fold_cat_t = torch.ones((num_batch,), device=self._device)
 
-            # If we are forward folding, then cat_t should be 1
+            # If we are forward folding, then cat_t should be 1 (i.e. data, sequence)
             # If we are inverse folding or codesign then cat_t should be uniform
             cat_t = (
                 forward_fold_mask * forward_fold_cat_t
                 + (1 - forward_fold_mask) * normal_cat_t
             )
 
-            # If we are inverse folding, then structure_t should be 1
+            # If we are inverse folding, then structure_t should be 1 (i.e. data, structure)
             # If we are forward folding or codesign then structure_t should be uniform
             structure_t = (
                 inverse_fold_mask * inverse_fold_structure_t
@@ -574,19 +577,26 @@ class Interpolant:
         inverse_folding: bool = False,
         separate_t: bool = False,
     ):
-        # TODO - better documentation for this function
+        """
+        Generate samples using the learned vector fields.
+        Generates initialy noise batch, samples using Euler steps for rotations, translations, and amino acid types.
+        Special handling for forward folding, reverse folding, and separate t.
+        """
 
         res_mask = torch.ones(num_batch, num_res, device=self._device)
 
-        # Set-up initial prior samples
+        # Set-up initial prior samples (noise)
 
         if trans_0 is None:
+            # Generate centered Gaussian noise for translations (shape: [num_batch, num_res, 3])
             trans_0 = (
                 _centered_gaussian(num_batch, num_res, self._device) * NM_TO_ANG_SCALE
             )
         if rotmats_0 is None:
+            # Generate uniform SO(3) rotation matrices (shape: [num_batch, num_res, 3, 3])
             rotmats_0 = _uniform_so3(num_batch, num_res, self._device)
         if aatypes_0 is None:
+            # Generate initial amino acid types based on the interpolant type
             if (
                 self.cfg.aatypes.interpolant_type
                 == InterpolantAATypesInterpolantTypeEnum.masking
@@ -604,14 +614,18 @@ class Interpolant:
                     f"Unknown aatypes interpolant type {self.cfg.aatypes.interpolant_type}"
                 )
         if res_idx is None:
+            # Generate residue indices (shape: [num_batch, num_res])
+            # Each generated sample will be the same length
             res_idx = torch.arange(num_res, device=self._device, dtype=torch.float32)[
                 None
             ].repeat(num_batch, 1)
 
         if chain_idx is None:
+            # Default: assumes monomer
             chain_idx = res_mask
 
         if diffuse_mask is None:
+            # Default: diffuse all residues
             diffuse_mask = res_mask
 
         trans_sc = torch.zeros(num_batch, num_res, 3, device=self._device)
@@ -628,6 +642,13 @@ class Interpolant:
             nbp.aatypes_sc: aatypes_sc,
         }
 
+        # Set-up time
+        if num_timesteps is None:
+            num_timesteps = self.cfg.sampling.num_timesteps
+        ts = torch.linspace(self.cfg.min_t, 1.0, num_timesteps)
+        t_1 = ts[0]
+
+        # Initialize t_1 values for translations, rotations, and aatypes
         if trans_1 is None:
             trans_1 = torch.zeros(num_batch, num_res, 3, device=self._device)
         if rotmats_1 is None:
@@ -653,25 +674,28 @@ class Interpolant:
             trans_0 = trans_1
             rotmats_0 = rotmats_1
 
-        logs_traj = defaultdict(list)
-
-        # Set-up time
-        if num_timesteps is None:
-            num_timesteps = self.cfg.sampling.num_timesteps
-        ts = torch.linspace(self.cfg.min_t, 1.0, num_timesteps)
-        t_1 = ts[0]
-
+        # Helper function to get structure from residue frames
         frames_to_atom37 = (
-            lambda x, y: all_atom.atom37_from_trans_rot(x, y, res_mask).detach().cpu()
+            lambda trans, rots: all_atom.atom37_from_trans_rot(
+                trans=trans,
+                rots=rots,
+                res_mask=res_mask,
+            )
+            .detach()
+            .cpu()
         )
+
+        # We will integrate in a loop over ts (handling the last step after the loop)
+        # t_1 is the current time, t_2 is the next time
+
         trans_t_1, rotmats_t_1, aatypes_t_1 = trans_0, rotmats_0, aatypes_0
+        # prot_traj tracks predicted intermediate states integrating from t=0 to t=1
         prot_traj = [
             (frames_to_atom37(trans_t_1, rotmats_t_1), aatypes_0.detach().cpu())
         ]
+        # clean_traj tracks states predicted by model without noise / processing
         clean_traj = []
         for t_2 in ts[1:]:
-
-            # Run model.
             if self.cfg.trans.corrupt:
                 batch[nbp.trans_t] = trans_t_1
             else:
@@ -708,6 +732,7 @@ class Interpolant:
                     batch[nbp.so3_t] = t
                 batch[nbp.r3_t] = t
                 batch[nbp.cat_t] = t
+
             if forward_folding and separate_t:
                 batch[nbp.cat_t] = (1 - self.cfg.min_t) * torch.ones_like(
                     batch[nbp.cat_t]
@@ -720,12 +745,11 @@ class Interpolant:
                     batch[nbp.so3_t]
                 )
 
-            d_t = t_2 - t_1
-
+            # Get model output at translations/rotations/aatypes respective `t`
             with torch.no_grad():
                 model_out = model(batch)
 
-            # Process model output.
+            # Process model output, getting predicted structure/sequence
             pred_trans_1 = model_out[pbp.pred_trans]
             pred_rotmats_1 = model_out[pbp.pred_rotmats]
             pred_aatypes_1 = model_out[pbp.pred_aatypes]
@@ -755,9 +779,12 @@ class Interpolant:
                     )
 
             # Take reverse step
+            # Move from current structure/sequence at t_1, taking d_t Euler step toward t_2
+            d_t = t_2 - t_1
             trans_t_2 = self._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
             rotmats_t_2 = self._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
 
+            # Update amino acid types, allowing for "purity", i.e. unmasking and re-masking
             if self.cfg.aatypes.do_purity:
                 aatypes_t_2 = self._aatypes_euler_step_purity(
                     d_t, t_1, pred_logits_1, aatypes_t_1
@@ -767,17 +794,23 @@ class Interpolant:
                     d_t, t_1, pred_logits_1, aatypes_t_1
                 )
 
+            # Only update the masked residues
             trans_t_2 = _trans_diffuse_mask(trans_t_2, trans_1, diffuse_mask)
             rotmats_t_2 = _rots_diffuse_mask(rotmats_t_2, rotmats_1, diffuse_mask)
             aatypes_t_2 = _aatypes_diffuse_mask(aatypes_t_2, aatypes_1, diffuse_mask)
-            trans_t_1, rotmats_t_1, aatypes_t_1 = trans_t_2, rotmats_t_2, aatypes_t_2
+
+            # Add to trajectory
             prot_traj.append(
                 (frames_to_atom37(trans_t_2, rotmats_t_2), aatypes_t_2.cpu().detach())
             )
 
+            # Get ready for the next step
+            trans_t_1, rotmats_t_1, aatypes_t_1 = trans_t_2, rotmats_t_2, aatypes_t_2
             t_1 = t_2
 
         # We only integrated to min_t, so need to make a final step
+        # and save the trajectory + final structure
+
         t_1 = ts[-1]
 
         if self.cfg.trans.corrupt:

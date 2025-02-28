@@ -326,7 +326,10 @@ class InterpolantTranslationsConfig:
     train_schedule: InterpolantTranslationsScheduleEnum = (
         InterpolantTranslationsScheduleEnum.linear
     )
-    # sample_schedule: sampling schedule for interpolant
+    # sample_schedule: sampling schedule for interpolant.
+    # Note that structures seem to generate better when rotations settle first.
+    # Therefore, rotations schedule should scale t faster than translations.
+    # For example, it might make sense for rotations=exponential, translations=linear.
     sample_schedule: InterpolantTranslationsScheduleEnum = (
         InterpolantTranslationsScheduleEnum.linear
     )
@@ -400,14 +403,18 @@ class InterpolantSamplingConfig:
 @dataclass
 class InterpolantConfig:
     min_t: float = 1e-2
-    separate_t: bool = False
-    provide_kappa: bool = False
+    separate_t: bool = False  # TODO drop, unused
+    # kappa allows scaling rotation t exponentially
+    provide_kappa: bool = True
     hierarchical_t: bool = False
+    # Whether to use separate t times for structure and sequence
     codesign_separate_t: bool = (
         "${ternary:${equals: ${inference.task}, 'unconditional'}, False, True}"
     )
+    # proportion of samples allocated to forward or inverse folding, if using separate t
     codesign_forward_fold_prop: float = 0.1
     codesign_inverse_fold_prop: float = 0.1
+    # enable self-conditioning
     self_condition: bool = "${model.edge_features.self_condition}"
     # sub-modules
     rots: InterpolantRotationsConfig = field(default_factory=InterpolantRotationsConfig)
