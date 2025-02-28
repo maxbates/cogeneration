@@ -122,13 +122,15 @@ class FlowModel(nn.Module):
         # Amino acid prediction
         pred_logits, pred_aatypes = self.aa_pred_net(
             node_embed=node_embed,
+            aatypes_t=aatypes_t,
             edge_embed=edge_embed,
             node_mask=node_mask,
             edge_mask=edge_mask,
             curr_rigids_nm=curr_rigids_nm,
             diffuse_mask=diffuse_mask,
             chain_index=chain_index,
-            aatypes_t=aatypes_t,
+            init_node_embed=init_node_embed,
+            init_edge_embed=init_edge_embed,
         )
 
         return {

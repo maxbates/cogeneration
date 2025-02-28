@@ -36,6 +36,8 @@ class BaseSequencePredictionNet(nn.Module):
         curr_rigids_nm: Rigid,
         diffuse_mask: torch.Tensor,
         chain_index: torch.Tensor,
+        init_node_embed: torch.Tensor,
+        init_edge_embed: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass to predict amino acid logits.
@@ -93,6 +95,8 @@ class AminoAcidPredictionNet(BaseSequencePredictionNet):
         curr_rigids_nm: Rigid,
         diffuse_mask: torch.Tensor,
         chain_index: torch.Tensor,
+        init_node_embed: torch.Tensor,
+        init_edge_embed: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Run through network to get logits
         pred_logits = self.aatype_pred_net(node_embed)
@@ -131,6 +135,8 @@ class AminoAcidNOOPNet(BaseSequencePredictionNet):
         curr_rigids_nm: Rigid,
         diffuse_mask: torch.Tensor,
         chain_index: torch.Tensor,
+        init_node_embed: torch.Tensor,
+        init_edge_embed: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         pred_aatypes = aatypes_t
         pred_logits = nn.functional.one_hot(

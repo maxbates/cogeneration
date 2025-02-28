@@ -92,7 +92,7 @@ class Experiment:
 
         log.info(f"Training with devices: {self._train_device_ids}")
 
-        # Initialize model
+        # Initialize module
         self._module = FlowModule(
             self.cfg,
             folding_device_id=folding_device_id,

@@ -18,6 +18,7 @@ Several parameters from Multiflow appear to be unused, many are marked with `# D
 # TODO - support default configs for `forward_folding` and `inverse folding`
 #   There are a handful of values across the config that need to have other defaults.
 #   i.e. instead of the current `ternary` paradigm
+#   to better differentate the training vs inference interpolant
 
 
 class ConfEnum(str, Enum):
@@ -252,6 +253,9 @@ class ModelSequenceIPANetConfig:
 
     # aatype_pred_num_tokens: number of amino acid types => logits / rate-matrix shape
     aatype_pred_num_tokens: int = "${model.hyper_params.aa_num_tokens}"
+    # add initial node + edge embeddings to post-IPA trunk embeddings
+    # FoldFlow-2 claimed this was important to pass through time + positional embeddings to logit prediction
+    use_init_embed: bool = True
     # IPA parameters
     # We use fewer blocks, because no backbone updates are performed
     ipa: ModelIPAConfig = field(
@@ -609,6 +613,8 @@ class ExperimentTrainerConfig:
 
 @dataclass
 class ExperimentCheckpointerConfig:
+    """Arguments to ModelCheckpoint()"""
+
     dirpath: str = (
         "ckpt/${experiment.wandb.project}/${experiment.wandb.name}/${shared.now}"
     )

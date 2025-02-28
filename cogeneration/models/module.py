@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, fields
 from random import random
 from typing import Any, Dict, Optional, Union
@@ -41,6 +42,9 @@ class TrainingLosses:
     auxiliary_loss: torch.Tensor
     aatypes_loss: torch.Tensor
     train_loss: torch.Tensor  # aggregated loss
+    loss_denom_num_res: (
+        torch.Tensor
+    )  # number of residues contributing to loss across batch
 
     def __getitem__(self, key: str) -> Any:
         # TODO - deprecate and use properties directly
@@ -74,6 +78,9 @@ class FlowModule(LightningModule):
 
         self._checkpoint_dir = None
         self._inference_dir = None
+
+        # batch / state tracking
+        self._data_history = deque(maxlen=100)
 
         # TODO - move folding / validation to its own class/module
         self._folding_model = None
@@ -193,7 +200,7 @@ class FlowModule(LightningModule):
             loss_mask *= noisy_batch[bp.plddt_mask]
         if torch.any(torch.sum(loss_mask, dim=-1) < 1):
             raise ValueError("Empty batch encountered")
-        loss_denom = torch.sum(loss_mask, dim=-1) * 3
+        loss_denom_num_res = torch.sum(loss_mask, dim=-1)
         num_batch, num_res = loss_mask.shape
 
         # Ground truth labels
@@ -243,20 +250,17 @@ class FlowModule(LightningModule):
             ).reshape(num_batch, num_res)
             / cat_norm_scale
         )
-        aatypes_loss = torch.sum(ce_loss * loss_mask, dim=-1) / (loss_denom / 3)
+        aatypes_loss = torch.sum(ce_loss * loss_mask, dim=-1) / loss_denom_num_res
         aatypes_loss *= training_cfg.aatypes_loss_weight
 
         # Backbone atom loss
         pred_bb_atoms = all_atom.to_atom37(pred_trans_1, pred_rotmats_1)[:, :, :3]
         gt_bb_atoms *= training_cfg.bb_atom_scale / r3_norm_scale[..., None]
         pred_bb_atoms *= training_cfg.bb_atom_scale / r3_norm_scale[..., None]
-        bb_atom_loss = (
-            torch.sum(
-                (gt_bb_atoms - pred_bb_atoms) ** 2 * loss_mask[..., None, None],
-                dim=(-1, -2, -3),
-            )
-            / loss_denom
-        )
+        bb_atom_loss = torch.sum(
+            (gt_bb_atoms - pred_bb_atoms) ** 2 * loss_mask[..., None, None],
+            dim=(-1, -2, -3),
+        ) / (loss_denom_num_res * 3)
 
         # TODO - translation vector field loss
         #   requires calculating and emitting from model. See FoldFlow2
@@ -268,7 +272,7 @@ class FlowModule(LightningModule):
         trans_loss = (
             training_cfg.translation_loss_weight
             * torch.sum(trans_error**2 * loss_mask[..., None], dim=(-1, -2))
-            / loss_denom
+            / (loss_denom_num_res * 3)
         )
         trans_loss = torch.clamp(trans_loss, max=5)
 
@@ -277,7 +281,7 @@ class FlowModule(LightningModule):
         rots_vf_loss = (
             training_cfg.rotation_loss_weights
             * torch.sum(rots_vf_error**2 * loss_mask[..., None], dim=(-1, -2))
-            / loss_denom
+            / (loss_denom_num_res * 3)
         )
 
         # TODO consider explicit rotation loss (see FoldFlow2)
@@ -329,17 +333,26 @@ class FlowModule(LightningModule):
 
         if torch.any(torch.isnan(train_loss)):
             raise ValueError("NaN loss encountered")
+        assert train_loss.shape == (num_batch,)
 
-        self._prev_batch = noisy_batch
-        self._prev_loss_denom = loss_denom
-        self._prev_loss = TrainingLosses(
+        losses = TrainingLosses(
             trans_loss=trans_loss,
             rots_vf_loss=rots_vf_loss,
             auxiliary_loss=auxiliary_loss,
             aatypes_loss=aatypes_loss,
             train_loss=train_loss,
+            loss_denom_num_res=loss_denom_num_res,
         )
-        return self._prev_loss
+
+        self._data_history.append(
+            {
+                "batch": noisy_batch,
+                "loss": losses,
+                "model_output": model_output,
+            }
+        )
+
+        return losses
 
     def validation_step(self, batch: Any, batch_idx: int):
         # TODO - run ProteinMPNN + folding to determine designability, using a separate FoldingModule

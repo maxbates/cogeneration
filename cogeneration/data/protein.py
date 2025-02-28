@@ -423,6 +423,7 @@ def write_prot_to_pdb(
 
     with open(save_path, "w") as f:
         if prot_pos.ndim == 4:
+            # Trajectory
             for t, pos37 in enumerate(prot_pos):
                 atom37_mask = np.sum(np.abs(pos37), axis=-1) > 1e-7
                 prot = create_full_prot(
@@ -431,6 +432,7 @@ def write_prot_to_pdb(
                 pdb_prot = to_pdb(prot, model=t + 1, add_end=False)
                 f.write(pdb_prot)
         elif prot_pos.ndim == 3:
+            # Single frame
             atom37_mask = np.sum(np.abs(prot_pos), axis=-1) > 1e-7
             prot = create_full_prot(
                 prot_pos, atom37_mask, aatype=aatype, b_factors=b_factors

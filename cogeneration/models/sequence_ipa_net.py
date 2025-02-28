@@ -59,9 +59,16 @@ class SequenceIPANet(BaseSequencePredictionNet):
         curr_rigids_nm: Rigid,
         diffuse_mask: torch.Tensor,
         chain_index: torch.Tensor,
+        init_node_embed: torch.Tensor,
+        init_edge_embed: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        node_embed = node_embed * node_mask[..., None]
-        edge_embed = edge_embed * edge_mask[..., None]
+        # Add initial embeddings, may improve passing though of time / positional embeddings
+        if self.cfg.use_init_embed:
+            node_embed = 0.5 * (node_embed + init_node_embed)
+            edge_embed = 0.5 * (edge_embed + init_edge_embed)
+
+            node_embed = node_embed * node_mask[..., None]
+            edge_embed = edge_embed * edge_mask[..., None]
 
         # run through IPA trunk
         node_embed, edge_embed, curr_rigids_nm = self.ipa_trunk(
