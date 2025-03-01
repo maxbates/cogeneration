@@ -1,5 +1,7 @@
 """Utilities for calculating all atom representations."""
 
+from typing import Optional, Tuple
+
 import torch
 
 from cogeneration.data import data_transforms, residue_constants
@@ -15,17 +17,21 @@ ATOM_MASK = torch.tensor(residue_constants.restype_atom14_mask)
 GROUP_IDX = torch.tensor(residue_constants.restype_atom14_to_rigid_group)
 
 
-def to_atom37(trans, rots):
+def to_atom37(
+    trans: torch.Tensor,
+    rots: torch.Tensor,
+    psi_torsions: Optional[torch.Tensor] = None,
+):
     num_batch, num_res, _ = trans.shape
     final_atom37 = compute_backbone(
         create_rigid(rots, trans),
-        torch.zeros(num_batch, num_res, 2, device=trans.device),
+        psi_torsions=psi_torsions,
     )[0]
     return final_atom37
 
 
 def torsion_angles_to_frames(
-    r: Rigid,  # type: ignore [valid-type]
+    r: Rigid,
     alpha: torch.Tensor,
     aatype: torch.Tensor,
 ):
@@ -42,12 +48,12 @@ def torsion_angles_to_frames(
     """
     # [*, N, 8, 4, 4]
     with torch.no_grad():
-        default_4x4 = DEFAULT_FRAMES.to(aatype.device)[aatype, ...]  # type: ignore [attr-defined]
+        default_4x4 = DEFAULT_FRAMES.to(aatype.device)[aatype, ...]
 
     # [*, N, 8] transformations, i.e.
     #   One [*, N, 8, 3, 3] rotation matrix and
     #   One [*, N, 8, 3]    translation matrix
-    default_r = r.from_tensor_4x4(default_4x4)  # type: ignore [attr-defined]
+    default_r = r.from_tensor_4x4(default_4x4)
 
     bb_rot = alpha.new_zeros((*((1,) * len(alpha.shape[:-1])), 2))
     bb_rot[..., 1] = 1
@@ -113,9 +119,9 @@ def prot_to_torsion_angles(aatype, atom37, atom37_mask):
 
 
 def frames_to_atom14_pos(
-    r: Rigid,  # type: ignore [valid-type]
+    r: Rigid,
     aatype: torch.Tensor,
-):
+) -> torch.Tensor:
     """Convert frames to their idealized all atom representation.
 
     Args:
@@ -123,7 +129,7 @@ def frames_to_atom14_pos(
         aatype: Residue types. [..., N]
 
     Returns:
-
+        Idealized all atom positions. [..., N, 14, 3]
     """
     with torch.no_grad():
         group_mask = GROUP_IDX.to(aatype.device)[aatype, ...]
@@ -131,11 +137,11 @@ def frames_to_atom14_pos(
             group_mask,
             num_classes=DEFAULT_FRAMES.shape[-3],
         )
-        frame_atom_mask = ATOM_MASK.to(aatype.device)[aatype, ...].unsqueeze(-1)  # type: ignore [attr-defined]
-        frame_null_pos = IDEALIZED_POS.to(aatype.device)[aatype, ...]  # type: ignore [attr-defined]
+        frame_atom_mask = ATOM_MASK.to(aatype.device)[aatype, ...].unsqueeze(-1)
+        frame_null_pos = IDEALIZED_POS.to(aatype.device)[aatype, ...]
 
     # [*, N, 14, 8]
-    t_atoms_to_global = r[..., None, :] * group_mask  # type: ignore [index]
+    t_atoms_to_global = r[..., None, :] * group_mask
 
     # [*, N, 14]
     t_atoms_to_global = t_atoms_to_global.map_tensor_fn(lambda x: torch.sum(x, dim=-1))
@@ -147,7 +153,17 @@ def frames_to_atom14_pos(
     return pred_positions
 
 
-def compute_backbone(bb_rigids, psi_torsions):
+def compute_backbone(
+    bb_rigids: torch.Tensor, psi_torsions: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute the backbone atoms from the rigid groups and torsion angles.
+
+    Generates atom37 backbone, atom37 mask, residue types, and atom14 backbone.
+    """
+    if psi_torsions is None:
+        psi_torsions = torch.zeros(bb_rigids.shape[:-1] + (2,), device=bb_rigids.device)
+
     torsion_angles = torch.tile(
         psi_torsions[..., None, :],
         tuple([1 for _ in range(len(bb_rigids.shape))]) + (7, 1),
@@ -216,22 +232,37 @@ def vector_projection(R_ab, P_n):
     return R_ab - (a_x_b / b_x_b)[:, None] * P_n
 
 
-def transrot_traj_to_atom37(transrot_traj, res_mask):
-    atom37_traj = []
-    for trans, rots in transrot_traj:
-        atom37_traj.append(atom37_from_trans_rot(trans, rots, res_mask))
-    return atom37_traj
-
-
-def atom37_from_trans_rot(trans, rots, res_mask=None):
+def atom37_from_trans_rot(
+    trans: torch.Tensor,
+    rots: torch.Tensor,
+    psi_torsions: Optional[torch.Tensor] = None,
+    res_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Generate atom37 backbone from translations and rotations.
+    """
     if res_mask is None:
         res_mask = torch.ones([*trans.shape[:-1]], device=trans.device)
     rigids = create_rigid(rots, trans)
     atom37 = compute_backbone(
-        rigids, torch.zeros(trans.shape[0], trans.shape[1], 2, device=trans.device)
+        rigids,
+        psi_torsions=psi_torsions,
     )[0]
     batch_atom37 = []
     num_batch = res_mask.shape[0]
     for i in range(num_batch):
         batch_atom37.append(adjust_oxygen_pos(atom37[i], res_mask[i]))
     return torch.stack(batch_atom37)
+
+
+def transrot_traj_to_atom37(
+    transrot_traj: torch.Tensor,
+    res_mask: Optional[torch.Tensor] = None,
+):
+    """
+    Generate atom37 backbone trajectory from translations and rotations trajectory (multiple time steps).
+    """
+    atom37_traj = []
+    for trans, rots in transrot_traj:
+        atom37_traj.append(atom37_from_trans_rot(trans, rots, res_mask))
+    return atom37_traj

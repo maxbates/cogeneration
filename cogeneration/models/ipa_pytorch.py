@@ -478,7 +478,6 @@ class TorsionAngles(nn.Module):
 
         self.linear_1 = Linear(self.c, self.c, init="relu")
         self.linear_2 = Linear(self.c, self.c, init="relu")
-        # TODO: Remove after published checkpoint is updated without these weights.
         self.linear_3 = Linear(self.c, self.c, init="final")
         self.linear_final = Linear(self.c, self.num_torsions * 2, init="final")
 

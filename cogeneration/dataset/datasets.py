@@ -344,14 +344,10 @@ class BaseDataset(Dataset):
             chain_feats["all_atom_positions"] += atom_position_noise
 
         # Run through OpenFold data transforms.
+        # Convert atomic representation to frames
         chain_feats = data_transforms.atom37_to_frames(chain_feats)
-        rigids_1 = rigid_utils.Rigid.from_tensor_4x4(
-            chain_feats[dtc.rigidgroups_gt_frames]
-        )[:, 0]
-        rotmats_1 = rigids_1.get_rots().get_rot_mats()
-        trans_1 = rigids_1.get_trans()
-        res_plddt = processed_feats[dpc.b_factors][:, 1]
-        res_mask = torch.tensor(processed_feats[dpc.bb_mask]).int()
+        # calculate torsion angles
+        chain_feats = data_transforms.atom37_to_torsion_angles()(chain_feats)
 
         # Re-number residue indices for each chain such that it starts from 1.
         # Randomize chain indices.
@@ -374,21 +370,31 @@ class BaseDataset(Dataset):
             replacement_chain_id = shuffled_chain_idx[i]
             new_chain_idx = new_chain_idx + replacement_chain_id * chain_mask
 
+        # Extract rigits (translations + rotations), check for poorly processed
+        rigids_1 = rigid_utils.Rigid.from_tensor_4x4(
+            chain_feats[dtc.rigidgroups_gt_frames]
+        )[:, 0]
+        rotmats_1 = rigids_1.get_rots().get_rot_mats()
+        trans_1 = rigids_1.get_trans()
         if torch.isnan(trans_1).any() or torch.isnan(rotmats_1).any():
             raise ValueError(f"Found NaNs in {processed_file_path}")
 
         # Mask low pLDDT residues
+        res_plddt = processed_feats[dpc.b_factors][:, 1]
+        res_mask = torch.tensor(processed_feats[dpc.bb_mask]).int()
         plddt_mask = torch.ones_like(res_mask)
         if self.dataset_cfg.add_plddt_mask:
             plddt_mask = torch.tensor(
                 res_plddt > self.dataset_cfg.min_plddt_threshold
             ).int()
 
+        # Take only necessary features
         return {
             bp.res_plddt: res_plddt,
             bp.aatypes_1: chain_feats[dpc.aatype],
             bp.rotmats_1: rotmats_1,
             bp.trans_1: trans_1,
+            bp.torsion_angles_sin_cos_1: chain_feats[dtc.torsion_angles_sin_cos],
             bp.res_mask: res_mask,
             bp.plddt_mask: plddt_mask,
             bp.chain_idx: new_chain_idx,

@@ -63,6 +63,7 @@ class FlowModel(nn.Module):
         self.attention_ipa_trunk = AttentionIPATrunk(
             cfg=cfg.ipa,
             perform_final_edge_update=self.aa_pred_net.uses_edge_embed,
+            predict_torsions=self.cfg.predict_psi_torsions,
         )
 
     def forward(self, input_feats) -> Dict[Union[bp, pbp], torch.Tensor]:
@@ -106,7 +107,7 @@ class FlowModel(nn.Module):
 
         # Main trunk
         # Note that IPA trunk works in nm scale, rather than angstroms
-        node_embed, edge_embed, curr_rigids_nm = self.attention_ipa_trunk(
+        node_embed, edge_embed, curr_rigids_nm, psi_pred = self.attention_ipa_trunk(
             init_node_embed=init_node_embed,
             init_edge_embed=init_edge_embed,
             node_mask=node_mask,
@@ -136,6 +137,10 @@ class FlowModel(nn.Module):
         return {
             pbp.pred_trans: pred_trans,
             pbp.pred_rotmats: pred_rotmats,
+            pbp.pred_psi: psi_pred,
             pbp.pred_logits: pred_logits,
             pbp.pred_aatypes: pred_aatypes,
+            # other model outputs
+            pbp.node_embed: node_embed,
+            pbp.edge_embed: edge_embed,
         }

@@ -13,6 +13,7 @@ class BatchProps(str, Enum):
     aatypes_1 = "aatypes_1"  # amino acid sequence
     trans_1 = "trans_1"  # frame translations
     rotmats_1 = "rotmats_1"  # frame rotations
+    torsion_angles_sin_cos_1 = "torsion_angles_sin_cos_1"  # torsion angles
     # structure metadata
     num_res = "num_res"  # number of residues in the protein. Important for inference.
     chain_idx = "chain_idx"  # re-indexed chain index (chains are shuffled)
@@ -58,8 +59,13 @@ class PredBatchProps(str, Enum):
 
     pred_trans = "pred_trans"
     pred_rotmats = "pred_rotmats"
+    pred_psi = "pred_psi"
     pred_logits = "pred_logits"
     pred_aatypes = "pred_aatypes"
+
+    # other model outputs
+    node_embed = "node_embed"
+    edge_embed = "edge_embed"
 
     def __str__(self):
         return self.value

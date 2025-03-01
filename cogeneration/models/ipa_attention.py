@@ -1,9 +1,12 @@
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 
 from cogeneration.config.base import ModelIPAConfig
 from cogeneration.data.rigid_utils import Rigid
 from cogeneration.models import ipa_pytorch
+from cogeneration.models.ipa_pytorch import TorsionAngles
 
 
 class AttentionIPATrunk(nn.Module):
@@ -30,11 +33,13 @@ class AttentionIPATrunk(nn.Module):
         cfg: ModelIPAConfig,
         perform_final_edge_update: bool = False,
         perform_backbone_update: bool = True,
+        predict_torsions: bool = True,
     ):
         super(AttentionIPATrunk, self).__init__()
         self.cfg = cfg
         self.perform_final_edge_update = perform_final_edge_update
         self.perform_backbone_update = perform_backbone_update
+        self.predict_torsions = predict_torsions
 
         self.trunk = nn.ModuleDict()
         for b in range(self.cfg.num_blocks):
@@ -77,6 +82,9 @@ class AttentionIPATrunk(nn.Module):
                     edge_embed_out=self.cfg.c_z,
                 )
 
+        if self.predict_torsions:
+            self.torsion_pred = TorsionAngles(self.cfg.c_s, num_torsions=1)
+
     def forward(
         self,
         init_node_embed: torch.Tensor,
@@ -85,7 +93,7 @@ class AttentionIPATrunk(nn.Module):
         edge_mask: torch.Tensor,
         diffuse_mask: torch.Tensor,
         curr_rigids_nm: Rigid,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor, Rigid, Optional[torch.Tensor]]:
         init_node_embed = init_node_embed * node_mask[..., None]
         node_embed = init_node_embed * node_mask[..., None]
         edge_embed = init_edge_embed * edge_mask[..., None]
@@ -121,4 +129,8 @@ class AttentionIPATrunk(nn.Module):
                 edge_embed = self.trunk[f"edge_transition_{b}"](node_embed, edge_embed)
                 edge_embed *= edge_mask[..., None]
 
-        return node_embed, edge_embed, curr_rigids_nm
+        psi_pred = None
+        if self.predict_torsions:
+            _, psi_pred = self.torsion_pred(node_embed)
+
+        return node_embed, edge_embed, curr_rigids_nm, psi_pred

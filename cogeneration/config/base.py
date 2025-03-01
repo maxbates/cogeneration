@@ -284,6 +284,8 @@ class ModelConfig:
     )
     ipa: ModelIPAConfig = field(default_factory=ModelIPAConfig)
 
+    predict_psi_torsions: bool = True  # not present in public MultiFlow
+
     # sequence prediction, default is simple aa_pred matching MultiFlow
     sequence_pred_type: ModelSequencePredictionEnum = (
         ModelSequencePredictionEnum.aa_pred
@@ -568,7 +570,7 @@ class ExperimentTrainingConfig:
     translation_loss_weight: float = 2.0
     t_normalize_clip: float = 0.9
     rotation_loss_weights: float = 1.0
-    aux_loss_weight: float = 0.25  # default 0.0 in multiflow
+    aux_loss_weight: float = 0.5  # default 0.0 in multiflow
     aux_loss_use_bb_loss: bool = True
     aux_loss_use_pair_loss: bool = True
     aux_loss_t_pass: float = 0.5  # minimum t for aux loss

@@ -1,5 +1,6 @@
 import copy
 from collections import defaultdict
+from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -565,9 +566,11 @@ class Interpolant:
         num_timesteps=None,
         trans_0=None,
         rotmats_0=None,
+        psis_0=None,
         aatypes_0=None,
         trans_1=None,
         rotmats_1=None,
+        psis_1=None,
         aatypes_1=None,
         diffuse_mask=None,
         chain_idx=None,
@@ -579,6 +582,8 @@ class Interpolant:
     ):
         """
         Generate samples using the learned vector fields.
+        Returns two trajectories: predicted states, and clean states
+
         Generates initialy noise batch, samples using Euler steps for rotations, translations, and amino acid types.
         Special handling for forward folding, reverse folding, and separate t.
         """
@@ -657,6 +662,8 @@ class Interpolant:
             )
         if aatypes_1 is None:
             aatypes_1 = torch.zeros((num_batch, num_res), device=self._device).long()
+        if psis_1 is None:
+            psis_1 = torch.zeros((num_batch, num_res, 2), device=self._device)
 
         logits_1 = torch.nn.functional.one_hot(
             aatypes_1, num_classes=self.num_tokens
@@ -670,15 +677,18 @@ class Interpolant:
         if inverse_folding:
             assert trans_1 is not None
             assert rotmats_1 is not None
+            assert psis_1 is not None
         if inverse_folding and separate_t:
             trans_0 = trans_1
             rotmats_0 = rotmats_1
+            psis_0 = psis_1
 
-        # Helper function to get structure from residue frames
+        # Helper function to get atom37 structure from residue frames
         frames_to_atom37 = (
-            lambda trans, rots: all_atom.atom37_from_trans_rot(
+            lambda trans, rots, psis: all_atom.atom37_from_trans_rot(
                 trans=trans,
                 rots=rots,
+                psi_torsions=psis,
                 res_mask=res_mask,
             )
             .detach()
@@ -687,14 +697,21 @@ class Interpolant:
 
         # We will integrate in a loop over ts (handling the last step after the loop)
         # t_1 is the current time, t_2 is the next time
+        # t_1 starts at t=0
+        trans_t_1 = trans_0
+        rotmats_t_1 = rotmats_0
+        psis_t_1 = psis_0
+        aatypes_t_1 = aatypes_0
 
-        trans_t_1, rotmats_t_1, aatypes_t_1 = trans_0, rotmats_0, aatypes_0
         # prot_traj tracks predicted intermediate states integrating from t=0 to t=1
-        prot_traj = [
-            (frames_to_atom37(trans_t_1, rotmats_t_1), aatypes_0.detach().cpu())
+        prot_traj: List[Tuple[torch.Tensor, torch.Tensor]] = [
+            (
+                frames_to_atom37(trans_t_1, rotmats_t_1, psis_t_1),
+                aatypes_0.detach().cpu(),
+            )
         ]
         # clean_traj tracks states predicted by model without noise / processing
-        clean_traj = []
+        clean_traj: List[Tuple[torch.Tensor, torch.Tensor]] = []
         for t_2 in ts[1:]:
             if self.cfg.trans.corrupt:
                 batch[nbp.trans_t] = trans_t_1
@@ -752,11 +769,12 @@ class Interpolant:
             # Process model output, getting predicted structure/sequence
             pred_trans_1 = model_out[pbp.pred_trans]
             pred_rotmats_1 = model_out[pbp.pred_rotmats]
+            pred_psis_1 = model_out[pbp.pred_psi]
             pred_aatypes_1 = model_out[pbp.pred_aatypes]
             pred_logits_1 = model_out[pbp.pred_logits]
             clean_traj.append(
                 (
-                    frames_to_atom37(pred_trans_1, pred_rotmats_1),
+                    frames_to_atom37(pred_trans_1, pred_rotmats_1, pred_psis_1),
                     pred_aatypes_1.detach().cpu(),
                 )
             )
@@ -783,6 +801,8 @@ class Interpolant:
             d_t = t_2 - t_1
             trans_t_2 = self._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
             rotmats_t_2 = self._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
+            # We do not have a vector field for psi angles, so just use model output at t_1
+            psi_t_2 = pred_psis_1
 
             # Update amino acid types, allowing for "purity", i.e. unmasking and re-masking
             if self.cfg.aatypes.do_purity:
@@ -794,23 +814,32 @@ class Interpolant:
                     d_t, t_1, pred_logits_1, aatypes_t_1
                 )
 
+            print("shapes")
+            print(psis_1.shape, psi_t_2.shape, pred_psis_1.shape, diffuse_mask.shape)
+
             # Only update the masked residues
             trans_t_2 = _trans_diffuse_mask(trans_t_2, trans_1, diffuse_mask)
             rotmats_t_2 = _rots_diffuse_mask(rotmats_t_2, rotmats_1, diffuse_mask)
+            psi_t_2 = _trans_diffuse_mask(psi_t_2, psis_1, diffuse_mask)
             aatypes_t_2 = _aatypes_diffuse_mask(aatypes_t_2, aatypes_1, diffuse_mask)
 
             # Add to trajectory
             prot_traj.append(
-                (frames_to_atom37(trans_t_2, rotmats_t_2), aatypes_t_2.cpu().detach())
+                (
+                    frames_to_atom37(trans_t_2, rotmats_t_2, psi_t_2),
+                    aatypes_t_2.cpu().detach(),
+                )
             )
 
             # Get ready for the next step
-            trans_t_1, rotmats_t_1, aatypes_t_1 = trans_t_2, rotmats_t_2, aatypes_t_2
+            trans_t_1 = trans_t_2
+            rotmats_t_1 = rotmats_t_2
+            psis_t_1 = psi_t_2
+            aatypes_t_1 = aatypes_t_2
             t_1 = t_2
 
         # We only integrated to min_t, so need to make a final step
         # and save the trajectory + final structure
-
         t_1 = ts[-1]
 
         if self.cfg.trans.corrupt:
@@ -841,6 +870,7 @@ class Interpolant:
         pred_trans_1 = model_out[pbp.pred_trans]
         pred_rotmats_1 = model_out[pbp.pred_rotmats]
         pred_aatypes_1 = model_out[pbp.pred_aatypes]
+        pred_psis_1 = model_out[pbp.pred_psi]
 
         if forward_folding:
             pred_aatypes_1 = aatypes_1
@@ -848,7 +878,7 @@ class Interpolant:
             pred_trans_1 = trans_1
             pred_rotmats_1 = rotmats_1
 
-        pred_atom37 = frames_to_atom37(pred_trans_1, pred_rotmats_1)
+        pred_atom37 = frames_to_atom37(pred_trans_1, pred_rotmats_1, pred_psis_1)
         clean_traj.append((pred_atom37, pred_aatypes_1.detach().cpu()))
         prot_traj.append((pred_atom37, pred_aatypes_1.detach().cpu()))
 

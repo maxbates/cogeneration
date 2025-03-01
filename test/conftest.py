@@ -5,7 +5,11 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
-from cogeneration.config.base import Config, InferenceSamplesConfig
+from cogeneration.config.base import (
+    Config,
+    InferenceSamplesConfig,
+    ModelHyperParamsConfig,
+)
 from cogeneration.data.batch_props import BatchProps as bp
 from cogeneration.data.batch_props import NoisyBatchProps as nbp
 from cogeneration.data.interpolant import Interpolant
@@ -22,6 +26,9 @@ logging.basicConfig(level=logging.DEBUG)
 def mock_cfg():
     """mock_cfg fixture defines default nested config"""
     raw_cfg = Config()
+
+    # default to tiny model
+    raw_cfg.model.hyper_params = ModelHyperParamsConfig.tiny()
 
     # interpolate etc. using OmegaConf
     # use to_object() so that intermediate structs are dataclasses, not DictConfig
@@ -61,6 +68,7 @@ class MockDataset(Dataset):
         input_feats[bp.aatypes_1] = torch.randint(0, 20, (N,))  # AA seq as ints
         input_feats[bp.trans_1] = torch.rand(N, 3)
         input_feats[bp.rotmats_1] = torch.rand(N, 3, 3)
+        input_feats[bp.torsion_angles_sin_cos_1] = torch.rand(N, 7, 2)
         input_feats[bp.chain_idx] = torch.zeros(N)
         input_feats[bp.res_idx] = torch.arange(N)
         input_feats[bp.pdb_name] = "test"

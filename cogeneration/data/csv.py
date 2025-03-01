@@ -69,3 +69,5 @@ class DatasetTransformColumns(str, Enum):
     rigidgroups_group_exists = "rigidgroups_group_exists"
     rigidgroups_group_is_ambiguous = "rigidgroups_group_is_ambiguous"
     rigidgroups_alt_gt_frames = "rigidgroups_alt_gt_frames"
+    # atom37_to_torsion_angles()
+    torsion_angles_sin_cos = "torsion_angles_sin_cos"

@@ -36,6 +36,7 @@ class SequenceIPANet(BaseSequencePredictionNet):
             cfg=cfg.ipa,
             perform_backbone_update=False,  # no backbone update
             perform_final_edge_update=False,  # no edge update on last block, not used further
+            predict_torsions=False,  # no torsion prediction, leave to structure module
         )
 
         # Use final representation to predict amino acid tokens
@@ -71,7 +72,7 @@ class SequenceIPANet(BaseSequencePredictionNet):
             edge_embed = edge_embed * edge_mask[..., None]
 
         # run through IPA trunk
-        node_embed, edge_embed, curr_rigids_nm = self.ipa_trunk(
+        node_embed, edge_embed, curr_rigids_nm, _ = self.ipa_trunk(
             init_node_embed=node_embed,
             init_edge_embed=edge_embed,
             node_mask=node_mask,
