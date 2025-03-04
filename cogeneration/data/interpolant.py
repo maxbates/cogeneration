@@ -1,6 +1,7 @@
 import copy
 from collections import defaultdict
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -18,6 +19,35 @@ from cogeneration.data.batch_props import NoisyBatchProps as nbp
 from cogeneration.data.batch_props import PredBatchProps as pbp
 from cogeneration.data.const import MASK_TOKEN_INDEX, NM_TO_ANG_SCALE, NUM_TOKENS
 from cogeneration.data.rigid import batch_align_structures
+
+
+@dataclass
+class SamplingStep:
+    """
+    A single step in the sampling trajectory.
+    """
+
+    backbone: torch.Tensor  # (batch_size, num_res, 37, 3)
+    amino_acids: torch.Tensor  # (batch_size, num_res)
+    logits: Optional[torch.Tensor] = None
+
+
+@dataclass
+class SamplingTrajectory:
+    """
+    A trajectory of inference sampling steps.
+    """
+
+    steps: List[SamplingStep] = field(default_factory=list)
+
+    def __len__(self):
+        return len(self.steps)
+
+    def __getitem__(self, index: int) -> SamplingStep:
+        return self.steps[index]
+
+    def append(self, step: SamplingStep):
+        self.steps.append(step)
 
 
 def _centered_gaussian(num_batch, num_res, device):
@@ -579,12 +609,14 @@ class Interpolant:
         forward_folding: bool = False,
         inverse_folding: bool = False,
         separate_t: bool = False,
-    ):
+    ) -> Tuple[SamplingTrajectory, SamplingTrajectory]:
         """
         Generate samples using the learned vector fields.
-        Returns two trajectories: predicted states, and clean states
+        Returns two trajectories:
+        1) protein_trajectory / predicted states - processed outputs and intermediate steps resulting from integration
+        2) model_trajectory / clean states - model output without noise / processing. Includes logits.
 
-        Generates initialy noise batch, samples using Euler steps for rotations, translations, and amino acid types.
+        Generates initially noise batch, samples using Euler steps for rotations, translations, and amino acid types.
         Special handling for forward folding, reverse folding, and separate t.
         """
 
@@ -672,16 +704,16 @@ class Interpolant:
         if forward_folding:
             assert aatypes_1 is not None
             assert self.cfg.aatypes.noise == 0.0  # cfg sanity check
-        if forward_folding and separate_t:
-            aatypes_0 = aatypes_1
+            if separate_t:
+                aatypes_0 = aatypes_1
         if inverse_folding:
             assert trans_1 is not None
             assert rotmats_1 is not None
             assert psis_1 is not None
-        if inverse_folding and separate_t:
-            trans_0 = trans_1
-            rotmats_0 = rotmats_1
-            psis_0 = psis_1
+            if separate_t:
+                trans_0 = trans_1
+                rotmats_0 = rotmats_1
+                psis_0 = psis_1
 
         # Helper function to get atom37 structure from residue frames
         frames_to_atom37 = (
@@ -703,15 +735,18 @@ class Interpolant:
         psis_t_1 = psis_0
         aatypes_t_1 = aatypes_0
 
-        # prot_traj tracks predicted intermediate states integrating from t=0 to t=1
-        prot_traj: List[Tuple[torch.Tensor, torch.Tensor]] = [
-            (
-                frames_to_atom37(trans_t_1, rotmats_t_1, psis_t_1),
-                aatypes_0.detach().cpu(),
+        # model_trajectory tracks states predicted by model without noise / processing
+        model_trajectory = SamplingTrajectory()
+        # protein_trajectory tracks predicted intermediate states integrating from t=0 to t=1
+        protein_trajectory = SamplingTrajectory()
+
+        protein_trajectory.append(
+            SamplingStep(
+                backbone=frames_to_atom37(trans_t_1, rotmats_t_1, psis_t_1),
+                amino_acids=aatypes_0.detach().cpu(),
             )
-        ]
-        # clean_traj tracks states predicted by model without noise / processing
-        clean_traj: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        )
+
         for t_2 in ts[1:]:
             if self.cfg.trans.corrupt:
                 batch[nbp.trans_t] = trans_t_1
@@ -772,12 +807,17 @@ class Interpolant:
             pred_psis_1 = model_out[pbp.pred_psi]
             pred_aatypes_1 = model_out[pbp.pred_aatypes]
             pred_logits_1 = model_out[pbp.pred_logits]
-            clean_traj.append(
-                (
-                    frames_to_atom37(pred_trans_1, pred_rotmats_1, pred_psis_1),
-                    pred_aatypes_1.detach().cpu(),
+
+            model_trajectory.append(
+                SamplingStep(
+                    backbone=frames_to_atom37(
+                        pred_trans_1, pred_rotmats_1, pred_psis_1
+                    ),
+                    amino_acids=pred_aatypes_1.detach().cpu(),
+                    logits=pred_logits_1.detach().cpu(),
                 )
             )
+
             if forward_folding:
                 pred_logits_1 = 100.0 * logits_1
             if inverse_folding:
@@ -814,9 +854,6 @@ class Interpolant:
                     d_t, t_1, pred_logits_1, aatypes_t_1
                 )
 
-            print("shapes")
-            print(psis_1.shape, psi_t_2.shape, pred_psis_1.shape, diffuse_mask.shape)
-
             # Only update the masked residues
             trans_t_2 = _trans_diffuse_mask(trans_t_2, trans_1, diffuse_mask)
             rotmats_t_2 = _rots_diffuse_mask(rotmats_t_2, rotmats_1, diffuse_mask)
@@ -824,10 +861,10 @@ class Interpolant:
             aatypes_t_2 = _aatypes_diffuse_mask(aatypes_t_2, aatypes_1, diffuse_mask)
 
             # Add to trajectory
-            prot_traj.append(
-                (
-                    frames_to_atom37(trans_t_2, rotmats_t_2, psi_t_2),
-                    aatypes_t_2.cpu().detach(),
+            protein_trajectory.append(
+                SamplingStep(
+                    backbone=frames_to_atom37(trans_t_2, rotmats_t_2, psi_t_2),
+                    amino_acids=aatypes_t_2.cpu().detach(),
                 )
             )
 
@@ -839,7 +876,7 @@ class Interpolant:
             t_1 = t_2
 
         # We only integrated to min_t, so need to make a final step
-        # and save the trajectory + final structure
+        # and generate the final structure
         t_1 = ts[-1]
 
         if self.cfg.trans.corrupt:
@@ -869,8 +906,9 @@ class Interpolant:
             model_out = model(batch)
         pred_trans_1 = model_out[pbp.pred_trans]
         pred_rotmats_1 = model_out[pbp.pred_rotmats]
-        pred_aatypes_1 = model_out[pbp.pred_aatypes]
         pred_psis_1 = model_out[pbp.pred_psi]
+        pred_aatypes_1 = model_out[pbp.pred_aatypes]
+        pred_logits_1 = model_out[pbp.pred_logits]
 
         if forward_folding:
             pred_aatypes_1 = aatypes_1
@@ -879,7 +917,17 @@ class Interpolant:
             pred_rotmats_1 = rotmats_1
 
         pred_atom37 = frames_to_atom37(pred_trans_1, pred_rotmats_1, pred_psis_1)
-        clean_traj.append((pred_atom37, pred_aatypes_1.detach().cpu()))
-        prot_traj.append((pred_atom37, pred_aatypes_1.detach().cpu()))
+        model_trajectory.append(
+            SamplingStep(
+                backbone=pred_atom37,
+                amino_acids=pred_aatypes_1.detach().cpu(),
+                logits=pred_logits_1.detach().cpu(),
+            )
+        )
+        protein_trajectory.append(
+            SamplingStep(
+                backbone=pred_atom37, amino_acids=pred_aatypes_1.detach().cpu()
+            )
+        )
 
-        return prot_traj, clean_traj
+        return protein_trajectory, model_trajectory

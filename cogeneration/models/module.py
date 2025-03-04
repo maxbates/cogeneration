@@ -266,7 +266,8 @@ class FlowModule(LightningModule):
         aatypes_loss *= training_cfg.aatypes_loss_weight
 
         # TODO - translation vector field loss
-        #   requires calculating and emitting from model. See FoldFlow2
+        #   See FoldFlow2
+        #   compute vf from t -> gt t=1 vs t -> pred t=1
 
         # Translation loss
         trans_error = (
@@ -404,7 +405,7 @@ class FlowModule(LightningModule):
             diffuse_mask == 1.0
         ).all()  # TODO - support partial masking (inpainting)
 
-        prot_traj, model_traj = self.interpolant.sample(
+        protein_traj, model_traj = self.interpolant.sample(
             num_batch,
             num_res,
             self.model,
@@ -415,11 +416,11 @@ class FlowModule(LightningModule):
             chain_idx=batch[bp.chain_idx],
             res_idx=batch[bp.res_idx],
         )
-        samples = prot_traj[-1][0].numpy()
+        final_step = protein_traj[-1]
+        samples = final_step.backbone.numpy()
         assert samples.shape == (num_batch, num_res, 37, 3)
-        # assert False, "need to separate aatypes from atom37_traj"
 
-        generated_aatypes = prot_traj[-1][1].numpy()
+        generated_aatypes = final_step.amino_acids.numpy()
         assert generated_aatypes.shape == (num_batch, num_res)
         batch_level_aatype_metrics = metrics.calc_aatype_metrics(generated_aatypes)
 
@@ -431,10 +432,14 @@ class FlowModule(LightningModule):
             )
             os.makedirs(sample_dir, exist_ok=True)
 
+            final_positions = samples[i]
+            final_sequence = generated_aatypes[i]
+
             # Write out sample to PDB file
-            final_pos = samples[i]
             saved_path = write_prot_to_pdb(
-                final_pos, os.path.join(sample_dir, "sample.pdb"), no_indexing=True
+                final_positions,
+                os.path.join(sample_dir, "sample.pdb"),
+                no_indexing=True,
             )
             if isinstance(self.logger, WandbLogger):
                 self.validation_epoch_samples.append(
@@ -630,10 +635,10 @@ class FlowModule(LightningModule):
             self._log.error(
                 f"instance {sample_ids} length {sample_length} already exists @ {sample_dirs}"
             )
-            return
+            return None
 
         # Sample batch
-        prot_traj, model_traj = interpolant.sample(
+        protein_traj, model_traj = interpolant.sample(
             num_batch=num_batch,
             num_res=sample_length,
             model=self.model,
@@ -650,8 +655,8 @@ class FlowModule(LightningModule):
         diffuse_mask = (
             diffuse_mask if diffuse_mask is not None else torch.ones(1, sample_length)
         )
-        atom37_traj = [x[0] for x in prot_traj]
-        atom37_model_traj = [x[0] for x in model_traj]
+        atom37_traj = [x.backbone for x in protein_traj]
+        atom37_model_traj = [x.backbone for x in model_traj]
 
         bb_trajs = to_numpy(torch.stack(atom37_traj, dim=0).transpose(0, 1))
         noisy_traj_length = bb_trajs.shape[1]
@@ -661,12 +666,12 @@ class FlowModule(LightningModule):
         clean_traj_length = model_trajs.shape[1]
         assert model_trajs.shape == (num_batch, clean_traj_length, sample_length, 37, 3)
 
-        aa_traj = [x[1] for x in prot_traj]
-        clean_aa_traj = [x[1] for x in model_traj]
+        aa_traj = [x.amino_acids for x in protein_traj]
+        clean_aa_traj = [x.amino_acids for x in model_traj]
 
+        # Check for remaining mask tokens in interpolated trajectory, reset if present (to 0 := alanine)
         aa_trajs = to_numpy(torch.stack(aa_traj, dim=0).transpose(0, 1).long())
         assert aa_trajs.shape == (num_batch, noisy_traj_length, sample_length)
-        # Check for remaining mask tokens in interpolated trajectory, reset if present (to 0 := alanine)
         for i in range(aa_trajs.shape[0]):
             for j in range(aa_trajs.shape[2]):
                 if aa_trajs[i, -1, j] == MASK_TOKEN_INDEX:
@@ -678,6 +683,19 @@ class FlowModule(LightningModule):
         )
         assert clean_aa_trajs.shape == (num_batch, clean_traj_length, sample_length)
 
+        # For now, we only emit logits from direct model output
+        # We don't currently emit logits, just aatypes, when integrating
+        clean_logits_traj = [x.logits for x in model_traj]
+        clean_logits_trajs = to_numpy(
+            torch.stack(clean_logits_traj, dim=0).transpose(0, 1)
+        )
+        assert clean_logits_trajs.shape == (
+            num_batch,
+            clean_traj_length,
+            sample_length,
+            self.cfg.model.aa_pred.aatype_pred_num_tokens,
+        )
+
         top_sample_paths = {}
         for i, sample_id in zip(range(num_batch), sample_ids):
             sample_dir = sample_dirs[i]
@@ -687,6 +705,7 @@ class FlowModule(LightningModule):
                 bb_traj=bb_trajs[i],
                 aa_traj=aa_trajs[i],
                 clean_aa_traj=clean_aa_trajs[i],
+                clean_logits_traj=clean_logits_trajs[i],
                 true_bb_pos=true_bb_pos,
                 true_aa=true_aatypes,
                 diffuse_mask=diffuse_mask,
@@ -710,6 +729,7 @@ class FlowModule(LightningModule):
         bb_traj: npt.NDArray,
         aa_traj: npt.NDArray,
         clean_aa_traj: npt.NDArray,
+        clean_logits_traj: npt.NDArray,
         true_bb_pos: Optional[npt.NDArray],
         true_aa: Optional[npt.NDArray],
         diffuse_mask: torch.Tensor,
@@ -726,11 +746,13 @@ class FlowModule(LightningModule):
         """
         noisy_traj_length, sample_length, _, _ = bb_traj.shape
         clean_traj_length = model_traj.shape[0]
+
         assert bb_traj.shape == (noisy_traj_length, sample_length, 37, 3)
         assert model_traj.shape == (clean_traj_length, sample_length, 37, 3)
+        if true_bb_pos is not None:
+            assert true_bb_pos.shape == (sample_length, 37, 3)
         assert aa_traj.shape == (noisy_traj_length, sample_length)
         assert clean_aa_traj.shape == (clean_traj_length, sample_length)
-
         if true_aa is not None:
             assert true_aa.shape == (1, sample_length)
 
@@ -738,13 +760,14 @@ class FlowModule(LightningModule):
 
         # Save trajectory
         traj_paths = save_traj(
-            bb_traj[-1],
-            bb_traj,
-            np.flip(model_traj, axis=0),
-            to_numpy(diffuse_mask)[0],
+            sample=bb_traj[-1],
+            bb_prot_traj=bb_traj,
+            x0_traj=np.flip(model_traj, axis=0),
+            diffuse_mask=to_numpy(diffuse_mask)[0],
             output_dir=sample_dir,
             aa_traj=aa_traj,
             clean_aa_traj=clean_aa_traj,
+            clean_logits_traj=clean_logits_traj,
             write_trajectories=write_sample_trajectories,
         )
 

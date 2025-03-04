@@ -103,7 +103,7 @@ class FlowModel(nn.Module):
         )
 
         # Initial rigids
-        curr_rigids_ang = create_rigid(rotmats_t, trans_t)
+        init_rigids_ang = create_rigid(rotmats_t, trans_t)
 
         # Main trunk
         # Note that IPA trunk works in nm scale, rather than angstroms
@@ -113,7 +113,7 @@ class FlowModel(nn.Module):
             node_mask=node_mask,
             edge_mask=edge_mask,
             diffuse_mask=diffuse_mask,
-            curr_rigids_nm=rigids_ang_to_nm(curr_rigids_ang),
+            curr_rigids_nm=rigids_ang_to_nm(init_rigids_ang),
         )
         # Convert back to angstroms, get translations and rotations
         curr_rigids_ang = rigids_nm_to_ang(curr_rigids_nm)
