@@ -1,11 +1,13 @@
 import datetime
 import os
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 from typing import List, Optional
 
 from hydra.core.config_store import ConfigStore
+from omegaconf import OmegaConf
+
+from cogeneration.util.base_classes import StrEnum
 
 """
 Note:
@@ -15,33 +17,24 @@ Structured configurations for cogeneration.
 Several parameters from Multiflow appear to be unused, many are marked with `# DROP`.
 """
 
+project_root_path = Path(__file__).parent.parent.parent.resolve()
+
 # TODO - support default configs for `forward_folding` and `inverse folding`
 #   There are a handful of values across the config that need to have other defaults.
 #   i.e. instead of the current `ternary` paradigm
 #   to better differentate the training vs inference interpolant
 
-
-class ConfEnum(str, Enum):
-    """
-    Base class for OmegaConf/Hydra Enums.
-    hydra does not currently support `Literal` and suggests using Enums instead.
-    https://github.com/omry/omegaconf/issues/422
-    """
-
-    def __str__(self):
-        return str(self.value)
-
-    def __repr__(self):
-        return str(self.value)
+# hydra does not currently support `Literal` and suggests using Enums instead.
+# https://github.com/omry/omegaconf/issues/422
 
 
-class DataTaskEnum(ConfEnum):
+class DataTaskEnum(StrEnum):
     """task for training"""
 
     hallucination = "hallucination"
 
 
-class InferenceTaskEnum(ConfEnum):
+class InferenceTaskEnum(StrEnum):
     """task for inference"""
 
     unconditional = "unconditional"
@@ -49,7 +42,7 @@ class InferenceTaskEnum(ConfEnum):
     inverse_folding = "inverse_folding"
 
 
-class DatasetEnum(ConfEnum):
+class DatasetEnum(StrEnum):
     """dataset for training"""
 
     pdb = "pdb"
@@ -62,13 +55,15 @@ class SharedConfig:
     """
 
     # `local` to train locally on a Mac. use `mps` not `gpu` with `ddp`, etc.
-    local: bool = False
+    local: bool = True
     # now timestamp
     now: str = field(
         default_factory=lambda: datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     )
     # random seed
     seed: int = 123
+    # project root path
+    project_root: str = str(project_root_path)
 
     # TODO - `size` argument to determine model hyperparameters
     # TODO - gpu size argument to determine batch size, etc.
@@ -99,10 +94,10 @@ class ModelHyperParamsConfig:
     def tiny(cls):
         """Factory for tiny configuration, e.g. for testing"""
         return cls(
-            node_embed_size=64,
-            edge_embed_size=32,
-            pos_embed_size=32,
-            timestep_embed_size=32,
+            node_embed_size=16,
+            edge_embed_size=16,
+            pos_embed_size=4,
+            timestep_embed_size=4,
         )
 
     @classmethod
@@ -265,7 +260,7 @@ class ModelSequenceIPANetConfig:
     )
 
 
-class ModelSequencePredictionEnum(ConfEnum):
+class ModelSequencePredictionEnum(StrEnum):
     NOOP = "noop"  # simply emit aatypes
     aa_pred = "aa_pred"  # public MultiFlow. Simple MLP.
     sequence_ipa_net = "sequence_ipa_net"  # IPA transformer architecture
@@ -284,7 +279,7 @@ class ModelConfig:
     )
     ipa: ModelIPAConfig = field(default_factory=ModelIPAConfig)
 
-    predict_psi_torsions: bool = True  # not present in public MultiFlow
+    predict_psi_torsions: bool = False  # not present in public MultiFlow
 
     # sequence prediction, default is simple aa_pred matching MultiFlow
     sequence_pred_type: ModelSequencePredictionEnum = (
@@ -296,7 +291,7 @@ class ModelConfig:
     )
 
 
-class InterpolantRotationsScheduleEnum(ConfEnum):
+class InterpolantRotationsScheduleEnum(StrEnum):
     linear = "linear"
     exp = "exp"
 
@@ -313,7 +308,7 @@ class InterpolantRotationsConfig:
     exp_rate: float = 10
 
 
-class InterpolantTranslationsScheduleEnum(ConfEnum):
+class InterpolantTranslationsScheduleEnum(StrEnum):
     linear = "linear"
     vpsde = "vpsde"  # variance-preserving SDE
 
@@ -349,12 +344,12 @@ class InterpolantTranslationsConfig:
     #   cutoff: 5.0
 
 
-class InterpolantAATypesScheduleEnum(ConfEnum):
+class InterpolantAATypesScheduleEnum(StrEnum):
     linear = "linear"
     exp = "exp"  # TODO re-introduce, 'exp' not used in public MultiFlow code
 
 
-class InterpolantAATypesInterpolantTypeEnum(ConfEnum):
+class InterpolantAATypesInterpolantTypeEnum(StrEnum):
     masking = "masking"
     uniform = "uniform"
 
@@ -418,6 +413,7 @@ class InterpolantConfig:
     codesign_inverse_fold_prop: float = 0.1
     # enable self-conditioning
     self_condition: bool = "${model.edge_features.self_condition}"
+    self_condition_prob: float = 0.5
     # sub-modules
     rots: InterpolantRotationsConfig = field(default_factory=InterpolantRotationsConfig)
     trans: InterpolantTranslationsConfig = field(
@@ -471,9 +467,7 @@ class DatasetFilterConfig:
 
 
 # dataset_metadata_dir_path is the root directory for dataset / metadata files
-dataset_metadata_dir_path = Path(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "datasets/metadata"))
-)
+dataset_metadata_dir_path = project_root_path / "cogeneration" / "datasets" / "metadata"
 
 
 @dataclass
@@ -639,9 +633,9 @@ class ExperimentCheckpointerConfig:
 class ExperimentConfig:
     """Training Experiment configuration."""
 
+    seed: int = "${shared.seed}"
     # debug True for local tensorboard logger, False to enable W&B, saving outputs etc
     debug: bool = False
-    seed: int = "${shared.seed}"
     # num GPU devices TODO support more than one, esp for GPUs
     num_devices: int = 1
     # directory, checkpoint path
@@ -665,7 +659,6 @@ class ExperimentConfig:
     checkpointer: ExperimentCheckpointerConfig = field(
         default_factory=ExperimentCheckpointerConfig
     )
-    inference_dir: Optional[str] = None
 
 
 @dataclass
@@ -692,6 +685,10 @@ class InferenceSamplesConfig:
     length_step: int = 1
 
 
+# assume we have public weights available, use as default checkpoint
+public_weights_path = project_root_path / "multiflow_weights"
+
+
 @dataclass
 class InferenceConfig:
     task: InferenceTaskEnum = InferenceTaskEnum.unconditional
@@ -699,14 +696,15 @@ class InferenceConfig:
     seed: int = "${shared.seed}"
     use_gpu: bool = True
     num_gpus: int = 1
-    predict_dir: Path = Path("./inference_outputs/")
+    predict_dir: str = str(project_root_path / "inference_outputs")
     inference_subdir: str = "${shared.now}"
 
     # checkpoints
-    saved_ckpt_dir: str = "./ckpt/${experiment.wandb.project}"
-    unconditional_ckpt_path: Optional[str] = "./weights/last.ckpt"
-    forward_folding_ckpt_path: Optional[str] = "./weights/last.ckpt"
-    inverse_folding_ckpt_path: Optional[str] = "./weights/last.ckpt"
+    saved_ckpt_dir: str = "${project_root}/ckpt/${experiment.wandb.project}"
+
+    unconditional_ckpt_path: Optional[str] = str(public_weights_path / "last.ckpt")
+    forward_folding_ckpt_path: Optional[str] = str(public_weights_path / "last.ckpt")
+    inverse_folding_ckpt_path: Optional[str] = str(public_weights_path / "last.ckpt")
 
     interpolant: InterpolantConfig = field(default_factory=InterpolantConfig)
     samples: InferenceSamplesConfig = field(default_factory=InferenceSamplesConfig)
@@ -721,15 +719,15 @@ class InferenceConfig:
 @dataclass
 class FoldingConfig:
     seq_per_sample: int = 8
-    # validate using esmf or af2
-    folding_model: str = "esmf"
+    folding_model: str = "af2"  # "af2" only at the moment, maybe "esm" in the future
     # dedicated device for folding. decrement other devices by 1 if True
     own_device: bool = False
-    pmpnn_path: Path = Path("./ProteinMPNN/")
-    pt_hub_dir: Path = Path("./.cache/torch/")
-    colabfold_path: Path = Path(
-        "path/to/colabfold-conda/bin/colabfold_batch"
-    )  # for AF2
+    # TODO update ProteinMPNN path
+    pmpnn_path: Path = project_root_path / "ProteinMPNN"
+    pmpnn_seed: int = "${shared.seed}"
+    pt_hub_dir: Path = project_root_path / "cache" / "torch"
+    # TODO update colabfold path
+    colabfold_path: Path = project_root_path / "colabfold/bin/colabfold_batch"
 
 
 @dataclass
@@ -748,6 +746,20 @@ class Config:
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     interpolant: InterpolantConfig = field(default_factory=InterpolantConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+
+    def interpolate(self) -> "Config":
+        """
+        Interpolate Config with OmegaConf, yielding an interpolated Config class
+
+        OmegaConf supports interpolated fields like `my_field: int = "${my_other_field}"`.
+        This function interpolates those fields, yielding a new Config object.
+
+        Intermediate fields are dataclasses, not DictConfig.
+        """
+        # use `to_object()` so intermediate fields are dataclasses, not DictConfig
+        # `create()` interpolates the fields
+        # TODO consider using `hydra.instantiate` to interpolate the config?
+        return OmegaConf.to_object(OmegaConf.create(self))
 
 
 # Register the config class with Hydra

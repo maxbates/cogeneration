@@ -25,9 +25,11 @@ from cogeneration.data.rigid import batch_align_structures
 class SamplingStep:
     """
     A single step in the sampling trajectory.
+
+    tensors should be detached and moved to CPU.
     """
 
-    backbone: torch.Tensor  # (batch_size, num_res, 37, 3)
+    structure: torch.Tensor  # (batch_size, num_res, 37, 3)  i.e. atom37 representation
     amino_acids: torch.Tensor  # (batch_size, num_res)
     logits: Optional[torch.Tensor] = None
 
@@ -38,7 +40,11 @@ class SamplingTrajectory:
     A trajectory of inference sampling steps.
     """
 
+    num_batch: int
+    num_res: int
+    num_tokens: int
     steps: List[SamplingStep] = field(default_factory=list)
+    check_dimensions: bool = True
 
     def __len__(self):
         return len(self.steps)
@@ -48,6 +54,61 @@ class SamplingTrajectory:
 
     def append(self, step: SamplingStep):
         self.steps.append(step)
+
+    @property
+    def num_steps(self):
+        return len(self.steps)
+
+    @property
+    def structure(self) -> torch.Tensor:
+        """
+        Returns structure / backbone tensor [num_batch, traj_length, sample_length, 37, 3]
+        """
+        t = torch.stack([step.structure for step in self.steps], dim=0).transpose(0, 1)
+        if self.check_dimensions:
+            expected_shape = (self.num_batch, self.num_steps, self.num_res, 37, 3)
+            assert (
+                t.shape == expected_shape
+            ), f"Unexpected structure shape {t.shape}, expected {expected_shape}"
+        return t
+
+    @property
+    def amino_acids(self) -> torch.Tensor:
+        """
+        Returns amino acid types tensor [num_batch, traj_length, sample_length]
+        """
+        t = (
+            torch.stack([step.amino_acids for step in self.steps], dim=0)
+            .transpose(0, 1)
+            .long()
+        )
+        if self.check_dimensions:
+            expected_shape = (self.num_batch, self.num_steps, self.num_res)
+            assert (
+                t.shape == expected_shape
+            ), f"Unexpected amino_acids shape {t.shape}, expected {expected_shape}"
+        return t
+
+    @property
+    def logits(self) -> Optional[torch.Tensor]:
+        """
+        Returns logits tensor if available [num_batch, traj_length, sample_length, num_tokens]
+        Currently only available for model steps, not protein steps, since we don't flow for logits.
+        """
+        if self.steps[0].logits is None:
+            return None
+        t = torch.stack([step.logits for step in self.steps], dim=0).transpose(0, 1)
+        if self.check_dimensions:
+            expected_shape = (
+                self.num_batch,
+                self.num_steps,
+                self.num_res,
+                self.num_tokens,
+            )
+            assert (
+                t.shape == expected_shape
+            ), f"Unexpected logits shape {t.shape}, expected {expected_shape}"
+        return t
 
 
 def _centered_gaussian(num_batch, num_res, device):
@@ -618,6 +679,8 @@ class Interpolant:
 
         Generates initially noise batch, samples using Euler steps for rotations, translations, and amino acid types.
         Special handling for forward folding, reverse folding, and separate t.
+
+        Note that while sample operates on backbones, the emitted structures are all-atom (i.e. atom37).
         """
 
         res_mask = torch.ones(num_batch, num_res, device=self._device)
@@ -736,13 +799,21 @@ class Interpolant:
         aatypes_t_1 = aatypes_0
 
         # model_trajectory tracks states predicted by model without noise / processing
-        model_trajectory = SamplingTrajectory()
+        model_trajectory = SamplingTrajectory(
+            num_batch=num_batch,
+            num_res=num_res,
+            num_tokens=self.num_tokens,
+        )
         # protein_trajectory tracks predicted intermediate states integrating from t=0 to t=1
-        protein_trajectory = SamplingTrajectory()
+        protein_trajectory = SamplingTrajectory(
+            num_batch=num_batch,
+            num_res=num_res,
+            num_tokens=self.num_tokens,
+        )
 
         protein_trajectory.append(
             SamplingStep(
-                backbone=frames_to_atom37(trans_t_1, rotmats_t_1, psis_t_1),
+                structure=frames_to_atom37(trans_t_1, rotmats_t_1, psis_t_1),
                 amino_acids=aatypes_0.detach().cpu(),
             )
         )
@@ -804,13 +875,13 @@ class Interpolant:
             # Process model output, getting predicted structure/sequence
             pred_trans_1 = model_out[pbp.pred_trans]
             pred_rotmats_1 = model_out[pbp.pred_rotmats]
-            pred_psis_1 = model_out[pbp.pred_psi]
+            pred_psis_1 = model_out[pbp.pred_psi]  # may be None, if not predicting
             pred_aatypes_1 = model_out[pbp.pred_aatypes]
             pred_logits_1 = model_out[pbp.pred_logits]
 
             model_trajectory.append(
                 SamplingStep(
-                    backbone=frames_to_atom37(
+                    structure=frames_to_atom37(
                         pred_trans_1, pred_rotmats_1, pred_psis_1
                     ),
                     amino_acids=pred_aatypes_1.detach().cpu(),
@@ -857,13 +928,14 @@ class Interpolant:
             # Only update the masked residues
             trans_t_2 = _trans_diffuse_mask(trans_t_2, trans_1, diffuse_mask)
             rotmats_t_2 = _rots_diffuse_mask(rotmats_t_2, rotmats_1, diffuse_mask)
-            psi_t_2 = _trans_diffuse_mask(psi_t_2, psis_1, diffuse_mask)
             aatypes_t_2 = _aatypes_diffuse_mask(aatypes_t_2, aatypes_1, diffuse_mask)
+            if psi_t_2 is not None:
+                psi_t_2 = _trans_diffuse_mask(psi_t_2, psis_1, diffuse_mask)
 
             # Add to trajectory
             protein_trajectory.append(
                 SamplingStep(
-                    backbone=frames_to_atom37(trans_t_2, rotmats_t_2, psi_t_2),
+                    structure=frames_to_atom37(trans_t_2, rotmats_t_2, psi_t_2),
                     amino_acids=aatypes_t_2.cpu().detach(),
                 )
             )
@@ -871,7 +943,6 @@ class Interpolant:
             # Get ready for the next step
             trans_t_1 = trans_t_2
             rotmats_t_1 = rotmats_t_2
-            psis_t_1 = psi_t_2
             aatypes_t_1 = aatypes_t_2
             t_1 = t_2
 
@@ -919,14 +990,14 @@ class Interpolant:
         pred_atom37 = frames_to_atom37(pred_trans_1, pred_rotmats_1, pred_psis_1)
         model_trajectory.append(
             SamplingStep(
-                backbone=pred_atom37,
+                structure=pred_atom37,
                 amino_acids=pred_aatypes_1.detach().cpu(),
                 logits=pred_logits_1.detach().cpu(),
             )
         )
         protein_trajectory.append(
             SamplingStep(
-                backbone=pred_atom37, amino_acids=pred_aatypes_1.detach().cpu()
+                structure=pred_atom37, amino_acids=pred_aatypes_1.detach().cpu()
             )
         )
 

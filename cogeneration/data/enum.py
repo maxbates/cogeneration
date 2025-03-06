@@ -1,5 +1,7 @@
 from enum import Enum
 
+from cogeneration.util.base_classes import StrEnum
+
 
 class DatasetColumns(str, Enum):
     """Columns in the training/synthetic/redesign/test metadata CSVs"""
@@ -33,7 +35,7 @@ class DatasetColumns(str, Enum):
 
 class DatasetProteinColumns(str, Enum):
     """
-    Information about the protein, pickled in `processed_path`
+    Information about the protein, pickled in `processed_path`, or from parsing a Protein / Chain (see `parse_chain_feats`)
 
     This code is not provided by MultiFlow, just the generated artifacts.
 
@@ -71,3 +73,60 @@ class DatasetTransformColumns(str, Enum):
     rigidgroups_alt_gt_frames = "rigidgroups_alt_gt_frames"
     # atom37_to_torsion_angles()
     torsion_angles_sin_cos = "torsion_angles_sin_cos"
+
+
+class MetricName(StrEnum):
+    """
+    Enumeration of metrics we calculate for protein structures, sequences, and trajectories
+    """
+
+    # Functions that parse structures / sequences / trajectories
+
+    # ca-ca metrics
+    ca_ca_deviation = "ca_ca_deviation"
+    ca_ca_valid_percent = "ca_ca_valid_percent"
+    num_ca_ca_clashes = "num_ca_ca_clashes"
+
+    # aatype metrics
+    aatype_histogram_dist = "aatype_histogram_dist"
+
+    # mdtraj metrics
+    non_coil_percent = "non_coil_percent"
+    coil_percent = "coil_percent"
+    helix_percent = "helix_percent"
+    strand_percent = "strand_percent"
+    radius_of_gyration = "radius_of_gyration"
+
+    # Assessment pipeline
+
+    # `parse_pdb_feats()` and `parse_chain_feats()` are called when parsing structures
+    # see DatasetProteinColumns
+
+    # metadata
+    sample_id = "sample_id"  # unique identifier for sample
+    sample_length = "sample_length"  # length of sample
+
+    # assess folded structures
+    header = "header"  # sequence name, header in fasta file
+    sequence = "sequence"  # sequence of amino acids
+    sample_pdb_path = "sample_pdb_path"  # filepath to generated pdb file
+    folded_pdb_path = "folded_path"  # filepath to folded pdb file
+    plddt_mean = "plddt_mean"  # mean pLDDT score
+
+    # structure comparison
+    bb_rmsd = "bb_rmsd"  # generated sample to folded structure
+    bb_rmsd_gt = (
+        "bb_rmsd_gt"  # generated sample to ground truth structure (if provided)
+    )
+    bb_rmsd_folded_gt = (
+        "bb_rmsd_folded_gt"  # folded structure to ground truth structure (if provided)
+    )
+
+    # sequence recovery
+    inverse_folding_sequence_recovery = (
+        "inverse_folding_sequence_recovery"  # if provided true sequence
+    )
+
+    # inverse + forward folding summary metrics
+    inverse_folding_bb_rmsd_min = "inverse_folding_bb_rmsd_min"
+    inverse_folding_bb_rmsd_mean = "inverse_folding_bb_rmsd_mean"

@@ -1,4 +1,3 @@
-from cogeneration.config.base import ExperimentConfig
 from cogeneration.scripts.train import Experiment
 
 

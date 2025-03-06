@@ -26,6 +26,7 @@ class TestFlowModel:
         model = FlowModel(mock_cfg.model)
         compiled_model = torch.compile(model)
         output = compiled_model(pdb_noisy_batch)
+        assert output is not None
 
     def test_model_sequence_ipa_net(self, mock_cfg, pdb_noisy_batch):
         mock_cfg.model.sequence_pred_type = ModelSequencePredictionEnum.sequence_ipa_net

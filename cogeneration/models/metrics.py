@@ -1,10 +1,11 @@
-from typing import Optional
+from typing import Dict, Optional
 
 import mdtraj as md
 import numpy as np
 import torch
 
 from cogeneration.data import residue_constants
+from cogeneration.data.enum import MetricName
 
 
 def t_stratified_loss(
@@ -47,11 +48,10 @@ def calc_ca_ca_metrics(ca_pos, bond_tol=0.1, clash_tol=1.0):
     inter_dists = ca_ca_dists2d[np.where(np.triu(ca_ca_dists2d, k=0) > 0)]
     clashes = inter_dists < clash_tol
 
-    # TODO - struct, class to calculate
     return {
-        "ca_ca_deviation": ca_ca_dev,
-        "ca_ca_valid_percent": ca_ca_valid,
-        "num_ca_ca_clashes": np.sum(clashes),
+        MetricName.ca_ca_deviation: ca_ca_dev,
+        MetricName.ca_ca_valid_percent: ca_ca_valid,
+        MetricName.num_ca_ca_clashes: np.sum(clashes),
     }
 
 
@@ -107,13 +107,12 @@ def calc_aatype_metrics(generated_aatypes):
         )
     )
 
-    # TODO - struct, class to calculate
-    return {"aatype_histogram_dist": hellinger_distance}
+    return {MetricName.aatype_histogram_dist: hellinger_distance}
 
 
-def calc_mdtraj_metrics(pdb_path):
+def calc_mdtraj_metrics(pdb_path: str) -> Dict[str, float]:
     """
-    Calculate trajectory metrics
+    Calculate trajectory metrics, secondary structure metrics
     """
     try:
         traj = md.load(pdb_path)
@@ -131,11 +130,10 @@ def calc_mdtraj_metrics(pdb_path):
         pdb_strand_percent = 0.0
         pdb_rg = 0.0
 
-    # TODO - struct, class to calculate
     return {
-        "non_coil_percent": pdb_ss_percent,
-        "coil_percent": pdb_coil_percent,
-        "helix_percent": pdb_helix_percent,
-        "strand_percent": pdb_strand_percent,
-        "radius_of_gyration": pdb_rg,
+        MetricName.non_coil_percent: pdb_ss_percent,
+        MetricName.coil_percent: pdb_coil_percent,
+        MetricName.helix_percent: pdb_helix_percent,
+        MetricName.strand_percent: pdb_strand_percent,
+        MetricName.radius_of_gyration: pdb_rg,
     }

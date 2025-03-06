@@ -1,10 +1,11 @@
+import json
 import logging
 import os
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, fields
 from random import random
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -23,10 +24,11 @@ from cogeneration.data.batch_props import BatchProps as bp
 from cogeneration.data.batch_props import NoisyBatchProps as nbp
 from cogeneration.data.batch_props import PredBatchProps as pbp
 from cogeneration.data.const import MASK_TOKEN_INDEX
+from cogeneration.data.folding_validation import FoldingValidator
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restypes, restypes_with_x
-from cogeneration.data.trajectory import save_traj
+from cogeneration.data.trajectory import SavedTrajectory, save_trajectory
 from cogeneration.models import metrics
 from cogeneration.models.model import FlowModel
 
@@ -54,7 +56,7 @@ class TrainingLosses:
 
 
 class FlowModule(LightningModule):
-    def __init__(self, cfg: Config, folding_device_id=None):
+    def __init__(self, cfg: Config, folding_device_id: int = 0):
         super().__init__()
         self.cfg = cfg
 
@@ -62,27 +64,27 @@ class FlowModule(LightningModule):
 
         self.interpolant = Interpolant(cfg.interpolant)
 
+        self.folding_validator = FoldingValidator(
+            cfg=self.cfg.folding,
+            device_id=folding_device_id,
+        )
+
         # self.logger defined in LightningModule
         self._log = logging.getLogger(__name__)
 
         self.save_hyperparameters()
 
-        self.validation_epoch_metrics = []
-        self.validation_epoch_samples = []
-        self.save_hyperparameters()
-
         self._epoch_start_time = None
+        # metrics generated during validation_step()
+        self.validation_epoch_metrics: List[pd.DataFrame] = []
+        # sample information tracked during validation_step()
+        self.validation_epoch_samples: List[Tuple[str, int, wandb.Molecule]] = []
 
         self._checkpoint_dir = None
         self._inference_dir = None
 
         # batch / state tracking
         self._data_history = deque(maxlen=100)
-
-        # TODO - move folding / validation to its own class/module
-        self._folding_model = None
-        self._folding_cfg = cfg.folding
-        self._folding_device_id = folding_device_id
 
     @property
     def checkpoint_dir(self) -> str:
@@ -107,16 +109,19 @@ class FlowModule(LightningModule):
         if self._inference_dir is None:
             if dist.is_initialized():
                 if dist.get_rank() == 0:
-                    inference_dir = [self.cfg.experiment.inference_dir]
+                    inference_dir = [self.cfg.inference.predict_dir]
                 else:
                     inference_dir = [None]
                 dist.broadcast_object_list(inference_dir, src=0)
                 inference_dir = inference_dir[0]
             else:
-                inference_dir = self.cfg.experiment.inference_dir
+                inference_dir = self.cfg.inference.predict_dir
                 if inference_dir is None:
                     inference_dir = os.path.join(self.checkpoint_dir, "inference")
 
+            assert (
+                inference_dir is not None and len(inference_dir) > 0
+            ), f"Invalid inference dir {inference_dir}"
             self._inference_dir = inference_dir
             os.makedirs(self._inference_dir, exist_ok=True)
 
@@ -389,77 +394,6 @@ class FlowModule(LightningModule):
 
         return losses
 
-    def validation_step(self, batch: Any, batch_idx: int):
-        # TODO - run ProteinMPNN + folding to determine designability, using a separate FoldingModule
-
-        assert batch is not None, "batch is None"
-
-        res_mask = batch[bp.res_mask]
-        num_batch, num_res = res_mask.shape
-
-        self.interpolant.set_device(res_mask.device)
-
-        csv_idx = batch[bp.csv_idx]
-        diffuse_mask = batch[bp.diffuse_mask]
-        assert (
-            diffuse_mask == 1.0
-        ).all()  # TODO - support partial masking (inpainting)
-
-        protein_traj, model_traj = self.interpolant.sample(
-            num_batch,
-            num_res,
-            self.model,
-            trans_1=batch[bp.trans_1],
-            rotmats_1=batch[bp.rotmats_1],
-            aatypes_1=batch[bp.aatypes_1],
-            diffuse_mask=diffuse_mask,
-            chain_idx=batch[bp.chain_idx],
-            res_idx=batch[bp.res_idx],
-        )
-        final_step = protein_traj[-1]
-        samples = final_step.backbone.numpy()
-        assert samples.shape == (num_batch, num_res, 37, 3)
-
-        generated_aatypes = final_step.amino_acids.numpy()
-        assert generated_aatypes.shape == (num_batch, num_res)
-        batch_level_aatype_metrics = metrics.calc_aatype_metrics(generated_aatypes)
-
-        batch_metrics = []
-        for i in range(num_batch):
-            sample_dir = os.path.join(
-                self.checkpoint_dir,
-                f"sample_{csv_idx[i].item()}_idx_{batch_idx}_len_{num_res}",
-            )
-            os.makedirs(sample_dir, exist_ok=True)
-
-            final_positions = samples[i]
-            final_sequence = generated_aatypes[i]
-
-            # Write out sample to PDB file
-            saved_path = write_prot_to_pdb(
-                final_positions,
-                os.path.join(sample_dir, "sample.pdb"),
-                no_indexing=True,
-            )
-            if isinstance(self.logger, WandbLogger):
-                self.validation_epoch_samples.append(
-                    [saved_path, self.global_step, wandb.Molecule(saved_path)]
-                )
-
-            # TODO - run designability with ProteinMPNN + folding, calculate metrics of sequence, structure
-            #   it should be able to be hidden behind a config flag
-
-            try:
-                mdtraj_metrics = metrics.calc_mdtraj_metrics(saved_path)
-                batch_metric = batch_level_aatype_metrics | mdtraj_metrics
-                batch_metrics.append(batch_metric)
-            except Exception as e:
-                print(e)
-                continue
-
-        batch_metrics = pd.DataFrame(batch_metrics)
-        self.validation_epoch_metrics.append(batch_metrics)
-
     def training_step(self, batch: Any):
         step_start_time = time.time()
 
@@ -467,7 +401,10 @@ class FlowModule(LightningModule):
         noisy_batch = self.interpolant.corrupt_batch(batch)
 
         # Enable self-conditioning during training
-        if self.cfg.interpolant.self_condition and random() > 0.5:
+        if (
+            self.cfg.interpolant.self_condition
+            and random() > self.cfg.interpolant.self_condition_prob
+        ):
             with torch.no_grad():
                 # Perform a model pass, and get predicted translations and aatypes
                 model_sc = self.model(noisy_batch)
@@ -550,8 +487,93 @@ class FlowModule(LightningModule):
 
         return train_loss
 
-    def predict_step(self, batch: Any, batch_idx: Any) -> Dict[str, str]:
+    def validation_step(self, batch: Any, batch_idx: int) -> pd.DataFrame:
+        assert batch is not None, "batch is None"
+
+        res_mask = batch[bp.res_mask]
+        num_batch, num_res = res_mask.shape
+        csv_idx = batch[bp.csv_idx]
+        diffuse_mask = batch[bp.diffuse_mask]
+        assert (diffuse_mask == 1.0).all()  # no partial masking yet
+
+        # validation runs "codesign"-ish, but will corrupt trans/rots/aa based on interpolant config.
+        self.interpolant.set_device(res_mask.device)
+        protein_traj, model_traj = self.interpolant.sample(
+            num_batch,
+            num_res,
+            self.model,
+            # t=0 values will be noise
+            trans_1=batch[bp.trans_1],
+            rotmats_1=batch[bp.rotmats_1],
+            aatypes_1=batch[bp.aatypes_1],
+            diffuse_mask=diffuse_mask,
+            chain_idx=batch[bp.chain_idx],
+            res_idx=batch[bp.res_idx],
+            forward_folding=False,
+            inverse_folding=False,
+        )
+
+        bb_trajs = to_numpy(protein_traj.structure)
+        aa_trajs = to_numpy(protein_traj.amino_acids)
+
+        model_bb_trajs = to_numpy(model_traj.structure)
+        model_aa_trajs = to_numpy(model_traj.amino_acids)
+        # For now, we only emit logits from direct model output (don't simulate logits)
+        model_logits_trajs = to_numpy(model_traj.logits)
+
+        final_step = protein_traj[-1]
+        generated_aatypes = to_numpy(final_step.amino_acids)
+        assert generated_aatypes.shape == (num_batch, num_res)
+        batch_level_aatype_metrics = metrics.calc_aatype_metrics(generated_aatypes)
+
+        batch_metrics = []
+        for i in range(num_batch):
+            sample_id = f"sample_{csv_idx[i].item()}_idx_{batch_idx}_len_{num_res}"
+            sample_dir = os.path.join(
+                self.checkpoint_dir,
+                sample_id,
+            )
+            os.makedirs(sample_dir, exist_ok=True)
+
+            # Compute metrics, inverse fold + fold
+            top_sample_metrics, saved_trajectory_files = self.compute_sample_metrics(
+                sample_id=sample_id,
+                sample_dir=sample_dir,
+                bb_traj=bb_trajs[i],
+                aa_traj=aa_trajs[i],
+                model_bb_traj=model_bb_trajs[i],
+                model_aa_traj=model_aa_trajs[i],
+                model_logits_traj=model_logits_trajs[i],
+                true_bb_pos=None,  # codesign
+                true_aa=None,  # codesign
+                diffuse_mask=to_numpy(diffuse_mask)[0],
+                aatypes_corrupt=self.cfg.interpolant.aatypes.corrupt,
+                also_fold_pmpnn_seq=True,  # always fold during validation
+                write_sample_trajectories=False,  # don't write trajectories during validation (just structures)
+                n_inverse_folds=1,  # only one during validation
+            )
+
+            # save molecule to W&B
+            if isinstance(self.logger, WandbLogger):
+                pdb_path = saved_trajectory_files.sample_pdb_path
+                assert pdb_path is not None
+                self.validation_epoch_samples.append(
+                    (pdb_path, self.global_step, wandb.Molecule(pdb_path))
+                )
+
+            # TODO - Only take metrics of interest, otherwise there will be too many
+            top_sample_metrics.update(batch_level_aatype_metrics)
+            batch_metrics.append(top_sample_metrics)
+
+        batch_metrics_df = pd.DataFrame(batch_metrics)
+        self.validation_epoch_metrics.append(batch_metrics_df)
+
+        return batch_metrics_df
+
+    def predict_step(self, batch: Any, batch_idx: Any):
+        # Create an inference-specific interpolant
         interpolant = Interpolant(self.cfg.inference.interpolant)
+
         device = (
             batch[bp.num_res].device
             if bp.num_res in batch
@@ -573,7 +595,6 @@ class FlowModule(LightningModule):
 
         if self.cfg.inference.task == InferenceTaskEnum.unconditional:
             sample_length = batch[bp.num_res].item()
-            true_bb_pos = None
             sample_dirs = [
                 os.path.join(
                     self.inference_dir,
@@ -582,7 +603,8 @@ class FlowModule(LightningModule):
                 )
                 for sample_id in sample_ids
             ]
-            trans_1 = rotmats_1 = diffuse_mask = aatypes_1 = true_aatypes = None
+            true_aatypes = true_bb_pos = None
+            trans_1 = rotmats_1 = diffuse_mask = aatypes_1 = None
         elif self.cfg.inference.task == InferenceTaskEnum.forward_folding:
             sample_length = batch[bp.trans_1].shape[1]
             sample_dirs = [
@@ -604,8 +626,6 @@ class FlowModule(LightningModule):
                 ),
                 aatype=to_numpy(batch[bp.aatypes_1][0]),
             )
-            true_bb_pos = true_bb_pos[..., :3, :].reshape(-1, 3).cpu().numpy()
-            assert true_bb_pos.shape == (sample_length * 3, 3)
             aatypes_1 = batch[bp.aatypes_1]
             trans_1 = rotmats_1 = diffuse_mask = true_aatypes = None
         elif self.cfg.inference.task == InferenceTaskEnum.inverse_folding:
@@ -635,7 +655,7 @@ class FlowModule(LightningModule):
             self._log.error(
                 f"instance {sample_ids} length {sample_length} already exists @ {sample_dirs}"
             )
-            return None
+            return
 
         # Sample batch
         protein_traj, model_traj = interpolant.sample(
@@ -655,141 +675,135 @@ class FlowModule(LightningModule):
         diffuse_mask = (
             diffuse_mask if diffuse_mask is not None else torch.ones(1, sample_length)
         )
-        atom37_traj = [x.backbone for x in protein_traj]
-        atom37_model_traj = [x.backbone for x in model_traj]
 
-        bb_trajs = to_numpy(torch.stack(atom37_traj, dim=0).transpose(0, 1))
-        noisy_traj_length = bb_trajs.shape[1]
-        assert bb_trajs.shape == (num_batch, noisy_traj_length, sample_length, 37, 3)
+        bb_trajs = to_numpy(protein_traj.structure)
+        aa_trajs = to_numpy(protein_traj.amino_acids)
 
-        model_trajs = to_numpy(torch.stack(atom37_model_traj, dim=0).transpose(0, 1))
-        clean_traj_length = model_trajs.shape[1]
-        assert model_trajs.shape == (num_batch, clean_traj_length, sample_length, 37, 3)
+        model_bb_trajs = to_numpy(model_traj.structure)
+        model_aa_trajs = to_numpy(model_traj.amino_acids)
+        # For now, we only emit logits from direct model output (don't simulate logits)
+        model_logits_trajs = to_numpy(model_traj.logits)
 
-        aa_traj = [x.amino_acids for x in protein_traj]
-        clean_aa_traj = [x.amino_acids for x in model_traj]
-
-        # Check for remaining mask tokens in interpolated trajectory, reset if present (to 0 := alanine)
-        aa_trajs = to_numpy(torch.stack(aa_traj, dim=0).transpose(0, 1).long())
-        assert aa_trajs.shape == (num_batch, noisy_traj_length, sample_length)
-        for i in range(aa_trajs.shape[0]):
-            for j in range(aa_trajs.shape[2]):
+        # Check for remaining mask tokens in final step of interpolated trajectory and reset to 0 := alanine
+        for i in range(aa_trajs.shape[0]):  # samples
+            for j in range(aa_trajs.shape[2]):  # positions
                 if aa_trajs[i, -1, j] == MASK_TOKEN_INDEX:
                     self._log.info("WARNING mask in predicted AA")
                     aa_trajs[i, -1, j] = 0
 
-        clean_aa_trajs = to_numpy(
-            torch.stack(clean_aa_traj, dim=0).transpose(0, 1).long()
-        )
-        assert clean_aa_trajs.shape == (num_batch, clean_traj_length, sample_length)
-
-        # For now, we only emit logits from direct model output
-        # We don't currently emit logits, just aatypes, when integrating
-        clean_logits_traj = [x.logits for x in model_traj]
-        clean_logits_trajs = to_numpy(
-            torch.stack(clean_logits_traj, dim=0).transpose(0, 1)
-        )
-        assert clean_logits_trajs.shape == (
-            num_batch,
-            clean_traj_length,
-            sample_length,
-            self.cfg.model.aa_pred.aatype_pred_num_tokens,
-        )
-
-        top_sample_paths = {}
         for i, sample_id in zip(range(num_batch), sample_ids):
             sample_dir = sample_dirs[i]
-            top_sample_df = self.compute_sample_metrics(
-                batch=batch,
-                model_traj=model_trajs[i],
+            top_sample_metrics, _ = self.compute_sample_metrics(
+                sample_id=sample_id,
+                sample_dir=sample_dir,
                 bb_traj=bb_trajs[i],
                 aa_traj=aa_trajs[i],
-                clean_aa_traj=clean_aa_trajs[i],
-                clean_logits_traj=clean_logits_trajs[i],
+                model_bb_traj=model_bb_trajs[i],
+                model_aa_traj=model_aa_trajs[i],
+                model_logits_traj=model_logits_trajs[i],
                 true_bb_pos=true_bb_pos,
                 true_aa=true_aatypes,
-                diffuse_mask=diffuse_mask,
-                sample_id=sample_id,
-                sample_length=sample_length,
-                sample_dir=sample_dir,
+                diffuse_mask=to_numpy(diffuse_mask)[0],
                 aatypes_corrupt=self.cfg.inference.interpolant.aatypes.corrupt,
                 also_fold_pmpnn_seq=self.cfg.inference.also_fold_pmpnn_seq,
                 write_sample_trajectories=self.cfg.inference.write_sample_trajectories,
             )
-            top_sample_csv_path = os.path.join(sample_dir, "top_sample.csv")
-            top_sample_df.to_csv(top_sample_csv_path, index=False)
-            top_sample_paths[sample_id] = top_sample_csv_path
-
-        return top_sample_paths
+            top_sample_path = os.path.join(sample_dir, "top_sample.json")
+            with open(top_sample_path, "w") as f:
+                json.dump(top_sample_metrics, f)
 
     def compute_sample_metrics(
         self,
-        batch: Any,
-        model_traj: npt.NDArray,
+        sample_id: Union[int, str],
+        sample_dir: str,  # inference output directory for this sample
         bb_traj: npt.NDArray,
         aa_traj: npt.NDArray,
-        clean_aa_traj: npt.NDArray,
-        clean_logits_traj: npt.NDArray,
-        true_bb_pos: Optional[npt.NDArray],
-        true_aa: Optional[npt.NDArray],
-        diffuse_mask: torch.Tensor,
-        sample_id: Union[int, str],
-        sample_length: int,
-        sample_dir: str,
+        model_bb_traj: npt.NDArray,
+        model_aa_traj: npt.NDArray,
+        model_logits_traj: npt.NDArray,
+        true_bb_pos: Optional[npt.NDArray],  # if relevant. None for unconditional.
+        true_aa: Optional[npt.NDArray],  # if relevant. None for unconditional.
+        diffuse_mask: npt.NDArray,
         aatypes_corrupt: bool = True,
         also_fold_pmpnn_seq: bool = True,
         write_sample_trajectories: bool = True,
-    ) -> pd.DataFrame:
+        n_inverse_folds: Optional[int] = None,
+    ) -> Tuple[Dict[str, Any], SavedTrajectory]:
         """
-        Compute metrics - trajectory, folding validation, etc. - for a single sample.
-        TODO - folding validation with ProteinMPNN and folding module
-        """
-        noisy_traj_length, sample_length, _, _ = bb_traj.shape
-        clean_traj_length = model_traj.shape[0]
+        Takes a single sample.
+        Saves trajectory. Runs self-consistency check running ProteinMPNN + folding to compute metrics.
+        Returns metrics for the top sample.
 
-        assert bb_traj.shape == (noisy_traj_length, sample_length, 37, 3)
-        assert model_traj.shape == (clean_traj_length, sample_length, 37, 3)
+        Note that this function expects numpy inputs. Tensors should be detached and converted.
+        """
+
+        # Noisy trajectory and model (clean) trajectory may not be the same number of steps.
+        noisy_traj_length, sample_length, _, _ = bb_traj.shape
+        assert bb_traj.shape == (
+            noisy_traj_length,
+            sample_length,
+            37,
+            3,
+        ), f"bb_traj shape {bb_traj.shape}"
         if true_bb_pos is not None:
-            assert true_bb_pos.shape == (sample_length, 37, 3)
-        assert aa_traj.shape == (noisy_traj_length, sample_length)
-        assert clean_aa_traj.shape == (clean_traj_length, sample_length)
+            assert true_bb_pos.shape == (
+                sample_length,
+                37,
+                3,
+            ), f"true_bb_pos shape {true_bb_pos.shape}"
+        assert aa_traj.shape == (
+            noisy_traj_length,
+            sample_length,
+        ), f"aa_traj shape {aa_traj.shape}"
+
+        models_traj_length = model_bb_traj.shape[0]
+        assert model_bb_traj.shape == (
+            models_traj_length,
+            sample_length,
+            37,
+            3,
+        ), f"model_traj shape {model_bb_traj.shape}"
+        assert model_aa_traj.shape == (
+            models_traj_length,
+            sample_length,
+        ), f"model_aa_traj shape {model_aa_traj.shape}"
         if true_aa is not None:
-            assert true_aa.shape == (1, sample_length)
+            assert true_aa.shape == (1, sample_length), f"true_aa shape {true_aa.shape}"
+            # unwrap single row
+            true_aa = true_aa[0]
 
         os.makedirs(sample_dir, exist_ok=True)
 
-        # Save trajectory
-        traj_paths = save_traj(
+        # Save PDBs, trajectories, and a fasta of the final sequence
+        saved_trajectory_files = save_trajectory(
+            sample_name=sample_id,
             sample=bb_traj[-1],
             bb_prot_traj=bb_traj,
-            x0_traj=np.flip(model_traj, axis=0),
-            diffuse_mask=to_numpy(diffuse_mask)[0],
+            x0_traj=np.flip(model_bb_traj, axis=0),
+            diffuse_mask=diffuse_mask,
             output_dir=sample_dir,
             aa_traj=aa_traj,
-            clean_aa_traj=clean_aa_traj,
-            clean_logits_traj=clean_logits_traj,
+            model_aa_traj=model_aa_traj,
+            model_logits_traj=model_logits_traj,
             write_trajectories=write_sample_trajectories,
         )
 
-        # TODO - support ProteinMPNN + folding + designability + secondary structure metrics
-        # all metrics should be defined by dataclass / enum
-        # calculation of metrics should probably be its own class. Should also handle inference stats.
+        # TODO - metrics about the trajectory?
 
-        # TODO - actually select the top sample to return
-        top_sample_df = pd.DataFrame(
-            {
-                "sample_id": [sample_id],
-                "length": [sample_length],
-                "seq_codesign": "".join([restypes[x] for x in aa_traj[-1]]),
-                "seq_true_aa": (
-                    "".join([restypes_with_x[i] for i in true_aa[0]])
-                    if true_aa is not None
-                    else None
-                ),
-                "pdb_path": traj_paths["sample_path"],
-            }
+        top_sample_metrics = self.folding_validator.assess_sample(
+            sample_name=sample_id,
+            sample_dir=sample_dir,
+            pred_pdb_path=saved_trajectory_files.sample_pdb_path,
+            pred_bb_positions=bb_traj[-1],
+            pred_aa=aa_traj[-1],
+            diffuse_mask=diffuse_mask,
+            also_fold_pmpnn_seq=also_fold_pmpnn_seq,
+            true_bb_positions=true_bb_pos,
+            true_aa=true_aa,
+            n_inverse_folds=n_inverse_folds,
         )
-        return top_sample_df
+
+        return top_sample_metrics, saved_trajectory_files
 
     def _log_scalar(
         self,

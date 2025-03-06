@@ -21,9 +21,9 @@ from cogeneration.config.base import (
 from cogeneration.data import data_transforms, rigid_utils
 from cogeneration.data.batch_props import BatchProps as bp
 from cogeneration.data.const import seq_to_aatype
-from cogeneration.data.csv import DatasetColumns as dc
-from cogeneration.data.csv import DatasetProteinColumns as dpc
-from cogeneration.data.csv import DatasetTransformColumns as dtc
+from cogeneration.data.enum import DatasetColumns as dc
+from cogeneration.data.enum import DatasetProteinColumns as dpc
+from cogeneration.data.enum import DatasetTransformColumns as dtc
 from cogeneration.data.io import read_pkl
 from cogeneration.dataset.data_utils import parse_chain_feats
 

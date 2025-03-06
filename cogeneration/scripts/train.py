@@ -69,7 +69,7 @@ class Experiment:
 
         # Determine devices, accounting that folding may be assigned its own device.
         if self.cfg.experiment.trainer.accelerator == "cpu":
-            folding_device_id = None
+            folding_device_id = 0
             # set to number of processors, rather than list of devices, this is what Trainer() wants.
             self._train_device_ids = torch.multiprocessing.cpu_count() // 2
         else:
@@ -87,7 +87,7 @@ class Experiment:
                 self._train_device_ids = device_ids[1:]
                 log.info(f"Folding device id: {folding_device_id}")
             else:
-                folding_device_id = None
+                folding_device_id = 0
                 self._train_device_ids = device_ids
 
         log.info(f"Training with devices: {self._train_device_ids}")

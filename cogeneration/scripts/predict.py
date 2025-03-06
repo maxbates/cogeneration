@@ -55,7 +55,7 @@ class EvalRunner:
         if local_rank == 0:
             inference_dir = self.setup_inference_dir(ckpt_path)
             log.info(f"Saving results to {inference_dir}")
-            self.cfg.experiment.inference_dir = inference_dir
+            self.cfg.inference.predict_dir = inference_dir
             config_path = os.path.join(inference_dir, "config.yaml")
             with open(config_path, "w") as f:
                 OmegaConf.save(config=self.cfg, f=f)
@@ -66,6 +66,7 @@ class EvalRunner:
             checkpoint_path=ckpt_path,
             cfg=self.cfg,
         )
+        self._flow_module.folding_validator.set_device_id(0)
         log.info(ModelSummary(self._flow_module))
         self._flow_module.eval()
 
@@ -129,11 +130,13 @@ class EvalRunner:
         #   We should merge `ckpt_cfg` into `cfg`.
         #   However, some fields, which determine behavior (like run `local`), should not be overridden.
         #   To merge into a dataclass, all fields must exist. Or we merge into a base DictConfig.
-        cfg = OmegaConf.merge(ckpt_cfg, cfg, ckpt_cfg)
+        merged_cfg = OmegaConf.merge(ckpt_cfg, cfg, ckpt_cfg)
+
         # Overwrite certain fields from the checkpoint config
-        cfg.experiment.checkpointer.dirpath = "./"
+        # TODO revisit more extensively
+        merged_cfg.experiment.checkpointer.dirpath = cfg.experiment.checkpointer.dirpath
         # Maintain important behavior specified in `cfg`
-        cfg.experiment.trainer.strategy = "auto"
+        merged_cfg.experiment.trainer.strategy = cfg.experiment.trainer.strategy
 
         # In an attempt (that probably won't last) to support MultiFlow,
         # if we got a config from MultiFlow, we need to map to our new module names.
@@ -143,7 +146,7 @@ class EvalRunner:
             ckpt = torch.load(ckpt_path, map_location=torch.device("cpu"))
 
             # Define new checkpoint directory
-            ckpt_dir = ckpt_dir + "_mapped"
+            ckpt_dir = f"{merged_cfg.experiment.checkpointer.dirpath}_mapped_{merged_cfg.shared.now}"
             ckpt_path = os.path.join(ckpt_dir, "mapped.ckpt")
 
             # Map modules in state_dict
@@ -165,7 +168,7 @@ class EvalRunner:
             torch.save(ckpt, ckpt_path)
             log.info(f"Saved mapped checkpoint to {ckpt_path}")
 
-        return cfg, ckpt_path
+        return merged_cfg, ckpt_path
 
     @print_timing
     def run_sampling(self):

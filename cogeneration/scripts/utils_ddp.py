@@ -40,6 +40,10 @@ def setup_ddp(
             local_rank = int(rank)
             world_size = int(world_size)
 
+            # Make sure not already initialized (mostly an issue in tests)
+            if dist.is_initialized():
+                return
+
             # In theory, we might want to support other backends, e.g. `nccl` if using GPUs
             # In practice, pytorch lightning will do this for us.
             # So we specify `gloo` which works with CPUs and MPS.

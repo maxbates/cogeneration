@@ -1,4 +1,6 @@
 import logging
+import os
+from pathlib import Path
 
 import pytest
 import torch
@@ -23,18 +25,48 @@ logging.basicConfig(level=logging.DEBUG)
 
 
 @pytest.fixture
-def mock_cfg():
+def public_weights_path() -> Path:
+    """
+    returns Path to public weights directory, containing a `config.yaml` and `last.ckpt`
+
+    These weights must be downloaded separately.
+    """
+    # check paths
+    public_weights_path = (Path(__file__).parent / "../multiflow_weights").resolve()
+    assert os.path.exists(
+        public_weights_path
+    ), f"""Public weights not found at {public_weights_path}
+    Public weights must be downloaded for some tests to work.
+    
+    See https://zenodo.org/records/10714631?token=eyJhbGciOiJIUzUxMiJ9.eyJpZCI6IjJjMTk2YjlmLTM4OTUtNGVhYi1hODcxLWE1ZjExOTczY2IzZiIsImRhdGEiOnt9LCJyYW5kb20iOiI4MDY5ZDUzYjVjMTNhNDllMDYxNmI3Yjc2NjcwYjYxZiJ9.C2eZZmRu-nu7H330G-DkV5kttfjYB3ANozdOMNm19uPahvtLrDRvd_4Eqlyb7lp24m06e4OHhHQ4zlj68S1O_A
+    """
+    assert os.path.exists(
+        public_weights_path / "config.yaml"
+    ), f"Public config not found at {public_weights_path}"
+    assert os.path.exists(
+        public_weights_path / "last.ckpt"
+    ), f"Public ckpt not found at {public_weights_path}"
+
+    return public_weights_path
+
+
+@pytest.fixture
+def mock_cfg(tmp_path) -> Config:
     """mock_cfg fixture defines default nested config"""
     raw_cfg = Config()
 
-    # default to tiny model
+    # default to tiny model for faster model evaluations
     raw_cfg.model.hyper_params = ModelHyperParamsConfig.tiny()
 
-    # interpolate etc. using OmegaConf
-    # use to_object() so that intermediate structs are dataclasses, not DictConfig
-    cfg: Config = OmegaConf.to_object(OmegaConf.create(raw_cfg))
+    # filter to small PDBs for faster model + sampling
+    raw_cfg.dataset.filter.max_num_res = 20
+    raw_cfg.dataset.filter.max_num_res = 25
 
-    return cfg
+    # set output directories to temp paths
+    raw_cfg.experiment.checkpointer.dirpath = str(tmp_path / "ckpt")
+    raw_cfg.inference.predict_dir = str(tmp_path / "inference")
+
+    return raw_cfg.interpolate()
 
 
 @pytest.fixture

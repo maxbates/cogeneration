@@ -14,15 +14,31 @@ class TestConfig:
         assert cfg.model is not None
         assert cfg.interpolant.aatypes is not None
 
-    def test_instantiate(self):
+    def test_interpolate(self):
+        # our own helper function to yield an interpolated config
+
+        raw_cfg = Config()
+        # str before interpolation
+        assert not isinstance(raw_cfg.model.node_features.c_s, int)
+
+        cfg = raw_cfg.interpolate()
+        # nested fields are dataclasses
+        assert isinstance(cfg.model, ModelConfig)
+        # int after interpolation
+        assert isinstance(cfg.model.node_features.c_s, int)
+
+    def test_hydra_instantiate(self):
+        # hydra uses `instantiate` when main() is wrapped with hydra
+
         cfg = Config()
-        assert not isinstance(
-            cfg.model.node_features.c_s, int
-        )  # str before interpolation
+        # str before interpolation
+        assert not isinstance(cfg.model.node_features.c_s, int)
+
         static_cfg = instantiate(Config, cfg)
-        assert isinstance(
-            static_cfg.model.node_features.c_s, int
-        )  # int after interpolation
+        # nested fields are dataclasses
+        assert isinstance(cfg.model, ModelConfig)
+        # int after interpolation
+        assert isinstance(static_cfg.model.node_features.c_s, int)
 
     def test_to_object(self):
         # interpolate the config, as we do for mock_cfg fixture
