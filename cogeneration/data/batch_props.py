@@ -1,7 +1,7 @@
-from enum import Enum
+from cogeneration.util.base_classes import StrEnum
 
 
-class BatchProps(str, Enum):
+class BatchProps(StrEnum):
     """
     Dataloader batches cannot be made type-safe, so we define an enum of batch properties.
 
@@ -15,7 +15,7 @@ class BatchProps(str, Enum):
     rotmats_1 = "rotmats_1"  # frame rotations
     torsion_angles_sin_cos_1 = "torsion_angles_sin_cos_1"  # torsion angles
     # structure metadata
-    num_res = "num_res"  # number of residues in the protein. Important for inference.
+    num_res = "num_res"  # number of residues in the protein. Defined for unconditional batches
     chain_idx = "chain_idx"  # re-indexed chain index (chains are shuffled)
     res_idx = "res_idx"  # re-indexed residue index (residues are re-numbered contiguously 1-indexed)
     res_plddt = "res_plddt"  # aka b-factors
@@ -32,7 +32,7 @@ class BatchProps(str, Enum):
         return self.value
 
 
-class NoisyBatchProps(str, Enum):
+class NoisyBatchProps(StrEnum):
     """
     Properties of a noised batch
 
@@ -52,7 +52,7 @@ class NoisyBatchProps(str, Enum):
         return self.value
 
 
-class PredBatchProps(str, Enum):
+class PredBatchProps(StrEnum):
     """
     Properties of a predicted batch
     """

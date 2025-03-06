@@ -70,6 +70,7 @@ class FoldingValidator:
 
         Also generates several intermediate fastas and dataframes.
         TODO enumerate + describe file structure. Should return written files. merge with SavedTrajectory?
+        TODO minimally consider returning designability_df
         """
         assert (
             pred_bb_positions.ndim == 3
@@ -149,6 +150,22 @@ class FoldingValidator:
                 f.write(f">{sample_name}\n")
                 f.write(true_aa_seq)
 
+        # Sequence recovery helpers
+        def _calc_seq_recovery(ref_seq: npt.NDArray, pred_seq: npt.NDArray) -> float:
+            return (ref_seq == pred_seq).mean()
+
+        def _calc_df_seq_recovery(
+            df: pd.DataFrame, ref_seq: npt.NDArray, col: str = MetricName.sequence
+        ) -> pd.Series:
+            if col not in df.columns:
+                raise KeyError(f"Column '{col}' not found in DataFrame: {df.columns}")
+            return df[col].apply(
+                lambda seq: _calc_seq_recovery(
+                    ref_seq,
+                    np.array([restypes_with_x.index(x) for x in seq]),
+                ),
+            )
+
         # Run inverse folding
         inverse_folded_fasta_path = self.inverse_fold_structure(
             pdb_input_path=pred_pdb_path,
@@ -181,37 +198,36 @@ class FoldingValidator:
                 true_bb_positions=true_bb_positions,
             )
 
+            # Calculate sequence recovery for each inverse folded sequence
+            designability_df[MetricName.inverse_folding_sequence_recovery_pred] = (
+                _calc_df_seq_recovery(
+                    df=designability_df,
+                    ref_seq=pred_aa,
+                )
+            )
+
         # If we have the actual sequence (e.g. not hallucinating), assess sequence self-consistency
         if true_aa is not None:
-            # Helper
-            def _calc_seq_recovery(
-                true_seq: npt.NDArray, pred_seq: npt.NDArray
-            ) -> float:
-                return (true_seq == pred_seq).mean()
-
-            folding_df[MetricName.inverse_folding_sequence_recovery] = (
+            folding_df[MetricName.inverse_folding_sequence_recovery_gt] = (
                 _calc_seq_recovery(true_aa, pred_aa)
             )
 
-            # Determine sequence recovery for Inverse Folded sequences
+            # Determine sequence recovery for Inverse Folded sequences to GT
             if designability_df is not None:
-                designability_df[MetricName.inverse_folding_sequence_recovery] = (
-                    designability_df.apply(
-                        lambda row: _calc_seq_recovery(
-                            true_aa,
-                            np.array(
-                                [
-                                    restypes_with_x.index(x)
-                                    for x in row[MetricName.sequence]
-                                ]
-                            ),
-                        ),
-                        axis=0,
+                designability_df[MetricName.inverse_folding_sequence_recovery_gt] = (
+                    _calc_df_seq_recovery(
+                        df=designability_df,
+                        ref_seq=true_aa,
                     )
                 )
 
         # Summarize designability data and include in folding_df
         if designability_df is not None:
+            folding_df[MetricName.inverse_folding_sequence_recovery_mean] = (
+                designability_df[
+                    MetricName.inverse_folding_sequence_recovery_pred
+                ].mean()
+            )
             folding_df[MetricName.inverse_folding_bb_rmsd_min] = designability_df[
                 MetricName.bb_rmsd
             ].min()

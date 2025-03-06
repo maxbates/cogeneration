@@ -1,25 +1,29 @@
 import logging
 import os
 from pathlib import Path
+from typing import List, Tuple
+from unittest.mock import patch
 
+import numpy as np
+import pandas as pd
 import pytest
 import torch
-from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
 from cogeneration.config.base import (
     Config,
     InferenceSamplesConfig,
+    InferenceTaskEnum,
     ModelHyperParamsConfig,
 )
+from cogeneration.data import all_atom
 from cogeneration.data.batch_props import BatchProps as bp
 from cogeneration.data.batch_props import NoisyBatchProps as nbp
+from cogeneration.data.enum import MetricName
 from cogeneration.data.interpolant import Interpolant
-from cogeneration.dataset.datasets import (
-    DatasetConstructor,
-    LengthSamplingDataset,
-    PdbDataset,
-)
+from cogeneration.data.protein import write_prot_to_pdb
+from cogeneration.data.residue_constants import restypes_with_x
+from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingDataset
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -59,12 +63,22 @@ def mock_cfg(tmp_path) -> Config:
     raw_cfg.model.hyper_params = ModelHyperParamsConfig.tiny()
 
     # filter to small PDBs for faster model + sampling
-    raw_cfg.dataset.filter.max_num_res = 20
-    raw_cfg.dataset.filter.max_num_res = 25
+    raw_cfg.dataset.filter.min_num_res = 20
+    raw_cfg.dataset.filter.max_num_res = 40
 
     # set output directories to temp paths
     raw_cfg.experiment.checkpointer.dirpath = str(tmp_path / "ckpt")
     raw_cfg.inference.predict_dir = str(tmp_path / "inference")
+
+    # limit number of lengths sampled for validation / inference
+    raw_cfg.inference.interpolant.sampling.num_timesteps = 10
+    raw_cfg.inference.samples.samples_per_length = 2
+    raw_cfg.inference.samples.length_subset = [10, 30]
+    raw_cfg.interpolant.sampling.num_timesteps = 10
+    raw_cfg.dataset.samples_per_eval_length = 2
+    raw_cfg.dataset.num_eval_lengths = 1
+    # shortest validation samples in public data are 60 residues
+    raw_cfg.dataset.max_eval_length = 63
 
     return raw_cfg.interpolate()
 
@@ -158,3 +172,96 @@ def mock_pred_conditional_dataloader(mock_cfg):
 
     dataloader = DataLoader(eval_dataset, batch_size=1)
     return dataloader
+
+
+@pytest.fixture
+def mock_folding_validation(tmp_path):
+    with patch(
+        "cogeneration.data.folding_validation.FoldingValidator._run_protein_mpnn"
+    ) as mock_run_protein_mpnn, patch(
+        "cogeneration.data.folding_validation.FoldingValidator._run_alphafold2"
+    ) as mock_run_alphafold2:
+
+        def setup_mocks(batch, cfg: Config, n_inverse_folds: int):
+            if cfg.inference.task != InferenceTaskEnum.unconditional:
+                print(
+                    "WARNING. mocks currently assume unconditional generation. May impact outputs."
+                )
+
+            # determine size of batch and residues, handling conditional and unconditional batches
+            if bp.res_mask in batch:
+                batch_size, num_res = batch[bp.res_mask].shape
+            else:
+                batch_size = batch[bp.num_res].shape[0]
+                num_res = batch[bp.num_res][0].item()
+            assert batch_size == 1, "Test expects batch size of 1"
+
+            # generate N random sequences for inverse folding
+            mock_seqs: List[Tuple[str, str]] = [
+                (
+                    f"pmpnn_seq_{i}",
+                    "".join(
+                        [restypes_with_x[x] for x in np.random.randint(0, 20, num_res)]
+                    ),
+                )
+                for i in range(n_inverse_folds)
+            ]
+
+            # determine true aa and true bb, using batch if available
+            if bp.aatypes_1 in batch:
+                true_aa = batch[bp.aatypes_1][0].cpu().detach().numpy()
+            else:
+                # mock it, e.g. for unconditional batches
+                true_aa = np.random.randint(0, 20, num_res)
+            true_sequence = "".join([restypes_with_x[x] for x in true_aa])
+
+            if bp.trans_1 in batch and bp.rotmats_1 in batch:
+                true_bb_pos = (
+                    all_atom.atom37_from_trans_rot(
+                        trans=batch[bp.trans_1],
+                        rots=batch[bp.rotmats_1],
+                    )
+                    .cpu()
+                    .detach()
+                    .numpy()
+                )
+            else:
+                # mock it, e.g. for unconditional batches
+                true_bb_pos = (
+                    all_atom.atom37_from_trans_rot(
+                        trans=torch.rand(1, num_res, 3),
+                        rots=torch.rand(1, num_res, 3, 3),
+                    )
+                    .cpu()
+                    .detach()
+                    .numpy()
+                )
+
+            # mock ProteinMPNN call
+            mock_mpnn_fasta_path = str(tmp_path / "mpnn.fasta")
+            mock_run_protein_mpnn.return_value = mock_mpnn_fasta_path
+            with open(mock_mpnn_fasta_path, "w") as f:
+                for mock_seq_name, mock_inverse_fold_seq in mock_seqs:
+                    f.write(f">{mock_seq_name}\n")
+                    f.write(mock_inverse_fold_seq)
+
+            # mock AlphaFold2 call
+            mock_af2_fasta_path = str(tmp_path / "sample.pdb")
+            af2_fasta_path = write_prot_to_pdb(
+                prot_pos=true_bb_pos[0],
+                file_path=mock_af2_fasta_path,
+                aatype=true_aa,
+            )
+            mock_run_alphafold2.return_value = pd.DataFrame(
+                [
+                    {
+                        MetricName.header: mock_seq_name,
+                        MetricName.folded_pdb_path: af2_fasta_path,
+                        MetricName.plddt_mean: np.random.rand() * 100,
+                    }
+                ]
+            )
+
+            return mock_run_protein_mpnn, mock_run_alphafold2
+
+        yield setup_mocks

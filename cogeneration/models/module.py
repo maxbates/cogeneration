@@ -26,13 +26,17 @@ from cogeneration.data.batch_props import PredBatchProps as pbp
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.folding_validation import FoldingValidator
 from cogeneration.data.interpolant import Interpolant
+from cogeneration.data.io import write_numpy_json
 from cogeneration.data.protein import write_prot_to_pdb
-from cogeneration.data.residue_constants import restypes, restypes_with_x
 from cogeneration.data.trajectory import SavedTrajectory, save_trajectory
 from cogeneration.models import metrics
 from cogeneration.models.model import FlowModel
 
-to_numpy = lambda x: x.detach().cpu().numpy()
+
+def to_numpy(x: Optional[torch.Tensor]) -> Optional[np.ndarray]:
+    if x is None:
+        return None
+    return x.detach().cpu().numpy()
 
 
 @dataclass
@@ -561,7 +565,6 @@ class FlowModule(LightningModule):
                     (pdb_path, self.global_step, wandb.Molecule(pdb_path))
                 )
 
-            # TODO - Only take metrics of interest, otherwise there will be too many
             top_sample_metrics.update(batch_level_aatype_metrics)
             batch_metrics.append(top_sample_metrics)
 
@@ -570,7 +573,7 @@ class FlowModule(LightningModule):
 
         return batch_metrics_df
 
-    def predict_step(self, batch: Any, batch_idx: Any):
+    def predict_step(self, batch: Any, batch_idx: Any) -> pd.DataFrame:
         # Create an inference-specific interpolant
         interpolant = Interpolant(self.cfg.inference.interpolant)
 
@@ -617,10 +620,12 @@ class FlowModule(LightningModule):
             true_bb_pos = all_atom.atom37_from_trans_rot(
                 batch[bp.trans_1], batch[bp.rotmats_1]
             )
+            # Ensure only have one valid structure for the batch
             assert true_bb_pos.shape == (1, sample_length, 37, 3)
+            true_bb_pos = true_bb_pos[0]
             # save the ground truth as a pdb
             write_prot_to_pdb(
-                prot_pos=to_numpy(true_bb_pos[0]),
+                prot_pos=to_numpy(true_bb_pos),
                 file_path=os.path.join(
                     sample_dirs[0], batch[bp.pdb_name][0] + "_gt.pdb"
                 ),
@@ -691,6 +696,7 @@ class FlowModule(LightningModule):
                     self._log.info("WARNING mask in predicted AA")
                     aa_trajs[i, -1, j] = 0
 
+        all_top_sample_metrics = []
         for i, sample_id in zip(range(num_batch), sample_ids):
             sample_dir = sample_dirs[i]
             top_sample_metrics, _ = self.compute_sample_metrics(
@@ -701,16 +707,20 @@ class FlowModule(LightningModule):
                 model_bb_traj=model_bb_trajs[i],
                 model_aa_traj=model_aa_trajs[i],
                 model_logits_traj=model_logits_trajs[i],
-                true_bb_pos=true_bb_pos,
-                true_aa=true_aatypes,
+                true_bb_pos=to_numpy(true_bb_pos),
+                true_aa=to_numpy(true_aatypes),
                 diffuse_mask=to_numpy(diffuse_mask)[0],
                 aatypes_corrupt=self.cfg.inference.interpolant.aatypes.corrupt,
                 also_fold_pmpnn_seq=self.cfg.inference.also_fold_pmpnn_seq,
                 write_sample_trajectories=self.cfg.inference.write_sample_trajectories,
             )
+
             top_sample_path = os.path.join(sample_dir, "top_sample.json")
-            with open(top_sample_path, "w") as f:
-                json.dump(top_sample_metrics, f)
+            write_numpy_json(top_sample_path, top_sample_metrics)
+
+            all_top_sample_metrics.append(top_sample_metrics)
+
+        return pd.DataFrame(all_top_sample_metrics)
 
     def compute_sample_metrics(
         self,

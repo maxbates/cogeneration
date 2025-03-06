@@ -450,7 +450,7 @@ class DataConfig:
 class DatasetFilterConfig:
     max_num_res: int = 384
     min_num_res: int = 60
-    max_coil_percent: float = 0.5
+    max_coil_percent: float = 0.667  # was 0.5 in public MultiFlow
     min_num_confident_plddt: float = 40
     # TODO - support filter on low pLDDT percentage
     # TODO - min/max motif percent threshold (avoid loopy things)
@@ -522,7 +522,7 @@ class DatasetConfig:
 
     # Eval parameters
     test_set_pdb_ids_path: Optional[Path] = None
-    max_eval_length: int = 256
+    max_eval_length: Optional[int] = 256
     samples_per_eval_length: int = 5
     num_eval_lengths: int = 8
 
@@ -673,7 +673,7 @@ class InferenceSamplesConfig:
     samples_per_length: int = 100
     # Batch size when sampling from the model
     num_batch: int = 1
-    # Subset of lengths to sample. If null, sample all targets.
+    # Subset of lengths to sample. If null, sample all targets between min_length and max_length
     length_subset: Optional[List[int]] = field(
         default_factory=lambda: [70, 100, 200, 300]
     )
@@ -700,7 +700,7 @@ class InferenceConfig:
     inference_subdir: str = "${shared.now}"
 
     # checkpoints
-    saved_ckpt_dir: str = "${project_root}/ckpt/${experiment.wandb.project}"
+    saved_ckpt_dir: str = "${shared.project_root}/ckpt/${experiment.wandb.project}"
 
     unconditional_ckpt_path: Optional[str] = str(public_weights_path / "last.ckpt")
     forward_folding_ckpt_path: Optional[str] = str(public_weights_path / "last.ckpt")

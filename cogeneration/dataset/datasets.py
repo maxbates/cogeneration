@@ -511,6 +511,8 @@ class LengthSamplingDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         num_res, sample_id = self._all_sample_ids[idx]
         item = {
+            bp.res_mask: torch.ones(num_res),
+            bp.diffuse_mask: torch.ones(num_res).bool(),
             bp.num_res: num_res,
             bp.sample_id: sample_id,
         }

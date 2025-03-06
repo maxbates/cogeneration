@@ -1,6 +1,10 @@
+import numpy as np
 import pandas as pd
 
-from cogeneration.config.base import InferenceTaskEnum
+from cogeneration.config.base import DataTaskEnum, InferenceTaskEnum
+from cogeneration.data.batch_props import BatchProps
+from cogeneration.data.enum import MetricName
+from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.models.module import FlowModule, TrainingLosses
 
 
@@ -10,100 +14,161 @@ class TestFlowModule:
         assert module is not None
         assert module.model is not None
 
-    def test_model_step(self, pdb_noisy_batch, mock_cfg):
+    def test_model_step(self, mock_cfg, pdb_noisy_batch):
         module = FlowModule(mock_cfg)
         losses = module.model_step(pdb_noisy_batch)
         assert isinstance(losses, TrainingLosses)
 
-    def test_training_step(self, pdb_noisy_batch, mock_cfg):
+    def test_training_step(self, mock_cfg, pdb_noisy_batch):
         module = FlowModule(mock_cfg)
         loss = module.training_step(pdb_noisy_batch)
         assert loss is not None
         assert hasattr(loss, "backward"), "Loss object does not have backward() method"
 
-    def test_validation_step(self, pdb_noisy_batch, mock_cfg):
-        # TODO - mock folding / inverse folding
+    def test_validation_step(self, mock_cfg, pdb_noisy_batch, mock_folding_validation):
         module = FlowModule(mock_cfg)
 
+        mock_folding_validation(
+            batch=pdb_noisy_batch,
+            cfg=mock_cfg,
+            n_inverse_folds=1,  # only one for validation
+        )
+
+        # Run validation step
         batch_metrics_df = module.validation_step(batch=pdb_noisy_batch, batch_idx=42)
-        assert batch_metrics_df is not None
-        # check for some specific data tracked in metrics
-        expected_columns = ["bb_rmsd"]
+
+        # check for subset of data tracked in metrics
+        expected_columns = [
+            MetricName.sample_pdb_path,  # input
+            MetricName.sequence,  # inverse folded
+            MetricName.folded_pdb_path,  # folded structure
+            MetricName.bb_rmsd,  # structure comparison
+            MetricName.inverse_folding_bb_rmsd_min,  # summary metric
+            MetricName.plddt_mean,  # af2 metric
+            MetricName.coil_percent,  # mdtraj
+            MetricName.ca_ca_deviation,  # ca_ca metric
+            MetricName.aatype_histogram_dist,  # aatype batch metric
+        ]
         assert len(set(expected_columns).intersection(batch_metrics_df.columns)) == len(
             expected_columns
         ), f"Expected columns {expected_columns} not found in {batch_metrics_df.columns}"
 
+        sample = batch_metrics_df.iloc[0]
+        input_seq = "".join(
+            [
+                restypes_with_x[x]
+                for x in pdb_noisy_batch[BatchProps.aatypes_1][0].cpu().detach().numpy()
+            ]
+        )
+        assert sample[MetricName.sequence] == input_seq
+        # should not sample the original structure
+        assert sample[MetricName.bb_rmsd] > 0.1
+        # random seq above should have low recovery
+        assert sample[MetricName.inverse_folding_sequence_recovery_mean] < 0.2
+
     def test_predict_step_default_outputs(
-        self, mock_cfg, mock_pred_unconditional_dataloader
+        self, mock_cfg, mock_pred_unconditional_dataloader, mock_folding_validation
     ):
-        # TODO - mock folding / inverse folding
         module = FlowModule(mock_cfg)
-
         batch = next(iter(mock_pred_unconditional_dataloader))
-        predictions = module.predict_step(batch, 0)
 
-        # ensure runs (not None), correct output format
-        assert predictions is not None and isinstance(predictions, dict)
-
-        # check output DF
-        first_sample_id = list(predictions.keys())[0]
-        df = pd.read_csv(predictions[first_sample_id])
-        assert (
-            "sample_id" in df.columns
-            and "length" in df.columns
-            and "seq_codesign" in df.columns
+        mock_folding_validation(
+            batch=batch,
+            cfg=mock_cfg,
+            n_inverse_folds=mock_cfg.folding.seq_per_sample,
         )
 
+        predictions = module.predict_step(batch, 0)
+
+        assert predictions is not None and isinstance(predictions, pd.DataFrame)
+
+        # check for subset of data tracked in metrics
+        expected_columns = [
+            MetricName.sample_pdb_path,  # input
+            MetricName.sequence,  # inverse folded
+            MetricName.folded_pdb_path,  # folded structure
+            MetricName.bb_rmsd,  # structure comparison
+            MetricName.inverse_folding_bb_rmsd_min,  # summary metric
+            MetricName.plddt_mean,  # af2 metric
+            MetricName.coil_percent,  # mdtraj
+            MetricName.ca_ca_deviation,  # ca_ca metric
+        ]
+        assert len(set(expected_columns).intersection(predictions.columns)) == len(
+            expected_columns
+        ), f"Expected columns {expected_columns} not found in {predictions.columns}"
+        # Don't expect some validation columns
+        assert (
+            MetricName.aatype_histogram_dist not in predictions.columns
+        ), f"Unexpected metric {MetricName.aatype_histogram_dist}"
+
     def test_predict_step_torsions_option(
-        self, mock_cfg, mock_pred_unconditional_dataloader
+        self, mock_cfg, mock_pred_unconditional_dataloader, mock_folding_validation
     ):
         # flip the default, whether we predict torsion angles or not
         mock_cfg.model.predict_psi_torsions = not mock_cfg.model.predict_psi_torsions
 
-        # TODO - mock folding / inverse folding
         module = FlowModule(mock_cfg)
-
         batch = next(iter(mock_pred_unconditional_dataloader))
-        predictions = module.predict_step(batch, 0)
 
-        # ensure runs (not None), correct output format
-        assert predictions is not None and isinstance(predictions, dict)
+        mock_folding_validation(
+            batch=batch,
+            cfg=mock_cfg,
+            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+        )
+
+        # just check that it works
+        _ = module.predict_step(batch, 0)
 
     def test_predict_step_unconditional_works(
-        self, mock_cfg, mock_pred_unconditional_dataloader
+        self, mock_cfg, mock_pred_unconditional_dataloader, mock_folding_validation
     ):
         mock_cfg.inference.task = InferenceTaskEnum.unconditional
 
-        # TODO - mock folding / inverse folding
         module = FlowModule(mock_cfg)
-
         batch = next(iter(mock_pred_unconditional_dataloader))
-        predictions = module.predict_step(batch, 0)
-        assert predictions is not None and isinstance(predictions, dict)
+
+        mock_folding_validation(
+            batch=batch,
+            cfg=mock_cfg,
+            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+        )
+
+        # just test that it works
+        _ = module.predict_step(batch, 0)
 
     def test_predict_step_forward_folding_works(
-        self, mock_cfg, mock_pred_conditional_dataloader
+        self, mock_cfg, mock_pred_conditional_dataloader, mock_folding_validation
     ):
         # modify config for forward folding
         mock_cfg.inference.task = InferenceTaskEnum.forward_folding
         mock_cfg.inference.interpolant.aatypes.noise = 0.0
         mock_cfg.inference.interpolant.aatypes.do_purity = False
 
-        # TODO - mock folding / inverse folding
         module = FlowModule(mock_cfg)
-
         batch = next(iter(mock_pred_conditional_dataloader))
-        predictions = module.predict_step(batch, 0)
-        assert predictions is not None and isinstance(predictions, dict)
+
+        mock_folding_validation(
+            batch=batch,
+            cfg=mock_cfg,
+            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+        )
+
+        # just test that it works
+        _ = module.predict_step(batch, 0)
 
     def test_predict_step_inverse_folding_works(
-        self, mock_cfg, mock_pred_conditional_dataloader
+        self, mock_cfg, mock_pred_conditional_dataloader, mock_folding_validation
     ):
         mock_cfg.inference.task = InferenceTaskEnum.inverse_folding
 
-        # TODO - mock folding / inverse folding
         module = FlowModule(mock_cfg)
-
         batch = next(iter(mock_pred_conditional_dataloader))
-        predictions = module.predict_step(batch, 0)
-        assert predictions is not None and isinstance(predictions, dict)
+
+        mock_folding_validation(
+            batch=batch,
+            cfg=mock_cfg,
+            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+        )
+
+        # just test that it works
+        _ = module.predict_step(batch, 0)

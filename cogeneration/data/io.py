@@ -1,8 +1,10 @@
 import io
+import json
 import os
 import pickle
 from typing import Any
 
+import numpy as np
 import torch
 
 
@@ -48,3 +50,16 @@ def read_pkl(read_path: str, verbose=True, use_torch=False, map_location=None):
                     f"Error. Failed to read {read_path}. First error: {e}\n Second error: {e2}"
                 )
             raise (e)
+
+
+def write_numpy_json(file_path: str, data: Any):
+    class NumpyEncoder(json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, np.generic):
+                return obj.item()
+            return super().default(obj)
+
+    with open(file_path, "w") as f:
+        json.dump(data, f, cls=NumpyEncoder)
