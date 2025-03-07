@@ -41,17 +41,18 @@ class EvalRunner:
         # Note that it is a DictConfig, because it may contain keys not defined in the Config dataclass
         self.cfg: DictConfig = merged_cfg
 
+        local_rank = DDPInfo.from_env().local_rank
+
         # Ensure DDP is set up for scenarios were pytorch lightning doesn't handle it
         # (e.g. debugging on Mac laptop)
         setup_ddp(
             trainer_strategy=cfg.experiment.trainer.strategy,
             accelerator=cfg.experiment.trainer.accelerator,
-            rank=os.environ.get("LOCAL_RANK", "0"),
+            rank=local_rank,
             world_size=str(cfg.experiment.num_devices),
         )
 
         # Set-up output directory only on rank 0, including writing `config.yaml`
-        local_rank = os.environ.get("LOCAL_RANK", 0)
         if local_rank == 0:
             inference_dir = self.setup_inference_dir(ckpt_path)
             log.info(f"Saving results to {inference_dir}")

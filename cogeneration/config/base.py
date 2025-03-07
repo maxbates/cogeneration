@@ -10,11 +10,12 @@ from omegaconf import OmegaConf
 from cogeneration.util.base_classes import StrEnum
 
 """
-Note:
-
 Structured configurations for cogeneration.
 
-Several parameters from Multiflow appear to be unused, many are marked with `# DROP`.
+See __init__.py for extensions to OmegaConf, e.g. `ternary`.
+
+Several parameters from Multiflow appear to be unused in the public code.
+Many are marked with `# DROP`.
 """
 
 project_root_path = Path(__file__).parent.parent.parent.resolve()

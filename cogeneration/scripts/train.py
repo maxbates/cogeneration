@@ -4,7 +4,6 @@ from dataclasses import asdict
 import hydra
 import torch
 import torch._dynamo as dynamo
-import wandb
 from omegaconf import OmegaConf
 from pytorch_lightning import LightningDataModule, LightningModule
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -12,6 +11,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.loggers.wandb import WandbLogger
 from pytorch_lightning.trainer import Trainer
 
+import wandb
 from cogeneration.config.base import Config
 from cogeneration.dataset.datasets import BaseDataset, DatasetConstructor, PdbDataset
 from cogeneration.dataset.protein_dataloader import ProteinData
@@ -146,6 +146,7 @@ class Experiment:
                 flat_cfg = dict(flatten_dict(asdict(self.cfg)))
                 logger.experiment.config.update(flat_cfg)
 
+        log.info("Setting up Trainer...")
         trainer = Trainer(
             **asdict(self.cfg.experiment.trainer),
             callbacks=callbacks,
@@ -174,6 +175,7 @@ class Experiment:
                 )
 
         # Train
+        log.info("Starting training...")
         trainer.fit(
             model=model,
             datamodule=self._datamodule,

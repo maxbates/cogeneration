@@ -31,7 +31,7 @@ def setup_ddp(
         # Can't seem to enable it here, so need to set it in the environment
         assert (
             os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] == "1"
-        ), "MPS fallback not enabled and not all ops supported on MPS"
+        ), "MPS fallback not enabled and not all ops supported on MPS. Set `PYTORCH_ENABLE_MPS_FALLBACK=1` in environment."
 
         # Lightning does not support DDP with MPS accelerator, i.e. on a Mac
         # However, DataLoaders use DDP, so we need to initialize it
@@ -54,7 +54,7 @@ def setup_ddp(
 
 @dataclass
 class DDPInfo:
-    """Helper to get DDP information"""
+    """Helper to get DDP information, handling when not using DDP."""
 
     node_id: int
     local_rank: int
@@ -63,7 +63,7 @@ class DDPInfo:
 
     @classmethod
     def from_env(cls):
-        local_rank = int(os.environ["LOCAL_RANK"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
         try:
             rank = dist.get_rank()
             world_size = dist.get_world_size()

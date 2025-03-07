@@ -12,13 +12,12 @@ import numpy.typing as npt
 import pandas as pd
 import torch
 import torch.distributed as dist
-import wandb
 from lightning_utilities.core.apply_func import apply_to_collection
 from pytorch_lightning import LightningModule
 from pytorch_lightning.loggers.wandb import WandbLogger
 
 import wandb
-from cogeneration.config.base import Config, DataTaskEnum, InferenceTaskEnum
+from cogeneration.config.base import Config, InferenceTaskEnum
 from cogeneration.data import all_atom, so3_utils
 from cogeneration.data.batch_props import BatchProps as bp
 from cogeneration.data.batch_props import NoisyBatchProps as nbp
@@ -195,6 +194,8 @@ class FlowModule(LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=len(val_epoch_metrics),
+                    sync_dist=True,
+                    rank_zero_only=False,
                 )
             self.validation_epoch_metrics.clear()
 
