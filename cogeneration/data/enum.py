@@ -114,6 +114,7 @@ class MetricName(StrEnum):
     # structure comparison
     # gt => ground truth true_bb_positions provided
     bb_rmsd = "bb_rmsd"  # generated sample to folded structure
+    is_designable = "is_designable"  # designability of structure, i.e. RMSD < 2.0
     # generated sample to ground truth structure (if provided)
     bb_rmsd_gt = "bb_rmsd_gt"
     # folded structure to ground truth structure (if provided)
@@ -128,5 +129,37 @@ class MetricName(StrEnum):
 
     # inverse + forward folding summary metrics
     inverse_folding_sequence_recovery_mean = "inverse_folding_sequence_recovery_mean"
+    inverse_folding_sequence_recovery_max = "inverse_folding_sequence_recovery_max"
+    inverse_folding_bb_rmsd_single_seq = "inverse_folding_bb_rmsd_single_seq"
     inverse_folding_bb_rmsd_min = "inverse_folding_bb_rmsd_min"
     inverse_folding_bb_rmsd_mean = "inverse_folding_bb_rmsd_mean"
+    num_inverse_folded = "num_inverse_folded"
+    num_designable = "num_designable"
+
+
+class OutputFileName(StrEnum):
+    # trajectory
+    sample_pdb = "sample.pdb"
+    bb_traj_pdb = "bb_traj.pdb"
+    x0_traj_pdb = "x0_traj.pdb"
+    aa_traj_fa = "aa_traj.fasta"
+    logits_traj_anim = "logits_traj.gif"
+
+    # folding validation
+    sample_sequence_fa = "sample.fasta"
+    true_sequence_fa = "true.fasta"
+    # inverse_folded_fa determined by MPNN, matches sample name
+    # inverse_folded_fa = "inverse_fold.fasta"
+    # folded_pdb_path determined by alphafold + model we use
+    # folded_pdb_path = "folded.pdb"
+
+    # sample summaries / top samples
+    top_sample_json = "top_samples.json"
+    codesign_df = "codesign.csv"
+    designability_df = "designability.csv"
+
+    # all samples + metrics
+    all_top_samples_df = "all_top_samples.csv"
+    designable_metrics_df = "designable_metrics.csv"
+    forward_fold_metrics_df = "forward_fold_metrics.csv"
+    inverse_fold_metrics_df = "inverse_fold_metrics.csv"

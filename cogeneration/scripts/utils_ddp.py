@@ -7,8 +7,8 @@ from torch import distributed as dist
 def setup_ddp(
     trainer_strategy="auto",  # config.experiment.trainer.strategy
     accelerator="cuda",  # config.experiment.trainer.accelerator
-    rank="0",  # rank / device, when multiple threads
-    world_size="1",
+    rank: str = "0",  # rank / device, when multiple threads
+    world_size: str = "1",
 ):
     """
     Sets up DistributedDataParallel if Pytorch Lightning won't do it for us (i.e. strategy != "ddp").

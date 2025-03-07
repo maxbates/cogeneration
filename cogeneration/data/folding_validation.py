@@ -5,7 +5,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -13,12 +13,13 @@ import pandas as pd
 import torch
 from Bio import PDB, SeqIO
 
-from cogeneration.config.base import FoldingConfig
+from cogeneration.config.base import FoldingConfig, InferenceTaskEnum
 from cogeneration.data import residue_constants
 from cogeneration.data.const import aatype_to_seq
 from cogeneration.data.enum import DatasetProteinColumns as dpc
-from cogeneration.data.enum import MetricName
-from cogeneration.data.residue_constants import restypes_with_x
+from cogeneration.data.enum import MetricName, OutputFileName
+from cogeneration.data.io import write_numpy_json
+from cogeneration.data.residue_constants import restype_order_with_x, restypes_with_x
 from cogeneration.data.superimposition import superimpose
 from cogeneration.dataset.data_utils import parse_pdb_feats
 from cogeneration.models.metrics import calc_ca_ca_metrics, calc_mdtraj_metrics
@@ -37,6 +38,9 @@ class FoldingValidator:
 
     cfg: FoldingConfig
     device_id: Optional[int] = None
+
+    def __post_init__(self):
+        self.log = logging.getLogger(__name__)
 
     def set_device_id(self, device_id: int):
         self.device_id = device_id
@@ -137,20 +141,23 @@ class FoldingValidator:
         is_codesign = true_bb_positions is None and true_aa is None
 
         # Write fasta files for predicted and true (if provided) sequences
-        sample_fasta_path = os.path.join(sample_dir, "sample.fasta")
+        sample_fasta_path = os.path.join(sample_dir, OutputFileName.sample_sequence_fa)
         pred_aa_seq = "".join([restypes_with_x[x] for x in pred_aa])
         with open(sample_fasta_path, "w") as f:
             f.write(f">{sample_name}\n")
             f.write(pred_aa_seq)
 
         if true_aa is not None:
-            true_fasta_path = os.path.join(sample_dir, "true.fasta")
+            true_fasta_path = os.path.join(sample_dir, OutputFileName.true_sequence_fa)
             true_aa_seq = "".join([restypes_with_x[x] for x in true_aa])
             with open(true_fasta_path, "w") as f:
                 f.write(f">{sample_name}\n")
                 f.write(true_aa_seq)
 
         # Sequence recovery helpers
+        def _seq_str_to_np(seq: str) -> npt.NDArray:
+            return np.array([restype_order_with_x[x] for x in seq])
+
         def _calc_seq_recovery(ref_seq: npt.NDArray, pred_seq: npt.NDArray) -> float:
             return (ref_seq == pred_seq).mean()
 
@@ -160,10 +167,7 @@ class FoldingValidator:
             if col not in df.columns:
                 raise KeyError(f"Column '{col}' not found in DataFrame: {df.columns}")
             return df[col].apply(
-                lambda seq: _calc_seq_recovery(
-                    ref_seq,
-                    np.array([restypes_with_x.index(x) for x in seq]),
-                ),
+                lambda seq: _calc_seq_recovery(ref_seq, _seq_str_to_np(seq)),
             )
 
         # Run inverse folding
@@ -175,13 +179,13 @@ class FoldingValidator:
         )
 
         # Run folding on the original sequence
-        folding_df = self.fold_fasta(
+        codesign_df = self.fold_fasta(
             fasta_path=sample_fasta_path,
             output_dir=folding_dir,
         )
-        folding_df = FoldingValidator.assess_folded_structures(
+        codesign_df = FoldingValidator.assess_folded_structures(
             sample_pdb_path=pred_pdb_path,
-            folded_df=folding_df,
+            folded_df=codesign_df,
             true_bb_positions=true_bb_positions,
         )
 
@@ -208,7 +212,7 @@ class FoldingValidator:
 
         # If we have the actual sequence (e.g. not hallucinating), assess sequence self-consistency
         if true_aa is not None:
-            folding_df[MetricName.inverse_folding_sequence_recovery_gt] = (
+            codesign_df[MetricName.inverse_folding_sequence_recovery_gt] = (
                 _calc_seq_recovery(true_aa, pred_aa)
             )
 
@@ -223,30 +227,47 @@ class FoldingValidator:
 
         # Summarize designability data and include in folding_df
         if designability_df is not None:
-            folding_df[MetricName.inverse_folding_sequence_recovery_mean] = (
+            # inverse folding metrics
+            codesign_df[MetricName.inverse_folding_sequence_recovery_mean] = (
                 designability_df[
                     MetricName.inverse_folding_sequence_recovery_pred
                 ].mean()
             )
-            folding_df[MetricName.inverse_folding_bb_rmsd_min] = designability_df[
+            codesign_df[MetricName.inverse_folding_sequence_recovery_max] = (
+                designability_df[
+                    MetricName.inverse_folding_sequence_recovery_pred
+                ].max()
+            )
+
+            # folding / designability metrics
+            codesign_df[MetricName.inverse_folding_bb_rmsd_single_seq] = (
+                designability_df[MetricName.bb_rmsd].iloc[0]
+            )
+            codesign_df[MetricName.inverse_folding_bb_rmsd_min] = designability_df[
                 MetricName.bb_rmsd
             ].min()
-            folding_df[MetricName.inverse_folding_bb_rmsd_mean] = designability_df[
+            codesign_df[MetricName.inverse_folding_bb_rmsd_mean] = designability_df[
                 MetricName.bb_rmsd
             ].mean()
+            codesign_df[MetricName.num_inverse_folded] = len(designability_df)
+            codesign_df[MetricName.num_designable] = len(
+                designability_df[designability_df[MetricName.is_designable]]
+            )
 
         # Assign some information to both dataframes
-        for df in [folding_df, designability_df]:
+        for df in [codesign_df, designability_df]:
             df[MetricName.sample_length] = sample_length
             df[MetricName.sample_id] = sample_name
 
         # Write the DataFrames
-        folding_df.to_csv(os.path.join(sample_dir, "folding.csv"))
+        codesign_df.to_csv(os.path.join(sample_dir, OutputFileName.codesign_df))
         if designability_df is not None:
-            designability_df.to_csv(os.path.join(sample_dir, "designability.csv"))
+            designability_df.to_csv(
+                os.path.join(sample_dir, OutputFileName.designability_df)
+            )
 
         # Candidates for top samples are described above. If codesign, just use what was generated + folded.
-        candidates_df = folding_df if is_codesign else designability_df
+        candidates_df = codesign_df if is_codesign else designability_df
         # Sort, in case we have multiple samples, by RMSD
         candidates_df = candidates_df.sort_values(MetricName.bb_rmsd, ascending=False)
         # Select the top sample
@@ -258,7 +279,118 @@ class FoldingValidator:
             calc_ca_ca_metrics(pred_bb_positions[:, residue_constants.atom_order["CA"]])
         )
 
+        top_sample_path = os.path.join(sample_dir, OutputFileName.top_sample_json)
+        write_numpy_json(top_sample_path, top_sample)
+
         return top_sample
+
+    def assess_all_top_samples(
+        self,
+        task: InferenceTaskEnum,
+        top_samples_df: pd.DataFrame,
+        output_dir: str,
+    ) -> Tuple[pd.DataFrame, str]:
+        """
+        Compute task specific summary metrics for all top samples, writes DataFrame to output_dir
+        """
+        # TODO - consider a new summary enum for these fields.
+
+        if task == InferenceTaskEnum.unconditional:
+            metrics_csv_path = os.path.join(
+                output_dir, OutputFileName.designable_metrics_df
+            )
+
+            # TODO - calculate diversity using FoldSeek, see MultiFlow.
+
+            metrics_df = pd.DataFrame(
+                [
+                    {
+                        "Total Samples": len(top_samples_df),
+                        "Total codesignable": top_samples_df[
+                            MetricName.is_designable
+                        ].sum(),
+                        "Percent codesignable": top_samples_df[
+                            MetricName.is_designable
+                        ].mean(),
+                        "Average Inv Fold Consistency": top_samples_df[
+                            MetricName.inverse_folding_sequence_recovery_mean
+                        ].mean(),
+                        "Average Inv Fold Best Consistency": top_samples_df[
+                            MetricName.inverse_folding_sequence_recovery_max
+                        ].max(),
+                        "Single Seq Inv Fold Designability": top_samples_df[
+                            MetricName.inverse_folding_bb_rmsd_single_seq
+                        ].mean(),
+                        "Top Seq Inv Fold Designability": top_samples_df[
+                            MetricName.inverse_folding_bb_rmsd_min
+                        ].mean(),
+                    }
+                ]
+            )
+        elif task == InferenceTaskEnum.forward_folding:
+            metrics_csv_path = os.path.join(
+                output_dir, OutputFileName.forward_fold_metrics_df
+            )
+            valid_fold = top_samples_df[MetricName.bb_rmsd_gt] <= 2.0
+            metrics_df = pd.DataFrame(
+                [
+                    {
+                        "Total Samples": len(top_samples_df),
+                        "Total Match Ground Truth": valid_fold.sum(),
+                        "Percent Match Ground Truth": valid_fold.mean(),
+                        "Average Sample RMSD to Ground Truth": top_samples_df[
+                            MetricName.bb_rmsd_gt
+                        ].mean(),
+                        "Average Folded RMSD to Ground Truth": top_samples_df[
+                            MetricName.bb_rmsd_folded_gt
+                        ].mean(),
+                    }
+                ]
+            )
+        elif task == InferenceTaskEnum.inverse_folding:
+            metrics_csv_path = os.path.join(
+                output_dir, OutputFileName.inverse_fold_metrics_df
+            )
+            metrics_df = pd.DataFrame(
+                [
+                    {
+                        "Total Samples": len(top_samples_df),
+                        "Total Designable": top_samples_df[
+                            MetricName.is_designable
+                        ].sum(),
+                        "Percent Designable": top_samples_df[
+                            MetricName.is_designable
+                        ].mean(),
+                        "Average RMSD to Sample": top_samples_df[
+                            MetricName.bb_rmsd
+                        ].mean(),
+                        "Average RMSD to Ground Truth": top_samples_df[
+                            MetricName.bb_rmsd_gt
+                        ].mean(),
+                        "Average Sequence Recovery to Ground Truth": top_samples_df[
+                            MetricName.inverse_folding_sequence_recovery_gt
+                        ].mean(),
+                        "Average Inv Fold RMSD": top_samples_df[
+                            MetricName.inverse_folding_bb_rmsd_mean
+                        ].mean(),
+                        "Average Inv Fold Best RMSD": top_samples_df[
+                            MetricName.inverse_folding_bb_rmsd_min
+                        ].mean(),
+                        "Average Inv Fold Sequence Recovery": top_samples_df[
+                            MetricName.inverse_folding_sequence_recovery_mean
+                        ].mean(),
+                        "Average Inv Fold Best Sequence Recovery": top_samples_df[
+                            MetricName.inverse_folding_sequence_recovery_max
+                        ].mean(),
+                    }
+                ]
+            )
+        else:
+            raise ValueError(f"Unsupported task {task}")
+
+        self.log.info(f"Summary metrics for task {task} -> {metrics_csv_path}")
+        metrics_df.to_csv(metrics_csv_path, index=False)
+        return metrics_df, metrics_csv_path
 
     def fold_fasta(self, fasta_path: str, output_dir: str) -> pd.DataFrame:
         """
@@ -477,6 +609,8 @@ class FoldingValidator:
         Calculate RMSD, pLDDT, and other metrics, comparing folded structures in `folded_df`
         to the sample structure, and ground truth structure if provided.
 
+        `folded_df` can be either the single generated sample, or ProteinMPNN re-folds.
+
         Extends the input `folded_df` rows with these metrics and returns DataFrame.
 
         edited from `process_folded_outputs()` in public multiflow
@@ -519,13 +653,13 @@ class FoldingValidator:
                 MetricName.sample_pdb_path: sample_pdb_path,
             }
 
-            # Calculate RMSD
+            # Calculate RMSD to generated sample
             folded_ca_pos = folded_feats[dpc.bb_positions]
             folded_bb_pos = folded_feats[dpc.atom_positions][:, :3].reshape(-1, 3)
             res_mask = torch.ones(folded_ca_pos.shape[0])
-            sample_metrics[MetricName.bb_rmsd] = _calc_bb_rmsd(
-                res_mask, sample_bb_pos, folded_bb_pos
-            )
+            bb_rmsd = _calc_bb_rmsd(res_mask, sample_bb_pos, folded_bb_pos)
+            sample_metrics[MetricName.bb_rmsd] = bb_rmsd
+            sample_metrics[MetricName.is_designable] = bb_rmsd <= 2.0
 
             # If provided ground truth bb positions, also compare to them
             if true_bb_positions is not None:

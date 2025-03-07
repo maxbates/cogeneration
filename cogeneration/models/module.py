@@ -1,3 +1,4 @@
+import glob
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ from cogeneration.data.batch_props import BatchProps as bp
 from cogeneration.data.batch_props import NoisyBatchProps as nbp
 from cogeneration.data.batch_props import PredBatchProps as pbp
 from cogeneration.data.const import MASK_TOKEN_INDEX
+from cogeneration.data.enum import OutputFileName
 from cogeneration.data.folding_validation import FoldingValidator
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.io import write_numpy_json
@@ -63,9 +65,9 @@ class FlowModule(LightningModule):
         super().__init__()
         self.cfg = cfg
 
-        self.model = FlowModel(cfg.model)
+        self.model = FlowModel(self.cfg.model)
 
-        self.interpolant = Interpolant(cfg.interpolant)
+        self.interpolant = Interpolant(self.cfg.interpolant)
 
         self.folding_validator = FoldingValidator(
             cfg=self.cfg.folding,
@@ -501,12 +503,13 @@ class FlowModule(LightningModule):
         diffuse_mask = batch[bp.diffuse_mask]
         assert (diffuse_mask == 1.0).all()  # no partial masking yet
 
-        # validation runs "codesign"-ish, but will corrupt trans/rots/aa based on interpolant config.
+        # validation mostly just runs "codesign" but will corrupt trans/rots/aa based on interpolant config.
         self.interpolant.set_device(res_mask.device)
         protein_traj, model_traj = self.interpolant.sample(
             num_batch,
             num_res,
             self.model,
+            task=InferenceTaskEnum.unconditional,
             # t=0 values will be noise
             trans_1=batch[bp.trans_1],
             rotmats_1=batch[bp.rotmats_1],
@@ -514,8 +517,6 @@ class FlowModule(LightningModule):
             diffuse_mask=diffuse_mask,
             chain_idx=batch[bp.chain_idx],
             res_idx=batch[bp.res_idx],
-            forward_folding=False,
-            inverse_folding=False,
         )
 
         bb_trajs = to_numpy(protein_traj.structure)
@@ -544,6 +545,7 @@ class FlowModule(LightningModule):
             top_sample_metrics, saved_trajectory_files = self.compute_sample_metrics(
                 sample_id=sample_id,
                 sample_dir=sample_dir,
+                task=InferenceTaskEnum.unconditional,
                 bb_traj=bb_trajs[i],
                 aa_traj=aa_trajs[i],
                 model_bb_traj=model_bb_trajs[i],
@@ -668,14 +670,11 @@ class FlowModule(LightningModule):
             num_batch=num_batch,
             num_res=sample_length,
             model=self.model,
+            task=self.cfg.inference.task,
             trans_1=trans_1,
             rotmats_1=rotmats_1,
             aatypes_1=aatypes_1,
             diffuse_mask=diffuse_mask,
-            forward_folding=self.cfg.inference.task
-            == InferenceTaskEnum.forward_folding,
-            inverse_folding=self.cfg.inference.task
-            == InferenceTaskEnum.inverse_folding,
             separate_t=self.cfg.inference.interpolant.codesign_separate_t,
         )
         diffuse_mask = (
@@ -703,6 +702,7 @@ class FlowModule(LightningModule):
             top_sample_metrics, _ = self.compute_sample_metrics(
                 sample_id=sample_id,
                 sample_dir=sample_dir,
+                task=self.cfg.inference.task,
                 bb_traj=bb_trajs[i],
                 aa_traj=aa_trajs[i],
                 model_bb_traj=model_bb_trajs[i],
@@ -716,9 +716,6 @@ class FlowModule(LightningModule):
                 write_sample_trajectories=self.cfg.inference.write_sample_trajectories,
             )
 
-            top_sample_path = os.path.join(sample_dir, "top_sample.json")
-            write_numpy_json(top_sample_path, top_sample_metrics)
-
             all_top_sample_metrics.append(top_sample_metrics)
 
         return pd.DataFrame(all_top_sample_metrics)
@@ -727,6 +724,7 @@ class FlowModule(LightningModule):
         self,
         sample_id: Union[int, str],
         sample_dir: str,  # inference output directory for this sample
+        task: InferenceTaskEnum,
         bb_traj: npt.NDArray,
         aa_traj: npt.NDArray,
         model_bb_traj: npt.NDArray,
@@ -747,7 +745,6 @@ class FlowModule(LightningModule):
 
         Note that this function expects numpy inputs. Tensors should be detached and converted.
         """
-
         # Noisy trajectory and model (clean) trajectory may not be the same number of steps.
         noisy_traj_length, sample_length, _, _ = bb_traj.shape
         assert bb_traj.shape == (
@@ -814,7 +811,48 @@ class FlowModule(LightningModule):
             n_inverse_folds=n_inverse_folds,
         )
 
+        # TODO - return other written file paths, not just trajectory
+
         return top_sample_metrics, saved_trajectory_files
+
+    def concat_all_top_samples(
+        self,
+        output_dir: str,
+        is_inference: bool = True,  # otherwise, validation
+    ) -> Tuple[pd.DataFrame, str]:
+        """
+        Loads all top samples CSVs in `output_dir` and concatenates them into a single DataFrame.
+        Writes `output_dir/all_top_samples.csv` and returns path.
+        """
+        assert os.path.exists(output_dir), f"Output dir {output_dir} does not exist"
+
+        # "memoize"
+        top_sample_csv_path = os.path.join(
+            output_dir, OutputFileName.all_top_samples_df
+        )
+        if os.path.exists(top_sample_csv_path):
+            self._log.info(f"Using existing top samples CSV {top_sample_csv_path}")
+            return pd.read_csv(top_sample_csv_path), top_sample_csv_path
+
+        # Inference: inference_dir/length/sample_name/top_sample.csv
+        # Validation: checkpoint_dir/sample_name/top_sample.csv
+        json_file_glob = (
+            f"*/*/{OutputFileName.top_sample_json}"
+            if is_inference
+            else f"*/{OutputFileName.top_sample_json}"
+        )
+
+        # load and concat
+        all_csv_paths = glob.glob(
+            os.path.join(output_dir, json_file_glob), recursive=True
+        )
+        assert len(all_csv_paths) > 0, f"No top samples JSONs found in {output_dir}"
+        top_sample_df = pd.concat([pd.read_json(x) for x in all_csv_paths])
+        top_sample_df.to_csv(top_sample_csv_path, index=False)
+
+        self._log.info(f"All top samples saved to {top_sample_csv_path}")
+
+        return top_sample_df, top_sample_csv_path
 
     def _log_scalar(
         self,

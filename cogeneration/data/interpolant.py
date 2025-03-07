@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 from cogeneration.config.base import (
+    InferenceTaskEnum,
     InterpolantAATypesInterpolantTypeEnum,
     InterpolantConfig,
     InterpolantRotationsScheduleEnum,
@@ -654,6 +655,7 @@ class Interpolant:
         num_batch: int,
         num_res: int,
         model,
+        task: InferenceTaskEnum,
         num_timesteps=None,
         trans_0=None,
         rotmats_0=None,
@@ -667,8 +669,6 @@ class Interpolant:
         chain_idx=None,
         res_idx=None,
         t_nn=None,
-        forward_folding: bool = False,
-        inverse_folding: bool = False,
         separate_t: bool = False,
     ) -> Tuple[SamplingTrajectory, SamplingTrajectory]:
         """
@@ -684,6 +684,11 @@ class Interpolant:
         """
 
         res_mask = torch.ones(num_batch, num_res, device=self._device)
+
+        # Prepare for task-specific behavior
+        # TODO - convert code to switch statements, support adding another task
+        forward_folding = task == InferenceTaskEnum.forward_folding
+        inverse_folding = task == InferenceTaskEnum.inverse_folding
 
         # Set-up initial prior samples (noise)
 

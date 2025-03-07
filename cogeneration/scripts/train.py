@@ -51,7 +51,7 @@ class Experiment:
         setup_ddp(
             trainer_strategy=cfg.experiment.trainer.strategy,
             accelerator=cfg.experiment.trainer.accelerator,
-            rank=os.environ.get("LOCAL_RANK", "0"),
+            rank=str(DDPInfo.from_env().rank),
             world_size=str(cfg.experiment.num_devices),
         )
 

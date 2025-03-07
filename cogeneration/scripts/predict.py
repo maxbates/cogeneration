@@ -1,10 +1,12 @@
 import copy
+import glob
 import os
 from collections import OrderedDict
 from dataclasses import asdict
-from typing import Tuple
+from typing import Optional, Tuple
 
 import hydra
+import pandas as pd
 import torch
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
@@ -48,7 +50,7 @@ class EvalRunner:
         setup_ddp(
             trainer_strategy=cfg.experiment.trainer.strategy,
             accelerator=cfg.experiment.trainer.accelerator,
-            rank=local_rank,
+            rank=str(local_rank),
             world_size=str(cfg.experiment.num_devices),
         )
 
@@ -210,30 +212,21 @@ class EvalRunner:
         )
         trainer.predict(self._flow_module, dataloaders=dataloader)
 
-    def compute_unconditional_metrics(self):
-        # TODO - need metrics class and to calculate task specific metrics. See Multiflow
-        metrics_csv_path = os.path.join(self.inference_dir, "designable.csv")
-
-    def compute_forward_folding_metrics(self):
-        # TODO - need metrics class and to calculate task specific metrics. See Multiflow
-        metrics_csv_path = os.path.join(self.inference_dir, "forward_fold_metrics.csv")
-
-    def compute_inverse_folding_metrics(self):
-        # TODO - need metrics class and to calculate task specific metrics. See Multiflow
-        metrics_csv_path = os.path.join(self.inference_dir, "inverse_fold_metrics.csv")
-
     @print_timing
     def compute_metrics(self):
-        log.info(f"Calculating metrics for {self.inference_dir}")
+        log.info(f"Calculating metrics for samples in {self.inference_dir}")
 
-        if self.cfg.inference.task == InferenceTaskEnum.unconditional:
-            self.compute_unconditional_metrics()
-        elif self.cfg.inference.task == InferenceTaskEnum.forward_folding:
-            self.compute_forward_folding_metrics()
-        elif self.cfg.inference.task == InferenceTaskEnum.inverse_folding:
-            self.compute_inverse_folding_metrics()
-        else:
-            raise ValueError(f"Unknown task {self.cfg.inference.task}")
+        top_samples_df, top_samples_path = self._flow_module.concat_all_top_samples(
+            output_dir=self.inference_dir,
+            is_inference=True,
+        )
+        top_metrics_df, top_metrics_path = (
+            self._flow_module.folding_validator.assess_all_top_samples(
+                task=self.cfg.inference.task,
+                top_samples_df=top_samples_df,
+                output_dir=self.inference_dir,
+            )
+        )
 
 
 @hydra.main(version_base=None, config_path="../config", config_name="base")

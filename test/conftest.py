@@ -246,10 +246,10 @@ def mock_folding_validation(tmp_path):
                     f.write(mock_inverse_fold_seq)
 
             # mock AlphaFold2 call
-            mock_af2_fasta_path = str(tmp_path / "sample.pdb")
+            mock_af2_pdb_path = str(tmp_path / "model_4.pdb")
             af2_fasta_path = write_prot_to_pdb(
                 prot_pos=true_bb_pos[0],
-                file_path=mock_af2_fasta_path,
+                file_path=mock_af2_pdb_path,
                 aatype=true_aa,
             )
             mock_run_alphafold2.return_value = pd.DataFrame(

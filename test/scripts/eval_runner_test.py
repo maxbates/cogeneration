@@ -1,4 +1,5 @@
 import os.path
+import unittest
 from pathlib import Path
 
 import torch
@@ -40,3 +41,11 @@ class TestEvalRunner:
             checkpoint_path=merged_ckpt_path,
             cfg=merged_cfg,
         )
+
+    @unittest.skip
+    def test_run_and_compute_metrics(self):
+        # TODO - run dummy sampling using `mock_cfg` and a dummy model
+        # Don't use public config and model, will be slow.
+        # We need to create a dummy checkpoint + config to load into EvalRunner.
+        # Then, run some sampling and compute metrics for each task
+        pass

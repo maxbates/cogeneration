@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
 
+from cogeneration.data.enum import OutputFileName
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restypes_with_x
 
@@ -66,7 +67,7 @@ def save_logits_traj(
     )
 
     # Save animation.
-    anim_path = os.path.join(output_dir, "logits_traj.gif")
+    anim_path = os.path.join(output_dir, OutputFileName.logits_traj_anim)
     anim.save(anim_path)
     plt.close(fig)
 
@@ -128,7 +129,7 @@ def save_trajectory(
     """
 
     diffuse_mask = diffuse_mask.astype(bool)
-    sample_pdb_path = os.path.join(output_dir, "sample.pdb")
+    sample_pdb_path = os.path.join(output_dir, OutputFileName.sample_pdb)
 
     noisy_traj_length, num_res, _, _ = bb_prot_traj.shape
     model_traj_length = x0_traj.shape[0]
@@ -157,8 +158,8 @@ def save_trajectory(
             sample_pdb_path=sample_pdb_path,
         )
 
-    prot_traj_path = os.path.join(output_dir, "bb_traj.pdb")
-    x0_traj_path = os.path.join(output_dir, "x0_traj.pdb")
+    prot_traj_path = os.path.join(output_dir, OutputFileName.bb_traj_pdb)
+    x0_traj_path = os.path.join(output_dir, OutputFileName.x0_traj_pdb)
     # These file paths gated by files being provided
     aa_traj_fasta_path = None
     model_logits_traj_path = None
@@ -180,7 +181,7 @@ def save_trajectory(
 
     # Write amino acids trajectory, if provided.
     if aa_traj is not None:
-        aa_traj_fasta_path = os.path.join(output_dir, "aa_traj.fasta")
+        aa_traj_fasta_path = os.path.join(output_dir, OutputFileName.aa_traj_fa)
         num_steps = aa_traj.shape[0]
         with open(aa_traj_fasta_path, "w") as f:
             for i in range(num_steps):
