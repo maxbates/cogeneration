@@ -279,6 +279,7 @@ class FoldingValidator:
             calc_ca_ca_metrics(pred_bb_positions[:, residue_constants.atom_order["CA"]])
         )
 
+        # write top sample JSON
         top_sample_path = os.path.join(sample_dir, OutputFileName.top_sample_json)
         write_numpy_json(top_sample_path, top_sample)
 

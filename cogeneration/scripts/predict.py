@@ -27,6 +27,10 @@ class EvalRunner:
     def __init__(self, cfg: Config):
         self._input_cfg: Config = copy.deepcopy(cfg)
 
+        # singletons
+        self._trainer: Optional[Trainer] = None
+        self._dataloader: Optional[torch.utils.data.DataLoader] = None
+
         # Read in checkpoint config
         if cfg.inference.task == InferenceTaskEnum.unconditional:
             ckpt_path = cfg.inference.unconditional_ckpt_path
@@ -130,15 +134,21 @@ class EvalRunner:
         OmegaConf.set_struct(ckpt_cfg, False)
 
         # TODO - better support for merging structured configs
+        #   To merge into a dataclass, all fields must exist. Or we merge into a base DictConfig.
         #   We should merge `ckpt_cfg` into `cfg`.
         #   However, some fields, which determine behavior (like run `local`), should not be overridden.
-        #   To merge into a dataclass, all fields must exist. Or we merge into a base DictConfig.
+        #   Note that interpolations don't apply here, since we are creating a dict (~already interpolated).
         merged_cfg = OmegaConf.merge(ckpt_cfg, cfg, ckpt_cfg)
 
         # Overwrite certain fields from the checkpoint config
-        # TODO revisit more extensively
+        # Model size etc. should match, but explicitly override some fields with specified config.
+        # TODO - we may need to add more here
+        # inference, folding validation take priority
+        merged_cfg.inference = OmegaConf.merge(merged_cfg.inference, cfg.inference)
+        merged_cfg.folding = OmegaConf.merge(merged_cfg.folding, cfg.folding)
+        # datasets not relevant, either sample lengths or `pdb_test` dataset
+        # training + validation cfg
         merged_cfg.experiment.checkpointer.dirpath = cfg.experiment.checkpointer.dirpath
-        # Maintain important behavior specified in `cfg`
         merged_cfg.experiment.trainer.strategy = cfg.experiment.trainer.strategy
 
         # In an attempt (that probably won't last) to support MultiFlow,
@@ -146,7 +156,9 @@ class EvalRunner:
         # We'll map, and save a new checkpoint, and then load that checkpoint.
         if "interpolant" in ckpt_cfg and "twisting" in ckpt_cfg.interpolant:
             log.info("Mapping MultiFlow state dict")
-            ckpt = torch.load(ckpt_path, map_location=torch.device("cpu"))
+            ckpt = torch.load(
+                ckpt_path, map_location=torch.device("cpu"), weights_only=False
+            )
 
             # Define new checkpoint directory
             ckpt_dir = f"{merged_cfg.experiment.checkpointer.dirpath}_mapped_{merged_cfg.shared.now}"
@@ -173,11 +185,14 @@ class EvalRunner:
 
         return merged_cfg, ckpt_path
 
-    @print_timing
-    def run_sampling(self):
-        devices = get_available_device(device_limit=self.cfg.experiment.num_devices)
-        log.info(f"Using devices: {devices}")
-        log.info(f"Evaluating {self.cfg.inference.task}")
+    @property
+    def dataloader(self):
+        """
+        Returns a dataloader singleton, i.e. with a fixed rng seed.
+        Reset it with `reset_dataloader` for new sampling dataset.
+        """
+        if self._dataloader is not None:
+            return self._dataloader
 
         if self.cfg.inference.task == InferenceTaskEnum.unconditional:
             eval_dataset = LengthSamplingDataset(self.cfg.inference.samples)
@@ -193,12 +208,25 @@ class EvalRunner:
         else:
             raise ValueError(f"Unknown task {self.cfg.inference.task}")
 
-        dataloader = torch.utils.data.DataLoader(
+        self._dataloader = torch.utils.data.DataLoader(
             eval_dataset,
             batch_size=1,
             shuffle=False,
             drop_last=False,
         )
+
+        return self._dataloader
+
+    def reset_dataloader(self):
+        self._dataloader = None
+
+    @property
+    def trainer(self) -> Trainer:
+        if self._trainer is not None:
+            return self._trainer
+
+        devices = get_available_device(device_limit=self.cfg.experiment.num_devices)
+        log.info(f"Using devices: {devices}")
 
         # Due to cfg merge above, cfg may be a structured config (dataclass) or a DictConfig
         trainer_cfg = (
@@ -206,14 +234,23 @@ class EvalRunner:
             if hasattr(self.cfg.experiment.trainer, "__dataclass_fields__")
             else self.cfg.experiment.trainer
         )
-        trainer = Trainer(
+        self._trainer = Trainer(
             **trainer_cfg,
             devices=devices,
         )
-        trainer.predict(self._flow_module, dataloaders=dataloader)
+        return self._trainer
 
     @print_timing
-    def compute_metrics(self):
+    def run_sampling(self):
+        log.info(f"Evaluating {self.cfg.inference.task}")
+
+        self.trainer.predict(
+            model=self._flow_module,
+            dataloaders=self.dataloader,
+        )
+
+    @print_timing
+    def compute_metrics(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         log.info(f"Calculating metrics for samples in {self.inference_dir}")
 
         top_samples_df, top_samples_path = self._flow_module.concat_all_top_samples(
@@ -227,6 +264,8 @@ class EvalRunner:
                 output_dir=self.inference_dir,
             )
         )
+
+        return top_samples_df, top_metrics_df
 
 
 @hydra.main(version_base=None, config_path="../config", config_name="base")

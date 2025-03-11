@@ -24,7 +24,7 @@ from cogeneration.data.batch_props import BatchProps as bp
 from cogeneration.data.batch_props import NoisyBatchProps as nbp
 from cogeneration.data.batch_props import PredBatchProps as pbp
 from cogeneration.data.const import MASK_TOKEN_INDEX
-from cogeneration.data.enum import OutputFileName
+from cogeneration.data.enum import MetricName, OutputFileName
 from cogeneration.data.folding_validation import FoldingValidator
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.io import write_numpy_json
@@ -93,6 +93,9 @@ class FlowModule(LightningModule):
 
     @property
     def checkpoint_dir(self) -> str:
+        """
+        directory for validation samples
+        """
         if self._checkpoint_dir is None:
             if dist.is_initialized():
                 if dist.get_rank() == 0:
@@ -188,6 +191,18 @@ class FlowModule(LightningModule):
         # Log validation metrics
         if len(self.validation_epoch_metrics) > 0:
             val_epoch_metrics = pd.concat(self.validation_epoch_metrics)
+
+            # drop non-metrics columns, e.g. can't take `mean()`
+            val_epoch_metrics = val_epoch_metrics.drop(
+                columns=[
+                    MetricName.sample_id,
+                    MetricName.header,
+                    MetricName.sequence,
+                    MetricName.sample_pdb_path,
+                    MetricName.folded_pdb_path,
+                ]
+            )
+
             for metric_name, metric_val in val_epoch_metrics.mean().to_dict().items():
                 self._log_scalar(
                     f"valid/{metric_name}",
@@ -843,14 +858,19 @@ class FlowModule(LightningModule):
         )
 
         # load and concat
-        all_csv_paths = glob.glob(
+        all_json_paths = glob.glob(
             os.path.join(output_dir, json_file_glob), recursive=True
         )
-        assert len(all_csv_paths) > 0, f"No top samples JSONs found in {output_dir}"
-        top_sample_df = pd.concat([pd.read_json(x) for x in all_csv_paths])
+        assert len(all_json_paths) > 0, f"No top samples JSONs found in {output_dir}"
+
+        def read_json(p):
+            with open(p, "r") as f:
+                return json.load(f)
+
+        top_sample_df = pd.DataFrame([read_json(p) for p in all_json_paths])
         top_sample_df.to_csv(top_sample_csv_path, index=False)
 
-        self._log.info(f"All top samples saved to {top_sample_csv_path}")
+        self._log.info(f"All top samples saved -> {top_sample_csv_path}")
 
         return top_sample_df, top_sample_csv_path
 

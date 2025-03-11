@@ -104,11 +104,13 @@ class MetricName(StrEnum):
     sample_id = "sample_id"  # unique identifier for sample
     sample_length = "sample_length"  # length of sample
 
-    # assess folded structures
+    # sequence + structure information
     header = "header"  # sequence name, header in fasta file
     sequence = "sequence"  # sequence of amino acids
     sample_pdb_path = "sample_pdb_path"  # filepath to generated pdb file
     folded_pdb_path = "folded_path"  # filepath to folded pdb file
+
+    # assess folded structures
     plddt_mean = "plddt_mean"  # mean pLDDT score
 
     # structure comparison

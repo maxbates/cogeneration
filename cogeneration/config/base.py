@@ -95,8 +95,8 @@ class ModelHyperParamsConfig:
     def tiny(cls):
         """Factory for tiny configuration, e.g. for testing"""
         return cls(
-            node_embed_size=16,
-            edge_embed_size=16,
+            node_embed_size=8,
+            edge_embed_size=8,
             pos_embed_size=4,
             timestep_embed_size=4,
         )
@@ -607,7 +607,8 @@ class ExperimentTrainerConfig:
     accumulate_grad_batches: int = 2
     # logging
     log_every_n_steps: int = 1
-    local_tensorboard_logdir: str = "./tensorboard_logs"
+    # TODO put somewhere else, invalid argument to Trainer()
+    # local_tensorboard_logdir: str = "./tensorboard_logs"
 
     def __post_init__(self):
         # distributed training (ddp) not currently supported with MPS

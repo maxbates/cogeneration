@@ -1,13 +1,16 @@
 import logging
 import os
+from dataclasses import asdict
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 import pytest
 import torch
+from omegaconf import OmegaConf
+from pytorch_lightning import Trainer
 from torch.utils.data import DataLoader, Dataset
 
 from cogeneration.config.base import (
@@ -24,6 +27,9 @@ from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingDataset
+from cogeneration.dataset.protein_dataloader import ProteinData
+from cogeneration.models.module import FlowModule
+from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -58,6 +64,9 @@ def public_weights_path() -> Path:
 def mock_cfg(tmp_path) -> Config:
     """mock_cfg fixture defines default nested config"""
     raw_cfg = Config()
+
+    # set to local mode, impacting accelerator etc.
+    raw_cfg.shared.local = True
 
     # default to tiny model for faster model evaluations
     raw_cfg.model.hyper_params = ModelHyperParamsConfig.tiny()
@@ -183,6 +192,9 @@ def mock_folding_validation(tmp_path):
     ) as mock_run_alphafold2:
 
         def setup_mocks(batch, cfg: Config, n_inverse_folds: int):
+            assert batch is not None, "batch is required for folding validation mock"
+            assert cfg is not None, "cfg is required for folding validation mock"
+
             if cfg.inference.task != InferenceTaskEnum.unconditional:
                 print(
                     "WARNING. mocks currently assume unconditional generation. May impact outputs."
@@ -265,3 +277,69 @@ def mock_folding_validation(tmp_path):
             return mock_run_protein_mpnn, mock_run_alphafold2
 
         yield setup_mocks
+
+
+@pytest.fixture
+def mock_checkpoint(mock_folding_validation):
+    """
+    Save a dummy checkpoint and config that we can load into EvalRunner
+
+    TODO - memoize, maybe if path is not provided?
+    #   Need to confirm cfg is equivalent enough to use as checkpoint? or overwrite when changes made?
+    #   Maybe we can hash the config (ignoring fields like `now`)
+    """
+
+    def create_mock_checkpoint(cfg: Config, path: Path) -> Tuple[str, str]:
+        ckpt_cfg_path = str(path / "config.yaml")
+        ckpt_path = str(path / "last.ckpt")
+
+        # save config
+        with open(ckpt_cfg_path, "w") as f:
+            OmegaConf.save(config=cfg, f=f)
+
+        # saving a checkpoint with pytorch lightning is annoying.
+        # We need to use a lightning `Trainer`, and call `fit()` on it, which requires a datamodule.
+
+        # Our datamodule requires DDP for now, so set it up
+        setup_ddp(
+            trainer_strategy=cfg.experiment.trainer.strategy,
+            accelerator=cfg.experiment.trainer.accelerator,
+            rank=str(DDPInfo.from_env().rank),
+            world_size=str(cfg.experiment.num_devices),
+        )
+
+        # set up datamodule
+        dataset_constructor = DatasetConstructor.from_cfg(cfg)
+        train_dataset, valid_dataset = dataset_constructor.create_datasets()
+        datamodule = ProteinData(
+            data_cfg=cfg.data,
+            dataset_cfg=cfg.dataset,
+            train_dataset=train_dataset,
+            valid_dataset=valid_dataset,
+        )
+
+        # Patch config to only allow one training epoch.
+        cfg.experiment.trainer.max_epochs = 1
+        cfg.experiment.trainer.min_epochs = 0
+
+        # mock validation step before calling `fit()`
+        val_batch = next(iter(datamodule.val_dataloader()))
+        mock_folding_validation(
+            batch=val_batch,
+            cfg=cfg,
+            n_inverse_folds=1,  # validation
+        )
+
+        # set up trainer
+        module = FlowModule(cfg)
+        trainer = Trainer(**asdict(cfg.experiment.trainer))
+
+        # call `fit()` to set the model
+        trainer.fit(module, datamodule=datamodule)
+
+        # finally, save checkpoint
+        trainer.save_checkpoint(ckpt_path)
+
+        return ckpt_cfg_path, ckpt_path
+
+    return create_mock_checkpoint

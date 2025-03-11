@@ -115,11 +115,12 @@ class Experiment:
 
         if self.cfg.shared.local:
             # If local, use tensorboard logger
+            local_tensorboard_logdir = "./tensorboard_logs"
             log.info(
-                f"Local mode. Using Tensorboard logger @ {self.cfg.experiment.trainer.local_tensorboard_logdir}"
+                f"Local mode. Using Tensorboard logger @ {local_tensorboard_logdir}"
             )
             logger = TensorBoardLogger(
-                save_dir=self.cfg.experiment.trainer.local_tensorboard_logdir,
+                save_dir=local_tensorboard_logdir,
                 name=self.cfg.experiment.wandb.name,
             )
         else:

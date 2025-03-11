@@ -1,12 +1,7 @@
 import os.path
-import unittest
-from pathlib import Path
 
-import torch
-from hydra.utils import instantiate
-from omegaconf import OmegaConf
-
-from cogeneration.config.base import Config
+from cogeneration.config.base import Config, InferenceTaskEnum
+from cogeneration.data.enum import MetricName
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.predict import EvalRunner
 
@@ -42,10 +37,73 @@ class TestEvalRunner:
             cfg=merged_cfg,
         )
 
-    @unittest.skip
-    def test_run_and_compute_metrics(self):
-        # TODO - run dummy sampling using `mock_cfg` and a dummy model
-        # Don't use public config and model, will be slow.
-        # We need to create a dummy checkpoint + config to load into EvalRunner.
-        # Then, run some sampling and compute metrics for each task
-        pass
+    def test_sampling_and_compute_metrics(
+        self, mock_cfg, mock_checkpoint, mock_folding_validation, tmp_path
+    ):
+        # create a dummy checkpoint
+        ckpt_cfg_path, ckpt_path = mock_checkpoint(cfg=mock_cfg, path=tmp_path)
+
+        # update config with the checkpoint
+        assert mock_cfg.inference.task == InferenceTaskEnum.unconditional
+        mock_cfg.inference.unconditional_ckpt_path = str(ckpt_path)
+
+        # Run sampling
+
+        # only sample one sample
+        # TODO - support multiple samples
+        #   We need to mock folding validation for all samples in pred dataloader.
+        mock_cfg.inference.samples.samples_per_length = 1
+        mock_cfg.inference.samples.length_subset = [23]
+
+        n_samples_expected = 1
+
+        sampler = EvalRunner(cfg=mock_cfg)
+
+        # we implicitly test that inference config takes priority over checkpoint
+        assert (
+            len(sampler.dataloader) == n_samples_expected
+        ), f"Expected only one sample in dataloader, got {len(sampler.dataloader)}"
+        pred_batch = next(iter(sampler.dataloader))
+        mock_folding_validation(
+            batch=pred_batch,
+            cfg=mock_cfg,
+            n_inverse_folds=8,  # prediction
+        )
+
+        # run sampling
+        sampler.run_sampling()
+
+        # ensure we get top samples
+        assert os.path.exists(mock_cfg.inference.predict_dir), f"Predict dir not found"
+
+        # compute metrics (using patched methods)
+        top_samples_df, top_metrics_df = sampler.compute_metrics()
+
+        # write to inspect
+        print(f"samples + metrics written to: {tmp_path}")
+        top_samples_df.to_csv(tmp_path / "top_samples_df.csv")
+        top_metrics_df.to_csv(tmp_path / "top_metrics_df.csv")
+
+        # check top samples
+        assert (
+            len(top_samples_df) == n_samples_expected
+        ), f"Expected {n_samples_expected} samples"
+        for col in [
+            # pdb structure paths
+            MetricName.sample_pdb_path,
+            MetricName.folded_pdb_path,
+            # subset of metrics
+            MetricName.bb_rmsd,
+            MetricName.inverse_folding_sequence_recovery_mean,
+            MetricName.helix_percent,
+        ]:
+            assert col in top_samples_df.columns, f"Expected {col} in top_samples_df"
+
+        # check summary metrics
+        assert len(top_metrics_df) == 1, f"Expected summary metrics to be single row"
+        assert (
+            "Total Samples" in top_metrics_df.columns
+        ), f"Expected 'Total Samples' in top_metrics_df"
+        assert (
+            top_metrics_df["Total Samples"].iloc[0] == n_samples_expected
+        ), f"Expected {n_samples_expected} samples"
