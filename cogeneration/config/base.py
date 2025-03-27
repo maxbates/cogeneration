@@ -61,7 +61,8 @@ class SharedConfig:
     now: str = field(
         default_factory=lambda: datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     )
-    # random seed
+    # randomness / stochastic paths
+    stochastic: bool = False
     seed: int = 123
     # project root path
     project_root: str = str(project_root_path)
@@ -95,8 +96,8 @@ class ModelHyperParamsConfig:
     def tiny(cls):
         """Factory for tiny configuration, e.g. for testing"""
         return cls(
-            node_embed_size=8,
-            edge_embed_size=8,
+            node_embed_size=4,
+            edge_embed_size=4,
             pos_embed_size=4,
             timestep_embed_size=4,
         )
@@ -280,7 +281,10 @@ class ModelConfig:
     )
     ipa: ModelIPAConfig = field(default_factory=ModelIPAConfig)
 
-    predict_psi_torsions: bool = False  # not present in public MultiFlow
+    # predict torsion angles
+    # note does not impact frames (trans/rots), just the rigid we construct (from trans/rot/psi)
+    # not present in public MultiFlow
+    predict_psi_torsions: bool = False
 
     # sequence prediction, default is simple aa_pred matching MultiFlow
     sequence_pred_type: ModelSequencePredictionEnum = (
@@ -294,12 +298,17 @@ class ModelConfig:
 
 class InterpolantRotationsScheduleEnum(StrEnum):
     linear = "linear"
+    # Note that structures seem to generate better when rotations settle first.
+    # Therefore, rotations schedule should scale t faster than translations.
+    # For example, it might make sense for rotations=exponential, translations=linear.
     exp = "exp"
 
 
 @dataclass
 class InterpolantRotationsConfig:
     corrupt: bool = True
+    # sampled noise std dev
+    igso3_sigma: float = 1.5  # 1.5 in public multiflow
     train_schedule: InterpolantRotationsScheduleEnum = (
         InterpolantRotationsScheduleEnum.linear
     )
@@ -307,11 +316,18 @@ class InterpolantRotationsConfig:
         InterpolantRotationsScheduleEnum.exp
     )
     exp_rate: float = 10
+    # stochastic paths
+    stochastic: bool = "${shared.stochastic}"
+    # sigma scaled by g * sqrt(t * (1-t))
+    stochastic_noise_intensity: float = 0.1  # `g` in FoldFlow SO3SFM
 
 
 class InterpolantTranslationsScheduleEnum(StrEnum):
     linear = "linear"
-    vpsde = "vpsde"  # variance-preserving SDE
+    # variance-preserving SDE. sampling only.
+    # does not itself inject noise into path, but variance controlled to remain stable throughout process.
+    # helps "smooth" intermediate samples to avoid collapse (low variance) or divergence (high variance).
+    vpsde = "vpsde"
 
 
 @dataclass
@@ -325,14 +341,11 @@ class InterpolantTranslationsConfig:
         InterpolantTranslationsScheduleEnum.linear
     )
     # sample_schedule: sampling schedule for interpolant.
-    # Note that structures seem to generate better when rotations settle first.
-    # Therefore, rotations schedule should scale t faster than translations.
-    # For example, it might make sense for rotations=exponential, translations=linear.
     sample_schedule: InterpolantTranslationsScheduleEnum = (
-        InterpolantTranslationsScheduleEnum.linear
+        "${ternary:${equals: ${shared.stochastic}, True}, 'vpsde', 'linear'}"
     )
     # sample_temp: sampling temperature
-    sample_temp: float = 1.0
+    sample_temp: float = 1.0  # TODO - drop
     # vpsde_bmin: variance-preserving SDE minimum
     vpsde_bmin: float = 0.1
     # vpsde_bmax: variance-preserving SDE maximum
@@ -343,6 +356,10 @@ class InterpolantTranslationsConfig:
     # rog:
     #   weight: 10.0
     #   cutoff: 5.0
+    # stochastic paths
+    stochastic: bool = "${shared.stochastic}"
+    # sigma scaled by g * sqrt(t * (1-t))
+    stochastic_noise_intensity: float = 0.1  # `g` in FoldFlow SO3SFM
 
 
 class InterpolantAATypesScheduleEnum(StrEnum):
@@ -388,6 +405,7 @@ class InterpolantAATypesConfig:
         "${ternary:${equals: ${inference.task}, 'forward_folding'}, False, True}"
     )
     train_extra_mask: float = 0.0  # DROP
+    # TODO - extra stochastic option, in addition to purity
 
 
 @dataclass
@@ -395,14 +413,14 @@ class InterpolantSamplingConfig:
     # training takes a random t. Sampling runs over t timestemps.
     num_timesteps: int = 500
     # SDE not in public multiflow code
-    do_sde: bool = False
+    do_sde: bool = "${shared.stochastic}"  # TODO drop? What is this for?
 
 
 @dataclass
 class InterpolantConfig:
     min_t: float = 1e-2
-    separate_t: bool = False  # TODO drop, unused
-    # kappa allows scaling rotation t exponentially
+    separate_t: bool = False  # TODO drop, unused / refactor into rots/trans/aa
+    # kappa allows scaling rotation t exponentially during sampling
     provide_kappa: bool = True
     hierarchical_t: bool = False
     # Whether to use separate t times for structure and sequence
@@ -414,7 +432,8 @@ class InterpolantConfig:
     codesign_inverse_fold_prop: float = 0.1
     # enable self-conditioning
     self_condition: bool = "${model.edge_features.self_condition}"
-    self_condition_prob: float = 0.5
+    self_condition_prob: float = 0.5  # 0.5 in public MultiFlow
+
     # sub-modules
     rots: InterpolantRotationsConfig = field(default_factory=InterpolantRotationsConfig)
     trans: InterpolantTranslationsConfig = field(
@@ -563,6 +582,7 @@ class ExperimentTrainingConfig:
     aatypes_loss_mean_or_sum: str = "mean"
     aatypes_loss_use_likelihood_weighting: bool = False
     translation_loss_weight: float = 2.0
+    # losses scaling normalized up to t
     t_normalize_clip: float = 0.9
     rotation_loss_weights: float = 1.0
     aux_loss_weight: float = 0.5  # default 0.0 in multiflow

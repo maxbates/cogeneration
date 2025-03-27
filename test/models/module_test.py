@@ -1,11 +1,17 @@
 import numpy as np
 import pandas as pd
 
-from cogeneration.config.base import DataTaskEnum, InferenceTaskEnum
+from cogeneration.config.base import (
+    DataTaskEnum,
+    InferenceTaskEnum,
+    InterpolantTranslationsScheduleEnum,
+)
 from cogeneration.data.batch_props import BatchProps
 from cogeneration.data.enum import MetricName
 from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.models.module import FlowModule, TrainingLosses
+
+from ..conftest import create_pdb_noisy_batch
 
 
 class TestFlowModule:
@@ -24,6 +30,20 @@ class TestFlowModule:
         loss = module.training_step(pdb_noisy_batch)
         assert loss is not None
         assert hasattr(loss, "backward"), "Loss object does not have backward() method"
+
+    def test_training_step_stochastic(self, mock_cfg_uninterpolated):
+        # test batch corruption with stochastic paths
+        mock_cfg_uninterpolated.shared.stochastic = True
+        mock_cfg = mock_cfg_uninterpolated.interpolate()
+
+        assert mock_cfg.interpolant.trans.stochastic
+        assert mock_cfg.interpolant.rots.stochastic
+
+        # create batch using stochastic paths
+        pdb_noisy_batch = create_pdb_noisy_batch(mock_cfg)
+
+        module = FlowModule(mock_cfg)
+        module.training_step(pdb_noisy_batch)
 
     def test_validation_step(self, mock_cfg, pdb_noisy_batch, mock_folding_validation):
         module = FlowModule(mock_cfg)
@@ -122,7 +142,7 @@ class TestFlowModule:
     def test_predict_step_unconditional_works(
         self, mock_cfg, mock_pred_unconditional_dataloader, mock_folding_validation
     ):
-        mock_cfg.inference.task = InferenceTaskEnum.unconditional
+        assert mock_cfg.inference.task == InferenceTaskEnum.unconditional
 
         module = FlowModule(mock_cfg)
         batch = next(iter(mock_pred_unconditional_dataloader))
@@ -137,12 +157,17 @@ class TestFlowModule:
         _ = module.predict_step(batch, 0)
 
     def test_predict_step_forward_folding_works(
-        self, mock_cfg, mock_pred_conditional_dataloader, mock_folding_validation
+        self,
+        mock_cfg_uninterpolated,
+        mock_pred_conditional_dataloader,
+        mock_folding_validation,
     ):
         # modify config for forward folding
-        mock_cfg.inference.task = InferenceTaskEnum.forward_folding
-        mock_cfg.inference.interpolant.aatypes.noise = 0.0
-        mock_cfg.inference.interpolant.aatypes.do_purity = False
+        mock_cfg_uninterpolated.inference.task = InferenceTaskEnum.forward_folding
+        mock_cfg = mock_cfg_uninterpolated.interpolate()
+
+        assert mock_cfg.inference.interpolant.aatypes.noise == 0.0
+        assert mock_cfg.inference.interpolant.aatypes.do_purity is False
 
         module = FlowModule(mock_cfg)
         batch = next(iter(mock_pred_conditional_dataloader))
@@ -157,12 +182,45 @@ class TestFlowModule:
         _ = module.predict_step(batch, 0)
 
     def test_predict_step_inverse_folding_works(
-        self, mock_cfg, mock_pred_conditional_dataloader, mock_folding_validation
+        self,
+        mock_cfg_uninterpolated,
+        mock_pred_conditional_dataloader,
+        mock_folding_validation,
     ):
-        mock_cfg.inference.task = InferenceTaskEnum.inverse_folding
+        mock_cfg_uninterpolated.inference.task = InferenceTaskEnum.inverse_folding
+        mock_cfg = mock_cfg_uninterpolated.interpolate()
 
         module = FlowModule(mock_cfg)
         batch = next(iter(mock_pred_conditional_dataloader))
+
+        mock_folding_validation(
+            batch=batch,
+            cfg=mock_cfg,
+            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+        )
+
+        # just test that it works
+        _ = module.predict_step(batch, 0)
+
+    def test_predict_step_unconditional_stochastic_works(
+        self,
+        mock_cfg_uninterpolated,
+        mock_pred_unconditional_dataloader,
+        mock_folding_validation,
+    ):
+        mock_cfg_uninterpolated.inference.task = InferenceTaskEnum.unconditional
+        mock_cfg_uninterpolated.shared.stochastic = True
+        mock_cfg = mock_cfg_uninterpolated.interpolate()
+
+        assert mock_cfg.inference.interpolant.rots.stochastic
+        assert mock_cfg.inference.interpolant.trans.stochastic
+        assert (
+            mock_cfg.inference.interpolant.trans.sample_schedule
+            == InterpolantTranslationsScheduleEnum.vpsde
+        )
+
+        module = FlowModule(mock_cfg)
+        batch = next(iter(mock_pred_unconditional_dataloader))
 
         mock_folding_validation(
             batch=batch,

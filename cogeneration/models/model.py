@@ -34,7 +34,11 @@ class FlowModel(nn.Module):
     Specifically, it predicts translations, rotations, and amino acid logits.
     Comparing the predicted translations and rotations to the ground truth structure is main loss.
     Also, the translation and rotation vector field is computed and compared to the ground truth trajectory.
-    The ground truth trajectory is (~simply) a linear interpolation from start (noise) to end (structure).
+    For ODE (no stochastic paths) the ground truth trajectory is (~simply)
+    a linear interpolation from start (noise) to end (structure).
+
+    Optionally we can predict psi torsions. These do not impact the input batch or output translations and rotations
+    directly. Instead, the psi torsions are used to construct the atom14 and atom37 rigits, to better pack side chains.
     """
 
     def __init__(self, cfg: ModelConfig):

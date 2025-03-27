@@ -1,8 +1,10 @@
 import copy
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
@@ -112,12 +114,12 @@ class SamplingTrajectory:
         return t
 
 
-def _centered_gaussian(num_batch, num_res, device):
+def _centered_gaussian(num_batch, num_res, device: torch.device, n_bb_atoms: int = 3):
     """
     Generates a tensor of shape (num_batch, num_res, 3) with values sampled from a centered Gaussian distribution.
     e.g. t=0 translations
     """
-    noise = torch.randn(num_batch, num_res, 3, device=device)
+    noise = torch.randn(num_batch, num_res, n_bb_atoms, device=device)
     return noise - torch.mean(noise, dim=-2, keepdims=True)
 
 
@@ -144,7 +146,7 @@ def random_rotation_matrices(num_matrices: int, device):
     )
 
 
-def _uniform_so3(num_batch: int, num_res: int, device):
+def _uniform_so3(num_batch: int, num_res: int, device) -> torch.Tensor:
     """
     Generates a tensor of shape (num_batch, num_res, 3, 3) with values sampled from a uniform SO(3) distribution.
     e.g. t=0 rotation matrices
@@ -154,7 +156,7 @@ def _uniform_so3(num_batch: int, num_res: int, device):
     )
 
 
-def _masked_categorical(num_batch, num_res, device):
+def _masked_categorical(num_batch, num_res, device) -> torch.Tensor:
     """
     Returns a mask tensor of shape (num_batch, num_res) with all values set to MASK_TOKEN_INDEX.
     e.g. t=0 aa types, masking interpolation
@@ -162,7 +164,7 @@ def _masked_categorical(num_batch, num_res, device):
     return torch.ones(size=(num_batch, num_res), device=device) * MASK_TOKEN_INDEX
 
 
-def _uniform_categorical(num_batch, num_res, num_tokens, device):
+def _uniform_categorical(num_batch, num_res, num_tokens, device) -> torch.Tensor:
     """
     Returns uniform random samples from the range [0, num_tokens) of shape (num_batch, num_res).
     e.g. t=0 aa types, uniform interpolation
@@ -172,37 +174,60 @@ def _uniform_categorical(num_batch, num_res, num_tokens, device):
     )
 
 
-def _trans_diffuse_mask(trans_t, trans_1, diffuse_mask):
+def _1d_mask(aatypes_t, aatypes_1, mask) -> torch.Tensor:
     """
-    Mask 2D tensor with 1D mask tensor.
+    Mask 1D tensor aatypes_t with 1D mask tensor mask, and set masked values to aatypes_1.
+    Appropriate for e.g. amino acid types with diffuse_mask
     """
-    return trans_t * diffuse_mask[..., None] + trans_1 * (1 - diffuse_mask[..., None])
+    return aatypes_t * mask + aatypes_1 * (1 - mask)
 
 
-def _rots_diffuse_mask(rotmats_t, rotmats_1, diffuse_mask):
+def _2d_mask(trans_t, trans_1, mask) -> torch.Tensor:
     """
-    Mask 3D tensor with 1D mask tensor.
+    Mask 2D tensor trans_t with 2D mask tensor mask, and set masked values to trans_1.
+    Appropriate for e.g. translations or logits with diffuse_mask
     """
-    return rotmats_t * diffuse_mask[..., None, None] + rotmats_1 * (
-        1 - diffuse_mask[..., None, None]
-    )
+    return trans_t * mask[..., None] + trans_1 * (1 - mask[..., None])
 
 
-def _aatypes_diffuse_mask(aatypes_t, aatypes_1, diffuse_mask):
+def _3d_mask(rotmats_t, rotmats_1, mask) -> torch.Tensor:
     """
-    Mask 1D tensor with 1D mask tensor.
+    Mask 3D tensor rotmats_t with 2D mask tensor mask, and set masked values to rotmats_1.
+    Appropriate for e.g. rotation matrices with diffuse_mask
     """
-    return aatypes_t * diffuse_mask + aatypes_1 * (1 - diffuse_mask)
+    return rotmats_t * mask[..., None, None] + rotmats_1 * (1 - mask[..., None, None])
 
 
 class Interpolant:
     """
-    Interpolant corrupts batches with noise, and generates samples using the learned vector fields.
+    Interpolant is responsible for generating noise, corrupting samples, and sampling from learned vector fields.
 
-    It generates noise for rotations (IGSO3), translations (Gaussian), and amino acid types (masking/uniform),
-    and supports corrupts the input batch with the generated noise.
+    It's primary roles are to:
+    (1) corrupt batches with noise,
+    (2) generates samples, interpolating each modality using the learned vector fields.
 
-    It implements sampling and Euler steps for rotations, translations, and amino acid types.
+    Works across 3 modalties: translations, rotations (i.e. backbone frames), and amino acid types (i.e. sequence).
+
+    (1) Translations
+    - in R^3 and are Euclidean
+    - Noise is Gaussian
+    - Supports minibatch optimal transport (OT)
+    - Supports stochastic paths
+    - Supports Euler sampling (standard flow matching, i.e. Euclidean)
+    (2) Rotations
+    - in SO(3) and are Riemannian
+    - Initial random rotation matrices are generated from uniform SO(3) distribution
+    - Noise is IGSO(3)
+    - Supports stochastic paths
+    - Supports Euler sampling using geodesic (Riemannian flow matching)
+    (3) Amino acid types
+    - are discrete
+    - over either uniform distribution (n=20) or with masks (n=21)
+    - supports Euler steps using learned rate matrix (discrete flow matching)
+    - supports "purity" sampling, i.e. masking by max log probs and re-masking noise
+
+    (Frames a.k.a. Rigids are therefore in SE(3) = R^3 x SO(3))
+    psi torsion angles are not really considered by the interpolant, except when output by the model to generate Rigids.
     """
 
     def __init__(self, cfg: InterpolantConfig):
@@ -219,7 +244,7 @@ class Interpolant:
     @property
     def igso3(self):
         if self._igso3 is None:
-            sigma_grid = torch.linspace(0.1, 1.5, 1000)
+            sigma_grid = torch.linspace(0.1, self.cfg.rots.igso3_sigma, 1000)
             self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=".cache")
         return self._igso3
 
@@ -231,18 +256,13 @@ class Interpolant:
         t = torch.rand(num_batch, device=self._device)
         return t * (1 - 2 * self.cfg.min_t) + self.cfg.min_t
 
-    def _corrupt_trans(self, trans_1, t, res_mask, diffuse_mask):
-        """Corrupt translations from t=1 to t using Gaussian noise."""
-        trans_nm_0 = _centered_gaussian(*res_mask.shape, self._device)
-        trans_0 = trans_nm_0 * NM_TO_ANG_SCALE
-        if self.cfg.trans.batch_ot:
-            trans_0 = self._batch_ot(trans_0, trans_1, diffuse_mask)
-        if self.cfg.trans.train_schedule == InterpolantTranslationsScheduleEnum.linear:
-            trans_t = (1 - t[..., None]) * trans_0 + t[..., None] * trans_1
-        else:
-            raise ValueError(f"Unknown trans schedule {self.cfg.trans.train_schedule}")
-        trans_t = _trans_diffuse_mask(trans_t, trans_1, diffuse_mask)
-        return trans_t * res_mask[..., None]
+    def _compute_sigma_t(self, t: torch.Tensor, scale: float, min_sigma: float = 0.01):
+        """
+        Compute the standard deviation of the IGSO(3) noise at time t.
+        The standard deviation is a parabolic function of t, with a minimum at t=0 and t=1.
+        """
+        sigma_t = scale * torch.sqrt(t * (1 - t) + 1e-4)
+        return torch.clamp(sigma_t, min=min_sigma)
 
     def _batch_ot(self, trans_0, trans_1, res_mask):
         """Compute optimal transport between two batches of translations."""
@@ -265,28 +285,85 @@ class Interpolant:
         noise_perm, gt_perm = linear_sum_assignment(cost_matrix.detach().cpu().numpy())
         return aligned_nm_0[(tuple(gt_perm), tuple(noise_perm))]
 
+    def _corrupt_trans(self, trans_1, t, res_mask, diffuse_mask):
+        """Corrupt translations from t=1 to t using Gaussian noise."""
+        trans_nm_0 = _centered_gaussian(*res_mask.shape, device=self._device)
+        trans_0 = trans_nm_0 * NM_TO_ANG_SCALE
+
+        # compute batch OT
+        if self.cfg.trans.batch_ot:
+            trans_0 = self._batch_ot(trans_0, trans_1, diffuse_mask)
+
+        # compute trans_t
+        if self.cfg.trans.train_schedule == InterpolantTranslationsScheduleEnum.linear:
+            trans_t = (1 - t[..., None]) * trans_0 + t[..., None] * trans_1
+        else:
+            raise ValueError(f"Unknown trans schedule {self.cfg.trans.train_schedule}")
+
+        # stochastic paths
+        if self.cfg.trans.stochastic:
+            # guassian noise added is markovian; just sample from gaussian, scaled by sigma_t, and add.
+            # sigma_t is ~parabolic (and ~0 at t=0 and t=1) so corrupted sample reflects marginal distribution at t.
+            sigma_t = self._compute_sigma_t(
+                t.squeeze(1),  # t is (bs, 1), we need (bs,)
+                scale=self.cfg.trans.stochastic_noise_intensity,
+            )
+            intermediate_noise = _centered_gaussian(
+                *res_mask.shape, device=self._device
+            )  # (bs, N, 3)
+            intermediate_noise = intermediate_noise * sigma_t[..., None]
+            intermediate_noise = intermediate_noise * NM_TO_ANG_SCALE
+            trans_t = trans_t + intermediate_noise
+
+        trans_t = _2d_mask(trans_t, trans_1, diffuse_mask)
+        return trans_t * res_mask[..., None]
+
     def _corrupt_rotmats(self, rotmats_1, t, res_mask, diffuse_mask):
         """Corrupt rotations from t=1 to t using IGSO3."""
         num_batch, num_res = res_mask.shape
-        noisy_rotmats = self.igso3.sample(torch.tensor([1.5]), num_batch * num_res).to(
-            self._device
-        )
+
+        # sample IGSO(3)
+        sigma = torch.tensor([self.cfg.rots.igso3_sigma])
+        noisy_rotmats = self.igso3.sample(sigma, num_batch * num_res).to(self._device)
         noisy_rotmats = noisy_rotmats.reshape(num_batch, num_res, 3, 3)
+
+        # multiple rotations by noise to get t=0 noisy rotations
+        # applying noise as composition ensures noise is relative to reference frame + stay on SO(3)
         rotmats_0 = torch.einsum("...ij,...jk->...ik", rotmats_1, noisy_rotmats)
 
         so3_schedule = self.cfg.rots.train_schedule
-        if so3_schedule == InterpolantRotationsScheduleEnum.exp:
-            so3_t = 1 - torch.exp(-t * self.cfg.rots.exp_rate)
-        elif so3_schedule == InterpolantRotationsScheduleEnum.linear:
+        if so3_schedule == InterpolantRotationsScheduleEnum.linear:
             so3_t = t
+        elif so3_schedule == InterpolantRotationsScheduleEnum.exp:
+            so3_t = 1 - torch.exp(-t * self.cfg.rots.exp_rate)
         else:
             raise ValueError(f"Invalid schedule: {so3_schedule}")
+
+        # interpolate on geodesic between rotmats_0 and rotmats_1 to get rotmats_t
         rotmats_t = so3_utils.geodesic_t(so3_t[..., None], rotmats_1, rotmats_0)
+
+        # stochastic paths
+        if self.cfg.rots.stochastic:
+            # gaussian noise added is markovian; we are sampling intermediate point directly from marginal
+            # so we just need to compute sigma_t for variance of IGSO(3) noise.
+            # compute noise std deviation (mean is just rotmats_t)
+            sigma_t = self._compute_sigma_t(
+                so3_t.squeeze(1),  # t is (bs, 1), we need (bs,)
+                scale=self.cfg.rots.stochastic_noise_intensity,
+            )
+            # multipy rotmats_t by IGSO(3) noise
+            intermediate_noise = self.igso3.sample(sigma_t, num_res).to(self._device)
+            intermediate_noise = intermediate_noise.reshape(num_batch, num_res, 3, 3)
+            rotmats_t = torch.einsum(
+                "...ij,...jk->...ik", rotmats_t, intermediate_noise
+            )
+
+        # set residues not in `res_mask` to identity
         identity = torch.eye(3, device=self._device)
-        rotmats_t = rotmats_t * res_mask[..., None, None] + identity[None, None] * (
-            1 - res_mask[..., None, None]
-        )
-        return _rots_diffuse_mask(rotmats_t, rotmats_1, diffuse_mask)
+        rotmats_t = _3d_mask(rotmats_t, identity[None, None], res_mask)
+
+        # only corrupt residues in `diffuse_mask`
+        return _3d_mask(rotmats_t, rotmats_1, diffuse_mask)
 
     def _corrupt_aatypes(self, aatypes_1, t, res_mask, diffuse_mask):
         """Corrupt AA residues from t=1 to t, using masking or uniform sampling."""
@@ -296,35 +373,40 @@ class Interpolant:
         assert res_mask.shape == (num_batch, num_res)
         assert diffuse_mask.shape == (num_batch, num_res)
 
+        # mask fraction of residues based on t
+        u = torch.rand(num_batch, num_res, device=self._device)
+        aatypes_t = aatypes_1.clone()
+        corruption_mask = u < (1 - t)  # (B, N)
+
         if (
             self.cfg.aatypes.interpolant_type
             == InterpolantAATypesInterpolantTypeEnum.masking
         ):
-            u = torch.rand(num_batch, num_res, device=self._device)
-            aatypes_t = aatypes_1.clone()
-            corruption_mask = u < (1 - t)  # (B, N)
-
+            # For masking interpolant, corrupted residues are set to mask
             aatypes_t[corruption_mask] = MASK_TOKEN_INDEX
-
-            aatypes_t = aatypes_t * res_mask + MASK_TOKEN_INDEX * (1 - res_mask)
 
         elif (
             self.cfg.aatypes.interpolant_type
             == InterpolantAATypesInterpolantTypeEnum.uniform
         ):
-            u = torch.rand(num_batch, num_res, device=self._device)
-            aatypes_t = aatypes_1.clone()
-            corruption_mask = u < (1 - t)  # (B, N)
+            # For uniform interpolant, corrupted residues are set to random logits
             uniform_sample = torch.randint_like(aatypes_t, low=0, high=NUM_TOKENS)
             aatypes_t[corruption_mask] = uniform_sample[corruption_mask]
-
-            aatypes_t = aatypes_t * res_mask + MASK_TOKEN_INDEX * (1 - res_mask)
         else:
             raise ValueError(
                 f"Unknown aatypes interpolant type {self.cfg.aatypes.interpolant_type}"
             )
 
-        return _aatypes_diffuse_mask(aatypes_t, aatypes_1, diffuse_mask)
+        # TODO - determine how to add additional noise
+        #   We only have access to the discrete types here, not the logits / rate matrix
+        #   But we want to be able to add additional noise to the rate matrix on trajectory
+        #   Do we just add additional noise now?
+
+        # residues outside `res_mask` are set to mask.
+        aatypes_t = aatypes_t * res_mask + MASK_TOKEN_INDEX * (1 - res_mask)
+
+        # only corrupt residues in `diffuse_mask`
+        return _1d_mask(aatypes_t, aatypes_1, diffuse_mask)
 
     def corrupt_batch(self, batch):
         """
@@ -383,6 +465,7 @@ class Interpolant:
             cat_t = cat_t[:, None]
 
         else:
+            # t is shared by each domain
             t = self.sample_t(num_batch)[:, None]
             so3_t = t
             r3_t = t
@@ -414,10 +497,13 @@ class Interpolant:
         else:
             aatypes_t = aatypes_1
         noisy_batch[nbp.aatypes_t] = aatypes_t
+
+        # zeroed out self-conditioned values
         noisy_batch[nbp.trans_sc] = torch.zeros_like(trans_1)
         noisy_batch[nbp.aatypes_sc] = torch.zeros_like(aatypes_1)[..., None].repeat(
             1, 1, self.num_tokens
         )
+
         return noisy_batch
 
     def rot_sample_kappa(self, t):
@@ -452,7 +538,18 @@ class Interpolant:
     def _trans_euler_step(self, d_t, t, trans_1, trans_t):
         assert d_t >= 0
         trans_vf = self._trans_vector_field(t, trans_1, trans_t)
-        return trans_t + trans_vf * d_t
+
+        trans_next = trans_t + trans_vf * d_t
+
+        if self.cfg.trans.stochastic:
+            # add gaussian noise scaled by sqrt(dt)
+            trans_next += (
+                torch.randn_like(trans_next)
+                * np.sqrt(d_t)
+                * self.cfg.trans.stochastic_noise_intensity
+            )
+
+        return trans_next
 
     def _rots_euler_step(self, d_t, t, rotmats_1, rotmats_t):
         if self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.linear:
@@ -461,8 +558,27 @@ class Interpolant:
             scaling = self.cfg.rots.exp_rate
         else:
             raise ValueError(f"Unknown sample schedule {self.cfg.rots.sample_schedule}")
-        # TODO: Add in SDE.
-        return so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)
+
+        rotmats_next = so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)
+
+        if self.cfg.rots.stochastic:
+            # Sample IGSO(3) noise with a time-independent sigma_t, scaled by sqrt(dt)
+            # Add IGSO(3) noise to stay on SO(3).
+            # Also scale by `scaling` so the ratio of drift and diffusion is consistent.
+            num_batch, num_res, _, _ = rotmats_t.shape
+            # TODO - determine approprite value for sigma
+            sigma = torch.tensor([1]) * (
+                scaling * self.cfg.rots.stochastic_noise_intensity * np.sqrt(d_t)
+            )
+            intermediate_noise = self.igso3.sample(sigma, num_batch * num_res).to(
+                rotmats_t.device
+            )
+            intermediate_noise = intermediate_noise.reshape(num_batch, num_res, 3, 3)
+            rotmats_next = torch.einsum(
+                "...ij,...jk->...ik", rotmats_next, intermediate_noise
+            )
+
+        return rotmats_next
 
     def _regularize_step_probs(self, step_probs, aatypes_t):
         """
@@ -475,23 +591,21 @@ class Interpolant:
 
         # clamp the probabilities in `step_probs` to the range [0.0, 1.0] to ensure valid probability values.
         step_probs = torch.clamp(step_probs, min=0.0, max=1.0)
+
         # set the probabilities corresponding to the current amino acid types to 0.0
-        # TODO replace with torch._scatter
-        step_probs[
-            torch.arange(batch_size, device=device).repeat_interleave(num_res),
-            torch.arange(num_res, device=device).repeat(batch_size),
-            aatypes_t.long().flatten(),
-        ] = 0.0
+        batch_idx = torch.arange(batch_size, device=device).repeat_interleave(num_res)
+        residue_idx = torch.arange(num_res, device=device).repeat(batch_size)
+        curr_states = aatypes_t.long().flatten()
+        step_probs[batch_idx, residue_idx, curr_states] = 0.0
+
         # adjust the probabilities at the current positions to be the negative sum of all other values in the row
-        step_probs[
-            torch.arange(batch_size, device=device).repeat_interleave(num_res),
-            torch.arange(num_res, device=device).repeat(batch_size),
-            aatypes_t.long().flatten(),
-        ] = (
-            1.0 - torch.sum(step_probs, dim=-1).flatten()
-        )
+        row_sums = torch.sum(step_probs, dim=-1).flatten()
+        step_probs[batch_idx, residue_idx, curr_states] = 1.0 - row_sums
+
         # clamp the probabilities in `step_probs` to the range [0.0, 1.0] to ensure valid probability values.
+        # in case negative or out-of-bound values appear after the diagonal assignment.
         step_probs = torch.clamp(step_probs, min=0.0, max=1.0)
+
         return step_probs
 
     def _aatypes_euler_step(self, d_t, t, logits_1, aatypes_t):
@@ -504,72 +618,89 @@ class Interpolant:
         2. "uniform": Samples new amino acid types uniformly, with the assumption that no MASK tokens are involved.
            Assumes S = 20.
         """
-        batch_size, num_res, S = logits_1.shape
+        # d_t:       float timestep delta
+        # t:         current interpolation time in [0,1]
+        # logits_1:  (B, N, S) unscaled probabilities for each aa
+        # aatypes_t: (B, N) current aa types
+
+        batch_size, num_res, num_states = logits_1.shape
         assert aatypes_t.shape == (batch_size, num_res)
         device = logits_1.device
+
+        temp = self.cfg.aatypes.temp
+        noise = self.cfg.aatypes.noise
 
         if (
             self.cfg.aatypes.interpolant_type
             == InterpolantAATypesInterpolantTypeEnum.masking
         ):
-            assert S == 21
+            assert num_states == 21
 
-            mask_one_hot = torch.zeros((S,), device=device)
-            mask_one_hot[MASK_TOKEN_INDEX] = 1.0
-
+            # set mask to small negative so won't be picked in softmax
             logits_1[:, :, MASK_TOKEN_INDEX] = -1e9
 
-            pt_x1_probs = F.softmax(
-                logits_1 / self.cfg.aatypes.temp, dim=-1
-            )  # (B, D, S)
+            # convert logits to probabilities
+            pt_x1_probs = F.softmax(logits_1 / temp, dim=-1)  # (B, N, S)
 
+            # prepare a (0,0,...1) mask vector to help add masking transitions.
+            mask_one_hot = torch.zeros((num_states,), device=device)
+            mask_one_hot[MASK_TOKEN_INDEX] = 1.0
+
+            # identify which positions are currently mask
             aatypes_t_is_mask = (
                 (aatypes_t == MASK_TOKEN_INDEX).view(batch_size, num_res, 1).float()
             )
+
+            # compute step probabilities (scaled by d_t), with noise and time factoring
             step_probs = (
-                d_t * pt_x1_probs * ((1 + self.cfg.aatypes.noise * t) / ((1 - t)))
-            )  # (B, D, S)
+                d_t * pt_x1_probs * ((1.0 + noise * t) / (1.0 - t))
+            )  # (B, N, S)
+            # add transitions from non-mask to mask as noise
             step_probs += (
-                d_t
-                * (1 - aatypes_t_is_mask)
-                * mask_one_hot.view(1, 1, -1)
-                * self.cfg.aatypes.noise
+                d_t * (1.0 - aatypes_t_is_mask) * mask_one_hot.view(1, 1, -1) * noise
             )
 
+            # force valid rate matrix
             step_probs = self._regularize_step_probs(step_probs, aatypes_t)
 
-            return torch.multinomial(step_probs.view(-1, S), num_samples=1).view(
-                batch_size, num_res
+            # sample new residues from step_probs
+            new_aatypes = torch.multinomial(
+                step_probs.view(-1, num_states), num_samples=1
             )
+            return new_aatypes.view(batch_size, num_res)
         elif (
             self.cfg.aatypes.interpolant_type
             == InterpolantAATypesInterpolantTypeEnum.uniform
         ):
-            assert S == 20
+            assert num_states == 20
             assert (
                 aatypes_t.max() < 20
             ), "No UNK tokens allowed in the uniform sampling step!"
 
-            pt_x1_probs = F.softmax(
-                logits_1 / self.cfg.aatypes.temp, dim=-1
-            )  # (B, D, S)
+            # convert logits to probabilities
+            pt_x1_probs = F.softmax(logits_1 / temp, dim=-1)  # (B, N, S)
 
+            # probability of x1 matching xt exactly
             pt_x1_eq_xt_prob = torch.gather(
                 pt_x1_probs, dim=-1, index=aatypes_t.long().unsqueeze(-1)
             )  # (B, D, 1)
             assert pt_x1_eq_xt_prob.shape == (batch_size, num_res, 1)
 
-            N = self.cfg.aatypes.noise
+            # compute step probabilities (scaled by d_t), with noise and time factoring.
+            # encourages transitions with an additional uniform 'noise' term for the matching residue.
             step_probs = d_t * (
-                pt_x1_probs * ((1 + N + N * (S - 1) * t) / (1 - t))
-                + N * pt_x1_eq_xt_prob
+                pt_x1_probs * ((1.0 + noise + noise * (num_states - 1) * t) / (1.0 - t))
+                + noise * pt_x1_eq_xt_prob
             )
 
+            # force valid rate matrix
             step_probs = self._regularize_step_probs(step_probs, aatypes_t)
 
-            return torch.multinomial(step_probs.view(-1, S), num_samples=1).view(
-                batch_size, num_res
+            # sample new residues from step_probs
+            new_aatypes = torch.multinomial(
+                step_probs.view(-1, num_states), num_samples=1
             )
+            return new_aatypes.view(batch_size, num_res)
         else:
             raise ValueError(
                 f"Unknown aatypes interpolant type {self.cfg.aatypes.interpolant_type}"
@@ -578,75 +709,93 @@ class Interpolant:
     def _aatypes_euler_step_purity(self, d_t, t, logits_1, aatypes_t):
         """
         Perform an Euler step with a focus on maintaining "purity" by selectively unmasking and updating
-        amino acid types.
+        amino acid types. This function is designed specifically for the "masking" interpolant type, where S = 21.
 
-        This function is designed specifically for the "masking" interpolant type, where S = 21. It prioritizes
-        unmasking residues based on their maximum log-probabilities and re-masks some positions with a probability
-        proportional to the noise term.
+        This function identifies masked residues, then picks some number to unmask based on their maximum
+        log-probabilities, then re-masks some positions proportional to noise.
         """
-        batch_size, num_res, S = logits_1.shape
+        batch_size, num_res, num_states = logits_1.shape
+        device = logits_1.device
+
         assert aatypes_t.shape == (batch_size, num_res)
-        assert S == 21
         assert (
             self.cfg.aatypes.interpolant_type
             == InterpolantAATypesInterpolantTypeEnum.masking
         )
-        device = logits_1.device
+        assert (
+            num_states == 21
+        ), "Purity-based unmasking only works with masking interpolant type"
 
-        logits_1_wo_mask = logits_1[:, :, 0:-1]  # (B, D, S-1)
-        pt_x1_probs = F.softmax(
-            logits_1_wo_mask / self.cfg.aatypes.temp, dim=-1
-        )  # (B, D, S-1)
-        # step_probs = (d_t * pt_x1_probs * (1/(1-t))).clamp(max=1) # (B, D, S-1)
-        max_logprob = torch.max(torch.log(pt_x1_probs), dim=-1)[0]  # (B, D)
-        # bias so that only currently masked positions get chosen to be unmasked
-        max_logprob = max_logprob - (aatypes_t != MASK_TOKEN_INDEX).float() * 1e9
-        sorted_max_logprobs_idcs = torch.argsort(
+        temp = self.cfg.aatypes.temp
+        noise = self.cfg.aatypes.noise
+
+        # remove mask dimension to handle only the 20 valid aa states. mask is 21.
+        logits_1_wo_mask = logits_1[:, :, : (num_states - 1)]  # (B, N, S-1)
+        # convert logits to probabilities for the non-mask states
+        pt_x1_probs = F.softmax(logits_1_wo_mask / temp, dim=-1)  # (B, N, S-1)
+        # find maximum log prob among valid states
+        max_logprob = torch.log(pt_x1_probs).max(dim=-1)[0]  # (B, N)
+        # bias so only currently masked are favored for unmasking
+        max_logprob -= (aatypes_t != MASK_TOKEN_INDEX).float() * 1e9
+        # sort positions by descending maximum log-prob (highest to lowest)
+        sorted_max_logprob_indices = torch.argsort(
             max_logprob, dim=-1, descending=True
-        )  # (B, D)
+        )  # (B, N)
 
-        unmask_probs = (
-            d_t * ((1 + self.cfg.aatypes.noise * t) / (1 - t)).to(device)
-        ).clamp(
-            max=1
-        )  # scalar
-
+        # determine how many masked residues to unmask
+        # probability of unmasking is scaled by d_t, noise, and time
+        unmask_probs = (d_t * ((1.0 + noise * t) / (1.0 - t))).clamp(max=1.0)  # scalar
+        masked_counts = (aatypes_t == MASK_TOKEN_INDEX).sum(dim=-1).float()  # (B,)
         number_to_unmask = torch.binomial(
-            count=torch.count_nonzero(aatypes_t == MASK_TOKEN_INDEX, dim=-1).float(),
-            prob=unmask_probs,
-        )
+            count=masked_counts, prob=unmask_probs
+        )  # (B,)
+
+        # sample new residues for unmasked positions from pt_x1_probs
+        # we'll assign these new residues to top 'number_to_unmask' positions
         unmasked_samples = torch.multinomial(
-            pt_x1_probs.view(-1, S - 1), num_samples=1
-        ).view(batch_size, num_res)
-
-        # Vectorized version of:
-        # for b in range(B):
-        #     for d in range(D):
-        #         if d < number_to_unmask[b]:
-        #             aatypes_t[b, sorted_max_logprobs_idcs[b, d]] = unmasked_samples[b, sorted_max_logprobs_idcs[b, d]]
-
-        D_grid = torch.arange(num_res, device=device).view(1, -1).repeat(batch_size, 1)
-        mask1 = (D_grid < number_to_unmask.view(-1, 1)).float()
-        inital_val_max_logprob_idcs = (
-            sorted_max_logprobs_idcs[:, 0].view(-1, 1).repeat(1, num_res)
+            pt_x1_probs.view(-1, num_states - 1), num_samples=1
         )
-        masked_sorted_max_logprobs_idcs = (
-            mask1 * sorted_max_logprobs_idcs + (1 - mask1) * inital_val_max_logprob_idcs
-        ).long()
+        unmasked_samples = unmasked_samples.view(batch_size, num_res)
+
+        # Next lines are vectorized version of:
+        # for b in range(B):
+        #     for n in range(N):
+        #         if n < number_to_unmask[b]:
+        #             aatypes_t[b, sorted_max_logprob_indices[b, n]] = unmasked_samples[b, sorted_max_logprob_indices[b, d]]
+
+        # create a mask that indicates top positions to unmask in each batch
+        D_grid = (
+            torch.arange(num_res, device=device).unsqueeze(0).expand(batch_size, -1)
+        )  # (B, N)
+        # 'mask1' is 1 where d < number_to_unmask[b], 0 otherwise
+        mask1 = (D_grid < number_to_unmask.view(-1, 1)).float()
+
+        # if 0 to unmask, we set sorted_max_logprob_indices[:, 0] for all positions
+        fallback = sorted_max_logprob_indices[:, 0].view(-1, 1).repeat(1, num_res)
+        selected_indices = (mask1 * sorted_max_logprob_indices) + (
+            (1.0 - mask1) * fallback
+        )
+        selected_indices = selected_indices.long()
+
+        # 'mask2' indicates precisely which positions in aatypes_t we replace
         mask2 = torch.zeros((batch_size, num_res), device=device)
         mask2.scatter_(
             dim=1,
-            index=masked_sorted_max_logprobs_idcs,
+            index=selected_indices,
             src=torch.ones((batch_size, num_res), device=device),
         )
-        unmask_zero_row = (number_to_unmask == 0).view(-1, 1).repeat(1, num_res).float()
-        mask2 = mask2 * (1 - unmask_zero_row)
-        aatypes_t = aatypes_t * (1 - mask2) + unmasked_samples * mask2
+        # if zero are unmasked, we skip altogether
+        none_unmasked_mask = (number_to_unmask == 0).unsqueeze(-1).float()
+        mask2 *= 1.0 - none_unmasked_mask
 
-        # re-mask
-        u = torch.rand(batch_size, num_res, device=self._device)
-        re_mask_mask = (u < d_t * self.cfg.aatypes.noise).float()
-        aatypes_t = aatypes_t * (1 - re_mask_mask) + MASK_TOKEN_INDEX * re_mask_mask
+        # update unmasked positions in aatypes_t
+        aatypes_t = aatypes_t * (1.0 - mask2) + unmasked_samples * mask2
+
+        # re-mask some positions as noise with probability (d_t * noise)
+        re_mask_prob = d_t * noise
+        rand_vals = torch.rand(batch_size, num_res, device=device)
+        re_mask_mask = (rand_vals < re_mask_prob).float()
+        aatypes_t = aatypes_t * (1.0 - re_mask_mask) + (MASK_TOKEN_INDEX * re_mask_mask)
 
         return aatypes_t
 
@@ -656,34 +805,46 @@ class Interpolant:
         num_res: int,
         model,
         task: InferenceTaskEnum,
-        num_timesteps=None,
-        trans_0=None,
-        rotmats_0=None,
-        psis_0=None,
-        aatypes_0=None,
-        trans_1=None,
-        rotmats_1=None,
-        psis_1=None,
-        aatypes_1=None,
-        diffuse_mask=None,
-        chain_idx=None,
-        res_idx=None,
-        t_nn=None,
+        num_timesteps: Optional[int] = None,
+        trans_0: Optional[torch.Tensor] = None,
+        rotmats_0: Optional[torch.Tensor] = None,
+        psis_0: Optional[torch.Tensor] = None,
+        aatypes_0: Optional[torch.Tensor] = None,
+        trans_1: Optional[torch.Tensor] = None,
+        rotmats_1: Optional[torch.Tensor] = None,
+        psis_1: Optional[torch.Tensor] = None,
+        aatypes_1: Optional[torch.Tensor] = None,
+        diffuse_mask: Optional[torch.Tensor] = None,
+        chain_idx: Optional[torch.Tensor] = None,
+        res_idx: Optional[torch.Tensor] = None,
+        # t_nn is model/function that generates explicit time steps (r3, so3, cat) given t
+        t_nn: Union[Callable[[torch.Tensor], torch.Tensor], Any] = None,
         separate_t: bool = False,
     ) -> Tuple[SamplingTrajectory, SamplingTrajectory]:
         """
         Generate samples using the learned vector fields.
-        Returns two trajectories:
-        1) protein_trajectory / predicted states - processed outputs and intermediate steps resulting from integration
-        2) model_trajectory / clean states - model output without noise / processing. Includes logits.
-
-        Generates initially noise batch, samples using Euler steps for rotations, translations, and amino acid types.
         Special handling for forward folding, reverse folding, and separate t.
 
+        Returns two trajectories:
+        1) protein_trajectory / predicted states - processed outputs and intermediate steps resulting from integration.
+        2) model_trajectory / clean states - model output without noise / processing. Includes logits.
+
         Note that while sample operates on backbones, the emitted structures are all-atom (i.e. atom37).
+
+        The general process is:
+        - generate the initial noisy batch, using optional inputs if provided
+        - sample over time-steps
+            - updating translations, rotations, and amino acid types at each time step
+            - generate rigids from the updated frames
+        - perform the final step after the loop
         """
 
         res_mask = torch.ones(num_batch, num_res, device=self._device)
+
+        # TODO support stochastic sampling
+        #   determine if noise added this function, or in euler steps
+        # TODO - should we use stochastic cfg values for trans and rots, why a global cfg?
+        sde = self.cfg.sampling.do_sde
 
         # Prepare for task-specific behavior
         # TODO - convert code to switch statements, support adding another task
@@ -695,7 +856,8 @@ class Interpolant:
         if trans_0 is None:
             # Generate centered Gaussian noise for translations (shape: [num_batch, num_res, 3])
             trans_0 = (
-                _centered_gaussian(num_batch, num_res, self._device) * NM_TO_ANG_SCALE
+                _centered_gaussian(num_batch, num_res, device=self._device)
+                * NM_TO_ANG_SCALE
             )
         if rotmats_0 is None:
             # Generate uniform SO(3) rotation matrices (shape: [num_batch, num_res, 3, 3])
@@ -726,13 +888,14 @@ class Interpolant:
             ].repeat(num_batch, 1)
 
         if chain_idx is None:
-            # Default: assumes monomer
+            # Default: assumes fully-considered monomer (i.e. ~ `torch.ones`)
             chain_idx = res_mask
 
         if diffuse_mask is None:
             # Default: diffuse all residues
             diffuse_mask = res_mask
 
+        # no self-conditioning during sampling
         trans_sc = torch.zeros(num_batch, num_res, 3, device=self._device)
         aatypes_sc = torch.zeros(
             num_batch, num_res, self.num_tokens, device=self._device
@@ -753,7 +916,7 @@ class Interpolant:
         ts = torch.linspace(self.cfg.min_t, 1.0, num_timesteps)
         t_1 = ts[0]
 
-        # Initialize t_1 values for translations, rotations, and aatypes
+        # Initialize t_1 values for translations, rotations, psi, and aatypes
         if trans_1 is None:
             trans_1 = torch.zeros(num_batch, num_res, 3, device=self._device)
         if rotmats_1 is None:
@@ -901,18 +1064,15 @@ class Interpolant:
                 pred_rotmats_1 = rotmats_1
 
             if self.cfg.self_condition:
-                batch[nbp.trans_sc] = _trans_diffuse_mask(
-                    pred_trans_1, trans_1, diffuse_mask
-                )
+                batch[nbp.trans_sc] = _2d_mask(pred_trans_1, trans_1, diffuse_mask)
                 if forward_folding:
                     batch[nbp.aatypes_sc] = logits_1
                 else:
-                    # TODO - bug? use _aatypes_diffuse_mask? Or just using because 2D?
-                    batch[nbp.aatypes_sc] = _trans_diffuse_mask(
+                    batch[nbp.aatypes_sc] = _2d_mask(
                         pred_logits_1, logits_1, diffuse_mask
                     )
 
-            # Take reverse step
+            # Take next step
             # Move from current structure/sequence at t_1, taking d_t Euler step toward t_2
             d_t = t_2 - t_1
             trans_t_2 = self._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
@@ -931,11 +1091,11 @@ class Interpolant:
                 )
 
             # Only update the masked residues
-            trans_t_2 = _trans_diffuse_mask(trans_t_2, trans_1, diffuse_mask)
-            rotmats_t_2 = _rots_diffuse_mask(rotmats_t_2, rotmats_1, diffuse_mask)
-            aatypes_t_2 = _aatypes_diffuse_mask(aatypes_t_2, aatypes_1, diffuse_mask)
+            trans_t_2 = _2d_mask(trans_t_2, trans_1, diffuse_mask)
+            rotmats_t_2 = _3d_mask(rotmats_t_2, rotmats_1, diffuse_mask)
+            aatypes_t_2 = _1d_mask(aatypes_t_2, aatypes_1, diffuse_mask)
             if psi_t_2 is not None:
-                psi_t_2 = _trans_diffuse_mask(psi_t_2, psis_1, diffuse_mask)
+                psi_t_2 = _2d_mask(psi_t_2, psis_1, diffuse_mask)
 
             # Add to trajectory
             protein_trajectory.append(
