@@ -27,7 +27,7 @@ from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingDataset
-from cogeneration.dataset.protein_dataloader import ProteinData
+from cogeneration.dataset.protein_dataloader import LengthBatcher, ProteinData
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
 
@@ -61,8 +61,11 @@ def public_weights_path() -> Path:
 
 
 @pytest.fixture
-def mock_cfg(tmp_path) -> Config:
-    """mock_cfg fixture defines default nested config"""
+def mock_cfg_uninterpolated(tmp_path) -> Config:
+    """
+    mock_cfg_uninterpolated fixture defines default test config.
+    It is not yet interpolated, so parameters like those in `shared` can be modified before interpolation.
+    """
     raw_cfg = Config()
 
     # set to local mode, impacting accelerator etc.
@@ -70,6 +73,10 @@ def mock_cfg(tmp_path) -> Config:
 
     # default to tiny model for faster model evaluations
     raw_cfg.model.hyper_params = ModelHyperParamsConfig.tiny()
+    raw_cfg.model.edge_features.feat_dim = 8
+    # and smaller transformer
+    raw_cfg.model.ipa.no_heads = 2
+    raw_cfg.model.ipa.num_blocks = 2
 
     # filter to small PDBs for faster model + sampling
     raw_cfg.dataset.filter.min_num_res = 20
@@ -80,32 +87,60 @@ def mock_cfg(tmp_path) -> Config:
     raw_cfg.inference.predict_dir = str(tmp_path / "inference")
 
     # limit number of lengths sampled for validation / inference
-    raw_cfg.inference.interpolant.sampling.num_timesteps = 10
+    raw_cfg.interpolant.sampling.num_timesteps = 3
+    raw_cfg.inference.interpolant.sampling.num_timesteps = 3
     raw_cfg.inference.samples.samples_per_length = 2
     raw_cfg.inference.samples.length_subset = [10, 30]
-    raw_cfg.interpolant.sampling.num_timesteps = 10
     raw_cfg.dataset.samples_per_eval_length = 2
     raw_cfg.dataset.num_eval_lengths = 1
     # shortest validation samples in public data are 60 residues
     raw_cfg.dataset.max_eval_length = 63
 
-    return raw_cfg.interpolate()
+    return raw_cfg
 
 
 @pytest.fixture
-def pdb_noisy_batch(mock_cfg):
+def mock_cfg(mock_cfg_uninterpolated) -> Config:
+    """
+    mock_cfg fixture defines default test config.
+    """
+    return mock_cfg_uninterpolated.interpolate()
+
+
+def create_pdb_noisy_batch(cfg: Config):
     dataset_constructor = DatasetConstructor.pdb_train_validation(
-        dataset_cfg=mock_cfg.dataset,
+        dataset_cfg=cfg.dataset,
     )
     train_dataset, valid_dataset = dataset_constructor.create_datasets()
 
+    # TODO - enable batches > 1
+    # # batch sampler required to sample batch size > 1
+    # # we borrow convention from MultiFlow to batch by length rather than pad
+    # batch_sampler = LengthBatcher(
+    #     sampler_cfg=mock_cfg.data.sampler,
+    #     metadata_csv=train_dataset.csv,
+    #     rank=0,
+    #     num_replicas=1,
+    # )
+    #
+    # dataloader = DataLoader(
+    #     train_dataset,
+    #     batch_sampler=batch_sampler,
+    #     num_workers=0,
+    # )
+
     dataloader = DataLoader(train_dataset, batch_size=1)
-    interpolant = Interpolant(mock_cfg.interpolant)
+    interpolant = Interpolant(cfg.interpolant)
 
     raw_feats = next(iter(dataloader))
     input_feats = interpolant.corrupt_batch(raw_feats)
 
     return input_feats
+
+
+@pytest.fixture
+def pdb_noisy_batch(mock_cfg):
+    return create_pdb_noisy_batch(mock_cfg)
 
 
 class MockDataset(Dataset):
@@ -133,7 +168,7 @@ class MockDataset(Dataset):
         input_feats[bp.csv_idx] = torch.tensor([0])
 
         # generate corrupted noisy values for input_feats
-        t = torch.rand(1)  # use same value but really they are independent
+        t = torch.rand(1)  # use same value as with unconditional + not separate_t
         input_feats[nbp.so3_t] = t
         input_feats[nbp.r3_t] = t
         input_feats[nbp.cat_t] = t
@@ -232,6 +267,7 @@ def mock_folding_validation(tmp_path):
                     all_atom.atom37_from_trans_rot(
                         trans=batch[bp.trans_1],
                         rots=batch[bp.rotmats_1],
+                        psi_torsions=batch[bp.torsion_angles_sin_cos_1][..., 2, :],
                     )
                     .cpu()
                     .detach()
@@ -332,7 +368,11 @@ def mock_checkpoint(mock_folding_validation):
 
         # set up trainer
         module = FlowModule(cfg)
-        trainer = Trainer(**asdict(cfg.experiment.trainer))
+        trainer_cfg = {
+            "max_steps": 1,  # curtail actual training
+            **asdict(cfg.experiment.trainer),
+        }
+        trainer = Trainer(**trainer_cfg)
 
         # call `fit()` to set the model
         trainer.fit(module, datamodule=datamodule)

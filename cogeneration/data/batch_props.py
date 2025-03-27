@@ -13,7 +13,8 @@ class BatchProps(StrEnum):
     aatypes_1 = "aatypes_1"  # amino acid sequence
     trans_1 = "trans_1"  # frame translations
     rotmats_1 = "rotmats_1"  # frame rotations
-    torsion_angles_sin_cos_1 = "torsion_angles_sin_cos_1"  # torsion angles
+    # torsion angles: only predict 1 in model to guide frames; take `[..., 2, :]` from ground truth.
+    torsion_angles_sin_cos_1 = "torsion_angles_sin_cos_1"
     # structure metadata
     num_res = "num_res"  # number of residues in the protein. Defined for unconditional batches
     chain_idx = "chain_idx"  # re-indexed chain index (chains are shuffled)
@@ -39,14 +40,14 @@ class NoisyBatchProps(StrEnum):
     Properties at time `t` (i.e. `"_t"`) are data with noise added, scaled by `t`. t=0 is pure noise.
     """
 
-    cat_t = "cat_t"  # t for amino acids (categoricals)
-    so3_t = "so3_t"  # t for SO3 (rotations)
-    r3_t = "r3_t"  # t for R3 (translations)
-    trans_t = "trans_t"  # (N, 3) tensor, translations @ t
-    rotmats_t = "rotmats_t"  # (N, 3, 3) tensor, rotations @ t
-    aatypes_t = "aatypes_t"  # (N) tensor, predicted amino acids @ t
-    trans_sc = "trans_sc"  # (N, 3) tensor, self-conditioned pred translations @ t
-    aatypes_sc = "aatypes_sc"  # (N, 21) tensor, self-conditioned pred sequence @ t, including mask token
+    cat_t = "cat_t"  # (bs, N, 1) tensor, t for amino acids (categoricals)
+    so3_t = "so3_t"  # (bs, N, 1) tensor, t for SO3 (rotations)
+    r3_t = "r3_t"  # (bs, N, 1) tensor, t for R3 (translations)
+    trans_t = "trans_t"  # (bs, N, 3) tensor, translations @ t
+    rotmats_t = "rotmats_t"  # (bs, N, 3, 3) tensor, rotations @ t
+    aatypes_t = "aatypes_t"  # (bs, N) tensor, predicted amino acids @ t
+    trans_sc = "trans_sc"  # (bs, N, 3) tensor, self-conditioned pred translations @ t
+    aatypes_sc = "aatypes_sc"  # (bs, N, 21) tensor, self-conditioned pred sequence @ t, including mask token
 
     def __str__(self):
         return self.value
@@ -59,7 +60,7 @@ class PredBatchProps(StrEnum):
 
     pred_trans = "pred_trans"
     pred_rotmats = "pred_rotmats"
-    pred_psi = "pred_psi"
+    pred_psi = "pred_psi"  # optionally output
     pred_logits = "pred_logits"
     pred_aatypes = "pred_aatypes"
 

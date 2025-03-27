@@ -252,6 +252,8 @@ class FlowModule(LightningModule):
         r3_t = noisy_batch[nbp.r3_t]  # (B, 1)
         so3_t = noisy_batch[nbp.so3_t]  # (B, 1)
         cat_t = noisy_batch[nbp.cat_t]  # (B, 1)
+
+        # losses for each domain scaled at `1 - min(t, clip)` (i.e. higher as t -> 1)
         r3_norm_scale = 1 - torch.min(
             r3_t[..., None], torch.tensor(training_cfg.t_normalize_clip)
         )  # (B, 1, 1)
@@ -305,7 +307,6 @@ class FlowModule(LightningModule):
             * torch.sum(trans_error**2 * loss_mask[..., None], dim=(-1, -2))
             / (loss_denom_num_res * 3)
         )
-        trans_loss = torch.clamp(trans_loss, max=5)
 
         # Rotation VF loss
         rots_vf_error = (gt_rot_vf - pred_rots_vf) / so3_norm_scale
@@ -316,6 +317,8 @@ class FlowModule(LightningModule):
         )
 
         # TODO consider explicit rotation loss (see FoldFlow2)
+
+        # TODO consider explicit `psi` loss?
 
         # Backbone atom loss
         pred_bb_atoms = all_atom.to_atom37(pred_trans_1, pred_rotmats_1, pred_psi_1)[
@@ -367,6 +370,9 @@ class FlowModule(LightningModule):
             so3_t[:, 0] > training_cfg.aux_loss_t_pass
         )
         auxiliary_loss *= training_cfg.aux_loss_weight
+
+        # clamp certain loss terms
+        trans_loss = torch.clamp(trans_loss, max=5)
         auxiliary_loss = torch.clamp(auxiliary_loss, max=5)
 
         # Total loss
@@ -445,16 +451,14 @@ class FlowModule(LightningModule):
 
         batch_losses = self.model_step(noisy_batch)
 
-        # TODO - move all loss terms to use struct rather than property accessors
-        #   (ideally TrainingLosses could be used as a schema)
-
-        num_batch = batch_losses["trans_loss"].shape[0]
-        total_losses = {k: torch.mean(v) for k, v in batch_losses.items()}
-
         # Log the calculated and other losses we want to track
+
+        num_batch = batch_losses.trans_loss.shape[0]
+        total_losses = {k: torch.mean(v) for k, v in batch_losses.items()}
         for k, v in total_losses.items():
             self._log_scalar(f"train/{k}", v, prog_bar=False, batch_size=num_batch)
-        # Stratified across t.
+
+        # log t
         so3_t = torch.squeeze(noisy_batch[nbp.so3_t])
         self._log_scalar(
             "train/so3_t",
@@ -473,6 +477,8 @@ class FlowModule(LightningModule):
             prog_bar=False,
             batch_size=num_batch,
         )
+
+        # Stratified losses across t.
         for loss_name, loss_dict in batch_losses.items():
             if loss_name == "rots_vf_loss":
                 batch_t = so3_t
@@ -481,6 +487,7 @@ class FlowModule(LightningModule):
             elif loss_name == "trans_loss":
                 batch_t = r3_t
             elif loss_name == "psi_loss":
+                # torsion angles are more impacted by rotation than translation (?)
                 batch_t = so3_t
             elif loss_name == "auxiliary_loss":
                 batch_t = r3_t
@@ -504,6 +511,7 @@ class FlowModule(LightningModule):
         step_time = time.time() - step_start_time
         self._log_scalar("train/examples_per_second", num_batch / step_time)
 
+        # log final loss explicitly (though it's already logged as `train_loss`)
         train_loss = total_losses["train_loss"]
         self._log_scalar("train/loss", train_loss, batch_size=num_batch)
 

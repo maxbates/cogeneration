@@ -113,7 +113,10 @@ class LengthBatcher:
 
         # Each replica needs the same number of batches. We set the number
         # of batches to arbitrarily be the number of examples per replica.
-        if "cluster" in self._data_csv.columns:
+        if (
+            "cluster" in self._data_csv.columns
+            and not (self._data_csv.cluster.isna()).all()
+        ):
             num_batches = self._data_csv["cluster"].nunique()
         else:
             num_batches = len(self._data_csv)
@@ -129,7 +132,7 @@ class LengthBatcher:
         )
 
     def _sample_indices(self):
-        if "cluster" in self._data_csv:
+        if "cluster" in self._data_csv and not (self._data_csv.cluster.isna()).all():
             cluster_sample = self._data_csv.groupby("cluster").sample(
                 1, random_state=self.seed + self.epoch
             )

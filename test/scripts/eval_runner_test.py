@@ -40,10 +40,13 @@ class TestEvalRunner:
     def test_sampling_and_compute_metrics(
         self, mock_cfg, mock_checkpoint, mock_folding_validation, tmp_path
     ):
+        # This is a long-running end-to-end test that performs sampling and computes metrics.
+
         # create a dummy checkpoint
         ckpt_cfg_path, ckpt_path = mock_checkpoint(cfg=mock_cfg, path=tmp_path)
 
         # update config with the checkpoint
+        # TODO - consider returning updated config from `mock_checkpoint`
         assert mock_cfg.inference.task == InferenceTaskEnum.unconditional
         mock_cfg.inference.unconditional_ckpt_path = str(ckpt_path)
 
@@ -52,10 +55,9 @@ class TestEvalRunner:
         # only sample one sample
         # TODO - support multiple samples
         #   We need to mock folding validation for all samples in pred dataloader.
+        n_samples_expected = 1
         mock_cfg.inference.samples.samples_per_length = 1
         mock_cfg.inference.samples.length_subset = [23]
-
-        n_samples_expected = 1
 
         sampler = EvalRunner(cfg=mock_cfg)
 

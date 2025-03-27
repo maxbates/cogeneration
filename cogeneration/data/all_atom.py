@@ -154,7 +154,7 @@ def frames_to_atom14_pos(
 
 
 def compute_backbone(
-    bb_rigids: torch.Tensor, psi_torsions: Optional[torch.Tensor] = None
+    rigid: Rigid, psi_torsions: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the backbone atoms from the rigid groups and torsion angles.
@@ -162,21 +162,22 @@ def compute_backbone(
     Generates atom37 backbone, atom37 mask, residue types, and atom14 backbone.
     """
     if psi_torsions is None:
-        psi_torsions = torch.zeros(bb_rigids.shape[:-1] + (2,), device=bb_rigids.device)
+        # rigid shape is (bs, N), add one dimension for 2 angles (i.e. 1 torsion)
+        psi_torsions = torch.zeros(rigid.shape[:] + (2,), device=rigid.device)
 
     torsion_angles = torch.tile(
         psi_torsions[..., None, :],
-        tuple([1 for _ in range(len(bb_rigids.shape))]) + (7, 1),
+        tuple([1 for _ in range(len(rigid.shape))]) + (7, 1),
     )
-    aatype = torch.zeros(bb_rigids.shape, device=bb_rigids.device).long()
-    # aatype = torch.zeros(bb_rigids.shape).long().to(bb_rigids.device)
+    aatype = torch.zeros(rigid.shape, device=rigid.device).long()
+
     all_frames = torsion_angles_to_frames(
-        bb_rigids,
-        torsion_angles,
-        aatype,
+        r=rigid,
+        alpha=torsion_angles,
+        aatype=aatype,
     )
     atom14_pos = frames_to_atom14_pos(all_frames, aatype)
-    atom37_bb_pos = torch.zeros(bb_rigids.shape + (37, 3), device=bb_rigids.device)
+    atom37_bb_pos = torch.zeros(rigid.shape + (37, 3), device=rigid.device)
     # atom14 bb order = ['N', 'CA', 'C', 'O', 'CB']
     # atom37 bb order = ['N', 'CA', 'C', 'CB', 'O']
     atom37_bb_pos[..., :3, :] = atom14_pos[..., :3, :]

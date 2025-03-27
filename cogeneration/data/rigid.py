@@ -17,7 +17,7 @@ def remove_com_from_tensor_7(tensor_7):
     return rigid.to_tensor_7()
 
 
-def create_rigid(rots, trans):
+def create_rigid(rots: torch.Tensor, trans: torch.Tensor) -> Rigid:
     rots = ru.Rotation(rot_mats=rots)
     return Rigid(rots=rots, trans=trans)
 

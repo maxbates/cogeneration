@@ -883,7 +883,7 @@ class BaseSampleSO3(nn.Module):
         Create a series of samples from the IGSO(3) angle distribution.
 
         Args:
-            sigma (torch.Tensor): Indices of the IGSO3 std deves for which to
+            sigma (torch.Tensor): 1D(?) Indices of the IGSO3 std deves for which to
               take samples.
             num_samples (int): Number of angle samples to take for each std dev.
 
