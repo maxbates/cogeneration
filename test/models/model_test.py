@@ -1,6 +1,8 @@
+import pytest
 import torch
 
 from cogeneration.config.base import Config, ModelConfig, ModelSequencePredictionEnum
+from cogeneration.data.batch_props import BatchProps as bp
 from cogeneration.models.model import FlowModel
 
 
@@ -14,11 +16,29 @@ class TestFlowModel:
         output = model(pdb_noisy_batch)
         assert output is not None
 
-    def test_forward_mock_dataloader(self, mock_cfg, pdb_noisy_batch, mock_dataloader):
+    @pytest.mark.parametrize(
+        "mock_dataloader",
+        [
+            {"batch_size": 1, "sample_lengths": [10]},
+            {"batch_size": 1, "sample_lengths": [10, 12]},
+            {
+                "batch_size": 2,
+                "sample_lengths": [10, 10],
+            },  # batches must be same length
+            {
+                "batch_size": 2,
+                "sample_lengths": [12, 12, 8, 8],
+            },  # batches must be same length
+        ],
+        indirect=True,
+    )
+    def test_forward_mock_dataloader(self, mock_cfg, mock_dataloader):
         model = FlowModel(mock_cfg.model)
-        input_feats = next(iter(mock_dataloader))
-        output = model(input_feats)
-        assert output is not None
+
+        for batch in mock_dataloader:
+            assert batch is not None
+            output = model(batch)
+            assert output is not None
 
     def test_model_torch_compiles(self, mock_cfg, pdb_noisy_batch):
         model = FlowModel(mock_cfg.model)

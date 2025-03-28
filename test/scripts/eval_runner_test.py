@@ -9,12 +9,14 @@ from cogeneration.scripts.predict import EvalRunner
 class TestEvalRunner:
     def test_init(self):
         # use actual config, so parameters match public multiflow we are loading from checkpoint
+        # TODO - migrate to a `public_multiflow` classmethod
         cfg = Config().interpolate()
 
         _ = EvalRunner(cfg=cfg)
 
     def test_can_load_public_weights_with_default_config(self, public_weights_path):
         # use actual config, so parameters match public multiflow we are loading from checkpoint
+        # TODO - migrate to a `public_multiflow` classmethod
         cfg = Config().interpolate()
 
         # create EvalRunner, merge configs, which creates merged checkpoint
@@ -69,7 +71,7 @@ class TestEvalRunner:
         mock_folding_validation(
             batch=pred_batch,
             cfg=mock_cfg,
-            n_inverse_folds=8,  # prediction
+            n_inverse_folds=mock_cfg.folding.seq_per_sample,  # prediction
         )
 
         # run sampling

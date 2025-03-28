@@ -449,7 +449,7 @@ class FoldingValidator:
 
         os.makedirs(output_dir, exist_ok=True)
 
-        # NOTE - appears public MultiFlow only runs model 4, but may want to consider running others.
+        # NOTE - public MultiFlow only runs model 4, but may want to consider running others.
 
         af2_args = [
             self.cfg.colabfold_path,
@@ -664,18 +664,28 @@ class FoldingValidator:
 
             # If provided ground truth bb positions, also compare to them
             if true_bb_positions is not None:
+                # Ideally we could reshape once, outside the loop, but safer to access to row's sample_length here
                 sample_length = res_mask.shape[0]
-                assert true_bb_positions.shape == (sample_length, 37, 3)
-                true_bb_positions = true_bb_positions[:, :3, :].reshape(-1, 3)
-                assert true_bb_positions.shape == (sample_length * 3, 3)
-                assert true_bb_positions.shape == sample_bb_pos.shape
-                assert true_bb_positions.shape == folded_bb_pos.shape
+                assert true_bb_positions.shape == (
+                    sample_length,
+                    37,
+                    3,
+                ), f"Invalid true_bb_positions shape {true_bb_positions.shape}"
+                true_bb_pos = true_bb_positions[:, :3, :].reshape(
+                    -1, 3
+                )  # rename for reshape
+                assert true_bb_pos.shape == (
+                    sample_length * 3,
+                    3,
+                ), f"Invalid true_bb_positions shape {true_bb_pos.shape}"
+                assert true_bb_pos.shape == sample_bb_pos.shape
+                assert true_bb_pos.shape == folded_bb_pos.shape
 
                 sample_metrics[MetricName.bb_rmsd_gt] = _calc_bb_rmsd(
-                    res_mask, sample_bb_pos, true_bb_positions
+                    res_mask, sample_bb_pos, true_bb_pos
                 )
                 sample_metrics[MetricName.bb_rmsd_folded_gt] = _calc_bb_rmsd(
-                    res_mask, folded_bb_pos, true_bb_positions
+                    res_mask, folded_bb_pos, true_bb_pos
                 )
 
             all_metrics.append(sample_metrics)

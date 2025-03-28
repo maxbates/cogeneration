@@ -311,7 +311,7 @@ class Interpolant:
             intermediate_noise = _centered_gaussian(
                 *res_mask.shape, device=self._device
             )  # (bs, N, 3)
-            intermediate_noise = intermediate_noise * sigma_t[..., None]
+            intermediate_noise = intermediate_noise * sigma_t[..., None, None]
             intermediate_noise = intermediate_noise * NM_TO_ANG_SCALE
             trans_t = trans_t + intermediate_noise
 

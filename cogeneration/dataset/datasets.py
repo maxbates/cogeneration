@@ -307,6 +307,8 @@ class BaseDataset(Dataset):
             self._log.info(
                 f"Validation: {len(self.csv)} examples with lengths {eval_lengths}"
             )
+
+        # reset index
         self.csv[dc.index] = list(range(len(self.csv)))
 
     def _process_processed_path(self, processed_file_path: str) -> Dict[str, Any]:

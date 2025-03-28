@@ -760,7 +760,6 @@ class Config:
     """
 
     shared: SharedConfig = field(default_factory=SharedConfig)
-
     data: DataConfig = field(default_factory=DataConfig)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     experiment: ExperimentConfig = field(default_factory=ExperimentConfig)
@@ -782,6 +781,53 @@ class Config:
         # `create()` interpolates the fields
         # TODO consider using `hydra.instantiate` to interpolate the config?
         return OmegaConf.to_object(OmegaConf.create(self))
+
+    @classmethod
+    def test_uninterpolated(cls, tmp_path: Path) -> "Config":
+        """
+        Return a config set up for testing, with a tiny (useless) model.
+        Requires running `interpolate()` to allow for further modification.
+        """
+        raw_cfg = cls()
+
+        # set to local mode, impacting accelerator etc.
+        raw_cfg.shared.local = True
+
+        # default to tiny model for faster model evaluations
+        raw_cfg.model.hyper_params = ModelHyperParamsConfig.tiny()
+        raw_cfg.model.edge_features.feat_dim = 8
+        # and smaller transformers
+        raw_cfg.model.ipa.no_heads = 2
+        raw_cfg.model.ipa.num_blocks = 2
+        raw_cfg.model.sequence_ipa_net.ipa.no_heads = 2
+        raw_cfg.model.sequence_ipa_net.ipa.num_blocks = 1
+
+        # filter to small PDBs for faster model + sampling
+        raw_cfg.dataset.filter.min_num_res = 20
+        raw_cfg.dataset.filter.max_num_res = 40
+        # avoid synthetic + redesigned samples
+        raw_cfg.dataset.use_redesigned = False
+        raw_cfg.dataset.use_synthetic = False
+        # small batches
+        raw_cfg.data.sampler.max_batch_size = 4
+
+        # set output directories to temp paths
+        raw_cfg.experiment.checkpointer.dirpath = str(tmp_path / "ckpt")
+        raw_cfg.inference.predict_dir = str(tmp_path / "inference")
+
+        # limit number of lengths sampled for validation / inference
+        raw_cfg.interpolant.sampling.num_timesteps = 3
+        raw_cfg.inference.interpolant.sampling.num_timesteps = 3
+        raw_cfg.inference.samples.samples_per_length = 2
+        raw_cfg.inference.samples.length_subset = [10, 30]
+        raw_cfg.dataset.samples_per_eval_length = 2
+        raw_cfg.dataset.num_eval_lengths = 1
+        # shortest validation samples in public data are 60 residues
+        raw_cfg.dataset.max_eval_length = 63
+
+        return raw_cfg
+
+    # TODO - classmethod for public MultiFlow compatible config, and migrate default to use new features.
 
 
 # Register the config class with Hydra
