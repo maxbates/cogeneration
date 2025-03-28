@@ -7,17 +7,18 @@ from cogeneration.scripts.predict import EvalRunner
 
 
 class TestEvalRunner:
-    def test_init(self):
-        # use actual config, so parameters match public multiflow we are loading from checkpoint
-        # TODO - migrate to a `public_multiflow` classmethod
-        cfg = Config().interpolate()
+    def test_mock_init(self, mock_cfg, mock_checkpoint, mock_folding_validation, tmp_path):
+        cfg, ckpt_path = mock_checkpoint(cfg=mock_cfg, path=tmp_path)
+        _ = EvalRunner(cfg=cfg)
 
+    def test_public_multiflow_init(self):
+        # use public multiflow config
+        cfg = Config.public_multiflow().interpolate()
         _ = EvalRunner(cfg=cfg)
 
     def test_can_load_public_weights_with_default_config(self, public_weights_path):
-        # use actual config, so parameters match public multiflow we are loading from checkpoint
-        # TODO - migrate to a `public_multiflow` classmethod
-        cfg = Config().interpolate()
+        # use public multiflow config
+        cfg = Config.public_multiflow().interpolate()
 
         # create EvalRunner, merge configs, which creates merged checkpoint
         merged_cfg, merged_ckpt_path = EvalRunner.merge_checkpoint_cfg(
@@ -45,23 +46,17 @@ class TestEvalRunner:
         # This is a long-running end-to-end test that performs sampling and computes metrics.
 
         # create a dummy checkpoint
-        ckpt_cfg_path, ckpt_path = mock_checkpoint(cfg=mock_cfg, path=tmp_path)
-
-        # update config with the checkpoint
-        # TODO - consider returning updated config from `mock_checkpoint`
-        assert mock_cfg.inference.task == InferenceTaskEnum.unconditional
-        mock_cfg.inference.unconditional_ckpt_path = str(ckpt_path)
-
-        # Run sampling
+        cfg, ckpt_path = mock_checkpoint(cfg=mock_cfg, path=tmp_path)
 
         # only sample one sample
         # TODO - support multiple samples
         #   We need to mock folding validation for all samples in pred dataloader.
         n_samples_expected = 1
-        mock_cfg.inference.samples.samples_per_length = 1
-        mock_cfg.inference.samples.length_subset = [23]
+        cfg.inference.samples.samples_per_length = 1
+        cfg.inference.samples.length_subset = [23]
 
-        sampler = EvalRunner(cfg=mock_cfg)
+        # Run sampling
+        sampler = EvalRunner(cfg=cfg)
 
         # we implicitly test that inference config takes priority over checkpoint
         assert (
@@ -70,15 +65,15 @@ class TestEvalRunner:
         pred_batch = next(iter(sampler.dataloader))
         mock_folding_validation(
             batch=pred_batch,
-            cfg=mock_cfg,
-            n_inverse_folds=mock_cfg.folding.seq_per_sample,  # prediction
+            cfg=cfg,
+            n_inverse_folds=cfg.folding.seq_per_sample,  # prediction
         )
 
         # run sampling
         sampler.run_sampling()
 
         # ensure we get top samples
-        assert os.path.exists(mock_cfg.inference.predict_dir), f"Predict dir not found"
+        assert os.path.exists(cfg.inference.predict_dir), f"Predict dir not found"
 
         # compute metrics (using patched methods)
         top_samples_df, top_metrics_df = sampler.compute_metrics()

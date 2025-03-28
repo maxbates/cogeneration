@@ -3,6 +3,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
+from xml.etree.ElementPath import xpath_tokenizer
 
 from hydra.core.config_store import ConfigStore
 from omegaconf import OmegaConf
@@ -18,7 +19,8 @@ Several parameters from Multiflow appear to be unused in the public code.
 Many are marked with `# DROP`.
 """
 
-project_root_path = Path(__file__).parent.parent.parent.resolve()
+PATH_PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
+PATH_PUBLIC_WEIGHTS = PATH_PROJECT_ROOT / "multiflow_weights"
 
 # TODO - support default configs for `forward_folding` and `inverse folding`
 #   There are a handful of values across the config that need to have other defaults.
@@ -62,10 +64,10 @@ class SharedConfig:
         default_factory=lambda: datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     )
     # randomness / stochastic paths
-    stochastic: bool = False
+    stochastic: bool = True
     seed: int = 123
     # project root path
-    project_root: str = str(project_root_path)
+    project_root: str = str(PATH_PROJECT_ROOT)
 
     # TODO - `size` argument to determine model hyperparameters
     # TODO - gpu size argument to determine batch size, etc.
@@ -100,6 +102,16 @@ class ModelHyperParamsConfig:
             edge_embed_size=4,
             pos_embed_size=4,
             timestep_embed_size=4,
+        )
+
+    @classmethod
+    def public_multiflow(cls):
+        """Factory for configuration compatible with public MultiFlow"""
+        return cls(
+            node_embed_size=256,
+            edge_embed_size=128,
+            pos_embed_size=128,
+            timestep_embed_size=128,
         )
 
     @classmethod
@@ -150,8 +162,8 @@ class ModelNodeFeaturesConfig:
     # max_num_res: maximum number of residues
     max_num_res: int = 2000
     timestep_int: int = 1000  # DROP
-    # embed_chain: whether to embed chain index. TODO True when support multimers
-    embed_chain: bool = False
+    # embed_chain: whether to embed chain index.
+    embed_chain: bool = True
     # embed_aatype: whether to embed amino acid type
     embed_aatype: bool = True
     # use_mlp: whether to use MLP for embedding, otherwise linear layer
@@ -176,10 +188,10 @@ class ModelEdgeFeaturesConfig:
     feat_dim: int = 64
     # num_bins: number of bins for edge distrogram
     num_bins: int = 22
-    # self_condition: used by interpolant config. TODO determine why defined here?
+    # self_condition: used by interpolant config.
     self_condition: bool = True
-    # embed_chain: whether to embed chain index. TODO True when support multimers
-    embed_chain: bool = False
+    # embed_chain: whether to embed chain index.
+    embed_chain: bool = True
     # embed_diffuse_mask: whether to embed diffuse mask
     embed_diffuse_mask: bool = True
 
@@ -214,8 +226,6 @@ class ModelAAPredConfig:
     Amino acid prediction configuration using simple linear layers.
     """
 
-    # aatype_pred: whether to predict amino acid types, i.e. enable this network
-    aatype_pred: bool = True  # TODO drop (deprecated, use NOOP network)
     # c_s: node embedding size (input)
     c_s: int = "${model.hyper_params.node_embed_size}"
     # aatype_pred_num_tokens: number of amino acid types => logits / rate-matrix shape
@@ -283,8 +293,7 @@ class ModelConfig:
 
     # predict torsion angles
     # note does not impact frames (trans/rots), just the rigid we construct (from trans/rot/psi)
-    # not present in public MultiFlow
-    predict_psi_torsions: bool = False
+    predict_psi_torsions: bool = True
 
     # sequence prediction, default is simple aa_pred matching MultiFlow
     sequence_pred_type: ModelSequencePredictionEnum = (
@@ -345,7 +354,7 @@ class InterpolantTranslationsConfig:
         "${ternary:${equals: ${shared.stochastic}, True}, 'vpsde', 'linear'}"
     )
     # sample_temp: sampling temperature
-    sample_temp: float = 1.0  # TODO - drop
+    sample_temp: float = 1.0  # TODO - drop or check FrameDiff for usage
     # vpsde_bmin: variance-preserving SDE minimum
     vpsde_bmin: float = 0.1
     # vpsde_bmax: variance-preserving SDE maximum
@@ -404,7 +413,7 @@ class InterpolantAATypesConfig:
     do_purity: bool = (
         "${ternary:${equals: ${inference.task}, 'forward_folding'}, False, True}"
     )
-    train_extra_mask: float = 0.0  # DROP
+    train_extra_mask: float = 0.0  # TODO reintroduce or DROP
     # TODO - extra stochastic option, in addition to purity
 
 
@@ -412,18 +421,16 @@ class InterpolantAATypesConfig:
 class InterpolantSamplingConfig:
     # training takes a random t. Sampling runs over t timestemps.
     num_timesteps: int = 500
-    # SDE not in public multiflow code
-    do_sde: bool = "${shared.stochastic}"  # TODO drop? What is this for?
 
 
 @dataclass
 class InterpolantConfig:
     min_t: float = 1e-2
-    separate_t: bool = False  # TODO drop, unused / refactor into rots/trans/aa
     # kappa allows scaling rotation t exponentially during sampling
     provide_kappa: bool = True
     hierarchical_t: bool = False
-    # Whether to use separate t times for structure and sequence
+    separate_t: bool = False  # TODO drop, unused / refactor into rots/trans/aa
+    # Whether to use separate t times for rots / trans / aatypes
     codesign_separate_t: bool = (
         "${ternary:${equals: ${inference.task}, 'unconditional'}, False, True}"
     )
@@ -487,7 +494,7 @@ class DatasetFilterConfig:
 
 
 # dataset_metadata_dir_path is the root directory for dataset / metadata files
-dataset_metadata_dir_path = project_root_path / "cogeneration" / "datasets" / "metadata"
+dataset_metadata_dir_path = PATH_PROJECT_ROOT / "cogeneration" / "datasets" / "metadata"
 
 
 @dataclass
@@ -707,10 +714,6 @@ class InferenceSamplesConfig:
     length_step: int = 1
 
 
-# assume we have public weights available, use as default checkpoint
-public_weights_path = project_root_path / "multiflow_weights"
-
-
 @dataclass
 class InferenceConfig:
     task: InferenceTaskEnum = InferenceTaskEnum.unconditional
@@ -718,15 +721,15 @@ class InferenceConfig:
     seed: int = "${shared.seed}"
     use_gpu: bool = True
     num_gpus: int = 1
-    predict_dir: str = str(project_root_path / "inference_outputs")
+    predict_dir: str = str(PATH_PROJECT_ROOT / "inference_outputs")
     inference_subdir: str = "${shared.now}"
 
     # checkpoints
     saved_ckpt_dir: str = "${shared.project_root}/ckpt/${experiment.wandb.project}"
 
-    unconditional_ckpt_path: Optional[str] = str(public_weights_path / "last.ckpt")
-    forward_folding_ckpt_path: Optional[str] = str(public_weights_path / "last.ckpt")
-    inverse_folding_ckpt_path: Optional[str] = str(public_weights_path / "last.ckpt")
+    unconditional_ckpt_path: Optional[str] = str(PATH_PUBLIC_WEIGHTS / "last.ckpt")
+    forward_folding_ckpt_path: Optional[str] = str(PATH_PUBLIC_WEIGHTS / "last.ckpt")
+    inverse_folding_ckpt_path: Optional[str] = str(PATH_PUBLIC_WEIGHTS / "last.ckpt")
 
     interpolant: InterpolantConfig = field(default_factory=InterpolantConfig)
     samples: InferenceSamplesConfig = field(default_factory=InferenceSamplesConfig)
@@ -745,11 +748,11 @@ class FoldingConfig:
     # dedicated device for folding. decrement other devices by 1 if True
     own_device: bool = False
     # TODO update ProteinMPNN path
-    pmpnn_path: Path = project_root_path / "ProteinMPNN"
+    pmpnn_path: Path = PATH_PROJECT_ROOT / "ProteinMPNN"
     pmpnn_seed: int = "${shared.seed}"
-    pt_hub_dir: Path = project_root_path / "cache" / "torch"
+    pt_hub_dir: Path = PATH_PROJECT_ROOT / "cache" / "torch"
     # TODO update colabfold path
-    colabfold_path: Path = project_root_path / "colabfold/bin/colabfold_batch"
+    colabfold_path: Path = PATH_PROJECT_ROOT / "colabfold/bin/colabfold_batch"
 
 
 @dataclass
@@ -827,7 +830,39 @@ class Config:
 
         return raw_cfg
 
-    # TODO - classmethod for public MultiFlow compatible config, and migrate default to use new features.
+    @classmethod
+    def public_multiflow(cls):
+        """
+        Returns a config that maintains compatibility with Public MultiFlow weights and better aligned with its defaults
+        """
+        raw_cfg = cls()
+
+        # Model
+        # Use public MultiFlow model size hyperparameters
+        raw_cfg.model.hyper_params = ModelHyperParamsConfig.public_multiflow()
+        # Use simple aa_pred_net from public MultiFlow
+        raw_cfg.model.sequence_pred_type = ModelSequencePredictionEnum.aa_pred
+        # stochastic paths not part of public MultiFlow
+        raw_cfg.shared.stochastic = False
+        # Don't predict torsion angles
+        raw_cfg.model.predict_psi_torsions = False
+        # Other parameters as defined by public codebase
+        raw_cfg.model.node_features.embed_chain = False
+        raw_cfg.model.edge_features.embed_chain = False
+
+        # Weights
+        # assume we have public weights available, use as default checkpoint
+        raw_cfg.inference.unconditional_ckpt_path = str(
+            PATH_PUBLIC_WEIGHTS / "last.ckpt"
+        )
+        raw_cfg.inference.forward_folding_ckpt_path = str(
+            PATH_PUBLIC_WEIGHTS / "last.ckpt"
+        )
+        raw_cfg.inference.inverse_folding_ckpt_path = str(
+            PATH_PUBLIC_WEIGHTS / "last.ckpt"
+        )
+
+        return raw_cfg
 
 
 # Register the config class with Hydra

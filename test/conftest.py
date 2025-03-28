@@ -30,6 +30,7 @@ from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingData
 from cogeneration.dataset.protein_dataloader import LengthBatcher, ProteinData
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
+from cogeneration.config.base import PATH_PUBLIC_WEIGHTS
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -42,22 +43,21 @@ def public_weights_path() -> Path:
     These weights must be downloaded separately.
     """
     # check paths
-    public_weights_path = (Path(__file__).parent / "../multiflow_weights").resolve()
     assert os.path.exists(
-        public_weights_path
-    ), f"""Public weights not found at {public_weights_path}
+        PATH_PUBLIC_WEIGHTS
+    ), f"""Public weights not found at {PATH_PUBLIC_WEIGHTS}
     Public weights must be downloaded for some tests to work.
     
     See https://zenodo.org/records/10714631?token=eyJhbGciOiJIUzUxMiJ9.eyJpZCI6IjJjMTk2YjlmLTM4OTUtNGVhYi1hODcxLWE1ZjExOTczY2IzZiIsImRhdGEiOnt9LCJyYW5kb20iOiI4MDY5ZDUzYjVjMTNhNDllMDYxNmI3Yjc2NjcwYjYxZiJ9.C2eZZmRu-nu7H330G-DkV5kttfjYB3ANozdOMNm19uPahvtLrDRvd_4Eqlyb7lp24m06e4OHhHQ4zlj68S1O_A
     """
     assert os.path.exists(
-        public_weights_path / "config.yaml"
+        PATH_PUBLIC_WEIGHTS / "config.yaml"
     ), f"Public config not found at {public_weights_path}"
     assert os.path.exists(
-        public_weights_path / "last.ckpt"
+        PATH_PUBLIC_WEIGHTS / "last.ckpt"
     ), f"Public ckpt not found at {public_weights_path}"
 
-    return public_weights_path
+    return PATH_PUBLIC_WEIGHTS
 
 
 @pytest.fixture
@@ -366,15 +366,25 @@ def mock_folding_validation(tmp_path):
 def mock_checkpoint(mock_folding_validation):
     """
     Save a dummy checkpoint and config that we can load into EvalRunner
+    Returns updated cfg, with the checkpoint path set, and the path to ckpt
+
+    Note this is sort of slow, because we actually have to call `Trainer.fit()`
+    to save the checkpoint, though we only train for one step.
 
     TODO - memoize, maybe if path is not provided?
     #   Need to confirm cfg is equivalent enough to use as checkpoint? or overwrite when changes made?
     #   Maybe we can hash the config (ignoring fields like `now`)
     """
 
-    def create_mock_checkpoint(cfg: Config, path: Path) -> Tuple[str, str]:
+    def create_mock_checkpoint(cfg: Config, path: Path) -> Tuple[Config, str]:
         ckpt_cfg_path = str(path / "config.yaml")
         ckpt_path = str(path / "last.ckpt")
+
+        # update config with the checkpoint
+        assert cfg.inference.task == InferenceTaskEnum.unconditional
+        cfg.inference.unconditional_ckpt_path = str(ckpt_path)
+        cfg.inference.forward_folding_ckpt_path = str(ckpt_path)
+        cfg.inference.inverse_folding_ckpt_path = str(ckpt_path)
 
         # save config
         with open(ckpt_cfg_path, "w") as f:
@@ -427,6 +437,6 @@ def mock_checkpoint(mock_folding_validation):
         # finally, save checkpoint
         trainer.save_checkpoint(ckpt_path)
 
-        return ckpt_cfg_path, ckpt_path
+        return cfg, ckpt_path
 
     return create_mock_checkpoint

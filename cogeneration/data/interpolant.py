@@ -243,6 +243,7 @@ class Interpolant:
 
     @property
     def igso3(self):
+        # On CPU. TODO consider moving to `self._device`.
         if self._igso3 is None:
             sigma_grid = torch.linspace(0.1, self.cfg.rots.igso3_sigma, 1000)
             self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=".cache")
@@ -309,7 +310,8 @@ class Interpolant:
                 scale=self.cfg.trans.stochastic_noise_intensity,
             )
             intermediate_noise = _centered_gaussian(
-                *res_mask.shape, device=self._device
+                *res_mask.shape,
+                device=self._device,
             )  # (bs, N, 3)
             intermediate_noise = intermediate_noise * sigma_t[..., None, None]
             intermediate_noise = intermediate_noise * NM_TO_ANG_SCALE
@@ -351,6 +353,7 @@ class Interpolant:
                 so3_t.squeeze(1),  # t is (bs, 1), we need (bs,)
                 scale=self.cfg.rots.stochastic_noise_intensity,
             )
+            sigma_t = sigma_t.cpu()  # ensure on cpu for igso3 calculation
             # multipy rotmats_t by IGSO(3) noise
             intermediate_noise = self.igso3.sample(sigma_t, num_res).to(self._device)
             intermediate_noise = intermediate_noise.reshape(num_batch, num_res, 3, 3)
@@ -841,11 +844,6 @@ class Interpolant:
 
         res_mask = torch.ones(num_batch, num_res, device=self._device)
 
-        # TODO support stochastic sampling
-        #   determine if noise added this function, or in euler steps
-        # TODO - should we use stochastic cfg values for trans and rots, why a global cfg?
-        sde = self.cfg.sampling.do_sde
-
         # Prepare for task-specific behavior
         # TODO - convert code to switch statements, support adding another task
         forward_folding = task == InferenceTaskEnum.forward_folding
@@ -861,20 +859,20 @@ class Interpolant:
             )
         if rotmats_0 is None:
             # Generate uniform SO(3) rotation matrices (shape: [num_batch, num_res, 3, 3])
-            rotmats_0 = _uniform_so3(num_batch, num_res, self._device)
+            rotmats_0 = _uniform_so3(num_batch, num_res, device=self._device)
         if aatypes_0 is None:
             # Generate initial amino acid types based on the interpolant type
             if (
                 self.cfg.aatypes.interpolant_type
                 == InterpolantAATypesInterpolantTypeEnum.masking
             ):
-                aatypes_0 = _masked_categorical(num_batch, num_res, self._device)
+                aatypes_0 = _masked_categorical(num_batch, num_res, device=self._device)
             elif (
                 self.cfg.aatypes.interpolant_type
                 == InterpolantAATypesInterpolantTypeEnum.uniform
             ):
                 aatypes_0 = _uniform_categorical(
-                    num_batch, num_res, self.num_tokens, self._device
+                    num_batch, num_res, num_tokens=self.num_tokens, device=self._device
                 )
             else:
                 raise ValueError(
@@ -913,7 +911,7 @@ class Interpolant:
         # Set-up time
         if num_timesteps is None:
             num_timesteps = self.cfg.sampling.num_timesteps
-        ts = torch.linspace(self.cfg.min_t, 1.0, num_timesteps)
+        ts = torch.linspace(self.cfg.min_t, 1.0, num_timesteps)  # cpu
         t_1 = ts[0]
 
         # Initialize t_1 values for translations, rotations, psi, and aatypes
