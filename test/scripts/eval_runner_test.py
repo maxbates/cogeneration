@@ -7,7 +7,9 @@ from cogeneration.scripts.predict import EvalRunner
 
 
 class TestEvalRunner:
-    def test_mock_init(self, mock_cfg, mock_checkpoint, mock_folding_validation, tmp_path):
+    def test_mock_init(
+        self, mock_cfg, mock_checkpoint, mock_folding_validation, tmp_path
+    ):
         cfg, ckpt_path = mock_checkpoint(cfg=mock_cfg, path=tmp_path)
         _ = EvalRunner(cfg=cfg)
 

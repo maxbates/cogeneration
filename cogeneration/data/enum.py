@@ -5,19 +5,23 @@ class DatasetColumns(StrEnum):
     """Columns in the training/synthetic/redesign/test metadata CSVs"""
 
     pdb_name = "pdb_name"
+    raw_path = "raw_path"  # original PDB file (optional)
     processed_path = "processed_path"  # pkl file
-    oligomeric_count = "oligomeric_count"
-    oligomeric_detail = "oligomeric_detail"
-    resolution = "resolution"
-    structure_method = "structure_method"
     quaternary_category = "quaternary_category"
+    oligomeric_count = "oligomeric_count"  # num non-unique sequences
+    oligomeric_detail = "oligomeric_detail"  # per-unique seq details
     num_chains = "num_chains"
-    seq_len = "seq_len"
-    modeled_seq_len = "modeled_seq_len"
+    seq_len = "seq_len"  # total number of atoms
+    modeled_seq_len = "modeled_seq_len"  # max - min res number
+    moduled_num_res = "moduled_num_res"  # (new) num residues in modeled structure
     coil_percent = "coil_percent"
     helix_percent = "helix_percent"
     strand_percent = "strand_percent"
     radius_gyration = "radius_gyration"
+
+    # TODO add in process_pdb_files
+    resolution = "resolution"
+    structure_method = "structure_method"
 
     # cluster metadata (added by loading clusters csv)
     cluster = "cluster"
@@ -33,9 +37,8 @@ class DatasetColumns(StrEnum):
 
 class DatasetProteinColumns(StrEnum):
     """
-    Information about the protein, pickled in `processed_path`, or from parsing a Protein / Chain (see `parse_chain_feats`)
-
-    This code is not provided by MultiFlow, just the generated artifacts.
+    Information about the protein, pickled in `processed_path`, or from parsing a Protein / Chain.
+    Most of these values are defined by `process_chain` and `parse_chain_feats`.
 
     Most fields and values seem straightforward from parsing the PDB file, but there are some oddities / potential bugs.
 

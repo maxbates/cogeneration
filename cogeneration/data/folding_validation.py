@@ -19,10 +19,10 @@ from cogeneration.data.const import aatype_to_seq
 from cogeneration.data.enum import DatasetProteinColumns as dpc
 from cogeneration.data.enum import MetricName, OutputFileName
 from cogeneration.data.io import write_numpy_json
+from cogeneration.data.metrics import calc_ca_ca_metrics, calc_mdtraj_metrics
 from cogeneration.data.residue_constants import restype_order_with_x, restypes_with_x
 from cogeneration.data.superimposition import superimpose
 from cogeneration.dataset.data_utils import parse_pdb_feats
-from cogeneration.models.metrics import calc_ca_ca_metrics, calc_mdtraj_metrics
 
 # NOTE - would be nice to better make 3rd party software injectable so easier to mock
 # However, it is not hard to patch the relevant functions for now.
@@ -94,7 +94,7 @@ class FoldingValidator:
         assert not os.path.exists(folding_dir), f"{folding_dir} already exists"
 
         # Check inputs
-        assert (diffuse_mask == 1.0).all(), "Diffuse mask must be all 1.0 for now"
+        assert (diffuse_mask == 1.0).all()  # TODO(inpainting)
         assert pred_bb_positions.shape == (
             sample_length,
             37,
@@ -416,7 +416,7 @@ class FoldingValidator:
         Generates and returns a fasta of inverse folded sequences using ProteinMPNN.
         The number of sequences is determined by cfg.
         """
-        assert (diffuse_mask == 1.0).all(), "Diffuse mask must be all 1.0 for now"
+        assert (diffuse_mask == 1.0).all()  # TODO(inpainting)
 
         if num_sequences is None:
             num_sequences = self.cfg.seq_per_sample

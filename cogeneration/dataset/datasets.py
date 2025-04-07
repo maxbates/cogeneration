@@ -311,9 +311,10 @@ class BaseDataset(Dataset):
         # reset index
         self.csv[dc.index] = list(range(len(self.csv)))
 
-    def _process_processed_path(self, processed_file_path: str) -> Dict[str, Any]:
+    def process_processed_path(self, processed_file_path: str) -> Dict[str, Any]:
         """
-        Processes a single structurs + metadata pickled at `processed_file_path`.
+        Processes a single structure + metadata pickled at `processed_file_path`.
+        This file is written by `parse_pdb_files.py`.
         """
         processed_feats = read_pkl(processed_file_path)
         processed_feats = parse_chain_feats(processed_feats)
@@ -417,7 +418,7 @@ class BaseDataset(Dataset):
         if use_cache and path in self._cache:
             return self._cache[path]
 
-        processed_row = self._process_processed_path(path)
+        processed_row = self.process_processed_path(path)
         processed_row[dc.pdb_name] = csv_row[dc.pdb_name]
 
         if self.dataset_cfg.use_redesigned:
@@ -443,6 +444,9 @@ class BaseDataset(Dataset):
 
         if self.task == DataTaskEnum.hallucination:
             feats[bp.diffuse_mask] = torch.ones_like(feats[bp.res_mask]).bool()
+        if self.task == DataTaskEnum.inpainting:
+            # TODO(inpainting) - specify more interesting + random patches. Determined by config.
+            feats[bp.diffuse_mask] = (torch.rand_like(feats[bp.res_mask]) > 0.5).bool()
         else:
             raise ValueError(f"Unknown task {self.task}")
         feats[bp.diffuse_mask] = feats[bp.diffuse_mask].int()
