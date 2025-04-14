@@ -85,6 +85,8 @@ class TestProcessPDBFiles:
             task=DataTaskEnum.hallucination,
         )
 
+        assert len(dataset) > 0
+
         # just test it works
         _ = dataset.process_processed_path(
             processed_file_path=metadata[dc.processed_path],

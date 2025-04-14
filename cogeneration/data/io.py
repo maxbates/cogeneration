@@ -2,6 +2,7 @@ import io
 import json
 import os
 import pickle
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np

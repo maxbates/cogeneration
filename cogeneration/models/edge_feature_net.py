@@ -39,8 +39,8 @@ class EdgeFeatureNet(nn.Module):
     def embed_relpos(self, r):
         # AlphaFold 2 Algorithm 4 & 5
         # Based on OpenFold utils/tensor_utils.py
-        # Input: [b, n_res]
-        # [b, n_res, n_res]
+        # Input: (B, N)
+        # Output: (B, N, N)
         d = r[:, :, None] - r[:, None, :]
         pos_emb = get_index_embedding(d, self.cfg.feat_dim, max_len=2056)
         return self.linear_relpos(pos_emb)
@@ -60,21 +60,20 @@ class EdgeFeatureNet(nn.Module):
 
     def forward(
         self,
-        node_embed,
-        trans,  # trans @ t, since this network considers residue positions -> edges
-        trans_sc,  # trans self-conditioned
-        edge_mask,
-        diffuse_mask,
-        chain_index,
+        node_embed: torch.Tensor,  # (B, N, c_s)
+        trans: torch.Tensor,  # (B, N, 3)
+        trans_sc: torch.Tensor,  # (B, N, 3)
+        edge_mask: torch.Tensor,  # (B, N, N)
+        diffuse_mask: torch.Tensor,  # (B, N)
+        chain_index: torch.Tensor,  # (B, N)
     ):
-        # Input: [b, n_res, c_s]
         num_batch, num_res, _ = node_embed.shape
 
-        # [b, n_res, c_p]
+        # (B, N, c_p]
         p_i = self.linear_s_p(node_embed)
         cross_node_feats = self._cross_concat(p_i, num_batch, num_res)
 
-        # [b, n_res]
+        # (B, N)
         r = (
             torch.arange(num_res, device=node_embed.device)
             .unsqueeze(0)

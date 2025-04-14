@@ -62,7 +62,7 @@ class TestFlowModule:
             MetricName.sample_pdb_path,  # input
             MetricName.sequence,  # inverse folded
             MetricName.folded_pdb_path,  # folded structure
-            MetricName.bb_rmsd,  # structure comparison
+            MetricName.bb_rmsd_folded,  # structure comparison
             MetricName.inverse_folding_bb_rmsd_min,  # summary metric
             MetricName.plddt_mean,  # af2 metric
             MetricName.coil_percent,  # mdtraj
@@ -82,7 +82,7 @@ class TestFlowModule:
         )
         assert sample[MetricName.sequence] == input_seq
         # should not sample the original structure
-        assert sample[MetricName.bb_rmsd] > 0.1
+        assert sample[MetricName.bb_rmsd_folded] > 0.1
         # random seq above should have low recovery
         assert sample[MetricName.inverse_folding_sequence_recovery_mean] < 0.2
 
@@ -107,7 +107,7 @@ class TestFlowModule:
             MetricName.sample_pdb_path,  # input
             MetricName.sequence,  # inverse folded
             MetricName.folded_pdb_path,  # folded structure
-            MetricName.bb_rmsd,  # structure comparison
+            MetricName.bb_rmsd_folded,  # structure comparison
             MetricName.inverse_folding_bb_rmsd_min,  # summary metric
             MetricName.plddt_mean,  # af2 metric
             MetricName.coil_percent,  # mdtraj

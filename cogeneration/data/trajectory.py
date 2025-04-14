@@ -12,6 +12,20 @@ from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restypes_with_x
 
 
+@dataclass
+class SavedTrajectory:
+    """
+    Struct that tracks file saved by `save_trajectory()`.
+    Entires should be None if not written.
+    """
+
+    sample_pdb_path: str  # OutputFileName.sample_pdb
+    traj_path: Optional[str] = None  # OutputFileName.bb_traj_pdb
+    x0_traj_path: Optional[str] = None  # OutputFileName.x0_traj_pdb
+    aa_traj_fasta_path: Optional[str] = None  # OutputFileName.aa_traj_fa
+    logits_traj_path: Optional[str] = None  # OutputFileName.logits_traj_anim
+
+
 def save_logits_traj(
     logits_traj: npt.NDArray,
     aa_traj: npt.NDArray,
@@ -22,8 +36,6 @@ def save_logits_traj(
     """
     Writes logits trajectory as a heatmap animation, one frame per step in the trajectory.
     Returns the path to the animation.
-
-    TODO - highlight diffuse_mask somehow
     """
 
     # Create output directory if it doesn't exist.
@@ -46,7 +58,11 @@ def save_logits_traj(
     def update(frame):
         im.set_data(logits_traj[frame].T)
 
-        # border cells in black for the current aa in aa_traj
+        # Clear previous patches
+        for patch in reversed(ax.patches):
+            patch.remove()
+
+        # Border cells in black for the current aa in aa_traj
         for i in range(logits_traj.shape[1]):
             ax.add_patch(
                 plt.Rectangle(
@@ -58,6 +74,21 @@ def save_logits_traj(
                     lw=1,
                 )
             )
+
+        # Highlight diffuse_mask cells in blue
+        for i in range(logits_traj.shape[1]):
+            if diffuse_mask[i]:
+                ax.add_patch(
+                    plt.Rectangle(
+                        (i - 0.5, 0 - 0.5),  # Highlight entire column
+                        1,
+                        logits_traj.shape[2],
+                        fill=True,
+                        edgecolor="blue",
+                        facecolor="blue",
+                        alpha=0.3,
+                    )
+                )
 
     anim = animation.FuncAnimation(
         fig,
@@ -72,20 +103,6 @@ def save_logits_traj(
     plt.close(fig)
 
     return anim_path
-
-
-@dataclass
-class SavedTrajectory:
-    """
-    Struct that tracks file saved by `save_trajectory()`.
-    Entires should be None if not written.
-    """
-
-    sample_pdb_path: str
-    traj_path: Optional[str] = None
-    x0_traj_path: Optional[str] = None
-    aa_traj_fasta_path: Optional[str] = None
-    logits_traj_path: Optional[str] = None
 
 
 def save_trajectory(
@@ -193,8 +210,8 @@ def save_trajectory(
         model_logits_traj_path = save_logits_traj(
             model_logits_traj,
             model_aa_traj,
-            diffuse_mask,
-            output_dir,
+            diffuse_mask=diffuse_mask,
+            output_dir=output_dir,
         )
 
     return SavedTrajectory(

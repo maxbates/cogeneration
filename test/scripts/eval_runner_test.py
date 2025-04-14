@@ -94,7 +94,7 @@ class TestEvalRunner:
             MetricName.sample_pdb_path,
             MetricName.folded_pdb_path,
             # subset of metrics
-            MetricName.bb_rmsd,
+            MetricName.bb_rmsd_folded,
             MetricName.inverse_folding_sequence_recovery_mean,
             MetricName.helix_percent,
         ]:

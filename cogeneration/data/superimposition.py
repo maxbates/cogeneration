@@ -11,9 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Tuple
+
 import numpy as np
+import numpy.typing as npt
 import torch
 from Bio.SVDSuperimposer import SVDSuperimposer
+from tmtools import tm_align
 
 
 def _superimpose_np(reference, coords):
@@ -102,3 +106,14 @@ def superimpose(reference, coords, mask, return_transform=False):
     if return_transform:
         return superimposed_reshaped, rmsds_reshaped, rots_stacked, trans_stacked
     return superimposed_reshaped, rmsds_reshaped
+
+
+def calc_tm_score(
+    pos_1: npt.NDArray,
+    pos_2: npt.NDArray,
+    seq_1: str,
+    seq_2: str,
+) -> Tuple[float, float]:
+    """Calculates TM score between two sets of coordinates."""
+    tm_results = tm_align(pos_1, pos_2, seq_1, seq_2)
+    return tm_results.tm_norm_chain1, tm_results.tm_norm_chain2

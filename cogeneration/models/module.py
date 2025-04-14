@@ -18,19 +18,22 @@ from pytorch_lightning import LightningModule
 from pytorch_lightning.loggers.wandb import WandbLogger
 
 import wandb
-from cogeneration.config.base import Config, InferenceTaskEnum
-from cogeneration.data import all_atom, so3_utils
+from cogeneration.config.base import Config, DataTaskEnum, InferenceTaskEnum
+from cogeneration.data import all_atom, metrics, so3_utils
 from cogeneration.data.batch_props import BatchProps as bp
 from cogeneration.data.batch_props import NoisyBatchProps as nbp
 from cogeneration.data.batch_props import PredBatchProps as pbp
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.enum import MetricName, OutputFileName
-from cogeneration.data.folding_validation import FoldingValidator
+from cogeneration.data.folding_validation import (
+    FoldingValidator,
+    SavedFoldingValidation,
+)
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.io import write_numpy_json
+from cogeneration.data.noise_mask import mask_blend_1d, mask_blend_2d, mask_blend_3d
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.trajectory import SavedTrajectory, save_trajectory
-from cogeneration.models import metrics
 from cogeneration.models.model import FlowModel
 
 
@@ -38,6 +41,25 @@ def to_numpy(x: Optional[torch.Tensor]) -> Optional[np.ndarray]:
     if x is None:
         return None
     return x.detach().cpu().numpy()
+
+
+@dataclass
+class AuxiliaryMetrics:
+    """Training auxiliary metrics"""
+
+    batch_train_loss: torch.Tensor
+    batch_rot_loss: torch.Tensor
+    batch_trans_loss: torch.Tensor
+    batch_bb_atom_loss: torch.Tensor
+    batch_dist_mat_loss: torch.Tensor
+    train_loss: torch.Tensor
+    rots_vf_loss: torch.Tensor
+    trans_loss: torch.Tensor
+    bb_atom_loss: torch.Tensor
+    dist_mat_loss: torch.Tensor
+    loss_denom_num_res: torch.Tensor
+    examples_per_step: torch.Tensor
+    res_length: torch.Tensor
 
 
 @dataclass
@@ -159,12 +181,6 @@ class FlowModule(LightningModule):
     def on_train_start(self):
         self._epoch_start_time = time.time()
 
-    # def on_after_backward(self):
-    #     # debugging, check for unused parameters
-    #     for name, param in self.named_parameters():
-    #         if param.grad is None:
-    #             print(f"Parameter {name} is unused (no gradient)")
-
     def on_train_epoch_end(self):
         epoch_time = (time.time() - self._epoch_start_time) / 60.0
         self.log(
@@ -221,32 +237,36 @@ class FlowModule(LightningModule):
 
         bb_mask = noisy_batch[bp.res_mask]
         loss_mask = bb_mask * noisy_batch[bp.diffuse_mask]
+
         if training_cfg.mask_plddt:
             loss_mask *= noisy_batch[bp.plddt_mask]
         if torch.any(torch.sum(loss_mask, dim=-1) < 1):
             raise ValueError("Empty batch encountered")
+
         num_batch, num_res = loss_mask.shape
         loss_denom_num_res = torch.sum(loss_mask, dim=-1)
         batch_loss_mask = torch.any(bb_mask, dim=-1)
 
         # Number of backbone atoms to consider for loss
         # 3 for C-alpha, N, C atoms, 5 if we also consider psi angles
+        # We still only use 3 atoms for frames + flow matching, but consider 5 for backbone loss
         n_bb_atoms = 5 if self.cfg.model.predict_psi_torsions else 3
 
         # Ground truth labels
         gt_trans_1 = noisy_batch[bp.trans_1]
         gt_rotmats_1 = noisy_batch[bp.rotmats_1]
+        gt_rot_vf = so3_utils.calc_rot_vf(
+            mat_t=noisy_batch[nbp.rotmats_t],
+            mat_1=gt_rotmats_1.type(torch.float32),
+        )
         gt_aatypes_1 = noisy_batch[bp.aatypes_1]
         gt_psi_torsions_1 = noisy_batch[bp.torsion_angles_sin_cos_1][..., 2, :]
         gt_bb_atoms, atom37_mask, _, _ = all_atom.compute_backbone(
-            all_atom.create_rigid(gt_rotmats_1, gt_trans_1),
+            rigid=all_atom.create_rigid(gt_rotmats_1, gt_trans_1),
             psi_torsions=gt_psi_torsions_1,
         )
         gt_bb_atoms = gt_bb_atoms[:, :, :n_bb_atoms]
         atom37_mask = atom37_mask[:, :, :n_bb_atoms]
-
-        rotmats_t = noisy_batch[nbp.rotmats_t]
-        gt_rot_vf = so3_utils.calc_rot_vf(rotmats_t, gt_rotmats_1.type(torch.float32))
 
         # Timestep used for normalization.
         r3_t = noisy_batch[nbp.r3_t]  # (B, 1)
@@ -278,7 +298,10 @@ class FlowModule(LightningModule):
         pred_psi_1 = model_output[pbp.pred_psi]  # might be None
         pred_logits = model_output[pbp.pred_logits]  # (B, N, aatype_pred_num_tokens)
 
-        pred_rots_vf = so3_utils.calc_rot_vf(rotmats_t, pred_rotmats_1)
+        pred_rots_vf = so3_utils.calc_rot_vf(
+            mat_t=noisy_batch[nbp.rotmats_t],
+            mat_1=pred_rotmats_1,
+        )
         if torch.any(torch.isnan(pred_rots_vf)):
             raise ValueError("NaN encountered in pred_rots_vf")
 
@@ -317,8 +340,6 @@ class FlowModule(LightningModule):
         )
 
         # TODO consider explicit rotation loss (see FoldFlow2)
-
-        # TODO consider explicit `psi` loss?
 
         # Backbone atom loss
         pred_bb_atoms = all_atom.to_atom37(pred_trans_1, pred_rotmats_1, pred_psi_1)[
@@ -382,6 +403,25 @@ class FlowModule(LightningModule):
             raise ValueError("NaN loss encountered")
         assert train_loss.shape == (num_batch,)
 
+        def normalize_loss(x):
+            return x.sum() / (batch_loss_mask.sum() + 1e-10)
+
+        aux = AuxiliaryMetrics(
+            batch_train_loss=train_loss,
+            batch_rot_loss=rots_vf_loss,
+            batch_trans_loss=trans_loss,
+            batch_bb_atom_loss=bb_atom_loss,
+            batch_dist_mat_loss=dist_mat_loss,
+            train_loss=normalize_loss(train_loss),
+            rots_vf_loss=normalize_loss(rots_vf_loss),
+            trans_loss=normalize_loss(trans_loss),
+            bb_atom_loss=normalize_loss(bb_atom_loss),
+            dist_mat_loss=normalize_loss(dist_mat_loss),
+            loss_denom_num_res=loss_denom_num_res,
+            examples_per_step=torch.tensor(num_batch),
+            res_length=torch.mean(torch.sum(bb_mask, dim=-1).float()),
+        )
+
         losses = TrainingLosses(
             trans_loss=trans_loss,
             rots_vf_loss=rots_vf_loss,
@@ -389,27 +429,6 @@ class FlowModule(LightningModule):
             aatypes_loss=aatypes_loss,
             train_loss=train_loss,
         )
-
-        def normalize_loss(x):
-            return x.sum() / (batch_loss_mask.sum() + 1e-10)
-
-        aux = {
-            "batch_train_loss": train_loss,
-            "batch_rot_loss": rots_vf_loss,
-            "batch_trans_loss": trans_loss,
-            "batch_bb_atom_loss": bb_atom_loss,
-            "batch_dist_mat_loss": dist_mat_loss,
-            # normalized
-            "train_loss": normalize_loss(train_loss),
-            "rots_vf_loss": normalize_loss(rots_vf_loss),
-            "trans_loss": normalize_loss(trans_loss),
-            "bb_atom_loss": normalize_loss(bb_atom_loss),
-            "dist_mat_loss": normalize_loss(dist_mat_loss),
-            # meta
-            "loss_denom_num_res": loss_denom_num_res,
-            "examples_per_step": torch.tensor(num_batch),
-            "res_length": torch.mean(torch.sum(bb_mask, dim=-1).float()),
-        }
 
         self._data_history.append(
             {
@@ -428,27 +447,31 @@ class FlowModule(LightningModule):
         self.interpolant.set_device(batch[bp.res_mask].device)
         noisy_batch = self.interpolant.corrupt_batch(batch)
 
-        # Enable self-conditioning during training
+        # Enable self-conditioning
         if (
             self.cfg.interpolant.self_condition
             and random() > self.cfg.interpolant.self_condition_prob
         ):
             with torch.no_grad():
-                # Perform a model pass, and get predicted translations and aatypes
+                # Perform a model pass, and use predicted translations and aatypes for self-conditioning
                 model_sc = self.model(noisy_batch)
-                noisy_batch[nbp.trans_sc] = model_sc[pbp.pred_trans] * noisy_batch[
-                    bp.diffuse_mask
-                ][..., None] + noisy_batch[bp.trans_1] * (
-                    1 - noisy_batch[bp.diffuse_mask][..., None]
+
+                noisy_batch[nbp.trans_sc] = mask_blend_2d(
+                    trans_t=model_sc[pbp.pred_trans],
+                    trans_1=noisy_batch[bp.trans_1],
+                    mask=noisy_batch[bp.diffuse_mask],
                 )
                 logits_1 = torch.nn.functional.one_hot(
                     batch[bp.aatypes_1].long(),
                     num_classes=self.cfg.model.aa_pred.aatype_pred_num_tokens,
                 ).float()
-                noisy_batch[nbp.aatypes_sc] = model_sc[pbp.pred_logits] * noisy_batch[
-                    bp.diffuse_mask
-                ][..., None] + logits_1 * (1 - noisy_batch[bp.diffuse_mask][..., None])
+                noisy_batch[nbp.aatypes_sc] = mask_blend_2d(
+                    trans_t=model_sc[pbp.pred_logits],
+                    trans_1=logits_1,
+                    mask=noisy_batch[bp.diffuse_mask],
+                )
 
+        # Model pass
         batch_losses = self.model_step(noisy_batch)
 
         # Log the calculated and other losses we want to track
@@ -511,6 +534,24 @@ class FlowModule(LightningModule):
         step_time = time.time() - step_start_time
         self._log_scalar("train/examples_per_second", num_batch / step_time)
 
+        # inpainting / scaffolding metrics
+        if self.cfg.data.task == DataTaskEnum.inpainting:
+            scaffold_percent = torch.mean(batch["diffuse_mask"].float()).item()
+            self._log_scalar(
+                "train/scaffolding_percent",
+                scaffold_percent,
+                prog_bar=False,
+                batch_size=num_batch,
+            )
+            motif_mask = 1 - batch["diffuse_mask"].float()
+            num_motif_res = torch.sum(motif_mask, dim=-1)
+            self._log_scalar(
+                "train/motif_size",
+                torch.mean(num_motif_res).item(),
+                prog_bar=False,
+                batch_size=num_batch,
+            )
+
         # log final loss explicitly (though it's already logged as `train_loss`)
         train_loss = total_losses["train_loss"]
         self._log_scalar("train/loss", train_loss, batch_size=num_batch)
@@ -524,15 +565,22 @@ class FlowModule(LightningModule):
         num_batch, num_res = res_mask.shape
         csv_idx = batch[bp.csv_idx]
         diffuse_mask = batch[bp.diffuse_mask]
-        assert (diffuse_mask == 1.0).all()  # no partial masking yet
 
-        # validation mostly just runs "codesign" but will corrupt trans/rots/aa based on interpolant config.
+        # Pick inference task corresponding to training task
+        if self.cfg.data.task == DataTaskEnum.inpainting:
+            inference_task = InferenceTaskEnum.inpainting
+        elif self.cfg.data.task == DataTaskEnum.hallucination:
+            inference_task = InferenceTaskEnum.unconditional
+        else:
+            inference_task = InferenceTaskEnum.unconditional
+
+        # Validation can run either unconditional generation, or inpainting
         self.interpolant.set_device(res_mask.device)
         protein_traj, model_traj = self.interpolant.sample(
             num_batch,
             num_res,
             self.model,
-            task=InferenceTaskEnum.unconditional,
+            task=inference_task,
             # t=0 values will be noise
             trans_1=batch[bp.trans_1],
             rotmats_1=batch[bp.rotmats_1],
@@ -550,6 +598,7 @@ class FlowModule(LightningModule):
         # For now, we only emit logits from direct model output (don't simulate logits)
         model_logits_trajs = to_numpy(model_traj.logits)
 
+        # batch-level aatype metrics
         final_step = protein_traj[-1]
         generated_aatypes = to_numpy(final_step.amino_acids)
         assert generated_aatypes.shape == (num_batch, num_res)
@@ -564,23 +613,24 @@ class FlowModule(LightningModule):
             )
             os.makedirs(sample_dir, exist_ok=True)
 
-            # Compute metrics, inverse fold + fold
-            top_sample_metrics, saved_trajectory_files = self.compute_sample_metrics(
-                sample_id=sample_id,
-                sample_dir=sample_dir,
-                task=InferenceTaskEnum.unconditional,
-                bb_traj=bb_trajs[i],
-                aa_traj=aa_trajs[i],
-                model_bb_traj=model_bb_trajs[i],
-                model_aa_traj=model_aa_trajs[i],
-                model_logits_traj=model_logits_trajs[i],
-                true_bb_pos=None,  # codesign
-                true_aa=None,  # codesign
-                diffuse_mask=to_numpy(diffuse_mask)[0],
-                aatypes_corrupt=self.cfg.interpolant.aatypes.corrupt,
-                also_fold_pmpnn_seq=True,  # always fold during validation
-                write_sample_trajectories=False,  # don't write trajectories during validation (just structures)
-                n_inverse_folds=1,  # only one during validation
+            # Compute metrics, and inverse fold + fold the designed structure
+            top_sample_metrics, saved_trajectory_files, saved_folding_validation = (
+                self.compute_sample_metrics(
+                    sample_id=sample_id,
+                    sample_dir=sample_dir,
+                    task=inference_task,
+                    bb_traj=bb_trajs[i],
+                    aa_traj=aa_trajs[i],
+                    model_bb_traj=model_bb_trajs[i],
+                    model_aa_traj=model_aa_trajs[i],
+                    model_logits_traj=model_logits_trajs[i],
+                    true_bb_pos=None,  # codesign
+                    true_aa=None,  # codesign
+                    diffuse_mask=to_numpy(diffuse_mask)[0],
+                    also_fold_pmpnn_seq=True,  # always fold during validation
+                    write_sample_trajectories=False,  # don't write trajectories during validation (just structures)
+                    n_inverse_folds=1,  # only one during validation
+                )
             )
 
             # save molecule to W&B
@@ -622,6 +672,7 @@ class FlowModule(LightningModule):
         sample_ids = [sample_ids] if isinstance(sample_ids, int) else sample_ids
         num_batch = len(sample_ids)
 
+        # TODO - prefer a struct for setting up each task
         if self.cfg.inference.task == InferenceTaskEnum.unconditional:
             sample_length = batch[bp.num_res].item()
             sample_dirs = [
@@ -634,17 +685,55 @@ class FlowModule(LightningModule):
             ]
             true_aatypes = true_bb_pos = None
             trans_1 = rotmats_1 = diffuse_mask = aatypes_1 = None
+
+        elif self.cfg.inference.task == InferenceTaskEnum.inpainting:
+            sample_pdb_name = batch[bp.pdb_name][0]
+            trans_1 = batch[bp.trans_1]
+            rotmats_1 = batch[bp.rotmats_1]
+            psi_torsions_1 = batch[bp.torsion_angles_sin_cos_1][..., 2, :]
+            aatypes_1 = true_aatypes = batch[bp.aatypes_1]
+
+            diffuse_mask = batch[bp.diffuse_mask]
+            sample_length = batch[bp.trans_1].shape[1]
+
+            sample_dirs = [
+                os.path.join(
+                    self.inference_dir, sample_pdb_name, f"sample_{str(sample_id)}"
+                )
+                for sample_id in sample_ids
+            ]
+
+            # true_bb_pos is masked and only defined at the motifs
+            # TODO(inpainting) ensure bb metrics are valid / useful
+            true_bb_pos = all_atom.atom37_from_trans_rot(
+                trans=trans_1,
+                rots=rotmats_1,
+                psi_torsions=psi_torsions_1,
+            )
+            true_bb_pos = true_bb_pos[..., :3, :].reshape(-1, 3)
+
+            write_prot_to_pdb(
+                prot_pos=to_numpy(true_bb_pos),
+                file_path=os.path.join(sample_dirs[0], sample_pdb_name + "_gt.pdb"),
+                aatype=to_numpy(batch[bp.aatypes_1][0]),
+            )
+
         elif self.cfg.inference.task == InferenceTaskEnum.forward_folding:
+            sample_pdb_name = batch[bp.pdb_name][0]
             sample_length = batch[bp.trans_1].shape[1]
             sample_dirs = [
                 os.path.join(
-                    self.inference_dir, f"length_{sample_length}", batch[bp.pdb_name][0]
+                    self.inference_dir,
+                    f"length_{sample_length}",
+                    sample_pdb_name,
                 )
             ]
             for sample_dir in sample_dirs:
                 os.makedirs(sample_dir, exist_ok=True)
             true_bb_pos = all_atom.atom37_from_trans_rot(
-                batch[bp.trans_1], batch[bp.rotmats_1]
+                trans=batch[bp.trans_1],
+                rots=batch[bp.rotmats_1],
+                psi_torsions=batch[bp.torsion_angles_sin_cos_1][..., 2, :],
             )
             # Ensure only have one valid structure for the batch
             assert true_bb_pos.shape == (1, sample_length, 37, 3)
@@ -652,24 +741,26 @@ class FlowModule(LightningModule):
             # save the ground truth as a pdb
             write_prot_to_pdb(
                 prot_pos=to_numpy(true_bb_pos),
-                file_path=os.path.join(
-                    sample_dirs[0], batch[bp.pdb_name][0] + "_gt.pdb"
-                ),
+                file_path=os.path.join(sample_dirs[0], sample_pdb_name + "_gt.pdb"),
                 aatype=to_numpy(batch[bp.aatypes_1][0]),
             )
             aatypes_1 = batch[bp.aatypes_1]
             trans_1 = rotmats_1 = diffuse_mask = true_aatypes = None
+
         elif self.cfg.inference.task == InferenceTaskEnum.inverse_folding:
+            sample_pdb_name = batch[bp.pdb_name][0]
             sample_length = batch[bp.trans_1].shape[1]
             trans_1 = batch[bp.trans_1]
             rotmats_1 = batch[bp.rotmats_1]
+            psi_torsions_1 = batch[bp.torsion_angles_sin_cos_1][..., 2, :]
             true_aatypes = batch[bp.aatypes_1]
             sample_dirs = [
                 os.path.join(
-                    self.inference_dir, f"length_{sample_length}", batch[bp.pdb_name][0]
+                    self.inference_dir, f"length_{sample_length}", sample_pdb_name
                 )
             ]
             aatypes_1 = diffuse_mask = true_bb_pos = None
+
         else:
             raise ValueError(f"Unknown task {self.cfg.inference.task}")
 
@@ -698,10 +789,15 @@ class FlowModule(LightningModule):
             rotmats_1=rotmats_1,
             aatypes_1=aatypes_1,
             diffuse_mask=diffuse_mask,
+            chain_idx=batch[bp.chain_idx],
+            res_idx=batch[bp.res_idx],
             separate_t=self.cfg.inference.interpolant.codesign_separate_t,
         )
+        # reset diffuse_mask to those residues sampled for calculating metrics
         diffuse_mask = (
-            diffuse_mask if diffuse_mask is not None else torch.ones(1, sample_length)
+            diffuse_mask
+            if diffuse_mask is not None
+            else torch.ones(num_batch, sample_length)
         )
 
         bb_trajs = to_numpy(protein_traj.structure)
@@ -709,7 +805,8 @@ class FlowModule(LightningModule):
 
         model_bb_trajs = to_numpy(model_traj.structure)
         model_aa_trajs = to_numpy(model_traj.amino_acids)
-        # For now, we only emit logits from direct model output (don't simulate logits)
+        # We only emit logits from direct model output (don't simulate logits)
+        # TODO(inpainting) FUTURE - consider how to simulate logits (since we work with discrete aatypes)
         model_logits_trajs = to_numpy(model_traj.logits)
 
         # Check for remaining mask tokens in final step of interpolated trajectory and reset to 0 := alanine
@@ -722,7 +819,7 @@ class FlowModule(LightningModule):
         all_top_sample_metrics = []
         for i, sample_id in zip(range(num_batch), sample_ids):
             sample_dir = sample_dirs[i]
-            top_sample_metrics, _ = self.compute_sample_metrics(
+            top_sample_metrics, _, _ = self.compute_sample_metrics(
                 sample_id=sample_id,
                 sample_dir=sample_dir,
                 task=self.cfg.inference.task,
@@ -733,8 +830,7 @@ class FlowModule(LightningModule):
                 model_logits_traj=model_logits_trajs[i],
                 true_bb_pos=to_numpy(true_bb_pos),
                 true_aa=to_numpy(true_aatypes),
-                diffuse_mask=to_numpy(diffuse_mask)[0],
-                aatypes_corrupt=self.cfg.inference.interpolant.aatypes.corrupt,
+                diffuse_mask=to_numpy(diffuse_mask[i]),
                 also_fold_pmpnn_seq=self.cfg.inference.also_fold_pmpnn_seq,
                 write_sample_trajectories=self.cfg.inference.write_sample_trajectories,
             )
@@ -756,11 +852,10 @@ class FlowModule(LightningModule):
         true_bb_pos: Optional[npt.NDArray],  # if relevant. None for unconditional.
         true_aa: Optional[npt.NDArray],  # if relevant. None for unconditional.
         diffuse_mask: npt.NDArray,
-        aatypes_corrupt: bool = True,
         also_fold_pmpnn_seq: bool = True,
         write_sample_trajectories: bool = True,
         n_inverse_folds: Optional[int] = None,
-    ) -> Tuple[Dict[str, Any], SavedTrajectory]:
+    ) -> Tuple[Dict[str, Any], SavedTrajectory, SavedFoldingValidation]:
         """
         Takes a single sample.
         Saves trajectory. Runs self-consistency check running ProteinMPNN + folding to compute metrics.
@@ -819,24 +914,22 @@ class FlowModule(LightningModule):
             write_trajectories=write_sample_trajectories,
         )
 
-        # TODO - metrics about the trajectory?
-
-        top_sample_metrics = self.folding_validator.assess_sample(
-            sample_name=sample_id,
-            sample_dir=sample_dir,
-            pred_pdb_path=saved_trajectory_files.sample_pdb_path,
-            pred_bb_positions=bb_traj[-1],
-            pred_aa=aa_traj[-1],
-            diffuse_mask=diffuse_mask,
-            also_fold_pmpnn_seq=also_fold_pmpnn_seq,
-            true_bb_positions=true_bb_pos,
-            true_aa=true_aa,
-            n_inverse_folds=n_inverse_folds,
+        top_sample_metrics, folding_validation_paths = (
+            self.folding_validator.assess_sample(
+                sample_name=sample_id,
+                sample_dir=sample_dir,
+                pred_pdb_path=saved_trajectory_files.sample_pdb_path,
+                pred_bb_positions=bb_traj[-1],
+                pred_aa=aa_traj[-1],
+                diffuse_mask=diffuse_mask,
+                also_fold_pmpnn_seq=also_fold_pmpnn_seq,
+                true_bb_positions=true_bb_pos,
+                true_aa=true_aa,
+                n_inverse_folds=n_inverse_folds,
+            )
         )
 
-        # TODO - return other written file paths, not just trajectory
-
-        return top_sample_metrics, saved_trajectory_files
+        return top_sample_metrics, saved_trajectory_files, folding_validation_paths
 
     def concat_all_top_samples(
         self,

@@ -19,7 +19,7 @@ class DatasetColumns(StrEnum):
     strand_percent = "strand_percent"
     radius_gyration = "radius_gyration"
 
-    # TODO add in process_pdb_files
+    # TODO add in process_pdb_files if provided
     resolution = "resolution"
     structure_method = "structure_method"
 
@@ -40,6 +40,10 @@ class DatasetProteinColumns(StrEnum):
     Information about the protein, pickled in `processed_path`, or from parsing a Protein / Chain.
     Most of these values are defined by `process_chain` and `parse_chain_feats`.
 
+    The saved proteins contain all molecules / residues, and is of length P.
+    `modeled_idx` is length N, and defines which residues are modeled.
+    It is used to select these out of the pickled file, then dropped almost immediately in loading / processing.
+
     Most fields and values seem straightforward from parsing the PDB file, but there are some oddities / potential bugs.
 
     For example, looking at `10mh`:
@@ -47,18 +51,17 @@ class DatasetProteinColumns(StrEnum):
     This is debatable, but reasonable, since the protein is binding something, and shouldn't be treated as a homomer.
     2. The chain IDs in the `pkl` are 26 (protein), 27 (DNA), 28 (DNA).
     There are some heteroatoms but unclear where these numbers come from. Probably not important that they are so high?
-
     """
 
-    aatype = "aatype"  # AA sequence (N, )
-    atom_positions = "atom_positions"  # all atom, (N, 37, 3)
-    atom_mask = "atom_mask"  # all atom (N, 37)
-    bb_mask = "bb_mask"  # alpha carbon  (N, )
-    bb_positions = "bb_positions"  # alpha carbon (N, 3)
-    residue_index = "residue_index"  # residue index (N, )
-    chain_index = "chain_index"  # chain index (N, )
-    b_factors = "b_factors"  # b factors (N, 37)
-    modeled_idx = "modeled_idx"  # index of modeled residues (dropped in processing) i.e. in mask (N, )
+    aatype = "aatype"  # (P, ) AA sequence residue indices
+    atom_positions = "atom_positions"  # (P, 37, 3) all atom positions
+    atom_mask = "atom_mask"  # (P, 37) all atoms to consider
+    bb_mask = "bb_mask"  # (P, ) alpha carbons considered
+    bb_positions = "bb_positions"  # (P, 3) alpha carbon
+    residue_index = "residue_index"  # (P, ) residue index
+    chain_index = "chain_index"  # (P, ) chain index
+    b_factors = "b_factors"  # (P, 37) b factors
+    modeled_idx = "modeled_idx"  # (N, ) index of modeled residues
 
 
 class DatasetTransformColumns(StrEnum):
@@ -117,13 +120,22 @@ class MetricName(StrEnum):
     plddt_mean = "plddt_mean"  # mean pLDDT score
 
     # structure comparison
-    # gt => ground truth true_bb_positions provided
-    bb_rmsd = "bb_rmsd"  # generated sample to folded structure
-    is_designable = "is_designable"  # designability of structure, i.e. RMSD < 2.0
-    # generated sample to ground truth structure (if provided)
+    # RMSD generated sample -> folded structure
+    bb_rmsd_folded = "bb_rmsd"
+    # designability of structure, i.e. RMSD < 2.0
+    is_designable = "is_designable"
+    # RMSD generated sample -> ground truth (if true_bb_positions provided)
     bb_rmsd_gt = "bb_rmsd_gt"
-    # folded structure to ground truth structure (if provided)
+    # RMSD folded structure -> ground truth structure (if true_bb_positions provided)
     bb_rmsd_folded_gt = "bb_rmsd_folded_gt"
+    # (inpainting) RMSD of fixed motifs, generated sample -> folded structure
+    motif_bb_rmsd_folded = "motif_bb_rmsd_folded"
+    # (inpainting) RMSD of fixed motifs, generated sample -> GT
+    motif_bb_rmsd_gt = "motif_bb_rmsd_gt"  # RMSD of fixed motifs to ground truth
+    # (inpainting) RMSD of fixed motifs, folded structure -> GT
+    motif_bb_rmsd_folded_gt = (
+        "motif_bb_rmsd_folded_gt"  # RMSD of fixed motifs after folding to ground truth
+    )
 
     # sequence recovery
     # gt => ground truth true_aa provided
@@ -131,15 +143,29 @@ class MetricName(StrEnum):
     inverse_folding_sequence_recovery_pred = "inverse_folding_sequence_recovery_pred"
     # either predicted or inverse folded sequence recovery with ground truth sequence
     inverse_folding_sequence_recovery_gt = "inverse_folding_sequence_recovery_gt"
+    # (inpainting) sequence recovery of fixed motifs
+    motif_sequence_recovery = "motif_sequence_recovery"
+    # (inpainting) sequence recovery of fixed motifs after inverse folding
+    motif_inverse_folding_sequence_recovery = "motif_inverse_folding_sequence_recovery"
 
-    # inverse + forward folding summary metrics
+    # summary metrics for inverse folding + folding
+    # counts
+    num_inverse_folded = "num_inverse_folded"
+    num_designable = "num_designable"
+    # codesign
     inverse_folding_sequence_recovery_mean = "inverse_folding_sequence_recovery_mean"
     inverse_folding_sequence_recovery_max = "inverse_folding_sequence_recovery_max"
     inverse_folding_bb_rmsd_single_seq = "inverse_folding_bb_rmsd_single_seq"
     inverse_folding_bb_rmsd_min = "inverse_folding_bb_rmsd_min"
     inverse_folding_bb_rmsd_mean = "inverse_folding_bb_rmsd_mean"
-    num_inverse_folded = "num_inverse_folded"
-    num_designable = "num_designable"
+    # inpainting
+    inverse_folding_motif_sequence_recovery_mean = (
+        "inverse_folding_motif_sequence_recovery_mean"
+    )
+    inverse_folding_motif_bb_rmsd_mean = "inverse_folding_motif_bb_rmsd_mean"
+
+
+# TODO - consider a SummaryMetricName enum
 
 
 class OutputFileName(StrEnum):

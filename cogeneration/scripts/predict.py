@@ -34,6 +34,8 @@ class EvalRunner:
         # Read in checkpoint config
         if cfg.inference.task == InferenceTaskEnum.unconditional:
             ckpt_path = cfg.inference.unconditional_ckpt_path
+        elif cfg.inference.task == InferenceTaskEnum.inpainting:
+            ckpt_path = cfg.inference.inpainting_ckpt_path
         elif cfg.inference.task == InferenceTaskEnum.forward_folding:
             ckpt_path = cfg.inference.forward_folding_ckpt_path
         elif cfg.inference.task == InferenceTaskEnum.inverse_folding:
@@ -197,14 +199,22 @@ class EvalRunner:
         if self.cfg.inference.task == InferenceTaskEnum.unconditional:
             eval_dataset = LengthSamplingDataset(self.cfg.inference.samples)
         elif (
-            self.cfg.inference.task == InferenceTaskEnum.forward_folding
+            self.cfg.inference.task == InferenceTaskEnum.inpainting
+            or self.cfg.inference.task == InferenceTaskEnum.forward_folding
             or self.cfg.inference.task == InferenceTaskEnum.inverse_folding
         ):
-            # We want to use the inference settings for the pdb dataset, not what was in the ckpt config
-            dataset_constructor = DatasetConstructor.pdb_test(
-                dataset_cfg=self._input_cfg.pdb_post2021_dataset
+            # We want to use the input cfg inference settings for the pdb dataset,
+            # not what was in the ckpt config
+            # TODO - actually read the config, rather than using constructor to get new instance
+            pdb_test_cfg = self._input_cfg.dataset.PDBPost2021()
+
+            # The dataset will behave differently depending on the task
+            # i.e. for inpainting, we generate motifs.
+            dataset_constructor = DatasetConstructor.pdb_dataset(
+                dataset_cfg=pdb_test_cfg,
+                task=self.cfg.inference.task,
             )
-            eval_dataset, _ = dataset_constructor.create_datasets()
+            _, eval_dataset = dataset_constructor.create_datasets()
         else:
             raise ValueError(f"Unknown task {self.cfg.inference.task}")
 

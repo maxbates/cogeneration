@@ -36,7 +36,7 @@ def parse_pdb_feats(
     pdb_name: str,
     pdb_path: str,
     scale_factor: float = 1.0,
-    # TODO: Make the default behaviour read all chains. Need to update return behavior.
+    # TODO(multimer) Make the default behaviour read all chains. Need to update return behavior.
     chain_id: str = "A",
 ) -> Dict[dpc, Any]:
     """
@@ -44,7 +44,7 @@ def parse_pdb_feats(
         pdb_name: name of PDB to parse.
         pdb_path: path to PDB file to read.
         scale_factor: factor to scale atom positions.
-        mean_center: whether to mean center atom positions.
+        mean_center: whether to mean center atom positions.  # TODO(multimer) implement
     Returns:
         Dict with CHAIN_FEATS features extracted from PDB with specified
         preprocessing.
@@ -54,7 +54,7 @@ def parse_pdb_feats(
     struct_chains = {chain.id: chain for chain in structure.get_chains()}
 
     def _process_chain_id(x):
-        chain_prot = process_chain(struct_chains[x], x)
+        chain_prot = process_chain(struct_chains[x], chain_id=x)
         chain_dict = dataclasses.asdict(chain_prot)
 
         # Take specific features needed for chain parsing

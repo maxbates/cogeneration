@@ -48,23 +48,21 @@ class NodeFeatureNet(nn.Module):
 
     def forward(
         self,
-        so3_t,
-        r3_t,
-        cat_t,
-        res_mask,
-        diffuse_mask,
-        chain_index,
-        res_index,
-        aatypes,
-        aatypes_sc,
+        so3_t: torch.Tensor,  # (B, 1)
+        r3_t: torch.Tensor,  # (B, 1)
+        cat_t: torch.Tensor,  # (B, 1)
+        res_mask: torch.Tensor,  # (B, N)
+        diffuse_mask: torch.Tensor,  # (B, N)
+        chain_index: torch.Tensor,  # (B, N)
+        res_index: torch.Tensor,  # (B, N)
+        aatypes: torch.Tensor,  # (B, N)
+        aatypes_sc: torch.Tensor,  # (B, N, aatype_pred_num_tokens)
     ):
-        # s: [b]
-
-        # [b, n_res, c_pos_emb]
+        # [B, N, c_pos_emb]
         pos_emb = get_index_embedding(res_index, self.cfg.c_pos_emb, max_len=2056)
         pos_emb = pos_emb * res_mask.unsqueeze(-1)
 
-        # [b, n_res, c_timestep_emb]
+        # [B, N, c_timestep_emb]
         input_feats = [
             pos_emb,
             diffuse_mask[..., None],

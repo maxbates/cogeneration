@@ -136,6 +136,7 @@ def process_file(file_path: str, write_dir: str):
         DataError if a known filtering rule is hit.
         All other errors are unexpected and are propogated.
     """
+    # TODO(multimer) reconcile functionality with data_utils `parse_pdb_feats`
     metadata = {}
     pdb_name = os.path.basename(file_path).replace(".pdb", "")
     metadata[dc.pdb_name] = pdb_name
@@ -153,9 +154,9 @@ def process_file(file_path: str, write_dir: str):
     all_seqs = set()
     for chain_id, chain in struct_chains.items():
         chain_id = chain_str_to_int(chain_id)
-        chain_protein = process_chain(chain, chain_id)
+        chain_protein = process_chain(chain, chain_id=chain_id)
         chain_dict = dataclasses.asdict(chain_protein)
-        chain_dict = parse_chain_feats(chain_dict)
+        chain_dict = parse_chain_feats(chain_dict, center=False)
         all_seqs.add(tuple(chain_dict[dpc.aatype]))
         struct_feats.append(chain_dict)
 
@@ -175,7 +176,7 @@ def process_file(file_path: str, write_dir: str):
     else:
         metadata[dc.quaternary_category] = "heteromer"
 
-    # Check residues to be modeled
+    # Determine residues to be modeled
     complex_aatype = complex_feats[dpc.aatype]
     metadata[dc.seq_len] = len(complex_aatype)
     modeled_idx = np.where(complex_aatype != unk_restype_index)[0]
@@ -187,22 +188,21 @@ def process_file(file_path: str, write_dir: str):
     metadata[dc.moduled_num_res] = len(modeled_idx)
     complex_feats[dpc.modeled_idx] = modeled_idx
 
+    # secondary structure, radius of gyration
+    # TODO - consider tracking secondary structure to each chain, rather only than complex metrics
     try:
         # MDtraj
         traj = md.load(file_path)
         # secondary structure calculation
         pdb_ss = md.compute_dssp(traj, simplified=True)
         # radius of gyration calculation
-        pdb_dg = md.compute_rg(traj)
+        pdb_rg = md.compute_rg(traj)
     except Exception as e:
         raise DataError(f"Mdtraj failed with error {e}")
-
-    # TODO - consider tracking secondary structure to each chain, rather only than complex metrics
-
     metadata[dc.coil_percent] = np.sum(pdb_ss == "C") / metadata[dc.modeled_seq_len]
     metadata[dc.helix_percent] = np.sum(pdb_ss == "H") / metadata[dc.modeled_seq_len]
     metadata[dc.strand_percent] = np.sum(pdb_ss == "E") / metadata[dc.modeled_seq_len]
-    metadata[dc.radius_gyration] = pdb_dg[0]
+    metadata[dc.radius_gyration] = pdb_rg[0]
 
     write_pkl(processed_path, complex_feats)
 

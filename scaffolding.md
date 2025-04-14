@@ -3,45 +3,172 @@ doc to plan for scaffolding feature
 Review FrameFlow (second version), which enables scaffolding within a similar codebase (just for protein scaffolding)
 https://github.com/microsoft/protein-frame-flow
 
-## TODOs
+## Initial Version
 
+- Pre-work
+    - [x] see frameflow 2 https://github.com/microsoft/protein-frame-flow/commit/20293ab04994a5bfe97f2d8cf8603a0b63af0609
 - Theory
-    - consider how scaffolding will work with logits, in both scaffolding regimes.
+    - [x] consider how scaffolding will work with logits, in both scaffolding regimes.
 - Codebase
-    - [ ] new training task `scaffolding`
-    - [ ] inference task `scaffolding`
-    - [ ] scaffolding type: `motif amortization` (fixed / conditional) vs `motif guidance` (move over time)
-    - [ ] determine how we switch between unconditional generation and scaffolding
+    - [x] new training task `scaffolding`
+    - [x] inference task `scaffolding`
+    - [x] scaffolding type: `motif amortization` (fixed / conditional)
+    - [x] ensure `forward_folding` and `inverse_folding` defined correctly, cannot just index on rotmats_1/trans_1 being defined any more.
+        - move to switch statements
+    - [x] determine how we switch between unconditional generation and scaffolding
         - e.g. support switching behavior if `diffuse_mask` is defined to support unconditional generation, with some fraction of batches each
-- Datasets
-    - [ ] factory to generate motif masks
-    - [ ] new eval dataset
-        - Length sampler not sufficient. Take PDB structures, mask portions of them. Independent remaining length.
+    - [x] cfg option `inpainting_percent`, defaults to unconditional otherwise
+- Training Dataset
+    - [x] factory to generate motif masks given a batch
+        - [x] initially, just simple motifs
+        - [x] motif factory config: window size, number motifs, motif size
+    - [x] training dataset, or modify interpolant to generate motifs, which defines `diffuse_mask`
 - Interpolant
-    - [ ] update `corrupt_batch()` 
-    - [ ] update sample() 
-        - [ ] partial `diffuse_mask`. require trans_1 and rotmats_1 defined.
-        - [ ] update centering procedure, if needed
-        - [ ] update self-conditioning to use `diffuse_mask`
-    - [ ] enable `twisting` for motif guidance sampling like FrameFlow
-        - see https://github.com/microsoft/protein-frame-flow/blob/main/data/interpolant.py#L327
-- Module
-    - [ ] `validation_step()` shouldn't only default to unconditional generation 
+    - [x] update `corrupt_batch()` 
+        - [x] pass `diffuse_mask` to `corrupt_trans` and `corrupt_rotmats` and `corrupt_aatype`
+            - see FrameFlow2 https://github.com/microsoft/protein-frame-flow/commit/f50d8dbbdae827be291e9f73d732b61b195f8816#diff-fa71335c2193d39db0b87deb7b1e8ba0943d147e774dc46af54a34c1208cab6f
+    - [x] need to center motif.
+        - See if in frameflow, the motif is centered, and the noised residues are also centered    
+    - [x] update OT 
+        - [x] OT needs to respect `diffuse_mask`    
+        - [x] need to fix centering, currently part of OT. need to center everything, not just in diffuse_mask
+    - [x] update `sample()` 
+        - [x] partial `diffuse_mask`. require trans_1 and rotmats_1 defined.
+        - [x] update centering procedure, if needed
+            - needs to match what happens in training
+        - [x] update self-conditioning to use `diffuse_mask`
 - Training
-    - [ ] log scaffolding metrics like scaffolding percent, motif size, `diffuse_mask.mean()`
+    - [x] log scaffolding metrics like scaffolding percent, motif size, `diffuse_mask.mean()`
+- Eval Dataset
+    - [x] new eval dataset
+        - [x] Modify scaffold lengths of masked PDB structures. Remove t=1 values from scaffold.
+        - see `proteina` MotifFactory https://github.com/NVIDIA-Digital-Bio/proteina/blob/main/proteinfoundation/nn/motif_factory.py#L450
 - Sampling
-    - [ ] new eval dataset (see above)
-    - [ ] modify sampling procedure for non-diffused residues
+    - [x] modify sampling procedure for non-diffused residues i.e. `diffuse_mask`
+    - [x] update predict.py with scaffolding dataset 
+    - [x] determine if should fix motif at final time step, depending on metrics calculated
+        - e.g. we might want to calculate RMSD of motifs, look for breaks, etc.
+- Module
+    - [x] inpainting `validation_step()` shouldn't only default to unconditional generation
+    - [x] need to align with eval dataset? or just generate motifs from PDB validation dataset?
 - Metrics
-    - [ ] update assess_sample() 
-    - [ ] New sample metrics
-    - [ ] New summary metrics
+    - [x] support metrics for inpainting
+    - [x] take scaffolding metrics from FrameFlow
+        - There arent really any present
+- Folding Validation
+    - [x] update `assess_sample` 
+        - Inpainting specific metrics. account for `diffuse_mask` appropriately.
+        - [x] sequence recovery of motifs
+        - [x] RMSD of motifs
+- Visualizing
+    - [x] update `save_trajectory()` for coloring logits - right now they are all green
+    - [x] support b-factors by `diffuse_mask`
+
+## Future Work
+
+- Centering
+    - Notes
+        - Fundamental tension: motifs and scaffolds will have a different center of mass.
+            - We can be invariant to the motifs, keeping them fixed, and learn the drift of the scaffolds => conditional invariance
+            - We can be invariant to everything, but the motifs will be "pushed" off-center and introduce bias and blurs conditioning
+            - **If we interpolate scaffold over time, centering is much easier! Just center everything.**
+        - Centering in FrameFlow
+            - t=1 (and t=0) motifs are centered by the dataset
+            - amortization (fixed motifs) there is no additional centering
+                - want condition to be fixed... may lead to off-center structure... I guess that's ok?
+                - would it make more sense to center at each intermediate time points
+            - guidance (interpolation) uses twisting to align diffused residues
+                - makes sense, "looks like" unconditional generation as residues move over time with diffuse residues.
+        - Centering in FoldFlow2
+            - FoldFlow2 samples in reverse, i.e. model predicts vectorfield and data sample is corrupted to yield trajectory
+            - `center` in `reverse()` at each time step
+            - in a presentation, they say they iterated on centering procedure, but didnt describe it...
+            - Unclear if actually includes scaffolding in codebase...
+            - Looks like it: 
+                - takes `trans_t` and `v_t` and `flow_mask`
+                - generates a `perturb`, adds noise, masks it 
+                - applies perturb to `trans_t`
+                - centers `trans_t` using COM of only residues in `flow_mask`
+                - updates `trans_t_1` at `flow_mask` positions
+                - ... which seems like is fine if `flow_mask` is everything 
+                  but will recenter scaffolds — and not move motifs — and merge them
+            - in their images, the motifs seem to interpolate over time...
+    - [ ] Support motif interpolation, rather than just being fixed
+        - [ ] Confirm can just use normal OT mapping, aligning structures
+        - [ ] OT mapping should only be for diffused residue
+    - [ ] move centering out of OT during training
+         - [ ] center all diffused residues? all `res_mask` residues? 
+            - Don't want to force motifs to be centered and scaffolds to move around...
+    - [ ] Align motifs and multiply structures by rotations
+          - if motifs not fixed, or if interpolating over time, need to align motifs and update scaffold rots + trans
+          - see FrameFlow
+    - [ ] Ensure valid re-centering each step during sampling + training
+        - When animate trajectory, motifs should be fixed... but not during sampling?
+        - [ ] Should everything be re-centered? Only if inpainting or stochastic?
+        - [ ] For inpainting, should motifs be fixed, and avoid re-centering scaffolds?
+
+- Misc / Backlog
+    - [x] update relevant task switch statements
+    - [ ] ensure `diffuse_mask` is obeyed throughout
+    - [x] update all `(diffuse_mask == 1.0).all()` references
+    - [ ] address `TODO(inpainting)`
+    - [ ] confirm masks used appropriately for metrics calculating: `res_mask`, `diffuse_mask`, `plddt_mask`
+
+- Tests
+    - [ ] ScaffoldingDataset - diffuse_mask, motif sizes
+        - [ ] ensure `diffuse_mask` does not contain anything not in res_mask or plddt_mask
+    - [ ] interpolant - corrupt_batch(), sample()
+    - [ ] inference for inpainting works
+    - [ ] metrics for inpainting
+
+- Folding Validation
+    - [ ] confirm existing metrics make sense for inpainting
+        - [ ] masks used appropriately
+        - [ ] true sequence and bb positions used sanely
+
+- Motif Selection
+    - [x] set up to allow other methods. abstract into class.
+    - [ ] allow trimming low pLDDT ends before selection
+    - [ ] interacting residues or potential active sites 
+    - [ ] cross-chain interactions
+        - can we augment dataset looking for large monomers with interacting motifs?
+    - [ ] based on secondary structure? e.g. enrich for beta sheets
+    - [ ] Allow selecting a residue and then removing / keeping residues within some distance
+
+- ESM embeddings
+    - Because some sequence is always defined (the motifs), and the intermediate sequence is discrete, can use ESM to get an embedding
+    - Can get both a single and pair representation, replacing `node_feature_net` and `edge_feature_net`
+    - In theory, should improve our ability to unmask sequences...
+    - FoldFlow2 also uses FoldingBlocks instead of IPA...
+    - [ ] Replace `node_feature_net` and `edge_feature_net` with ESM embeddings
+        - ESM should be frozen
+    - [ ] Improve sequence prediction using ESM embeddings. How different is unmasking in ESM using logits?
+    - [ ] Cfg option to use ESM
+        - [ ] Specify ESM model size
+    - Should only work with tasks where sequence is provided, e.g. inpainting and forward_folding
+        - [ ] validate approach with forward_folding
+        - [ ] compare IPA to folding blocks approach
+
+- Training
+    - [ ] define a training curriculum
+        - train on small monomers + scaffolding, then larger + complexes, preferring infilling interacting domains.
+    
+- Inference
+    - [ ] make inference easier, e.g. to sample around some motif taken from a protein
+    - [ ] support parsing RFDiffusion style contigmaps. See FrameFlow.
+    
+- Metrics
+    - [ ] secondary structure of scaffolds, clashes in scaffolds
+
 - Benchmarks
     - [ ] Take benchmark dataset + dataloader from FrameFlow
         - https://github.com/microsoft/protein-frame-flow/blob/main/experiments/utils.py#L45
-- Helpers
-    - [ ] make inference easier, e.g. to sample around some motif taken from a protein
-- Misc
-    - [ ] update relevant switch statements
-    - [ ] update all `(diffuse_mask == 1.0).all()` references
-    - [ ] update `twisting` reference for multiflow config check
+    
+- Scaffolding modeling Features
+    - [ ] Option to only fix structure, not sequence
+        - [ ] Add metrics for sequence recovery
+    - [ ] alternative scaffolding method: `motif guidance` (move over time)
+        - [ ] update `rotmats1` and `trans1` to support interpolation for motifc guidance, not just fixed
+    - [ ] enable `twisting` for motif guidance sampling like FrameFlow
+        - see https://github.com/microsoft/protein-frame-flow/blob/main/data/interpolant.py#L327
+        - [ ] update `twisting` reference for multiflow config check. This is currently how we differentiate it.

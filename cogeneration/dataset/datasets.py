@@ -2,7 +2,8 @@ import logging
 import os
 import random
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, TypeVar
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, TypeVar, Union
 
 import numpy as np
 import pandas as pd
@@ -26,9 +27,23 @@ from cogeneration.data.enum import DatasetProteinColumns as dpc
 from cogeneration.data.enum import DatasetTransformColumns as dtc
 from cogeneration.data.io import read_pkl
 from cogeneration.dataset.data_utils import parse_chain_feats
+from cogeneration.dataset.motif_factory import Motif, MotifFactory, Segment
+from cogeneration.dataset.util import empty_feats
+
+# MetadataCSVRow type alias for a single row of the metadata CSV file
+MetadataCSVRow = Dict[dc, Any]
+
+# MetadataDataFrame type alias for the metadata CSV file, composed of MetadataCSVRow
+MetadataDataFrame = pd.DataFrame
+
+# ProcessedFile for pre-processed pkl, produced by `parse_pdb_files.py`. Expects numpy values, not Tensors.
+ProcessedFile = Dict[dpc, Any]
+
+# ProcessedFeats for features after featurizing ProcessedFile
+ProcessedFeats = Dict[bp, Any]
 
 
-def _read_clusters(cluster_path, synthetic=False):
+def _read_clusters(cluster_path: Union[Path, str], synthetic=False) -> Dict[str, Any]:
     pdb_to_cluster = {}
     with open(cluster_path, "r") as f:
         for i, line in enumerate(f):
@@ -46,7 +61,7 @@ class DatasetFilterer:
         self.dataset_cfg = dataset_cfg
         self._log = logging.getLogger("DatasetFilterer")
 
-    def _rog_filter(self, data_csv: pd.DataFrame) -> pd.DataFrame:
+    def _rog_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:
         """
         Filter by radius of gyration.
         """
@@ -74,14 +89,14 @@ class DatasetFilterer:
         row_rog_cutoffs = data_csv[dc.modeled_seq_len].map(lambda x: pred_y[x - 1])
         return data_csv[data_csv[dc.radius_gyration] < row_rog_cutoffs]
 
-    def _length_filter(self, data_csv: pd.DataFrame) -> pd.DataFrame:
+    def _length_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:
         """Filter by sequence length."""
         return data_csv[
             (data_csv[dc.modeled_seq_len] >= self.dataset_cfg.filter.min_num_res)
             & (data_csv[dc.modeled_seq_len] <= self.dataset_cfg.filter.max_num_res)
         ]
 
-    def _plddt_filter(self, data_csv: pd.DataFrame) -> pd.DataFrame:
+    def _plddt_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:
         """Filter proteins which do not have the required minimum pLDDT."""
         # not used in the public multiflow codebase
         # TODO - pull out pLDDTs from structure, not available in current CSV
@@ -91,13 +106,13 @@ class DatasetFilterer:
         # ]
         return data_csv
 
-    def _max_coil_filter(self, data_csv: pd.DataFrame) -> pd.DataFrame:
+    def _max_coil_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:
         """Filter proteins which exceed max_coil_percent."""
         return data_csv[
             data_csv[dc.coil_percent] <= self.dataset_cfg.filter.max_coil_percent
         ]
 
-    def filter_metadata(self, raw_csv: pd.DataFrame) -> pd.DataFrame:
+    def filter_metadata(self, raw_csv: MetadataDataFrame) -> MetadataDataFrame:
         """
         Initial filtering of dataset.
         Does not filter redesigned / synthetic datasets.
@@ -169,8 +184,15 @@ class BaseDataset(Dataset):
         self._is_training = is_training
         self.dataset_cfg = dataset_cfg
         self.task = task
-        self._rng = np.random.default_rng(seed=self.dataset_cfg.seed)
+
         self._cache = {}
+        self._rng = np.random.default_rng(seed=self.dataset_cfg.seed)
+        self._rng_fixed = np.random.default_rng(seed=42069)
+
+        self.motif_factory = MotifFactory(
+            cfg=self.dataset_cfg.inpainting,
+            rng=self._rng if self.is_training else self._rng_fixed,
+        )
 
         # Process structures and clusters
         assert os.path.exists(
@@ -278,17 +300,18 @@ class BaseDataset(Dataset):
     def __len__(self):
         return len(self.csv)
 
-    def _create_split(self, data_csv):
+    def _create_split(self, data_csv: MetadataDataFrame):
         # Training or validation specific logic.
+        # TODO actually split - this isn't really splitting... it's ~ all the samples in both cases
         if self.is_training:
             self.csv = data_csv
             self._log.info(f"Training: {len(self.csv)} examples")
         else:
-            if self.dataset_cfg.max_eval_length is None:
-                eval_lengths = data_csv[dc.modeled_seq_len]
-            else:
-                eval_lengths = data_csv[dc.modeled_seq_len][
-                    data_csv[dc.modeled_seq_len] <= self.dataset_cfg.max_eval_length
+            # pick all samples in data_csv with valid eval length
+            eval_lengths = data_csv[dc.modeled_seq_len]
+            if self.dataset_cfg.max_eval_length is not None:
+                eval_lengths = eval_lengths[
+                    eval_lengths <= self.dataset_cfg.max_eval_length
                 ]
             all_lengths = np.sort(eval_lengths.unique())
             length_indices = (len(all_lengths) - 1) * np.linspace(
@@ -311,15 +334,17 @@ class BaseDataset(Dataset):
         # reset index
         self.csv[dc.index] = list(range(len(self.csv)))
 
-    def process_processed_path(self, processed_file_path: str) -> Dict[str, Any]:
+    @staticmethod
+    def _load_processed_path(processed_file_path: str) -> ProcessedFile:
         """
-        Processes a single structure + metadata pickled at `processed_file_path`.
-        This file is written by `parse_pdb_files.py`.
+        Loads a single structure + metadata pickled at `processed_file_path`.
+        This file is written by e.g. `parse_pdb_files.py`.
         """
         processed_feats = read_pkl(processed_file_path)
-        processed_feats = parse_chain_feats(processed_feats)
+        processed_feats = parse_chain_feats(processed_feats, center=True)
 
         # Only take modeled residues.
+        # This filters away residues outside range of consideration, yield length N := len(modeled_idx)
         modeled_idx = processed_feats[dpc.modeled_idx]
         min_idx = np.min(modeled_idx)
         max_idx = np.max(modeled_idx)
@@ -328,34 +353,39 @@ class BaseDataset(Dataset):
             lambda x: x[min_idx : (max_idx + 1)], processed_feats
         )
 
-        # Construct an intermediate `chain_feats` for OpenFold pipeline
-        chain_feats = {
-            "aatype": torch.tensor(processed_feats[dpc.aatype]).long(),
-            "all_atom_positions": torch.tensor(
-                processed_feats[dpc.atom_positions]
-            ).double(),
-            "all_atom_mask": torch.tensor(processed_feats[dpc.atom_mask]).double(),
-        }
+        return processed_feats
 
-        # Add noise to atom positions.
-        # Features are in angstrom-scale.
-        if self.dataset_cfg.noise_atom_positions_angstroms > 0:
-            atom_position_noise = (
-                torch.randn_like(chain_feats["all_atom_positions"])
-                * self.dataset_cfg.noise_atom_positions_angstroms
-            )
-            chain_feats["all_atom_positions"] += atom_position_noise
+    def load_processed_path_with_caching(
+        self, csv_row: MetadataCSVRow
+    ) -> ProcessedFile:
+        """
+        Loads a single structure + metadata pickled at `processed_file_path`, with caching.
+        """
+        processed_file_path = os.path.join(
+            self.dataset_cfg.processed_data_path, csv_row[dc.processed_path]
+        )
+        seq_len = csv_row[dc.modeled_seq_len]
+        use_cache = seq_len > self.dataset_cfg.cache_num_res
 
-        # Run through OpenFold data transforms.
-        # Convert atomic representation to frames
-        chain_feats = data_transforms.atom37_to_frames(chain_feats)
-        # calculate torsion angles
-        chain_feats = data_transforms.atom37_to_torsion_angles()(chain_feats)
+        if use_cache and processed_file_path in self._cache:
+            return self._cache[processed_file_path]
 
-        # Re-number residue indices for each chain such that it starts from 1.
-        # Randomize chain indices.
-        chain_idx = processed_feats[dpc.chain_index]
-        res_idx = processed_feats[dpc.residue_index]
+        processed_feats = self._load_processed_path(processed_file_path)
+
+        if use_cache:
+            self._cache[processed_file_path] = processed_feats
+
+        return processed_feats
+
+    @staticmethod
+    def reset_residues_and_randomize_chains(feats: ProcessedFeats):
+        """
+        Randomize chain indices, and re-number residue indices for each chain to start from 1.
+        Modifies the input features in place.
+        """
+        chain_idx = feats[bp.chain_idx]
+        res_idx = feats[bp.res_idx]
+
         new_res_idx = np.zeros_like(res_idx)
         new_chain_idx = np.zeros_like(res_idx)
         all_chain_idx = np.unique(chain_idx).tolist()
@@ -373,86 +403,229 @@ class BaseDataset(Dataset):
             replacement_chain_id = shuffled_chain_idx[i]
             new_chain_idx = new_chain_idx + replacement_chain_id * chain_mask
 
-        # Extract rigits (translations + rotations), check for poorly processed
+        feats[bp.chain_idx] = torch.tensor(new_chain_idx).long()
+        feats[bp.res_idx] = torch.tensor(new_res_idx).long()
+
+    @staticmethod
+    def recenter_structure(
+        feats: ProcessedFeats,
+    ):
+        """
+        Centers the structure using diffuse_mask, to be translation invariant.
+        Note, structure should already be centered by Dataset, so not required if whole structure is used.
+        """
+        # TODO(inpainting) explicit flag to only consider `diffuse_mask` for centering
+        if (feats[bp.diffuse_mask] == 0).any():
+            # Re-center the structure based on non-diffused (motif) locations. Motifs should not move.
+            motif_mask = 1 - feats[bp.diffuse_mask]
+            motif_1 = feats[bp.trans_1] * motif_mask[:, None]
+            center_of_mass = torch.sum(motif_1, dim=0) / (torch.sum(motif_mask) + 1e-5)
+        else:
+            center_of_mass = torch.sum(feats[bp.trans_1], dim=0) / torch.sum(
+                feats[bp.diffuse_mask] + 1e-5
+            )
+
+        # modify in place
+        feats[bp.trans_1] -= center_of_mass[None, :]
+
+    @staticmethod
+    def segment_features(
+        feats: ProcessedFeats,
+        segments: List[Segment],
+    ):
+        """
+        Apply `Motif` and `Scaffold` `Segments` to `feats`.
+        Preserves the feats in motifs, and masks them in scaffolds, and extends scaffolds to target length.
+        """
+        new_total_length = sum([seg.length for seg in segments])
+        new_feats = empty_feats(N=new_total_length)
+
+        # TODO(inpainting) confirm we don't need to create an intermediate Rigid for each motif
+        #   and can just pass the translations and rotations through...
+
+        for segment in segments:
+            if isinstance(segment, Motif):
+                s, e = segment.start, segment.end
+                e = e + 1  # make end position inclusive for range selection
+
+                # copy over relevant motif features
+                for prop, value in new_feats.items():
+                    new_feats[prop][s:e] = feats[prop][s:e]
+
+                # enforce certain values in motif
+                new_feats[bp.diffuse_mask][s:e] = 1.0
+
+        # copy over some features from original
+        for prop in [bp.pdb_name, bp.csv_idx, bp.sample_id]:
+            if prop in feats:
+                new_feats[prop] = feats[prop]
+
+        return new_feats
+
+    @staticmethod
+    def _featurize_processed_file(
+        cfg: DatasetConfig,
+        task: DataTaskEnum,
+        is_training: bool,
+        processed_file: ProcessedFile,
+        csv_row: MetadataCSVRow,
+        motif_factory: MotifFactory,
+    ) -> ProcessedFeats:
+        """
+        Processes a pickled features from single structure + metadata.
+
+        This function should be called as examples are needed, i.e. in `__get_item__`,
+        because it adds noise to atom positions, picks motif positions, etc. as defined by cfg.
+        """
+        # Redesigned sequences can be used to substitute the original sequence.
+        if cfg.use_redesigned:
+            best_seq = csv_row[dc.best_seq]
+            if not isinstance(best_seq, str):
+                raise ValueError(f"Unexpected value best_seq: {best_seq}")
+
+            best_aatype = np.array(seq_to_aatype(best_seq))
+            processed_file[dpc.aatype] = best_aatype
+
+            assert (
+                processed_file[dpc.aatype].shape == best_aatype.shape
+            ), f"best_seq different length: {processed_file[dpc.aatype].shape} vs {best_aatype.shape}"
+
+        # Check the sequence
+        aatypes_1 = processed_file[dpc.aatype]
+        num_unique_aatypes = len(set(aatypes_1))
+        if num_unique_aatypes <= 1:
+            raise ValueError(
+                f"Example {csv_row[dc.pdb_name]} @ {csv_row[dc.processed_path]} has only {num_unique_aatypes} unique amino acids."
+            )
+
+        # Construct an intermediate `chain_feats` for OpenFold pipeline
+        chain_feats = {
+            "aatype": torch.tensor(aatypes_1).long(),
+            "all_atom_positions": torch.tensor(
+                processed_file[dpc.atom_positions]
+            ).double(),
+            "all_atom_mask": torch.tensor(processed_file[dpc.atom_mask]).double(),
+        }
+
+        # Add noise to atom position tensor.
+        # Features are in angstrom-scale.
+        add_noise = cfg.noise_atom_positions_angstroms > 0
+        if add_noise:
+            atom_position_noise = (
+                torch.randn_like(chain_feats["all_atom_positions"])
+                * cfg.noise_atom_positions_angstroms
+            )
+            chain_feats["all_atom_positions"] += atom_position_noise
+
+        # Run through OpenFold data transforms.
+        # Convert atomic representation to frames
+        chain_feats = data_transforms.atom37_to_frames(chain_feats)
+        # calculate torsion angles, in case predicting psi angles
+        chain_feats = data_transforms.atom37_to_torsion_angles()(chain_feats)
+
+        # Extract rigids (translations + rotations), check for poorly processed
         rigids_1 = rigid_utils.Rigid.from_tensor_4x4(
             chain_feats[dtc.rigidgroups_gt_frames]
         )[:, 0]
         rotmats_1 = rigids_1.get_rots().get_rot_mats()
         trans_1 = rigids_1.get_trans()
         if torch.isnan(trans_1).any() or torch.isnan(rotmats_1).any():
-            raise ValueError(f"Found NaNs in {processed_file_path}")
+            raise ValueError(f"Found NaNs in {csv_row[dc.processed_path]}")
+
+        # res_mask for residues under consideration
+        res_mask = torch.tensor(processed_file[dpc.bb_mask]).int()
 
         # Mask low pLDDT residues
-        res_plddt = processed_feats[dpc.b_factors][:, 1]
-        res_mask = torch.tensor(processed_feats[dpc.bb_mask]).int()
+        res_plddt = processed_file[dpc.b_factors][:, 1]
         plddt_mask = torch.ones_like(res_mask)
-        if self.dataset_cfg.add_plddt_mask:
-            plddt_mask = torch.tensor(
-                res_plddt > self.dataset_cfg.min_plddt_threshold
-            ).int()
+        if cfg.add_plddt_mask:
+            plddt_mask = torch.tensor(res_plddt > cfg.min_plddt_threshold).int()
 
-        # Take only necessary features
-        return {
-            bp.res_plddt: res_plddt,
-            bp.aatypes_1: chain_feats[dpc.aatype],
-            bp.rotmats_1: rotmats_1,
-            bp.trans_1: trans_1,
-            bp.torsion_angles_sin_cos_1: chain_feats[dtc.torsion_angles_sin_cos],
+        # Determine diffuse_mask depending on task
+        if task == DataTaskEnum.hallucination:
+            diffuse_mask = torch.ones_like(res_mask).bool()
+        elif task == DataTaskEnum.inpainting:
+            diffuse_mask = motif_factory.generate_diffuse_mask(res_mask=res_mask)
+        else:
+            raise ValueError(f"Unknown task {task}")
+
+        # Ensure have a valid `diffuse_mask` for modeling
+        if torch.sum(diffuse_mask) < 1:
+            diffuse_mask = torch.ones_like(diffuse_mask)
+        diffuse_mask = diffuse_mask.int()
+
+        feats: ProcessedFeats = {
             bp.res_mask: res_mask,
+            bp.aatypes_1: aatypes_1,
+            bp.trans_1: trans_1,
+            bp.rotmats_1: rotmats_1,
+            bp.torsion_angles_sin_cos_1: chain_feats[dtc.torsion_angles_sin_cos],
+            bp.chain_idx: processed_file[dpc.chain_index],
+            bp.res_idx: processed_file[dpc.residue_index],
+            bp.res_plddt: res_plddt,
+            bp.diffuse_mask: diffuse_mask,
             bp.plddt_mask: plddt_mask,
-            bp.chain_idx: new_chain_idx,
-            bp.res_idx: new_res_idx,
+            # Pass through relevant data from CSV
+            bp.pdb_name: csv_row[dc.pdb_name],
         }
 
-    def process_csv_row(self, csv_row):
-        """
-        Process a single row of the CSV file, with caching.
-        """
-        path = os.path.join(
-            self.dataset_cfg.processed_data_path, csv_row[dc.processed_path]
+        # For inpainting evaluation (i.e. not training), vary scaffold lengths
+        # Using the `diffuse_mask`, modify the scaffold region lengths, and mask out the scaffolds
+        if (
+            task == DataTaskEnum.inpainting
+            and not is_training
+            and (diffuse_mask == 0).any()
+        ):
+            segments = motif_factory.generate_segments_from_diffuse_mask(
+                diffuse_mask=diffuse_mask
+            )
+            BaseDataset.segment_features(feats=feats, segments=segments)
+
+        # If some positions are fixed, those motifs need to be re-centered
+        # to avoid hinting / memorizing where to place scaffolds.
+        if add_noise or (diffuse_mask == 0).any():
+            BaseDataset.recenter_structure(feats=feats)
+
+        # Randomize chains and reset residue positions - after motif-selection!
+        BaseDataset.reset_residues_and_randomize_chains(feats=feats)
+
+        return feats
+
+    def process_processed_file(
+        self, processed_file: ProcessedFile, csv_row: MetadataCSVRow
+    ) -> ProcessedFeats:
+        return self._featurize_processed_file(
+            cfg=self.dataset_cfg,
+            task=self.task,
+            is_training=self.is_training,
+            processed_file=processed_file,
+            csv_row=csv_row,
+            motif_factory=self.motif_factory,
         )
-        seq_len = csv_row[dc.modeled_seq_len]
 
-        # Large protein files are slow to read. Cache them.
-        use_cache = seq_len > self.dataset_cfg.cache_num_res
-        if use_cache and path in self._cache:
-            return self._cache[path]
-
-        processed_row = self.process_processed_path(path)
-        processed_row[dc.pdb_name] = csv_row[dc.pdb_name]
-
-        if self.dataset_cfg.use_redesigned:
-            best_seq = csv_row[dc.best_seq]
-            if not isinstance(best_seq, float):
-                best_aatype = torch.tensor(seq_to_aatype(best_seq)).long()
-                assert processed_row[bp.aatypes_1].shape == best_aatype.shape
-                processed_row[bp.aatypes_1] = best_aatype
-
-        aatypes_1 = processed_row[bp.aatypes_1].detach().cpu().numpy()
-
-        if len(set(aatypes_1)) == 1:
-            raise ValueError(f"Example {path} has only one amino acid.")
-        if use_cache:
-            self._cache[path] = processed_row
-
+    def process_csv_row(self, csv_row: MetadataCSVRow) -> ProcessedFeats:
+        """
+        Process a single row of the CSV file.
+        File loading is cached.
+        Addition of noise, determination of masks etc. is not cached.
+        """
+        processed_file = self.load_processed_path_with_caching(
+            csv_row=csv_row,
+        )
+        processed_row = self.process_processed_file(
+            processed_file=processed_file,
+            csv_row=csv_row,
+        )
         return processed_row
 
     def __getitem__(self, row_idx):
-        # Process data example.
         csv_row = self.csv.iloc[row_idx]
-        feats = self.process_csv_row(csv_row)  # process on the fly (with caching)
-
-        if self.task == DataTaskEnum.hallucination:
-            feats[bp.diffuse_mask] = torch.ones_like(feats[bp.res_mask]).bool()
-        if self.task == DataTaskEnum.inpainting:
-            # TODO(inpainting) - specify more interesting + random patches. Determined by config.
-            feats[bp.diffuse_mask] = (torch.rand_like(feats[bp.res_mask]) > 0.5).bool()
-        else:
-            raise ValueError(f"Unknown task {self.task}")
-        feats[bp.diffuse_mask] = feats[bp.diffuse_mask].int()
+        feats = self.process_csv_row(csv_row)
 
         # Storing the csv index is helpful for debugging.
+        # Assign here to ensure we have the correct index.
         feats[bp.csv_idx] = torch.ones(1, dtype=torch.long) * row_idx
+
         return feats
 
 
@@ -481,7 +654,7 @@ class PdbDataset(BaseDataset):
         )
 
 
-class LengthSamplingDataset(torch.utils.data.Dataset):
+class LengthSamplingDataset(Dataset):
     """
     During predictions/inference, dataset to generate (e.g. unconditional) samples across lengths
     Each item comprises `num_res` (int) and `sample_id` (torch.Tensor, int or ints or strings)
@@ -551,21 +724,14 @@ class DatasetConstructor:
         return train_dataset, eval_dataset
 
     @classmethod
-    def pdb_train_validation(cls, dataset_cfg: DatasetConfig):
+    def pdb_dataset(
+        cls, dataset_cfg: DatasetConfig, task: DataTaskEnum = DataTaskEnum.hallucination
+    ):
         """Generates default training and evaluation datasets"""
         return cls(
             dataset_class=PdbDataset,
             cfg=dataset_cfg,
-            task=DataTaskEnum.hallucination,
-        )
-
-    @classmethod
-    def pdb_test(cls, dataset_cfg: DatasetConfig):
-        """Generates default eval dataset"""
-        return cls(
-            dataset_class=PdbDataset,
-            cfg=dataset_cfg,
-            task=DataTaskEnum.hallucination,
+            task=task,
         )
 
     @classmethod

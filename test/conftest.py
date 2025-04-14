@@ -14,6 +14,7 @@ from pytorch_lightning import Trainer
 from torch.utils.data import DataLoader, Dataset
 
 from cogeneration.config.base import (
+    PATH_PUBLIC_WEIGHTS,
     Config,
     InferenceSamplesConfig,
     InferenceTaskEnum,
@@ -28,9 +29,9 @@ from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingDataset
 from cogeneration.dataset.protein_dataloader import LengthBatcher, ProteinData
+from cogeneration.dataset.util import mock_noisy_feats
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
-from cogeneration.config.base import PATH_PUBLIC_WEIGHTS
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -78,7 +79,7 @@ def mock_cfg(mock_cfg_uninterpolated) -> Config:
 
 
 def create_pdb_noisy_batch(cfg: Config):
-    dataset_constructor = DatasetConstructor.pdb_train_validation(
+    dataset_constructor = DatasetConstructor.pdb_dataset(
         dataset_cfg=cfg.dataset,
     )
 
@@ -86,6 +87,7 @@ def create_pdb_noisy_batch(cfg: Config):
 
     # batch sampler required to sample batch size > 1
     # we borrow convention from MultiFlow to batch by length rather than pad
+    # modify sampler cfg to specify `max_batch_size`.
     batch_sampler = LengthBatcher(
         sampler_cfg=cfg.data.sampler,
         metadata_csv=train_dataset.csv,
@@ -130,37 +132,7 @@ class MockDataset(Dataset):
         all_items = []
 
         for i, N in enumerate(self.sample_lengths):
-            input_feats = {}
-
-            # N residue protein, random frames
-            input_feats[bp.num_res] = torch.tensor([N])
-            input_feats[bp.res_mask] = torch.ones(N)
-            input_feats[bp.aatypes_1] = torch.randint(0, 20, (N,))  # AA seq as ints
-            input_feats[bp.trans_1] = torch.rand(N, 3)
-            input_feats[bp.rotmats_1] = torch.rand(N, 3, 3)
-            input_feats[bp.torsion_angles_sin_cos_1] = torch.rand(N, 7, 2)
-            input_feats[bp.chain_idx] = torch.zeros(N)
-            input_feats[bp.res_idx] = torch.arange(N)
-            input_feats[bp.pdb_name] = f"test_{i}"
-            input_feats[bp.res_plddt] = torch.floor(torch.rand(N) + 0.5)
-            input_feats[bp.plddt_mask] = input_feats[bp.res_plddt] > 0.6
-            input_feats[bp.diffuse_mask] = torch.ones(N)
-            input_feats[bp.csv_idx] = torch.tensor([0])
-
-            # generate corrupted noisy values for input_feats
-            t = torch.rand(1)  # use same value as with unconditional + not separate_t
-            input_feats[nbp.so3_t] = t
-            input_feats[nbp.r3_t] = t
-            input_feats[nbp.cat_t] = t
-            input_feats[nbp.trans_t] = torch.rand(N, 3)
-            input_feats[nbp.rotmats_t] = torch.rand(N, 3, 3)
-            input_feats[nbp.aatypes_t] = (
-                torch.rand(N) * 20
-            )  # amino acid sequence as floats
-            input_feats[nbp.trans_sc] = torch.rand(N, 3)
-            input_feats[nbp.aatypes_sc] = torch.rand(N, 21)  # include mask token
-
-            all_items.append(input_feats)
+            all_items.append(mock_noisy_feats(N=N, idx=i))
 
         return all_items
 
@@ -173,6 +145,7 @@ class MockDataset(Dataset):
 
 @pytest.fixture
 def mock_dataloader(request):
+    # TODO - increase default batch size > 1
     batch_size = request.param.get("batch_size", 1)
     sample_lengths = request.param.get("sample_lengths", None)
 
@@ -183,6 +156,8 @@ def mock_dataloader(request):
 
 @pytest.fixture
 def mock_pred_unconditional_dataloader():
+    # TODO - increase batch size > 1
+
     length_sampling_dataset = LengthSamplingDataset(
         InferenceSamplesConfig(
             samples_per_length=1,
@@ -196,10 +171,12 @@ def mock_pred_unconditional_dataloader():
 
 @pytest.fixture
 def mock_pred_conditional_dataloader(mock_cfg):
-    dataset_constructor = DatasetConstructor.pdb_test(
+    # TODO - increase batch size > 1
+
+    dataset_constructor = DatasetConstructor.pdb_dataset(
         dataset_cfg=mock_cfg.dataset,
     )
-    eval_dataset, _ = dataset_constructor.create_datasets()
+    _, eval_dataset = dataset_constructor.create_datasets()
 
     dataloader = DataLoader(eval_dataset, batch_size=1)
     return dataloader
@@ -383,6 +360,7 @@ def mock_checkpoint(mock_folding_validation):
         # update config with the checkpoint
         assert cfg.inference.task == InferenceTaskEnum.unconditional
         cfg.inference.unconditional_ckpt_path = str(ckpt_path)
+        cfg.inference.inpainting_ckpt_path = str(ckpt_path)
         cfg.inference.forward_folding_ckpt_path = str(ckpt_path)
         cfg.inference.inverse_folding_ckpt_path = str(ckpt_path)
 

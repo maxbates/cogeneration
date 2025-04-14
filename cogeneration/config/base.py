@@ -3,7 +3,6 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
-from xml.etree.ElementPath import xpath_tokenizer
 
 from hydra.core.config_store import ConfigStore
 from omegaconf import OmegaConf
@@ -35,12 +34,14 @@ class DataTaskEnum(StrEnum):
     """task for training"""
 
     hallucination = "hallucination"
+    inpainting = "inpainting"  # aka `scaffolding`
 
 
 class InferenceTaskEnum(StrEnum):
     """task for inference"""
 
     unconditional = "unconditional"
+    inpainting = "inpainting"  # aka `scaffolding`
     forward_folding = "forward_folding"
     inverse_folding = "inverse_folding"
 
@@ -124,26 +125,6 @@ class ModelHyperParamsConfig:
             timestep_embed_size=128,
         )
 
-    @classmethod
-    def esmc_300m(cls):
-        """Factory for configuration compatible with ESM-C 300M"""
-        return cls(
-            node_embed_size=960,
-            edge_embed_size=256,
-            pos_embed_size=128,
-            timestep_embed_size=128,
-        )
-
-    @classmethod
-    def esmc_600m(cls):
-        """Factory for configuration compatible with ESM-C 600M"""
-        return cls(
-            node_embed_size=1152,
-            edge_embed_size=384,
-            pos_embed_size=192,
-            timestep_embed_size=192,
-        )
-
 
 @dataclass
 class ModelNodeFeaturesConfig:
@@ -161,7 +142,6 @@ class ModelNodeFeaturesConfig:
     aatype_pred_num_tokens: int = "${model.hyper_params.aa_num_tokens}"
     # max_num_res: maximum number of residues
     max_num_res: int = 2000
-    timestep_int: int = 1000  # DROP
     # embed_chain: whether to embed chain index.
     embed_chain: bool = True
     # embed_aatype: whether to embed amino acid type
@@ -181,9 +161,6 @@ class ModelEdgeFeaturesConfig:
     c_s: int = "${model.hyper_params.node_embed_size}"
     # c_p: output embedding size + MLP width
     c_p: int = "${model.hyper_params.edge_embed_size}"
-    relpos_k: int = (
-        64  # DROP. duplicate of `feat_dim`? Appears to be carry over from AF2?
-    )
     # feat_dim: partial internal dimension (actual width is multiple)
     feat_dim: int = 64
     # num_bins: number of bins for edge distrogram
@@ -192,7 +169,7 @@ class ModelEdgeFeaturesConfig:
     self_condition: bool = True
     # embed_chain: whether to embed chain index.
     embed_chain: bool = True
-    # embed_diffuse_mask: whether to embed diffuse mask
+    # embed_diffuse_mask: whether to embed diffuse mask. important esp. for `scaffolding` task.
     embed_diffuse_mask: bool = True
 
 
@@ -297,7 +274,7 @@ class ModelConfig:
 
     # sequence prediction, default is simple aa_pred matching MultiFlow
     sequence_pred_type: ModelSequencePredictionEnum = (
-        ModelSequencePredictionEnum.aa_pred
+        ModelSequencePredictionEnum.sequence_ipa_net
     )
     aa_pred: ModelAAPredConfig = field(default_factory=ModelAAPredConfig)
     sequence_ipa_net: ModelSequenceIPANetConfig = field(
@@ -343,7 +320,7 @@ class InterpolantTranslationsScheduleEnum(StrEnum):
 class InterpolantTranslationsConfig:
     # corrupt: corrupt translations
     corrupt: bool = True
-    # batch_ot: enable minibatch optimal transport
+    # batch_ot: enable minibatch optimal transport AND importantly, centering
     batch_ot: bool = True
     # train_schedule: training schedule for interpolant
     train_schedule: InterpolantTranslationsScheduleEnum = (
@@ -404,7 +381,7 @@ class InterpolantAATypesConfig:
     )
     # temp: temperature
     temp: float = 0.1
-    # noise: AA type change noise
+    # noise: AA type change noise. No noise for forward_folding.
     noise: float = (
         "${ternary:${equals: ${inference.task}, 'forward_folding'}, 0.0, 20.0}"
     )
@@ -430,11 +407,12 @@ class InterpolantConfig:
     provide_kappa: bool = True
     hierarchical_t: bool = False
     separate_t: bool = False  # TODO drop, unused / refactor into rots/trans/aa
-    # Whether to use separate t times for rots / trans / aatypes
+    # Use separate t times for rots / trans / aatypes in batch corruption
+    # Effectively sets some proportion of the batch to be forward_folding / inverse_folding
     codesign_separate_t: bool = (
         "${ternary:${equals: ${inference.task}, 'unconditional'}, False, True}"
     )
-    # proportion of samples allocated to forward or inverse folding, if using separate t
+    # proportion of samples allocated to forward or inverse folding, if using codesign_separate_t
     codesign_forward_fold_prop: float = 0.1
     codesign_inverse_fold_prop: float = 0.1
     # enable self-conditioning
@@ -478,7 +456,7 @@ class DatasetFilterConfig:
     max_num_res: int = 384
     min_num_res: int = 60
     max_coil_percent: float = 0.667  # was 0.5 in public MultiFlow
-    min_num_confident_plddt: float = 40
+    min_num_confident_plddt: float = 40  # TODO implement
     # TODO - support filter on low pLDDT percentage
     # TODO - min/max motif percent threshold (avoid loopy things)
     rog_quantile: float = 0.96
@@ -491,6 +469,27 @@ class DatasetFilterConfig:
         ]
     )
     num_chains: List[int] = field(default_factory=lambda: [1])
+
+
+@dataclass
+class DatasetInpaintingConfig:
+    """
+    Configuration for generating motifs / scaffolding
+    """
+
+    # % of time unconditional, i.e. not motif selected. 0% in FoldFlow.
+    unconditional_percent: float = 0.2
+    # number of possible motifs
+    min_num_motifs: int = 1
+    max_num_motifs: int = 5
+    # fraction of residues to be in motif
+    min_percent_motifs: float = 0.05
+    max_percent_motifs: float = 0.50
+    # motif length bounds
+    min_motif_len: int = 8
+    max_motif_len: int = 768
+    # minimal spacing between motifs (i.e. min scaffold length)
+    min_padding: int = 3
 
 
 # dataset_metadata_dir_path is the root directory for dataset / metadata files
@@ -526,10 +525,11 @@ class DatasetConfig:
     cache_num_res: int = 0  # min size to enable caching
     inpainting_percent: float = 1.0
     # plddt [0, 100]. Minimum threshold, per residue, masked if below and add_plddt_mask=True
-    add_plddt_mask: bool = False
+    add_plddt_mask: bool = True
     min_plddt_threshold: float = 0.0
     # add gaussian noise to atom positions
-    # TODO only add noise if t below some threshold
+    # TODO cfg to only add noise if t below some threshold (requires moving out of dataset)
+    # TODO ensure noise added each time accessed and not cached
     noise_atom_positions_angstroms: float = 0.1
 
     # Redesigned, i.e. use ProteinMPNN to generate sequences for a structure
@@ -553,11 +553,15 @@ class DatasetConfig:
     samples_per_eval_length: int = 5
     num_eval_lengths: int = 8
 
+    # Scaffolding / inpainting parameters
+    inpainting: DatasetInpaintingConfig = field(default_factory=DatasetInpaintingConfig)
+
     # Filtering
     filter: DatasetFilterConfig = field(default_factory=DatasetFilterConfig)
 
     @classmethod
     def PDBPost2021(cls):
+        # Config for test-set of PDB structures from 2021 and later
         return cls(
             csv_path=dataset_metadata_dir_path / "test_set_metadata.csv",
             cluster_path=dataset_metadata_dir_path / "test_set_clusters.csv",
@@ -730,6 +734,8 @@ class InferenceConfig:
     unconditional_ckpt_path: Optional[str] = str(PATH_PUBLIC_WEIGHTS / "last.ckpt")
     forward_folding_ckpt_path: Optional[str] = str(PATH_PUBLIC_WEIGHTS / "last.ckpt")
     inverse_folding_ckpt_path: Optional[str] = str(PATH_PUBLIC_WEIGHTS / "last.ckpt")
+    # note inpainting not explicitly supported by public MultiFlow model
+    inpainting_ckpt_path: Optional[str] = str(PATH_PUBLIC_WEIGHTS / "last.ckpt")
 
     interpolant: InterpolantConfig = field(default_factory=InterpolantConfig)
     samples: InferenceSamplesConfig = field(default_factory=InferenceSamplesConfig)
@@ -789,7 +795,7 @@ class Config:
     def test_uninterpolated(cls, tmp_path: Path) -> "Config":
         """
         Return a config set up for testing, with a tiny (useless) model.
-        Requires running `interpolate()` to allow for further modification.
+        Requires running `interpolate()`, to allow for further modification.
         """
         raw_cfg = cls()
 
@@ -818,7 +824,7 @@ class Config:
         raw_cfg.experiment.checkpointer.dirpath = str(tmp_path / "ckpt")
         raw_cfg.inference.predict_dir = str(tmp_path / "inference")
 
-        # limit number of lengths sampled for validation / inference
+        # limit number of lengths + timesteps sampled for validation / inference
         raw_cfg.interpolant.sampling.num_timesteps = 3
         raw_cfg.inference.interpolant.sampling.num_timesteps = 3
         raw_cfg.inference.samples.samples_per_length = 2
@@ -833,9 +839,14 @@ class Config:
     @classmethod
     def public_multiflow(cls):
         """
-        Returns a config that maintains compatibility with Public MultiFlow weights and better aligned with its defaults
+        Returns a config that maintains compatibility with Public MultiFlow weights + better aligned with its defaults.
+        Requires running `interpolate()`, to allow for further modification.
         """
         raw_cfg = cls()
+
+        # Default to unconditional generation
+        raw_cfg.data.task = DataTaskEnum.hallucination
+        raw_cfg.inference.task = InferenceTaskEnum.unconditional
 
         # Model
         # Use public MultiFlow model size hyperparameters

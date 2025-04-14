@@ -23,6 +23,7 @@ def create_rigid(rots: torch.Tensor, trans: torch.Tensor) -> Rigid:
 
 
 def batch_align_structures(pos_1: torch.Tensor, pos_2: torch.Tensor, mask=None):
+    """Center and align structures to reference structures"""
     if pos_1.shape != pos_2.shape:
         raise ValueError("pos_1 and pos_2 must have the same shape.")
     if pos_1.ndim != 3:
