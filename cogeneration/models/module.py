@@ -445,7 +445,7 @@ class FlowModule(LightningModule):
         step_start_time = time.time()
 
         self.interpolant.set_device(batch[bp.res_mask].device)
-        noisy_batch = self.interpolant.corrupt_batch(batch)
+        noisy_batch = self.interpolant.corrupt_batch(batch, task=self.cfg.data.task)
 
         # Enable self-conditioning
         if (
@@ -536,15 +536,15 @@ class FlowModule(LightningModule):
 
         # inpainting / scaffolding metrics
         if self.cfg.data.task == DataTaskEnum.inpainting:
-            scaffold_percent = torch.mean(batch["diffuse_mask"].float()).item()
+            diffuse_mask = batch[bp.diffuse_mask].float()
+            scaffold_percent = torch.mean(diffuse_mask).item()
             self._log_scalar(
                 "train/scaffolding_percent",
                 scaffold_percent,
                 prog_bar=False,
                 batch_size=num_batch,
             )
-            motif_mask = 1 - batch["diffuse_mask"].float()
-            num_motif_res = torch.sum(motif_mask, dim=-1)
+            num_motif_res = torch.sum(1 - diffuse_mask, dim=-1)
             self._log_scalar(
                 "train/motif_size",
                 torch.mean(num_motif_res).item(),
@@ -684,7 +684,7 @@ class FlowModule(LightningModule):
                 for sample_id in sample_ids
             ]
             true_aatypes = true_bb_pos = None
-            trans_1 = rotmats_1 = diffuse_mask = aatypes_1 = None
+            trans_1 = rotmats_1 = psi_torsions_1 = diffuse_mask = aatypes_1 = None
 
         elif self.cfg.inference.task == InferenceTaskEnum.inpainting:
             sample_pdb_name = batch[bp.pdb_name][0]
@@ -745,7 +745,7 @@ class FlowModule(LightningModule):
                 aatype=to_numpy(batch[bp.aatypes_1][0]),
             )
             aatypes_1 = batch[bp.aatypes_1]
-            trans_1 = rotmats_1 = diffuse_mask = true_aatypes = None
+            trans_1 = rotmats_1 = psi_torsions_1 = diffuse_mask = true_aatypes = None
 
         elif self.cfg.inference.task == InferenceTaskEnum.inverse_folding:
             sample_pdb_name = batch[bp.pdb_name][0]
@@ -787,10 +787,11 @@ class FlowModule(LightningModule):
             task=self.cfg.inference.task,
             trans_1=trans_1,
             rotmats_1=rotmats_1,
+            psis_1=psi_torsions_1,
             aatypes_1=aatypes_1,
             diffuse_mask=diffuse_mask,
-            chain_idx=batch[bp.chain_idx],
-            res_idx=batch[bp.res_idx],
+            chain_idx=batch[bp.chain_idx] if bp.chain_idx in batch else None,
+            res_idx=batch[bp.res_idx] if bp.res_idx in batch else None,
             separate_t=self.cfg.inference.interpolant.codesign_separate_t,
         )
         # reset diffuse_mask to those residues sampled for calculating metrics

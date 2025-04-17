@@ -693,11 +693,9 @@ class FoldingValidator:
     def assess_folded_structures(
         sample_pdb_path: str,
         folded_df: pd.DataFrame,
-        true_bb_positions: Optional[npt.NDArray] = None,  # [n_residues, 37, 3]
-        diffuse_mask: Optional[
-            npt.NDArray
-        ] = None,  # [n_residues] for inpainting metrics
-        task: InferenceTaskEnum = InferenceTaskEnum.unconditional,  # task type to determine which metrics to compute
+        true_bb_positions: Optional[npt.NDArray] = None,  # (N, 37, 3)
+        diffuse_mask: Optional[npt.NDArray] = None,  # (N) inpainting
+        task: InferenceTaskEnum = InferenceTaskEnum.unconditional,  # influences which metrics to compute
     ) -> pd.DataFrame:
         """
         Calculate RMSD, pLDDT, and other metrics, comparing folded structures in `folded_df`
@@ -712,28 +710,21 @@ class FoldingValidator:
         edited from `process_folded_outputs()` in public multiflow
         """
         sample_feats = parse_pdb_feats("sample", pdb_path=sample_pdb_path)
-        sample_ca_pos = sample_feats[dpc.bb_positions]
-        sample_bb_pos = sample_feats[dpc.atom_positions][:, :3].reshape(-1, 3)
+        sample_bb_pos = sample_feats[dpc.atom_positions][:, :3]  # (N, 3, 3)
 
+        num_res = sample_bb_pos.shape[0]
+        res_mask = torch.ones(num_res)
         motif_mask = torch.tensor(diffuse_mask == 0)
 
-        # Helpers to calculate RMSD
-        def _calc_ca_rmsd(mask, sample_ca_pos, folded_ca_pos):
-            return (
-                superimpose(
-                    torch.tensor(sample_ca_pos)[None],
-                    torch.tensor(folded_ca_pos)[None],
-                    mask,
-                )[1]
-                .rmsd[0]
-                .item()
-            )
-
-        def _calc_bb_rmsd(mask, sample_bb_pos, folded_bb_pos):
+        def _calc_bb_rmsd(
+            mask: torch.Tensor,  # (N)
+            pos_1: npt.NDArray,  # (N, 3, 3)
+            pos_2: npt.NDArray,  # (N, 3, 3)
+        ):
             aligned_rmsd = superimpose(
-                torch.tensor(sample_bb_pos)[None],
-                torch.tensor(folded_bb_pos)[None],
-                mask[:, None].repeat(1, 3).reshape(-1),
+                torch.tensor(pos_1).reshape(-1, 3)[None],  # (1, N*3, 3)
+                torch.tensor(pos_2).reshape(-1, 3)[None],  # (1, N*3, 3)
+                mask=mask[:, None].repeat(1, 3).reshape(-1),  # (1, N*3)
             )
             return aligned_rmsd[1].item()
 
@@ -752,8 +743,7 @@ class FoldingValidator:
             }
 
             # Calculate RMSD to generated sample
-            folded_bb_pos = folded_feats[dpc.atom_positions][:, :3].reshape(-1, 3)
-            res_mask = torch.ones(folded_bb_pos.shape[0])
+            folded_bb_pos = folded_feats[dpc.atom_positions][:, :3]  # (N, 3, 3)
             bb_rmsd = _calc_bb_rmsd(res_mask, sample_bb_pos, folded_bb_pos)
             sample_metrics[MetricName.bb_rmsd_folded] = bb_rmsd
             sample_metrics[MetricName.is_designable] = bb_rmsd <= 2.0
@@ -766,20 +756,18 @@ class FoldingValidator:
 
             # If provided ground truth bb positions, also compare to them
             if true_bb_positions is not None:
-                # Ideally we could reshape once, outside the loop, but safer to access to row's sample_length here
-                sample_length = res_mask.shape[0]
+                # Ideally we could reshape once, outside the loop, but safer to access to row's sample length here
                 assert true_bb_positions.shape == (
-                    sample_length,
+                    num_res,
                     37,
                     3,
-                ), f"Invalid true_bb_positions shape {true_bb_positions.shape}"
-                true_bb_pos = true_bb_positions[:, :3, :].reshape(
-                    -1, 3
-                )  # rename for reshape
+                ), f"Invalid true_bb_positions shape {true_bb_positions.shape}, expected ({num_res}, 37, 3)"
+                true_bb_pos = true_bb_positions[:, :3, :]  # (N, 3, 3)
                 assert true_bb_pos.shape == (
-                    sample_length * 3,
+                    num_res,
                     3,
-                ), f"Invalid true_bb_positions shape {true_bb_pos.shape}"
+                    3,
+                ), f"Invalid true_bb_positions shape {true_bb_pos.shape}, expected ({num_res}, 3, 3)"
                 assert true_bb_pos.shape == sample_bb_pos.shape
                 assert true_bb_pos.shape == folded_bb_pos.shape
 

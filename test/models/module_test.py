@@ -9,9 +9,8 @@ from cogeneration.config.base import (
 from cogeneration.data.batch_props import BatchProps
 from cogeneration.data.enum import MetricName
 from cogeneration.data.residue_constants import restypes_with_x
+from cogeneration.dataset.test_utils import create_pdb_noisy_batch
 from cogeneration.models.module import FlowModule, TrainingLosses
-
-from ..conftest import create_pdb_noisy_batch
 
 
 class TestFlowModule:

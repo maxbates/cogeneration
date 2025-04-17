@@ -22,8 +22,30 @@ def create_rigid(rots: torch.Tensor, trans: torch.Tensor) -> Rigid:
     return Rigid(rots=rots, trans=trans)
 
 
-def batch_align_structures(pos_1: torch.Tensor, pos_2: torch.Tensor, mask=None):
-    """Center and align structures to reference structures"""
+def batch_center_of_mass(pos: torch.Tensor, mask=None) -> torch.Tensor:
+    """
+    Compute the center of mass of a batch of structures.
+    pos: [B, N, 3] positions of atoms in the batch.
+    mask: [B, N]
+    Returns center of mass [B, 3] for each structure in the batch.
+    """
+    if pos.ndim != 3:
+        raise ValueError(f"Expected inputs to have shape [B, N, 3]")
+    if mask is None:
+        return torch.sum(pos, dim=1) / pos.shape[1]
+    else:
+        return torch.sum(pos * mask[..., None], dim=1) / (
+            torch.sum(mask, dim=1)[..., None] + 1e-5
+        )
+
+
+def batch_align_structures(
+    pos_1: torch.Tensor, pos_2: torch.Tensor, mask=None, center=False
+):
+    """
+    Center and align structures to reference structures
+    If no mask is provided, structures are centered at origin, otherwise pass `center=True` to center
+    """
     if pos_1.shape != pos_2.shape:
         raise ValueError("pos_1 and pos_2 must have the same shape.")
     if pos_1.ndim != 3:
@@ -50,6 +72,12 @@ def batch_align_structures(pos_1: torch.Tensor, pos_2: torch.Tensor, mask=None):
         flat_pos_1[flat_mask], flat_batch_indices[flat_mask], flat_pos_2[flat_mask]
     )
     aligned_pos_1 = torch.bmm(pos_1, align_rots)
+
+    # To match the behavior when a mask is not provided, can center after aligning
+    if center:
+        aligned_pos_1 -= batch_center_of_mass(aligned_pos_1, mask)[:, None]
+        pos_2 -= batch_center_of_mass(pos_2, mask)[:, None]
+
     return aligned_pos_1, pos_2, align_rots
 
 

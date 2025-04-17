@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 from cogeneration.config.base import (
+    DataTaskEnum,
     InferenceTaskEnum,
     InterpolantAATypesInterpolantTypeEnum,
     InterpolantConfig,
@@ -29,7 +30,7 @@ from cogeneration.data.noise_mask import (
     uniform_categorical,
     uniform_so3,
 )
-from cogeneration.data.rigid import batch_align_structures
+from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
 
 
 def to_cpu(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -133,10 +134,10 @@ class Interpolant:
     Interpolant is responsible for generating noise, corrupting samples, and sampling from learned vector fields.
 
     It's primary roles are to:
-    (1) corrupt batches with noise,
-    (2) generates samples, interpolating each modality using the learned vector fields.
+    (1) corrupt batches with noise, generating intermediate samples at some time `t`
+    (2) generates samples, interpolating each modality using the learned vector fields over t=[0, 1]
 
-    Works across 3 modalties: translations, rotations (i.e. backbone frames), and amino acid types (i.e. sequence).
+    Works across 3 modalties: translations and rotations (i.e. backbone frames), and amino acid types (i.e. sequence).
 
     (1) Translations
     - in R^3 and are Euclidean
@@ -195,46 +196,51 @@ class Interpolant:
         sigma_t = scale * torch.sqrt(t * (1 - t) + 1e-4)
         return torch.clamp(sigma_t, min=min_sigma)
 
-    def _batch_ot(self, trans_0, trans_1, res_mask, diffuse_mask):
+    def _batch_ot(self, trans_0, trans_1, res_mask, center: bool = False):
         """
-        Compute optimal transport between two batches of translations
-        Re-centers both, and returns OT mapping to trans_1 of trans_0
+        Compute optimal transport between two batches of translations.
+        returns OT mapping of trans_0 structures to trans_1 structures.
+        Will force translations are centered if `center==True`.
+        Does not re-order the translations within a structure.
         """
-
-        # NOTE for inpainting:
-        # If some residues are fixed, then they will be fixed at t=[0,1) and t=1
-        # We don't need to explicitly consider `diffuse_mask` for OT map - they should automatically map.
-        # Similarly, we assume that centering just falls through, both at start and through process.
-        # TODO(inpainting) check these assumptions. move centering out of OT.
-
         num_batch, num_res = trans_0.shape[:2]
+
+        # note the indexing here `(num_batch, num_batch)` creates all pairs for calculating minibatch OT cost matrix
         noise_idx, gt_idx = torch.where(torch.ones(num_batch, num_batch))
         batch_0 = trans_0[noise_idx]
         batch_1 = trans_1[gt_idx]
         batch_mask = res_mask[gt_idx]
 
-        # center and align the structures
-        batch_0, batch_1, _ = batch_align_structures(batch_0, batch_1, mask=batch_mask)
-        batch_0 = batch_0.reshape(num_batch, num_batch, num_res, 3)
-        batch_1 = batch_1.reshape(num_batch, num_batch, num_res, 3)
+        # center and align the structures within each pairing
+        batch_0, batch_1, _ = batch_align_structures(
+            batch_0, batch_1, mask=batch_mask, center=center
+        )
+        batch_0 = batch_0.reshape(num_batch, num_batch, num_res, 3)  # (B, B, N, 3)
+        batch_1 = batch_1.reshape(num_batch, num_batch, num_res, 3)  # (B, B, N, 3)
+        batch_mask = batch_mask.reshape(num_batch, num_batch, num_res)  # (B, B, N)
 
-        # Compute cost matrix of aligned noise to ground truth
-        batch_mask = batch_mask.reshape(num_batch, num_batch, num_res)
-        cost_matrix = torch.sum(
-            torch.linalg.norm(batch_0 - batch_1, dim=-1), dim=-1
-        ) / torch.sum(batch_mask, dim=-1)
+        # Compute cost matrix between all pairings
+        distances = torch.linalg.norm(batch_0 - batch_1, dim=-1)  # (B, B, N)
+        cost_matrix = torch.sum(distances, dim=-1) / torch.sum(batch_mask, dim=-1)
+
+        # Find optimal matching between noisy and ground truth structures
+        # Return the reordered noisy structures -> ground truth pairing
         noise_perm, gt_perm = linear_sum_assignment(to_cpu(cost_matrix).numpy())
         return batch_0[(tuple(gt_perm), tuple(noise_perm))]
 
     def _corrupt_trans(self, trans_1, t, res_mask, diffuse_mask):
-        """Corrupt translations from t=1 to t using Gaussian noise."""
+        """
+        Corrupt translations from t=1 to t using Gaussian noise.
+        """
         trans_nm_0 = centered_gaussian(*res_mask.shape, device=self._device)
         trans_0 = trans_nm_0 * NM_TO_ANG_SCALE
 
-        # compute batch OT, which includes centering
+        # compute batch OT. Expect no need to center, noise and t=1 should already be.
         if self.cfg.trans.batch_ot:
             trans_0 = self._batch_ot(
-                trans_0, trans_1, res_mask=res_mask, diffuse_mask=diffuse_mask
+                trans_0,
+                trans_1,
+                res_mask=res_mask,
             )
 
         # compute trans_t
@@ -259,11 +265,18 @@ class Interpolant:
             intermediate_noise = intermediate_noise * NM_TO_ANG_SCALE
             trans_t = trans_t + intermediate_noise
 
+        # TODO(inpainting) don't fix at t=1 if interpolating
         trans_t = mask_blend_2d(trans_t, trans_1, diffuse_mask)
+
+        # Center residues at origin
+        trans_t -= batch_center_of_mass(trans_t, mask=res_mask)[:, None]
+
         return trans_t * res_mask[..., None]
 
     def _corrupt_rotmats(self, rotmats_1, t, res_mask, diffuse_mask):
-        """Corrupt rotations from t=1 to t using IGSO3."""
+        """
+        Corrupt rotations from t=1 to t using IGSO3.
+        """
         num_batch, num_res = res_mask.shape
 
         # sample IGSO(3)
@@ -307,6 +320,7 @@ class Interpolant:
         identity = torch.eye(3, device=self._device)
         rotmats_t = mask_blend_3d(rotmats_t, identity[None, None], res_mask)
 
+        # TODO(inpainting) don't fix at t=1 if interpolating
         # only corrupt residues in `diffuse_mask`
         return mask_blend_3d(rotmats_t, rotmats_1, diffuse_mask)
 
@@ -353,7 +367,7 @@ class Interpolant:
         # only corrupt residues in `diffuse_mask`
         return mask_blend_1d(aatypes_t, aatypes_1, diffuse_mask)
 
-    def corrupt_batch(self, batch):
+    def corrupt_batch(self, batch, task: DataTaskEnum):
         """
         Sample t to generate a noisy batch from the input batch.
         """
@@ -364,8 +378,16 @@ class Interpolant:
         aatypes_1 = batch[bp.aatypes_1]  # [B, N]
         res_mask = batch[bp.res_mask]  # [B, N]
         diffuse_mask = batch[bp.diffuse_mask]  # [B, N]
+        num_batch, num_res = res_mask.shape
 
-        num_batch, num_res = diffuse_mask.shape
+        # For inpainting, the motifs are interpolated over time, so we corrupt the entire structure.
+        # Only the motif sequence is fixed.
+        # HACK - should be a better way to pass this in than `task` argument.
+        # TODO(inpainting-fixed) support fixed motifs
+        if task == DataTaskEnum.inpainting:
+            diffuse_mask_structure = res_mask
+        else:
+            diffuse_mask_structure = diffuse_mask
 
         if self.cfg.codesign_separate_t:
             # Generate random values `u` to determine the type of corruption
@@ -415,7 +437,9 @@ class Interpolant:
         # Apply corruptions
 
         if self.cfg.trans.corrupt:
-            trans_t = self._corrupt_trans(trans_1, r3_t, res_mask, diffuse_mask)
+            trans_t = self._corrupt_trans(
+                trans_1, r3_t, res_mask=res_mask, diffuse_mask=diffuse_mask_structure
+            )
         else:
             trans_t = trans_1
         if torch.any(torch.isnan(trans_t)):
@@ -423,7 +447,9 @@ class Interpolant:
         noisy_batch[nbp.trans_t] = trans_t
 
         if self.cfg.rots.corrupt:
-            rotmats_t = self._corrupt_rotmats(rotmats_1, so3_t, res_mask, diffuse_mask)
+            rotmats_t = self._corrupt_rotmats(
+                rotmats_1, so3_t, res_mask=res_mask, diffuse_mask=diffuse_mask_structure
+            )
         else:
             rotmats_t = rotmats_1
         if torch.any(torch.isnan(rotmats_t)):
@@ -431,12 +457,14 @@ class Interpolant:
         noisy_batch[nbp.rotmats_t] = rotmats_t
 
         if self.cfg.aatypes.corrupt:
-            aatypes_t = self._corrupt_aatypes(aatypes_1, cat_t, res_mask, diffuse_mask)
+            aatypes_t = self._corrupt_aatypes(
+                aatypes_1, cat_t, res_mask=res_mask, diffuse_mask=diffuse_mask
+            )
         else:
             aatypes_t = aatypes_1
         noisy_batch[nbp.aatypes_t] = aatypes_t
 
-        # zeroed out self-conditioned values
+        # zeroed out self-conditioned values. may be defined by module.
         noisy_batch[nbp.trans_sc] = torch.zeros_like(trans_1)
         noisy_batch[nbp.aatypes_sc] = torch.zeros_like(aatypes_1)[..., None].repeat(
             1, 1, self.num_tokens
@@ -783,11 +811,6 @@ class Interpolant:
             - generate rigids from the updated frames
         - perform the final step after the loop
         """
-        # check initial values
-        assert not self.cfg.trans.corrupt or trans_1 is not None
-        assert not self.cfg.rots.corrupt or rotmats_1 is not None
-        assert not self.cfg.aatypes.corrupt or aatypes_1 is not None
-
         # task specific input checks
         if task == InferenceTaskEnum.unconditional:
             assert self.cfg.trans.corrupt
@@ -810,7 +833,9 @@ class Interpolant:
             assert not self.cfg.aatypes.corrupt
             # inputs
             assert aatypes_1 is not None
-            assert self.cfg.aatypes.noise == 0.0  # cfg sanity check
+            assert (
+                self.cfg.aatypes.noise == 0.0
+            )  # cfg check unnecessary if not corrupting?
         elif task == InferenceTaskEnum.inverse_folding:
             assert not self.cfg.trans.corrupt
             assert not self.cfg.rots.corrupt
@@ -884,11 +909,11 @@ class Interpolant:
                     f"Unknown aatypes interpolant type {self.cfg.aatypes.interpolant_type}"
                 )
 
-        # For inpainting, fix motif residues at t=1 positions
-        # The motifs should already be zero-centered by dataset
+        # For inpainting, fix motif sequence. Translations and rotations will be sampled.
+        # TODO(inpainting-fixed) support fixed motifs
         if task == InferenceTaskEnum.inpainting:
-            trans_0 = mask_blend_2d(trans_0, trans_1, diffuse_mask)
-            rotmats_0 = mask_blend_3d(rotmats_0, rotmats_1, diffuse_mask)
+            # trans_0 = mask_blend_2d(trans_0, trans_1, diffuse_mask)
+            # rotmats_0 = mask_blend_3d(rotmats_0, rotmats_1, diffuse_mask)
             aatypes_0 = mask_blend_1d(aatypes_0, aatypes_1, diffuse_mask)
 
         # Handle separate_t, i.e. when each domain has its own t
@@ -1029,9 +1054,10 @@ class Interpolant:
             if task == InferenceTaskEnum.unconditional:
                 pass
             elif task == InferenceTaskEnum.inpainting:
-                # for inpainting, depending on guidance type, set _1 values to t=1 using mask
-                pred_trans_1 = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
-                pred_rotmats_1 = mask_blend_3d(pred_rotmats_1, rotmats_1, diffuse_mask)
+                # TODO(inpainting-fixed) depending on guidance type, set _1 values to t=1 using mask
+                # pred_trans_1 = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
+                # pred_rotmats_1 = mask_blend_3d(pred_rotmats_1, rotmats_1, diffuse_mask)
+                # pred_psis_1 = mask_blend_2d(pred_psis_1, psis_1, diffuse_mask)
                 pred_logits_1 = mask_blend_2d(pred_logits_1, logits_1, diffuse_mask)
                 pred_aatypes_1 = mask_blend_1d(pred_aatypes_1, aatypes_1, diffuse_mask)
             elif task == InferenceTaskEnum.forward_folding:
@@ -1047,13 +1073,34 @@ class Interpolant:
 
             # Update self-conditioning values
             if self.cfg.self_condition:
-                batch[nbp.trans_sc] = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
-                if task == InferenceTaskEnum.forward_folding:
-                    batch[nbp.aatypes_sc] = logits_1
-                else:
+                if task == InferenceTaskEnum.unconditional:
+                    batch[nbp.trans_sc] = mask_blend_2d(
+                        pred_trans_1, trans_1, diffuse_mask
+                    )
                     batch[nbp.aatypes_sc] = mask_blend_2d(
                         pred_logits_1, logits_1, diffuse_mask
                     )
+                elif task == InferenceTaskEnum.inpainting:
+                    # TODO(inpainting-fixed) set _1 values to t=1 using mask
+                    # batch[nbp.trans_sc] = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
+                    batch[nbp.trans_sc] = pred_trans_1  # interpolate all residues
+                    batch[nbp.aatypes_sc] = mask_blend_2d(
+                        pred_logits_1, logits_1, diffuse_mask
+                    )
+                elif task == InferenceTaskEnum.forward_folding:
+                    batch[nbp.trans_sc] = mask_blend_2d(
+                        pred_trans_1, trans_1, diffuse_mask
+                    )
+                    batch[nbp.aatypes_sc] = logits_1  # sequence fixed
+                elif task == InferenceTaskEnum.inverse_folding:
+                    batch[nbp.trans_sc] = mask_blend_2d(
+                        pred_trans_1, trans_1, diffuse_mask
+                    )
+                    batch[nbp.aatypes_sc] = mask_blend_2d(
+                        pred_logits_1, logits_1, diffuse_mask
+                    )
+                else:
+                    raise ValueError(f"Unknown task {task}")
 
             # Take next step, size `d_t` from `t_1` (current value) to `t_2` (toward predicted value)
             # We are at `t_1` with state `{domain}_t_1`. The model predicted `pred_{domain}_1`.
@@ -1064,23 +1111,30 @@ class Interpolant:
             # HACK: We do not have a vector field for psi angles, so just use model output at t_1
             psi_t_2 = pred_psis_1
 
-            # For inpainting, fix non-diffused residues; only predict diffused residues.
-            # (For other tasks, `diffuse_mask` is domain specific)
+            # For inpainting, fix motif sequence; set motif structure by interpolating
+            # TODO(inpainting-fixed) support fixed motifs
             if task == InferenceTaskEnum.inpainting:
-                trans_t_2 = mask_blend_2d(trans_t_2, trans_1, diffuse_mask)
-                rotmats_t_2 = mask_blend_3d(rotmats_t_2, rotmats_1, diffuse_mask)
+                # Get interpolated values for motif translations and rotations
+                trans_t_2_motif = self._corrupt_trans(
+                    trans_1, t_2, res_mask=res_mask, diffuse_mask=None
+                )
+                rotmats_t_2_motif = self._corrupt_rotmats(
+                    rotmats_1, t_2, res_mask=res_mask, diffuse_mask=None
+                )
+                # Set motif positions to interpolated values
+                trans_t_2 = mask_blend_2d(trans_t_2, trans_t_2_motif, diffuse_mask)
+                rotmats_t_2 = mask_blend_3d(
+                    rotmats_t_2, rotmats_t_2_motif, diffuse_mask
+                )
+                # Sequence is fixed for motifs at t=1
                 aatypes_t_2 = mask_blend_1d(aatypes_t_2, aatypes_1, diffuse_mask)
                 if psi_t_2 is not None:
                     psi_t_2 = mask_blend_2d(psi_t_2, psis_1, diffuse_mask)
 
-            # Center diffused residues, whether stochastic or inpainting to maintain translation invariance
-            # TODO(inpainting) confirm this centers correctly, motifs are fixed correctly
-            # TODO problem to always center e.g. if folding or hallucinating?
-            if task == InferenceTaskEnum.inpainting or self.cfg.trans.stochastic:
-                diffused_center_of_mass = torch.sum(trans_t_2, dim=0) / (
-                    torch.sum(diffuse_mask) + 1e-5
-                )
-                trans_t_2 -= diffused_center_of_mass[None, :]
+            # Center diffused residues to maintain translation invariance
+            # Definitely should center if inpainting or stochastic, but might as well if unconditional too
+            # TODO(inpainting-fixed) keep fixed motifs centered, so condition remains the same (learn scaffold drift)
+            trans_t_2 -= batch_center_of_mass(trans_t_2, mask=res_mask)[:, None]
 
             # Add to trajectory
             protein_trajectory.append(
@@ -1097,8 +1151,8 @@ class Interpolant:
             t_1 = t_2
 
         # We only integrated to min_t, so need to make a final step
-        # and generate the final structure
         t_1 = ts[-1]
+        batch["t"] = torch.ones((num_batch, 1), device=self._device) * t_1
 
         batch[nbp.trans_t] = trans_t_1 if self.cfg.trans.corrupt else trans_1
         batch[nbp.rotmats_t] = rotmats_t_1 if self.cfg.rots.corrupt else rotmats_1
@@ -1128,7 +1182,7 @@ class Interpolant:
         elif task == InferenceTaskEnum.inpainting:
             # Here, deviate from the convention in FrameFlow which leaves these alone.
             # Forcing them, like `forward_folding` or `inverse_folding` seems to make sense
-            # if they are fixed for guidance. Perhaps less if they are interpolated / use twisting.
+            # if they are used for guidance.
             pred_logits_1 = mask_blend_2d(pred_logits_1, logits_1, diffuse_mask)
             pred_aatypes_1 = mask_blend_1d(pred_aatypes_1, aatypes_1, diffuse_mask)
             pred_trans_1 = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)

@@ -2,7 +2,7 @@ import logging
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 from unittest.mock import patch
 
 import numpy as np
@@ -11,25 +11,22 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 from pytorch_lightning import Trainer
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 from cogeneration.config.base import (
     PATH_PUBLIC_WEIGHTS,
     Config,
     InferenceSamplesConfig,
     InferenceTaskEnum,
-    ModelHyperParamsConfig,
 )
 from cogeneration.data import all_atom
 from cogeneration.data.batch_props import BatchProps as bp
-from cogeneration.data.batch_props import NoisyBatchProps as nbp
 from cogeneration.data.enum import MetricName
-from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingDataset
-from cogeneration.dataset.protein_dataloader import LengthBatcher, ProteinData
-from cogeneration.dataset.util import mock_noisy_feats
+from cogeneration.dataset.protein_dataloader import ProteinData
+from cogeneration.dataset.test_utils import MockDataset, create_pdb_noisy_batch
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
 
@@ -78,69 +75,9 @@ def mock_cfg(mock_cfg_uninterpolated) -> Config:
     return mock_cfg_uninterpolated.interpolate()
 
 
-def create_pdb_noisy_batch(cfg: Config):
-    dataset_constructor = DatasetConstructor.pdb_dataset(
-        dataset_cfg=cfg.dataset,
-    )
-
-    train_dataset, _ = dataset_constructor.create_datasets()
-
-    # batch sampler required to sample batch size > 1
-    # we borrow convention from MultiFlow to batch by length rather than pad
-    # modify sampler cfg to specify `max_batch_size`.
-    batch_sampler = LengthBatcher(
-        sampler_cfg=cfg.data.sampler,
-        metadata_csv=train_dataset.csv,
-        rank=0,
-        num_replicas=1,
-    )
-
-    dataloader = DataLoader(
-        train_dataset,
-        batch_sampler=batch_sampler,
-        num_workers=0,
-    )
-
-    interpolant = Interpolant(cfg.interpolant)
-
-    raw_feats = next(iter(dataloader))
-    input_feats = interpolant.corrupt_batch(raw_feats)
-
-    return input_feats
-
-
 @pytest.fixture
 def pdb_noisy_batch(mock_cfg):
     return create_pdb_noisy_batch(mock_cfg)
-
-
-class MockDataset(Dataset):
-    """
-    Creates mock dataset.
-    Note that batches must be the same length, so if batch_size > 1, create sets of samples with the same length
-    """
-
-    def __init__(self, sample_lengths: Optional[List[int]] = None):
-        if sample_lengths is None:
-            sample_lengths = [10]
-        assert len(sample_lengths) > 0
-        self.sample_lengths = sample_lengths
-
-        self.data = self._create_mock_data()
-
-    def _create_mock_data(self):
-        all_items = []
-
-        for i, N in enumerate(self.sample_lengths):
-            all_items.append(mock_noisy_feats(N=N, idx=i))
-
-        return all_items
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx]
 
 
 @pytest.fixture

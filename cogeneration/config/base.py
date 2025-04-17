@@ -292,7 +292,10 @@ class InterpolantRotationsScheduleEnum(StrEnum):
 
 @dataclass
 class InterpolantRotationsConfig:
-    corrupt: bool = True
+    # corrupt rotations (unless inverse folding)
+    corrupt: bool = (
+        "${ternary:${equals: ${inference.task}, 'inverse_folding'}, False, True}"
+    )
     # sampled noise std dev
     igso3_sigma: float = 1.5  # 1.5 in public multiflow
     train_schedule: InterpolantRotationsScheduleEnum = (
@@ -318,8 +321,10 @@ class InterpolantTranslationsScheduleEnum(StrEnum):
 
 @dataclass
 class InterpolantTranslationsConfig:
-    # corrupt: corrupt translations
-    corrupt: bool = True
+    # corrupt translations (unless inverse folding)
+    corrupt: bool = (
+        "${ternary:${equals: ${inference.task}, 'inverse_folding'}, False, True}"
+    )
     # batch_ot: enable minibatch optimal transport AND importantly, centering
     batch_ot: bool = True
     # train_schedule: training schedule for interpolant
@@ -368,8 +373,10 @@ class InterpolantAATypesConfig:
         or, consider a subclass which handles default arguments accordingly
     """
 
-    # corrupt: corrupt amino acid types
-    corrupt: bool = True
+    # corrupt amino acid types (unless forward folding)
+    corrupt: bool = (
+        "${ternary:${equals: ${inference.task}, 'forward_folding'}, False, True}"
+    )
     # schedule: training schedule for interpolant
     schedule: InterpolantAATypesScheduleEnum = InterpolantAATypesScheduleEnum.linear
     # schedule_exp_rate: exponential rate for schedule
@@ -523,7 +530,6 @@ class DatasetConfig:
     cluster_path: Optional[Path] = dataset_metadata_dir_path / "pdb.clusters"
     max_cache_size: int = 100_000
     cache_num_res: int = 0  # min size to enable caching
-    inpainting_percent: float = 1.0
     # plddt [0, 100]. Minimum threshold, per residue, masked if below and add_plddt_mask=True
     add_plddt_mask: bool = True
     min_plddt_threshold: float = 0.0

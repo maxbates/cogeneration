@@ -23,6 +23,7 @@ from cogeneration.data.io import write_pkl
 from cogeneration.data.protein import process_chain
 from cogeneration.data.residue_constants import unk_restype_index
 from cogeneration.dataset.data_utils import parse_chain_feats
+from cogeneration.dataset.datasets import MetadataCSVRow
 
 # TODO - support MMCIF files
 
@@ -122,7 +123,7 @@ def oligomeric_detail(
     )
 
 
-def process_file(file_path: str, write_dir: str):
+def process_file(file_path: str, write_dir: str) -> MetadataCSVRow:
     """Processes protein file into usable, smaller pickles.
 
     Args:
@@ -214,7 +215,7 @@ def process_serially(
     write_dir: str,
     delete_original: bool = False,
     verbose: bool = False,
-):
+) -> List[MetadataCSVRow]:
     all_metadata = []
     for i, file_path in tqdm(enumerate(all_paths), desc="Processing PDBs"):
         try:

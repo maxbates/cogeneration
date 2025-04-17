@@ -85,6 +85,8 @@ class FlowModel(nn.Module):
         trans_sc = input_feats[nbp.trans_sc]
         aatypes_sc = input_feats[nbp.aatypes_sc]
 
+        init_rigids_ang = create_rigid(rots=rotmats_t, trans=trans_t)
+
         # Initialize node and edge embeddings
         init_node_embed = self.node_feature_net(
             so3_t=so3_t,
@@ -105,9 +107,6 @@ class FlowModel(nn.Module):
             diffuse_mask=diffuse_mask,
             chain_index=chain_index,
         )
-
-        # Initial rigids
-        init_rigids_ang = create_rigid(rotmats_t, trans_t)
 
         # Main trunk
         # Note that IPA trunk works in nm scale, rather than angstroms

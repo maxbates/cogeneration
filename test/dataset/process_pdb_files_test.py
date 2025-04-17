@@ -88,6 +88,10 @@ class TestProcessPDBFiles:
         assert len(dataset) > 0
 
         # just test it works
-        _ = dataset.process_processed_path(
-            processed_file_path=metadata[dc.processed_path],
+        processed_file = dataset.load_processed_path(
+            processed_file_path=metadata[dc.processed_path]
+        )
+        _ = dataset.process_processed_file(
+            processed_file=processed_file,
+            csv_row=metadata,
         )

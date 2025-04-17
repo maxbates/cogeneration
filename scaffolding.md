@@ -66,9 +66,9 @@ https://github.com/microsoft/protein-frame-flow
 
 ## Future Work
 
-- Centering
+- Centering - move to interpolating rather than fixed
     - Notes
-        - Fundamental tension: motifs and scaffolds will have a different center of mass.
+        - Fundamental tension if fixed: motifs and scaffolds will have a different center of mass.
             - We can be invariant to the motifs, keeping them fixed, and learn the drift of the scaffolds => conditional invariance
             - We can be invariant to everything, but the motifs will be "pushed" off-center and introduce bias and blurs conditioning
             - **If we interpolate scaffold over time, centering is much easier! Just center everything.**
@@ -93,19 +93,30 @@ https://github.com/microsoft/protein-frame-flow
                 - ... which seems like is fine if `flow_mask` is everything 
                   but will recenter scaffolds — and not move motifs — and merge them
             - in their images, the motifs seem to interpolate over time...
-    - [ ] Support motif interpolation, rather than just being fixed
-        - [ ] Confirm can just use normal OT mapping, aligning structures
-        - [ ] OT mapping should only be for diffused residue
-    - [ ] move centering out of OT during training
-         - [ ] center all diffused residues? all `res_mask` residues? 
-            - Don't want to force motifs to be centered and scaffolds to move around...
-    - [ ] Align motifs and multiply structures by rotations
-          - if motifs not fixed, or if interpolating over time, need to align motifs and update scaffold rots + trans
-          - see FrameFlow
-    - [ ] Ensure valid re-centering each step during sampling + training
-        - When animate trajectory, motifs should be fixed... but not during sampling?
-        - [ ] Should everything be re-centered? Only if inpainting or stochastic?
-        - [ ] For inpainting, should motifs be fixed, and avoid re-centering scaffolds?
+    - [x] Training
+        - [x] Interpolate motifs rather than just masking
+        - [x] Interpolate rotations as well 
+        - [x] add noise to motif positions (i.e. all positions)
+        - [x] Center everything after adding noise 
+        - Still predict changes for every residue
+        - [x] For amino acids, keep them fixed
+            - In future, later can start as masks and mess with logits. 
+        - [x] Fix loss calculation
+        - [x] Remove motif centering in dataset
+    - [x] Sampling
+        - [x] Center after adding noise
+        - [x] Interpolate motifs over time, rather than just masking
+        - [x] add noise to all residues
+        - [x] Final time step, fix motifs
+        - [x] For amino acids, keep them fixed
+
+- Folding Validation
+    - [ ] confirm existing metrics make sense for inpainting
+        - [ ] masks used appropriately
+        - [ ] true sequence and bb positions used sanely
+    - [ ] Update expectations that only doing unconditional `validation_step()`
+        - [ ] pass true_bb_positions and true_aa when appropriate
+        - [ ] update `is_codesign` check in `assess_sample()`
 
 - Misc / Backlog
     - [x] update relevant task switch statements
@@ -121,21 +132,9 @@ https://github.com/microsoft/protein-frame-flow
     - [ ] inference for inpainting works
     - [ ] metrics for inpainting
 
-- Folding Validation
-    - [ ] confirm existing metrics make sense for inpainting
-        - [ ] masks used appropriately
-        - [ ] true sequence and bb positions used sanely
-
-- Motif Selection
-    - [x] set up to allow other methods. abstract into class.
-    - [ ] allow trimming low pLDDT ends before selection
-    - [ ] interacting residues or potential active sites 
-    - [ ] cross-chain interactions
-        - can we augment dataset looking for large monomers with interacting motifs?
-    - [ ] based on secondary structure? e.g. enrich for beta sheets
-    - [ ] Allow selecting a residue and then removing / keeping residues within some distance
 
 - ESM embeddings
+    - Particularly if only sequence is fixed, and structure is interpolated, should get embedding given sequence + structure. Currently, its primarily structure.
     - Because some sequence is always defined (the motifs), and the intermediate sequence is discrete, can use ESM to get an embedding
     - Can get both a single and pair representation, replacing `node_feature_net` and `edge_feature_net`
     - In theory, should improve our ability to unmask sequences...
@@ -148,6 +147,20 @@ https://github.com/microsoft/protein-frame-flow
     - Should only work with tasks where sequence is provided, e.g. inpainting and forward_folding
         - [ ] validate approach with forward_folding
         - [ ] compare IPA to folding blocks approach
+
+- Motif Selection
+    - [x] set up to allow other methods. abstract into class.
+    - [ ] allow trimming low pLDDT ends before selection
+    - [ ] interacting residues or potential active sites 
+    - [ ] cross-chain interactions
+        - can we augment dataset looking for large monomers with interacting motifs?
+    - [ ] based on secondary structure? e.g. enrich for beta sheets
+    - [ ] Allow selecting a residue and then removing / keeping residues within some distance
+
+- Amino acid corruption
+    - [ ] Currently, sequence is fixed, i.e. whole process is motif-sequence-conditioned
+    - [ ] If e.g. we worked in logits, it would be possible to interpolate in a clear way
+    - [ ] **May make sense to introduce another task to differentiate sequence-conditioned interpolation vs scaffolding given fixed motifs + sequence**
 
 - Training
     - [ ] define a training curriculum

@@ -335,7 +335,7 @@ class BaseDataset(Dataset):
         self.csv[dc.index] = list(range(len(self.csv)))
 
     @staticmethod
-    def _load_processed_path(processed_file_path: str) -> ProcessedFile:
+    def load_processed_path(processed_file_path: str) -> ProcessedFile:
         """
         Loads a single structure + metadata pickled at `processed_file_path`.
         This file is written by e.g. `parse_pdb_files.py`.
@@ -370,7 +370,7 @@ class BaseDataset(Dataset):
         if use_cache and processed_file_path in self._cache:
             return self._cache[processed_file_path]
 
-        processed_feats = self._load_processed_path(processed_file_path)
+        processed_feats = self.load_processed_path(processed_file_path)
 
         if use_cache:
             self._cache[processed_file_path] = processed_feats
@@ -411,19 +411,23 @@ class BaseDataset(Dataset):
         feats: ProcessedFeats,
     ):
         """
-        Centers the structure using diffuse_mask, to be translation invariant.
-        Note, structure should already be centered by Dataset, so not required if whole structure is used.
+        Centers the structure to be translation invariant.
+        Note, structure should already be centered on load by `parse_pdb_feats`.
         """
-        # TODO(inpainting) explicit flag to only consider `diffuse_mask` for centering
-        if (feats[bp.diffuse_mask] == 0).any():
-            # Re-center the structure based on non-diffused (motif) locations. Motifs should not move.
-            motif_mask = 1 - feats[bp.diffuse_mask]
-            motif_1 = feats[bp.trans_1] * motif_mask[:, None]
-            center_of_mass = torch.sum(motif_1, dim=0) / (torch.sum(motif_mask) + 1e-5)
-        else:
-            center_of_mass = torch.sum(feats[bp.trans_1], dim=0) / torch.sum(
-                feats[bp.diffuse_mask] + 1e-5
-            )
+        center_of_mass = torch.sum(feats[bp.trans_1], dim=0) / torch.sum(
+            feats[bp.res_mask] + 1e-5
+        )
+
+        # # TODO(inpainting-fixed) explicit flag to only consider `diffuse_mask` for centering
+        # if (feats[bp.diffuse_mask] == 0).any():
+        #     # Re-center the structure based on non-diffused (motif) locations. Motifs should not move.
+        #     motif_mask = 1 - feats[bp.diffuse_mask]
+        #     motif_1 = feats[bp.trans_1] * motif_mask[:, None]
+        #     center_of_mass = torch.sum(motif_1, dim=0) / (torch.sum(motif_mask) + 1e-5)
+        # else:
+        #     center_of_mass = torch.sum(feats[bp.trans_1], dim=0) / torch.sum(
+        #         feats[bp.res_mask] + 1e-5
+        #     )
 
         # modify in place
         feats[bp.trans_1] -= center_of_mass[None, :]
@@ -571,6 +575,7 @@ class BaseDataset(Dataset):
 
         # For inpainting evaluation (i.e. not training), vary scaffold lengths
         # Using the `diffuse_mask`, modify the scaffold region lengths, and mask out the scaffolds
+        # i.e. {trans,rots,aatypes}_1 only defined for motif positions
         if (
             task == DataTaskEnum.inpainting
             and not is_training
@@ -581,10 +586,11 @@ class BaseDataset(Dataset):
             )
             BaseDataset.segment_features(feats=feats, segments=segments)
 
-        # If some positions are fixed, those motifs need to be re-centered
+        # TODO(inpainting-fixed) If motif positions are fixed, those motifs need to be re-centered
         # to avoid hinting / memorizing where to place scaffolds.
-        if add_noise or (diffuse_mask == 0).any():
-            BaseDataset.recenter_structure(feats=feats)
+        # Need to update `recenter_structure` method to use `diffuse_mask` appropriately.
+        # if add_noise or (diffuse_mask == 0).any()
+        #    BaseDataset.recenter_structure(feats=feats)
 
         # Randomize chains and reset residue positions - after motif-selection!
         BaseDataset.reset_residues_and_randomize_chains(feats=feats)
