@@ -2,14 +2,15 @@ import numpy as np
 import pytest
 import torch
 
-from cogeneration.config.base import Config, DataTaskEnum, InferenceTaskEnum
-from cogeneration.data.batch_props import BatchProps as bp
-from cogeneration.data.batch_props import NoisyBatchProps as nbp
-from cogeneration.data.batch_props import PredBatchProps as pbp
+from cogeneration.config.base import Config
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import centered_gaussian
 from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
 from cogeneration.dataset.test_utils import create_pdb_batch
+from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import NoisyBatchProps as nbp
+from cogeneration.type.batch import PredBatchProps as pbp
+from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
 
 
 class TestInterpolant:

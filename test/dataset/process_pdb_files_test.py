@@ -4,12 +4,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from cogeneration.config.base import DatasetConfig, DatasetFilterConfig, DataTaskEnum
-from cogeneration.data.enum import DatasetColumns as dc
-from cogeneration.data.enum import DatasetProteinColumns as dpc
+from cogeneration.config.base import DatasetConfig, DatasetFilterConfig
 from cogeneration.dataset.data_utils import parse_chain_feats
 from cogeneration.dataset.datasets import BaseDataset
 from cogeneration.dataset.process_pdb_files import process_file
+from cogeneration.type.dataset import DatasetColumns as dc
+from cogeneration.type.dataset import DatasetProteinColumns as dpc
+from cogeneration.type.task import DataTaskEnum
 
 # https://www2.rcsb.org/structure/2QLW
 example_pdb_path = Path(__file__).parent / "2qlw.pdb"

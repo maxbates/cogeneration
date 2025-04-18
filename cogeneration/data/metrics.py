@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from cogeneration.data import residue_constants
-from cogeneration.data.enum import MetricName
+from cogeneration.type.metrics import MetricName
 
 
 def t_stratified_loss(

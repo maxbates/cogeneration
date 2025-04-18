@@ -2,17 +2,17 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
 
-from cogeneration.config.base import (
-    DataTaskEnum,
-    InferenceTaskEnum,
-    InterpolantTranslationsScheduleEnum,
-)
-from cogeneration.data.batch_props import BatchProps as bp
-from cogeneration.data.enum import MetricName
+from cogeneration.config.base import InterpolantTranslationsScheduleEnum
 from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.dataset.datasets import DatasetConstructor
-from cogeneration.dataset.test_utils import create_pdb_noisy_batch
+from cogeneration.dataset.test_utils import (
+    create_pdb_dataloader,
+    create_pdb_noisy_batch,
+)
 from cogeneration.models.module import FlowModule, TrainingLosses
+from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.metrics import MetricName
+from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
 
 
 class TestFlowModule:
@@ -190,12 +190,12 @@ class TestFlowModule:
         assert mock_cfg.dataset.inpainting.unconditional_percent == 1.0
 
         # Explicitly create dataset, to pass mock_cfg
-        dataset_constructor = DatasetConstructor.pdb_dataset(
-            dataset_cfg=mock_cfg.dataset,
+        dataloader = create_pdb_dataloader(
+            cfg=mock_cfg,
             task=DataTaskEnum.inpainting,
+            training=False,
+            eval_batch_size=1,
         )
-        _, eval_dataset = dataset_constructor.create_datasets()
-        dataloader = DataLoader(eval_dataset, batch_size=1)
         batch = next(iter(dataloader))
 
         # ensure get an unconditional-like diffuse mask

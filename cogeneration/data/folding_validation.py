@@ -11,19 +11,20 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 import torch
-from Bio import PDB, SeqIO
+from Bio import SeqIO
 
-from cogeneration.config.base import FoldingConfig, InferenceTaskEnum
+from cogeneration.config.base import FoldingConfig
 from cogeneration.data import residue_constants
 from cogeneration.data.const import aatype_to_seq
-from cogeneration.data.enum import DatasetProteinColumns as dpc
-from cogeneration.data.enum import MetricName, OutputFileName
 from cogeneration.data.io import write_numpy_json
 from cogeneration.data.metrics import calc_ca_ca_metrics, calc_mdtraj_metrics
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restype_order_with_x, restypes_with_x
 from cogeneration.data.superimposition import superimpose
 from cogeneration.dataset.data_utils import parse_pdb_feats
+from cogeneration.type.dataset import DatasetProteinColumns as dpc
+from cogeneration.type.metrics import MetricName, OutputFileName
+from cogeneration.type.task import InferenceTaskEnum
 
 # NOTE - would be nice to better make 3rd party software injectable so easier to mock
 # However, it is not hard to patch the relevant functions for now.

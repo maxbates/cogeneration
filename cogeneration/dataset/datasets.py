@@ -13,28 +13,20 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
 from torch.utils.data import Dataset
 
-from cogeneration.config.base import (
-    Config,
-    DatasetConfig,
-    DataTaskEnum,
-    InferenceSamplesConfig,
-)
+from cogeneration.config.base import Config, DatasetConfig, InferenceSamplesConfig
 from cogeneration.data import data_transforms, rigid_utils
-from cogeneration.data.batch_props import BatchProps as bp
 from cogeneration.data.const import seq_to_aatype
-from cogeneration.data.enum import DatasetColumns as dc
-from cogeneration.data.enum import DatasetProteinColumns as dpc
-from cogeneration.data.enum import DatasetTransformColumns as dtc
 from cogeneration.data.io import read_pkl
 from cogeneration.dataset.data_utils import parse_chain_feats
 from cogeneration.dataset.motif_factory import Motif, MotifFactory, Segment
-from cogeneration.dataset.util import (
-    MetadataCSVRow,
-    MetadataDataFrame,
-    ProcessedFeats,
-    ProcessedFile,
-    empty_feats,
-)
+from cogeneration.type.batch import BatchFeatures
+from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import empty_feats
+from cogeneration.type.dataset import DatasetColumns as dc
+from cogeneration.type.dataset import DatasetProteinColumns as dpc
+from cogeneration.type.dataset import DatasetTransformColumns as dtc
+from cogeneration.type.dataset import MetadataCSVRow, MetadataDataFrame, ProcessedFile
+from cogeneration.type.task import DataTaskEnum
 
 
 def _read_clusters(cluster_path: Union[Path, str], synthetic=False) -> Dict[str, Any]:
@@ -372,7 +364,7 @@ class BaseDataset(Dataset):
         return processed_feats
 
     @staticmethod
-    def reset_residues_and_randomize_chains(feats: ProcessedFeats):
+    def reset_residues_and_randomize_chains(feats: BatchFeatures):
         """
         Randomize chain indices, and re-number residue indices for each chain to start from 1.
         Modifies the input features in place.
@@ -404,7 +396,7 @@ class BaseDataset(Dataset):
 
     @staticmethod
     def recenter_structure(
-        feats: ProcessedFeats,
+        feats: BatchFeatures,
     ):
         """
         Centers the structure to be translation invariant.
@@ -430,7 +422,7 @@ class BaseDataset(Dataset):
 
     @staticmethod
     def segment_features(
-        feats: ProcessedFeats,
+        feats: BatchFeatures,
         segments: List[Segment],
     ):
         """
@@ -471,7 +463,7 @@ class BaseDataset(Dataset):
         processed_file: ProcessedFile,
         csv_row: MetadataCSVRow,
         motif_factory: MotifFactory,
-    ) -> ProcessedFeats:
+    ) -> BatchFeatures:
         """
         Processes a pickled features from single structure + metadata.
         Converts numpy feats to tensor feats.
@@ -557,7 +549,7 @@ class BaseDataset(Dataset):
             diffuse_mask = torch.ones_like(diffuse_mask)
         diffuse_mask = diffuse_mask.int()
 
-        feats: ProcessedFeats = {
+        feats: BatchFeatures = {
             bp.res_mask: res_mask,
             bp.aatypes_1: aatypes_1,
             bp.trans_1: trans_1,
@@ -599,7 +591,7 @@ class BaseDataset(Dataset):
 
     def process_processed_file(
         self, processed_file: ProcessedFile, csv_row: MetadataCSVRow
-    ) -> ProcessedFeats:
+    ) -> BatchFeatures:
         return self._featurize_processed_file(
             cfg=self.dataset_cfg,
             task=self.task,
@@ -609,7 +601,7 @@ class BaseDataset(Dataset):
             motif_factory=self.motif_factory,
         )
 
-    def process_csv_row(self, csv_row: MetadataCSVRow) -> ProcessedFeats:
+    def process_csv_row(self, csv_row: MetadataCSVRow) -> BatchFeatures:
         """
         Process a single row of the CSV file.
         File loading is cached.

@@ -1,9 +1,14 @@
-from cogeneration.util.base_classes import StrEnum
+from typing import Dict, Union
+
+import torch
+
+from cogeneration.data.const import MASK_TOKEN_INDEX
+from cogeneration.type.str_enum import StrEnum
 
 
 class BatchProps(StrEnum):
     """
-    Dataloader batches cannot be made type-safe, so we define an enum of batch properties.
+    Dataloader batches cannot be structs, so we define an enum of batch properties.
 
     Properties at time `1` (i.e. `"_1"`) are the ground truth, i.e. the original data.
     """
@@ -65,3 +70,39 @@ class PredBatchProps(StrEnum):
     # other model outputs
     node_embed = "node_embed"
     edge_embed = "edge_embed"
+
+
+"""TensorFeat is a feature in primitive or pytorch"""
+TensorFeat = Union[torch.Tensor, str, int]
+
+"""BatchFeatures is a batch, features after featurizing ProcessedFile"""
+BatchFeatures = Dict[BatchProps, TensorFeat]
+
+"""NoisyFeatures is an item of a batch corrupted by Interpolant"""
+NoisyFeatures = Dict[Union[BatchProps, NoisyBatchProps], TensorFeat]
+
+"""InferenceFeatures is an inference (validation / prediction) batch"""
+InferenceFeatures = Dict[BatchProps, TensorFeat]
+
+"""ModelPrediction is the output of the model, i.e. the predicted features"""
+ModelPrediction = Dict[PredBatchProps, TensorFeat]
+
+
+def empty_feats(N: int) -> BatchFeatures:
+    """
+    Create empty features for a protein of length N.
+    """
+    return {
+        BatchProps.res_mask: torch.ones(N),
+        BatchProps.aatypes_1: torch.ones(N) * MASK_TOKEN_INDEX,
+        BatchProps.trans_1: torch.zeros(N, 3),
+        BatchProps.rotmats_1: torch.eye(3).repeat(N, 1, 1),
+        BatchProps.torsion_angles_sin_cos_1: torch.zeros(N, 7, 2),
+        BatchProps.chain_idx: torch.ones(N),
+        BatchProps.res_idx: torch.arange(N),
+        BatchProps.res_plddt: torch.zeros(N),
+        BatchProps.diffuse_mask: torch.ones(N),
+        BatchProps.plddt_mask: torch.ones(N),
+        BatchProps.pdb_name: "",
+        BatchProps.csv_idx: torch.tensor([1], dtype=torch.long),
+    }

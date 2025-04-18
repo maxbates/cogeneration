@@ -1,15 +1,15 @@
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional, Union
+from typing import Optional, Union
 
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
 
-from cogeneration.data.enum import OutputFileName
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restypes_with_x
+from cogeneration.type.metrics import OutputFileName
 
 
 @dataclass

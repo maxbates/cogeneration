@@ -1,18 +1,60 @@
 from typing import List, Optional
 
+import torch
 from torch.utils.data import DataLoader, Dataset
 
 from cogeneration.config.base import Config
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.dataset.datasets import DatasetConstructor
 from cogeneration.dataset.protein_dataloader import LengthBatcher
-from cogeneration.dataset.util import mock_noisy_feats
+from cogeneration.type.batch import BatchFeatures
+from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import NoisyBatchProps as nbp
+from cogeneration.type.batch import NoisyFeatures
+from cogeneration.type.task import DataTaskEnum
+
+
+def mock_noisy_feats(N: int, idx: int) -> NoisyFeatures:
+    """
+    Create random + corrupted features for a protein of length N
+    """
+    feats = {}
+
+    # N residue protein, random frames
+    feats[bp.res_mask] = torch.ones(N)
+    feats[bp.aatypes_1] = torch.randint(0, 20, (N,))
+    feats[bp.trans_1] = torch.rand(N, 3)
+    feats[bp.rotmats_1] = torch.rand(N, 3, 3)
+    feats[bp.torsion_angles_sin_cos_1] = torch.rand(N, 7, 2)
+    feats[bp.chain_idx] = torch.zeros(N)
+    feats[bp.res_idx] = torch.arange(N)
+    feats[bp.pdb_name] = f"test_{idx}"
+    feats[bp.res_plddt] = torch.floor(torch.rand(N) + 0.5)
+    feats[bp.plddt_mask] = feats[bp.res_plddt] > 0.6
+    feats[bp.diffuse_mask] = torch.ones(N)
+    feats[bp.csv_idx] = torch.tensor([0])
+
+    # inference feats  # TODO remove, dedicated mock function
+    feats[bp.num_res] = torch.tensor([N])
+    feats[bp.sample_id] = f"test_{idx}"
+
+    # generate corrupted noisy values for input_feats
+    t = torch.rand(1)  # use same value as with unconditional + not separate_t
+    feats[nbp.so3_t] = t
+    feats[nbp.r3_t] = t
+    feats[nbp.cat_t] = t
+    feats[nbp.trans_t] = torch.rand(N, 3)
+    feats[nbp.rotmats_t] = torch.rand(N, 3, 3)
+    feats[nbp.aatypes_t] = torch.rand(N) * 20  # AA seq as floats
+    feats[nbp.trans_sc] = torch.rand(N, 3)
+    feats[nbp.aatypes_sc] = torch.rand(N, 21)  # include mask token
+
+    return feats
 
 
 class MockDataset(Dataset):
     """
-    Creates mock dataset.
-    Note that batches must be the same length, so if batch_size > 1, create sets of samples with the same length
+    Creates mock dataset with `len(sample_lengths)` samples.
     """
 
     def __init__(self, sample_lengths: Optional[List[int]] = None):
@@ -38,30 +80,70 @@ class MockDataset(Dataset):
         return self.data[idx]
 
 
-def create_pdb_batch(cfg: Config):
+class MockDataloader(DataLoader):
     """
-    Creates a single training batch of a PDB dataset given `cfg`
+    Creates mock dataloader with `len(sample_lengths)` samples, and uses batch size `batch_size`.
+
+    Note that batches must be the same length, so if batch_size > 1,
+    in dataloader, create sets of samples with the same length
+    """
+
+    def __init__(self, batch_size: int = 1, sample_lengths: Optional[List[int]] = None):
+        dataset = MockDataset(sample_lengths=sample_lengths)
+        super().__init__(dataset, batch_size=batch_size)
+
+
+def create_pdb_dataloader(
+    cfg: Config,
+    task: DataTaskEnum = DataTaskEnum.hallucination,
+    training: bool = True,
+    eval_batch_size: int = 1,
+) -> DataLoader:
+    """
+    Creates a Dataloader for PDB dataset given `cfg`
+    Returns `train_dataset` if `training` is True, else `eval_dataset`.
     """
     dataset_constructor = DatasetConstructor.pdb_dataset(
         dataset_cfg=cfg.dataset,
+        task=task,
     )
 
     train_dataset, eval_dataset = dataset_constructor.create_datasets()
 
-    # batch sampler required to sample batch size > 1
-    # we borrow convention from MultiFlow to batch by length rather than pad
-    # modify sampler cfg to specify `max_batch_size`.
-    batch_sampler = LengthBatcher(
-        sampler_cfg=cfg.data.sampler,
-        metadata_csv=train_dataset.csv,
-        rank=0,
-        num_replicas=1,
-    )
+    if training:
+        # batch sampler required to sample batch size > 1
+        # we borrow convention from MultiFlow to batch by length rather than pad
+        # modify sampler cfg to specify `max_batch_size`.
+        batch_sampler = LengthBatcher(
+            sampler_cfg=cfg.data.sampler,
+            metadata_csv=train_dataset.csv,
+            rank=0,
+            num_replicas=1,
+        )
 
-    dataloader = DataLoader(
-        train_dataset,
-        batch_sampler=batch_sampler,
-        num_workers=0,
+        dataloader = DataLoader(
+            train_dataset,
+            batch_sampler=batch_sampler,
+            num_workers=0,
+        )
+    else:
+        dataloader = DataLoader(
+            eval_dataset,
+            batch_size=eval_batch_size,
+            num_workers=0,
+        )
+
+    return dataloader
+
+
+def create_pdb_batch(
+    cfg: Config, training: bool = True, eval_batch_size: int = 1
+) -> BatchFeatures:
+    """
+    Creates a single training batch of a PDB dataset given `cfg`
+    """
+    dataloader = create_pdb_dataloader(
+        cfg=cfg, training=training, eval_batch_size=eval_batch_size
     )
 
     raw_feats = next(iter(dataloader))
@@ -69,11 +151,15 @@ def create_pdb_batch(cfg: Config):
     return raw_feats
 
 
-def create_pdb_noisy_batch(cfg: Config):
+def create_pdb_noisy_batch(
+    cfg: Config, training: bool = True, eval_batch_size: int = 1
+) -> NoisyFeatures:
     """
     Creates a single corrupted batch of a PDB dataset given `cfg`
     """
-    raw_feats = create_pdb_batch(cfg)
-    interpolant = Interpolant(cfg.interpolant)
+    raw_feats = create_pdb_batch(
+        cfg=cfg, training=training, eval_batch_size=eval_batch_size
+    )
+    interpolant = Interpolant(cfg=cfg.interpolant)
     noisy_feats = interpolant.corrupt_batch(raw_feats, task=cfg.data.task)
     return noisy_feats

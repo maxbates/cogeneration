@@ -18,23 +18,25 @@ from pytorch_lightning import LightningModule
 from pytorch_lightning.loggers.wandb import WandbLogger
 
 import wandb
-from cogeneration.config.base import Config, DataTaskEnum, InferenceTaskEnum
+from cogeneration.config.base import Config
 from cogeneration.data import all_atom, metrics, so3_utils
-from cogeneration.data.batch_props import BatchProps as bp
-from cogeneration.data.batch_props import NoisyBatchProps as nbp
-from cogeneration.data.batch_props import PredBatchProps as pbp
 from cogeneration.data.const import MASK_TOKEN_INDEX
-from cogeneration.data.enum import MetricName, OutputFileName
 from cogeneration.data.folding_validation import (
     FoldingValidator,
     SavedFoldingValidation,
 )
 from cogeneration.data.interpolant import Interpolant
-from cogeneration.data.io import write_numpy_json
-from cogeneration.data.noise_mask import mask_blend_1d, mask_blend_2d, mask_blend_3d
-from cogeneration.data.protein import write_prot_to_pdb
+from cogeneration.data.noise_mask import mask_blend_2d
 from cogeneration.data.trajectory import SavedTrajectory, save_trajectory
 from cogeneration.models.model import FlowModel
+from cogeneration.type.batch import BatchFeatures
+from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import InferenceFeatures
+from cogeneration.type.batch import NoisyBatchProps as nbp
+from cogeneration.type.batch import NoisyFeatures
+from cogeneration.type.batch import PredBatchProps as pbp
+from cogeneration.type.metrics import MetricName, OutputFileName
+from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
 
 
 def to_numpy(x: Optional[torch.Tensor]) -> Optional[np.ndarray]:
@@ -232,14 +234,14 @@ class FlowModule(LightningModule):
                 )
             self.validation_epoch_metrics.clear()
 
-    def model_step(self, noisy_batch: Any) -> TrainingLosses:
+    def model_step(self, batch: NoisyFeatures) -> TrainingLosses:
         training_cfg = self.cfg.experiment.training
 
-        bb_mask = noisy_batch[bp.res_mask]
-        loss_mask = bb_mask * noisy_batch[bp.diffuse_mask]
+        bb_mask = batch[bp.res_mask]
+        loss_mask = bb_mask * batch[bp.diffuse_mask]
 
         if training_cfg.mask_plddt:
-            loss_mask *= noisy_batch[bp.plddt_mask]
+            loss_mask *= batch[bp.plddt_mask]
         if torch.any(torch.sum(loss_mask, dim=-1) < 1):
             raise ValueError("Empty batch encountered")
 
@@ -253,14 +255,14 @@ class FlowModule(LightningModule):
         n_bb_atoms = 5 if self.cfg.model.predict_psi_torsions else 3
 
         # Ground truth labels
-        gt_trans_1 = noisy_batch[bp.trans_1]
-        gt_rotmats_1 = noisy_batch[bp.rotmats_1]
+        gt_trans_1 = batch[bp.trans_1]
+        gt_rotmats_1 = batch[bp.rotmats_1]
         gt_rot_vf = so3_utils.calc_rot_vf(
-            mat_t=noisy_batch[nbp.rotmats_t],
+            mat_t=batch[nbp.rotmats_t],
             mat_1=gt_rotmats_1.type(torch.float32),
         )
-        gt_aatypes_1 = noisy_batch[bp.aatypes_1]
-        gt_psi_torsions_1 = noisy_batch[bp.torsion_angles_sin_cos_1][..., 2, :]
+        gt_aatypes_1 = batch[bp.aatypes_1]
+        gt_psi_torsions_1 = batch[bp.torsion_angles_sin_cos_1][..., 2, :]
         gt_bb_atoms, atom37_mask, _, _ = all_atom.compute_backbone(
             rigid=all_atom.create_rigid(gt_rotmats_1, gt_trans_1),
             psi_torsions=gt_psi_torsions_1,
@@ -269,9 +271,9 @@ class FlowModule(LightningModule):
         atom37_mask = atom37_mask[:, :, :n_bb_atoms]
 
         # Timestep used for normalization.
-        r3_t = noisy_batch[nbp.r3_t]  # (B, 1)
-        so3_t = noisy_batch[nbp.so3_t]  # (B, 1)
-        cat_t = noisy_batch[nbp.cat_t]  # (B, 1)
+        r3_t = batch[nbp.r3_t]  # (B, 1)
+        so3_t = batch[nbp.so3_t]  # (B, 1)
+        cat_t = batch[nbp.cat_t]  # (B, 1)
 
         # losses for each domain scaled at `1 - min(t, clip)` (i.e. higher as t -> 1)
         r3_norm_scale = 1 - torch.min(
@@ -292,14 +294,14 @@ class FlowModule(LightningModule):
         # Basically, predict translations, rotations, and sequence and compare to ground truth.
         # Also compute the vector field, from the sampled `t` to predicted trans + rots.
         # To learn/refine vector field at t (for trans and rots) for init_rigids -> pred_rigids.
-        model_output = self.model(noisy_batch)
+        model_output = self.model(batch)
         pred_trans_1 = model_output[pbp.pred_trans]
         pred_rotmats_1 = model_output[pbp.pred_rotmats]
         pred_psi_1 = model_output[pbp.pred_psi]  # might be None
         pred_logits = model_output[pbp.pred_logits]  # (B, N, aatype_pred_num_tokens)
 
         pred_rots_vf = so3_utils.calc_rot_vf(
-            mat_t=noisy_batch[nbp.rotmats_t],
+            mat_t=batch[nbp.rotmats_t],
             mat_1=pred_rotmats_1,
         )
         if torch.any(torch.isnan(pred_rots_vf)):
@@ -432,7 +434,7 @@ class FlowModule(LightningModule):
 
         self._data_history.append(
             {
-                "batch": noisy_batch,
+                "batch": batch,
                 "loss": losses,
                 "model_output": model_output,
                 "aux": aux,
@@ -441,7 +443,7 @@ class FlowModule(LightningModule):
 
         return losses
 
-    def training_step(self, batch: Any):
+    def training_step(self, batch: NoisyFeatures):
         step_start_time = time.time()
 
         self.interpolant.set_device(batch[bp.res_mask].device)
@@ -558,7 +560,7 @@ class FlowModule(LightningModule):
 
         return train_loss
 
-    def validation_step(self, batch: Any, batch_idx: int) -> pd.DataFrame:
+    def validation_step(self, batch: InferenceFeatures, batch_idx: int) -> pd.DataFrame:
         assert batch is not None, "batch is None"
 
         res_mask = batch[bp.res_mask]
@@ -653,7 +655,7 @@ class FlowModule(LightningModule):
 
         return batch_metrics_df
 
-    def predict_step(self, batch: Any, batch_idx: Any) -> pd.DataFrame:
+    def predict_step(self, batch: InferenceFeatures, batch_idx: Any) -> pd.DataFrame:
         # Create an inference-specific interpolant
         interpolant = Interpolant(self.cfg.inference.interpolant)
 

@@ -1,20 +1,18 @@
-from typing import Dict, Union
-
-import torch
 from torch import nn
 
 from cogeneration.config.base import ModelConfig, ModelSequencePredictionEnum
-from cogeneration.data.batch_props import BatchProps as bp
-from cogeneration.data.batch_props import NoisyBatchProps as nbp
-from cogeneration.data.batch_props import PredBatchProps as pbp
 from cogeneration.data.const import rigids_ang_to_nm, rigids_nm_to_ang
 from cogeneration.data.rigid import create_rigid
-from cogeneration.dataset.util import ModelPrediction
 from cogeneration.models.aa_pred import AminoAcidNOOPNet, AminoAcidPredictionNet
 from cogeneration.models.edge_feature_net import EdgeFeatureNet
 from cogeneration.models.ipa_attention import AttentionIPATrunk
 from cogeneration.models.node_feature_net import NodeFeatureNet
 from cogeneration.models.sequence_ipa_net import SequenceIPANet
+from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import ModelPrediction
+from cogeneration.type.batch import NoisyBatchProps as nbp
+from cogeneration.type.batch import NoisyFeatures
+from cogeneration.type.batch import PredBatchProps as pbp
 
 
 class FlowModel(nn.Module):
@@ -71,20 +69,20 @@ class FlowModel(nn.Module):
             predict_torsions=self.cfg.predict_psi_torsions,
         )
 
-    def forward(self, input_feats) -> ModelPrediction:
-        node_mask = input_feats[bp.res_mask]
+    def forward(self, batch: NoisyFeatures) -> ModelPrediction:
+        node_mask = batch[bp.res_mask]
         edge_mask = node_mask[:, None] * node_mask[:, :, None]
-        diffuse_mask = input_feats[bp.diffuse_mask]
-        chain_index = input_feats[bp.chain_idx]
-        res_index = input_feats[bp.res_idx]
-        so3_t = input_feats[nbp.so3_t]
-        r3_t = input_feats[nbp.r3_t]
-        cat_t = input_feats[nbp.cat_t]
-        trans_t = input_feats[nbp.trans_t]
-        rotmats_t = input_feats[nbp.rotmats_t]
-        aatypes_t = input_feats[nbp.aatypes_t].long()  # converts to int64
-        trans_sc = input_feats[nbp.trans_sc]
-        aatypes_sc = input_feats[nbp.aatypes_sc]
+        diffuse_mask = batch[bp.diffuse_mask]
+        chain_index = batch[bp.chain_idx]
+        res_index = batch[bp.res_idx]
+        so3_t = batch[nbp.so3_t]
+        r3_t = batch[nbp.r3_t]
+        cat_t = batch[nbp.cat_t]
+        trans_t = batch[nbp.trans_t]
+        rotmats_t = batch[nbp.rotmats_t]
+        aatypes_t = batch[nbp.aatypes_t].long()  # converts to int64
+        trans_sc = batch[nbp.trans_sc]
+        aatypes_sc = batch[nbp.aatypes_sc]
 
         init_rigids_ang = create_rigid(rots=rotmats_t, trans=trans_t)
 

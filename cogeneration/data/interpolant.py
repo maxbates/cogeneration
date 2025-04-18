@@ -6,20 +6,15 @@ from typing import Any, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy.optimize import linear_sum_assignment
+from scipy.optimize import linear_sum_assignment  # noqa
 
 from cogeneration.config.base import (
-    DataTaskEnum,
-    InferenceTaskEnum,
     InterpolantAATypesInterpolantTypeEnum,
     InterpolantConfig,
     InterpolantRotationsScheduleEnum,
     InterpolantTranslationsScheduleEnum,
 )
 from cogeneration.data import all_atom, so3_utils
-from cogeneration.data.batch_props import BatchProps as bp
-from cogeneration.data.batch_props import NoisyBatchProps as nbp
-from cogeneration.data.batch_props import PredBatchProps as pbp
 from cogeneration.data.const import MASK_TOKEN_INDEX, NM_TO_ANG_SCALE, NUM_TOKENS
 from cogeneration.data.noise_mask import (
     centered_gaussian,
@@ -31,6 +26,12 @@ from cogeneration.data.noise_mask import (
     uniform_so3,
 )
 from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
+from cogeneration.type.batch import BatchFeatures
+from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import NoisyBatchProps as nbp
+from cogeneration.type.batch import NoisyFeatures
+from cogeneration.type.batch import PredBatchProps as pbp
+from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
 
 
 def to_cpu(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -365,13 +366,13 @@ class Interpolant:
         # only corrupt residues in `diffuse_mask`
         return mask_blend_1d(aatypes_t, aatypes_1, diffuse_mask)
 
-    def corrupt_batch(self, batch, task: DataTaskEnum):
+    def corrupt_batch(self, batch: BatchFeatures, task: DataTaskEnum) -> NoisyFeatures:
         """
         Sample t to generate a noisy batch from the input batch.
         """
-        noisy_batch = copy.deepcopy(batch)
+        noisy_batch: NoisyFeatures = copy.deepcopy(batch)
 
-        trans_1 = batch[bp.trans_1]  # [B, N, 3] in Angstrom
+        trans_1 = batch[bp.trans_1]  # [B, N, 3] in Angstroms
         rotmats_1 = batch[bp.rotmats_1]  # [B, N, 3, 3]
         aatypes_1 = batch[bp.aatypes_1]  # [B, N]
         res_mask = batch[bp.res_mask]  # [B, N]

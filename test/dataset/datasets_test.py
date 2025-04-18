@@ -1,9 +1,9 @@
 import torch
 
-from cogeneration.data.batch_props import BatchProps as bp
 from cogeneration.dataset.datasets import BaseDataset
 from cogeneration.dataset.motif_factory import Motif, Scaffold
-from cogeneration.dataset.util import empty_feats
+from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import empty_feats
 
 
 class TestBaseDataset:

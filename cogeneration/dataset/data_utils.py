@@ -5,8 +5,8 @@ import numpy as np
 from Bio import PDB
 
 from cogeneration.data.const import CA_IDX
-from cogeneration.data.enum import DatasetProteinColumns as dpc
 from cogeneration.data.protein import process_chain
+from cogeneration.type.dataset import DatasetProteinColumns as dpc
 
 
 def parse_chain_feats(

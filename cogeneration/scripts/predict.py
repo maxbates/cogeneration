@@ -1,5 +1,4 @@
 import copy
-import glob
 import os
 from collections import OrderedDict
 from dataclasses import asdict
@@ -12,11 +11,12 @@ from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning.utilities.model_summary import ModelSummary
 
-from cogeneration.config.base import Config, InferenceTaskEnum
+from cogeneration.config.base import Config
 from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingDataset
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.utils import get_available_device, print_timing
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
+from cogeneration.type.task import InferenceTaskEnum
 from cogeneration.util.log import rank_zero_logger
 
 torch.set_float32_matmul_precision("high")

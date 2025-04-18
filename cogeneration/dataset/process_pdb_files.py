@@ -8,7 +8,7 @@ import multiprocessing as mp
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional
 
 import mdtraj as md
 import numpy as np
@@ -18,13 +18,13 @@ from Bio import PDB
 from tqdm.auto import tqdm
 
 from cogeneration.data.const import ALPHANUMERIC, CHAIN_TO_INT
-from cogeneration.data.enum import DatasetColumns as dc
-from cogeneration.data.enum import DatasetProteinColumns as dpc
 from cogeneration.data.io import write_pkl
 from cogeneration.data.protein import process_chain
 from cogeneration.data.residue_constants import unk_restype_index
 from cogeneration.dataset.data_utils import parse_chain_feats
-from cogeneration.dataset.util import MetadataCSVRow
+from cogeneration.type.dataset import DatasetColumns as dc
+from cogeneration.type.dataset import DatasetProteinColumns as dpc
+from cogeneration.type.dataset import MetadataCSVRow
 
 # TODO - support MMCIF files
 

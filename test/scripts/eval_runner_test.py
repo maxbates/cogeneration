@@ -1,9 +1,10 @@
 import os.path
 
-from cogeneration.config.base import Config, InferenceTaskEnum
-from cogeneration.data.enum import MetricName
+from cogeneration.config.base import Config
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.predict import EvalRunner
+from cogeneration.type.metrics import MetricName
+from cogeneration.type.task import InferenceTaskEnum
 
 
 class TestEvalRunner:

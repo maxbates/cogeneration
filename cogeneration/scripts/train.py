@@ -11,9 +11,8 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.loggers.wandb import WandbLogger
 from pytorch_lightning.trainer import Trainer
 
-import wandb
 from cogeneration.config.base import Config
-from cogeneration.dataset.datasets import BaseDataset, DatasetConstructor, PdbDataset
+from cogeneration.dataset.datasets import DatasetConstructor
 from cogeneration.dataset.protein_dataloader import ProteinData
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.utils import flatten_dict, get_available_device, print_timing

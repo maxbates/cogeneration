@@ -13,23 +13,23 @@ from omegaconf import OmegaConf
 from pytorch_lightning import Trainer
 from torch.utils.data import DataLoader
 
-from cogeneration.config.base import (
-    PATH_PUBLIC_WEIGHTS,
-    Config,
-    DataTaskEnum,
-    InferenceSamplesConfig,
-    InferenceTaskEnum,
-)
+from cogeneration.config.base import PATH_PUBLIC_WEIGHTS, Config, InferenceSamplesConfig
 from cogeneration.data import all_atom
-from cogeneration.data.batch_props import BatchProps as bp
-from cogeneration.data.enum import MetricName
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingDataset
 from cogeneration.dataset.protein_dataloader import ProteinData
-from cogeneration.dataset.test_utils import MockDataset, create_pdb_noisy_batch
+from cogeneration.dataset.test_utils import (
+    MockDataloader,
+    MockDataset,
+    create_pdb_dataloader,
+    create_pdb_noisy_batch,
+)
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
+from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.metrics import MetricName
+from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -84,17 +84,19 @@ def pdb_noisy_batch(mock_cfg):
 @pytest.fixture
 def mock_dataloader(request):
     # TODO - increase default batch size > 1
-    batch_size = request.param.get("batch_size", 1)
-    sample_lengths = request.param.get("sample_lengths", None)
+    batch_size = getattr(request, "param", {}).get("batch_size", 1)
+    sample_lengths = getattr(request, "param", {}).get("sample_lengths", None)
 
-    dataset = MockDataset(sample_lengths=sample_lengths)
-    dataloader = DataLoader(dataset, batch_size=batch_size)
-    return dataloader
+    return MockDataloader(
+        batch_size=batch_size,
+        sample_lengths=sample_lengths,
+    )
 
 
 @pytest.fixture
-def mock_pred_unconditional_dataloader():
-    # TODO - increase batch size > 1
+def mock_pred_unconditional_dataloader(request):
+    # TODO - increase default batch size > 1
+    batch_size = getattr(request, "param", {}).get("batch_size", 1)
 
     length_sampling_dataset = LengthSamplingDataset(
         InferenceSamplesConfig(
@@ -103,36 +105,35 @@ def mock_pred_unconditional_dataloader():
             length_subset=[10],
         )
     )
-    dataloader = DataLoader(length_sampling_dataset, batch_size=1)
+    dataloader = DataLoader(length_sampling_dataset, batch_size=batch_size)
     return dataloader
 
 
 @pytest.fixture
-def mock_pred_conditional_dataloader(mock_cfg):
+def mock_pred_conditional_dataloader(request, mock_cfg):
     """For `forward_folding` or `inverse_folding` tasks"""
-    # TODO - increase batch size > 1
+    # TODO - increase default batch size > 1
+    batch_size = getattr(request, "param", {}).get("batch_size", 1)
 
-    dataset_constructor = DatasetConstructor.pdb_dataset(
-        dataset_cfg=mock_cfg.dataset,
+    return create_pdb_dataloader(
+        cfg=mock_cfg,
+        task=DataTaskEnum.hallucination,
+        training=False,
+        eval_batch_size=batch_size,
     )
-    _, eval_dataset = dataset_constructor.create_datasets()
-
-    dataloader = DataLoader(eval_dataset, batch_size=1)
-    return dataloader
 
 
 @pytest.fixture
-def mock_pred_inpainting_dataloader(mock_cfg):
-    # TODO - increase batch size > 1
+def mock_pred_inpainting_dataloader(request, mock_cfg):
+    # TODO - increase default batch size > 1
+    batch_size = getattr(request, "param", {}).get("batch_size", 1)
 
-    dataset_constructor = DatasetConstructor.pdb_dataset(
-        dataset_cfg=mock_cfg.dataset,
+    return create_pdb_dataloader(
+        cfg=mock_cfg,
         task=DataTaskEnum.inpainting,
+        training=False,
+        eval_batch_size=batch_size,
     )
-    _, eval_dataset = dataset_constructor.create_datasets()
-
-    dataloader = DataLoader(eval_dataset, batch_size=1)
-    return dataloader
 
 
 @dataclass

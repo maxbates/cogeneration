@@ -7,7 +7,8 @@ from typing import List, Optional
 from hydra.core.config_store import ConfigStore
 from omegaconf import OmegaConf
 
-from cogeneration.util.base_classes import StrEnum
+from cogeneration.type.str_enum import StrEnum
+from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
 
 """
 Structured configurations for cogeneration.
@@ -28,22 +29,6 @@ PATH_PUBLIC_WEIGHTS = PATH_PROJECT_ROOT / "multiflow_weights"
 
 # hydra does not currently support `Literal` and suggests using Enums instead.
 # https://github.com/omry/omegaconf/issues/422
-
-
-class DataTaskEnum(StrEnum):
-    """task for training"""
-
-    hallucination = "hallucination"
-    inpainting = "inpainting"  # aka `scaffolding`
-
-
-class InferenceTaskEnum(StrEnum):
-    """task for inference"""
-
-    unconditional = "unconditional"
-    inpainting = "inpainting"  # aka `scaffolding`
-    forward_folding = "forward_folding"
-    inverse_folding = "inverse_folding"
 
 
 class DatasetEnum(StrEnum):
