@@ -35,7 +35,7 @@ def mock_noisy_feats(N: int, idx: int) -> Dict[Union[bp, nbp], Any]:
 
     # N residue protein, random frames
     feats[bp.res_mask] = torch.ones(N)
-    feats[bp.aatypes_1] = torch.randint(0, 20, (N,))  # AA seq as ints
+    feats[bp.aatypes_1] = torch.randint(0, 20, (N,))
     feats[bp.trans_1] = torch.rand(N, 3)
     feats[bp.rotmats_1] = torch.rand(N, 3, 3)
     feats[bp.torsion_angles_sin_cos_1] = torch.rand(N, 7, 2)

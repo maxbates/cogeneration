@@ -444,8 +444,12 @@ class BaseDataset(Dataset):
         new_total_length = sum([seg.length for seg in segments])
         new_feats = empty_feats(N=new_total_length)
 
-        # TODO(inpainting) confirm we don't need to create an intermediate Rigid for each motif
-        #   and can just pass the translations and rotations through...
+        metadata_props = [bp.pdb_name, bp.csv_idx, bp.sample_id]
+
+        # copy over some features from original
+        for prop in metadata_props:
+            if prop in feats:
+                new_feats[prop] = feats[prop]
 
         for segment in segments:
             if isinstance(segment, Motif):
@@ -454,15 +458,12 @@ class BaseDataset(Dataset):
 
                 # copy over relevant motif features
                 for prop, value in new_feats.items():
+                    if prop in metadata_props:
+                        continue
                     new_feats[prop][s:e] = feats[prop][s:e]
 
                 # enforce certain values in motif
                 new_feats[bp.diffuse_mask][s:e] = 1.0
-
-        # copy over some features from original
-        for prop in [bp.pdb_name, bp.csv_idx, bp.sample_id]:
-            if prop in feats:
-                new_feats[prop] = feats[prop]
 
         return new_feats
 
@@ -582,7 +583,8 @@ class BaseDataset(Dataset):
             and (diffuse_mask == 0).any()
         ):
             segments = motif_factory.generate_segments_from_diffuse_mask(
-                diffuse_mask=diffuse_mask
+                diffuse_mask=diffuse_mask,
+                chain_idx=feats[bp.chain_idx],
             )
             BaseDataset.segment_features(feats=feats, segments=segments)
 
@@ -697,7 +699,9 @@ class LengthSamplingDataset(Dataset):
         num_res, sample_id = self._all_sample_ids[idx]
         item = {
             bp.res_mask: torch.ones(num_res),
-            bp.diffuse_mask: torch.ones(num_res).bool(),
+            bp.diffuse_mask: torch.ones(num_res),
+            bp.res_idx: torch.ones(num_res),
+            bp.chain_idx: torch.ones(num_res),
             bp.num_res: num_res,
             bp.sample_id: sample_id,
         }

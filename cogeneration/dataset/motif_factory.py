@@ -2,7 +2,7 @@ import random
 import re
 from dataclasses import dataclass
 from math import ceil, floor
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -22,7 +22,13 @@ class Segment:
 
 @dataclass
 class Motif(Segment):
-    chain: str
+    chain: Optional[str] = None
+    chain_idx: Optional[int] = None
+
+    def __post_init__(self):
+        assert (
+            self.chain is not None or self.chain_idx is not None
+        ), "Either chain or chain_idx must be provided"
 
 
 @dataclass
@@ -66,7 +72,10 @@ class MotifFactory:
         return segments
 
     def generate_segments_from_diffuse_mask(
-        self, diffuse_mask: torch.Tensor, random_scale_range=(0.5, 2)
+        self,
+        diffuse_mask: torch.Tensor,
+        chain_idx: torch.Tensor,
+        random_scale_range=(0.5, 2),
     ):
         """
         Generate segments from a diffuse mask.
@@ -74,6 +83,8 @@ class MotifFactory:
         Scaffold regions are randomly scaled by a factor in random_scale_range.
         """
         rng = self.rng
+
+        # TODO(multimer) handle multiple chains i.e. diffuse mask over multiple chains
 
         segments = []
         seg_start = 0
@@ -91,7 +102,13 @@ class MotifFactory:
                     )
                 # 0 = motif region
                 else:
-                    segments.append(Motif(start=seg_start, end=seg_end))
+                    segments.append(
+                        Motif(
+                            start=seg_start,
+                            end=seg_end,
+                            chain_idx=chain_idx[seg_start].item(),
+                        )
+                    )
                 current_val = diffuse_mask[i]
                 seg_start = i
 

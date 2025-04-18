@@ -38,15 +38,15 @@ class MockDataset(Dataset):
         return self.data[idx]
 
 
-def create_pdb_noisy_batch(cfg: Config):
+def create_pdb_batch(cfg: Config):
     """
-    Creates a single corrupted batch of a PDB dataset given `cfg`
+    Creates a single training batch of a PDB dataset given `cfg`
     """
     dataset_constructor = DatasetConstructor.pdb_dataset(
         dataset_cfg=cfg.dataset,
     )
 
-    train_dataset, _ = dataset_constructor.create_datasets()
+    train_dataset, eval_dataset = dataset_constructor.create_datasets()
 
     # batch sampler required to sample batch size > 1
     # we borrow convention from MultiFlow to batch by length rather than pad
@@ -64,9 +64,16 @@ def create_pdb_noisy_batch(cfg: Config):
         num_workers=0,
     )
 
-    interpolant = Interpolant(cfg.interpolant)
-
     raw_feats = next(iter(dataloader))
-    noisy_feats = interpolant.corrupt_batch(raw_feats, task=cfg.data.task)
 
+    return raw_feats
+
+
+def create_pdb_noisy_batch(cfg: Config):
+    """
+    Creates a single corrupted batch of a PDB dataset given `cfg`
+    """
+    raw_feats = create_pdb_batch(cfg)
+    interpolant = Interpolant(cfg.interpolant)
+    noisy_feats = interpolant.corrupt_batch(raw_feats, task=cfg.data.task)
     return noisy_feats

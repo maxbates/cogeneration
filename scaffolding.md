@@ -64,8 +64,6 @@ https://github.com/microsoft/protein-frame-flow
     - [x] update `save_trajectory()` for coloring logits - right now they are all green
     - [x] support b-factors by `diffuse_mask`
 
-## Future Work
-
 - Centering - move to interpolating rather than fixed
     - Notes
         - Fundamental tension if fixed: motifs and scaffolds will have a different center of mass.
@@ -111,27 +109,28 @@ https://github.com/microsoft/protein-frame-flow
         - [x] For amino acids, keep them fixed
 
 - Folding Validation
-    - [ ] confirm existing metrics make sense for inpainting
-        - [ ] masks used appropriately
-        - [ ] true sequence and bb positions used sanely
+    - [x] confirm existing metrics make sense for inpainting
+        - [x] masks used appropriately
+        - [x] true sequence and bb positions used sanely
     - [ ] Update expectations that only doing unconditional `validation_step()`
         - [ ] pass true_bb_positions and true_aa when appropriate
         - [ ] update `is_codesign` check in `assess_sample()`
 
 - Misc / Backlog
     - [x] update relevant task switch statements
-    - [ ] ensure `diffuse_mask` is obeyed throughout
+    - [x] ensure `diffuse_mask` is obeyed throughout
     - [x] update all `(diffuse_mask == 1.0).all()` references
-    - [ ] address `TODO(inpainting)`
-    - [ ] confirm masks used appropriately for metrics calculating: `res_mask`, `diffuse_mask`, `plddt_mask`
+    - [x] address `TODO(inpainting)`
+    - [x] confirm masks used appropriately for metrics calculating: `res_mask`, `diffuse_mask`, `plddt_mask`
 
 - Tests
-    - [ ] ScaffoldingDataset - diffuse_mask, motif sizes
-        - [ ] ensure `diffuse_mask` does not contain anything not in res_mask or plddt_mask
-    - [ ] interpolant - corrupt_batch(), sample()
-    - [ ] inference for inpainting works
+    - [x] ScaffoldingDataset - diffuse_mask, motif sizes
+    - [x] interpolant - corrupt_batch() 
+    - [x] interpolant - sample()
+    - [x] inference for inpainting works
     - [ ] metrics for inpainting
 
+## Future Work
 
 - ESM embeddings
     - Particularly if only sequence is fixed, and structure is interpolated, should get embedding given sequence + structure. Currently, its primarily structure.

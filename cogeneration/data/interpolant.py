@@ -265,7 +265,6 @@ class Interpolant:
             intermediate_noise = intermediate_noise * NM_TO_ANG_SCALE
             trans_t = trans_t + intermediate_noise
 
-        # TODO(inpainting) don't fix at t=1 if interpolating
         trans_t = mask_blend_2d(trans_t, trans_1, diffuse_mask)
 
         # Center residues at origin
@@ -320,7 +319,6 @@ class Interpolant:
         identity = torch.eye(3, device=self._device)
         rotmats_t = mask_blend_3d(rotmats_t, identity[None, None], res_mask)
 
-        # TODO(inpainting) don't fix at t=1 if interpolating
         # only corrupt residues in `diffuse_mask`
         return mask_blend_3d(rotmats_t, rotmats_1, diffuse_mask)
 
@@ -1115,11 +1113,18 @@ class Interpolant:
             # TODO(inpainting-fixed) support fixed motifs
             if task == InferenceTaskEnum.inpainting:
                 # Get interpolated values for motif translations and rotations
+                t_motif = torch.tensor([t_2])[:, None]
                 trans_t_2_motif = self._corrupt_trans(
-                    trans_1, t_2, res_mask=res_mask, diffuse_mask=None
+                    trans_1,
+                    t=t_motif,
+                    res_mask=res_mask,
+                    diffuse_mask=res_mask,  # interpolate all residues
                 )
                 rotmats_t_2_motif = self._corrupt_rotmats(
-                    rotmats_1, t_2, res_mask=res_mask, diffuse_mask=None
+                    rotmats_1,
+                    t=t_motif,
+                    res_mask=res_mask,
+                    diffuse_mask=res_mask,  # interpolate all residues
                 )
                 # Set motif positions to interpolated values
                 trans_t_2 = mask_blend_2d(trans_t_2, trans_t_2_motif, diffuse_mask)

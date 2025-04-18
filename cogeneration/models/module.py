@@ -672,7 +672,8 @@ class FlowModule(LightningModule):
         sample_ids = [sample_ids] if isinstance(sample_ids, int) else sample_ids
         num_batch = len(sample_ids)
 
-        # TODO - prefer a struct for setting up each task
+        # TODO - prefer a struct for setting up each task. reduce duplicated logic.
+
         if self.cfg.inference.task == InferenceTaskEnum.unconditional:
             sample_length = batch[bp.num_res].item()
             sample_dirs = [
@@ -702,25 +703,29 @@ class FlowModule(LightningModule):
                 )
                 for sample_id in sample_ids
             ]
+            for sample_dir in sample_dirs:
+                os.makedirs(sample_dir, exist_ok=True)
 
             # true_bb_pos is masked and only defined at the motifs
-            # TODO(inpainting) ensure bb metrics are valid / useful
             true_bb_pos = all_atom.atom37_from_trans_rot(
                 trans=trans_1,
                 rots=rotmats_1,
                 psi_torsions=psi_torsions_1,
             )
-            true_bb_pos = true_bb_pos[..., :3, :].reshape(-1, 3)
+            assert true_bb_pos.shape == (1, sample_length, 37, 3)
+            true_bb_pos = true_bb_pos[0]
 
             write_prot_to_pdb(
                 prot_pos=to_numpy(true_bb_pos),
                 file_path=os.path.join(sample_dirs[0], sample_pdb_name + "_gt.pdb"),
-                aatype=to_numpy(batch[bp.aatypes_1][0]),
+                aatype=to_numpy(aatypes_1[0]),
             )
 
         elif self.cfg.inference.task == InferenceTaskEnum.forward_folding:
             sample_pdb_name = batch[bp.pdb_name][0]
             sample_length = batch[bp.trans_1].shape[1]
+            aatypes_1 = batch[bp.aatypes_1]
+
             sample_dirs = [
                 os.path.join(
                     self.inference_dir,
@@ -730,6 +735,7 @@ class FlowModule(LightningModule):
             ]
             for sample_dir in sample_dirs:
                 os.makedirs(sample_dir, exist_ok=True)
+
             true_bb_pos = all_atom.atom37_from_trans_rot(
                 trans=batch[bp.trans_1],
                 rots=batch[bp.rotmats_1],
@@ -742,9 +748,9 @@ class FlowModule(LightningModule):
             write_prot_to_pdb(
                 prot_pos=to_numpy(true_bb_pos),
                 file_path=os.path.join(sample_dirs[0], sample_pdb_name + "_gt.pdb"),
-                aatype=to_numpy(batch[bp.aatypes_1][0]),
+                aatype=to_numpy(aatypes_1[0]),
             )
-            aatypes_1 = batch[bp.aatypes_1]
+
             trans_1 = rotmats_1 = psi_torsions_1 = diffuse_mask = true_aatypes = None
 
         elif self.cfg.inference.task == InferenceTaskEnum.inverse_folding:
@@ -807,7 +813,6 @@ class FlowModule(LightningModule):
         model_bb_trajs = to_numpy(model_traj.structure)
         model_aa_trajs = to_numpy(model_traj.amino_acids)
         # We only emit logits from direct model output (don't simulate logits)
-        # TODO(inpainting) FUTURE - consider how to simulate logits (since we work with discrete aatypes)
         model_logits_trajs = to_numpy(model_traj.logits)
 
         # Check for remaining mask tokens in final step of interpolated trajectory and reset to 0 := alanine

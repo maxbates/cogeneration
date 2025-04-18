@@ -155,6 +155,28 @@ class TestFlowModule:
         # just test that it works
         _ = module.predict_step(batch, 0)
 
+    def test_predict_step_inpainting_works(
+        self,
+        mock_cfg_uninterpolated,
+        mock_pred_conditional_dataloader,
+        mock_folding_validation,
+    ):
+        # modify config for forward folding
+        mock_cfg_uninterpolated.inference.task = InferenceTaskEnum.inpainting
+        mock_cfg = mock_cfg_uninterpolated.interpolate()
+
+        module = FlowModule(mock_cfg)
+        batch = next(iter(mock_pred_conditional_dataloader))
+
+        mock_folding_validation(
+            batch=batch,
+            cfg=mock_cfg,
+            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+        )
+
+        # just test that it works
+        _ = module.predict_step(batch, 0)
+
     def test_predict_step_forward_folding_works(
         self,
         mock_cfg_uninterpolated,
