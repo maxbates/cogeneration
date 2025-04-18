@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import mdtraj as md
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 from Bio import PDB
 from tqdm.auto import tqdm
@@ -23,7 +24,7 @@ from cogeneration.data.io import write_pkl
 from cogeneration.data.protein import process_chain
 from cogeneration.data.residue_constants import unk_restype_index
 from cogeneration.dataset.data_utils import parse_chain_feats
-from cogeneration.dataset.datasets import MetadataCSVRow
+from cogeneration.dataset.util import MetadataCSVRow
 
 # TODO - support MMCIF files
 
@@ -43,7 +44,9 @@ def chain_str_to_int(chain_str: str):
     return chain_int
 
 
-def concat_np_features(np_dicts: List[Dict[str, np.ndarray]], add_batch_dim: bool):
+def concat_np_features(
+    np_dicts: List[Dict[str, npt.NDArray]], add_batch_dim: bool
+) -> Dict[str, npt.NDArray]:
     """Performs a nested concatenation of feature dicts.
 
     Args:

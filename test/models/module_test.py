@@ -1,14 +1,16 @@
 import numpy as np
 import pandas as pd
+from torch.utils.data import DataLoader
 
 from cogeneration.config.base import (
     DataTaskEnum,
     InferenceTaskEnum,
     InterpolantTranslationsScheduleEnum,
 )
-from cogeneration.data.batch_props import BatchProps
+from cogeneration.data.batch_props import BatchProps as bp
 from cogeneration.data.enum import MetricName
 from cogeneration.data.residue_constants import restypes_with_x
+from cogeneration.dataset.datasets import DatasetConstructor
 from cogeneration.dataset.test_utils import create_pdb_noisy_batch
 from cogeneration.models.module import FlowModule, TrainingLosses
 
@@ -76,7 +78,7 @@ class TestFlowModule:
         input_seq = "".join(
             [
                 restypes_with_x[x]
-                for x in pdb_noisy_batch[BatchProps.aatypes_1][0].cpu().detach().numpy()
+                for x in pdb_noisy_batch[bp.aatypes_1][0].cpu().detach().numpy()
             ]
         )
         assert sample[MetricName.sequence] == input_seq
@@ -158,15 +160,48 @@ class TestFlowModule:
     def test_predict_step_inpainting_works(
         self,
         mock_cfg_uninterpolated,
-        mock_pred_conditional_dataloader,
+        mock_pred_inpainting_dataloader,
         mock_folding_validation,
     ):
-        # modify config for forward folding
         mock_cfg_uninterpolated.inference.task = InferenceTaskEnum.inpainting
         mock_cfg = mock_cfg_uninterpolated.interpolate()
 
         module = FlowModule(mock_cfg)
-        batch = next(iter(mock_pred_conditional_dataloader))
+        batch = next(iter(mock_pred_inpainting_dataloader))
+
+        mock_folding_validation(
+            batch=batch,
+            cfg=mock_cfg,
+            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+        )
+
+        # just test that it works
+        _ = module.predict_step(batch, 0)
+
+    def test_predict_step_inpainting_but_actually_unconditional_works(
+        self,
+        mock_cfg_uninterpolated,
+        mock_folding_validation,
+    ):
+        # modify config for inpainting, but actually unconditional
+        mock_cfg_uninterpolated.inference.task = InferenceTaskEnum.inpainting
+        mock_cfg_uninterpolated.dataset.inpainting.unconditional_percent = 1.0
+        mock_cfg = mock_cfg_uninterpolated.interpolate()
+        assert mock_cfg.dataset.inpainting.unconditional_percent == 1.0
+
+        # Explicitly create dataset, to pass mock_cfg
+        dataset_constructor = DatasetConstructor.pdb_dataset(
+            dataset_cfg=mock_cfg.dataset,
+            task=DataTaskEnum.inpainting,
+        )
+        _, eval_dataset = dataset_constructor.create_datasets()
+        dataloader = DataLoader(eval_dataset, batch_size=1)
+        batch = next(iter(dataloader))
+
+        # ensure get an unconditional-like diffuse mask
+        assert (batch[bp.diffuse_mask] == 1).all()
+
+        module = FlowModule(mock_cfg)
 
         mock_folding_validation(
             batch=batch,
@@ -183,7 +218,6 @@ class TestFlowModule:
         mock_pred_conditional_dataloader,
         mock_folding_validation,
     ):
-        # modify config for forward folding
         mock_cfg_uninterpolated.inference.task = InferenceTaskEnum.forward_folding
         mock_cfg = mock_cfg_uninterpolated.interpolate()
 

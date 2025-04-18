@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from cogeneration.config.base import (
     PATH_PUBLIC_WEIGHTS,
     Config,
+    DataTaskEnum,
     InferenceSamplesConfig,
     InferenceTaskEnum,
 )
@@ -108,10 +109,25 @@ def mock_pred_unconditional_dataloader():
 
 @pytest.fixture
 def mock_pred_conditional_dataloader(mock_cfg):
+    """For `forward_folding` or `inverse_folding` tasks"""
     # TODO - increase batch size > 1
 
     dataset_constructor = DatasetConstructor.pdb_dataset(
         dataset_cfg=mock_cfg.dataset,
+    )
+    _, eval_dataset = dataset_constructor.create_datasets()
+
+    dataloader = DataLoader(eval_dataset, batch_size=1)
+    return dataloader
+
+
+@pytest.fixture
+def mock_pred_inpainting_dataloader(mock_cfg):
+    # TODO - increase batch size > 1
+
+    dataset_constructor = DatasetConstructor.pdb_dataset(
+        dataset_cfg=mock_cfg.dataset,
+        task=DataTaskEnum.inpainting,
     )
     _, eval_dataset = dataset_constructor.create_datasets()
 
@@ -146,6 +162,7 @@ def mock_folding_validation(tmp_path):
             assert batch is not None, "batch is required for folding validation mock"
             assert cfg is not None, "cfg is required for folding validation mock"
 
+            # TODO(inpainting) improve mock for inpainting
             if cfg.inference.task != InferenceTaskEnum.unconditional:
                 print(
                     f"WARNING. mocks currently assume unconditional generation. May impact outputs. Got {cfg.inference.task}"

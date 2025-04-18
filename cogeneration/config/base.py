@@ -840,6 +840,9 @@ class Config:
         # shortest validation samples in public data are 60 residues
         raw_cfg.dataset.max_eval_length = 63
 
+        # inpainting, always generate motifs
+        raw_cfg.dataset.inpainting.unconditional_percent = 0.0
+
         return raw_cfg
 
     @classmethod

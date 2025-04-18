@@ -568,7 +568,11 @@ class FlowModule(LightningModule):
 
         # Pick inference task corresponding to training task
         if self.cfg.data.task == DataTaskEnum.inpainting:
-            inference_task = InferenceTaskEnum.inpainting
+            # Handle `unconditional_percent` -> unconditional generation
+            if (diffuse_mask == 1).all():
+                inference_task = InferenceTaskEnum.unconditional
+            else:
+                inference_task = InferenceTaskEnum.inpainting
         elif self.cfg.data.task == DataTaskEnum.hallucination:
             inference_task = InferenceTaskEnum.unconditional
         else:
@@ -624,9 +628,9 @@ class FlowModule(LightningModule):
                     model_bb_traj=model_bb_trajs[i],
                     model_aa_traj=model_aa_trajs[i],
                     model_logits_traj=model_logits_trajs[i],
-                    true_bb_pos=None,  # codesign
-                    true_aa=None,  # codesign
                     diffuse_mask=to_numpy(diffuse_mask)[0],
+                    true_bb_pos=None,  # codesign  # TODO(inpainting) define
+                    true_aa=None,  # codesign  # TODO(inpainting) define
                     also_fold_pmpnn_seq=True,  # always fold during validation
                     write_sample_trajectories=False,  # don't write trajectories during validation (just structures)
                     n_inverse_folds=1,  # only one during validation
@@ -653,6 +657,8 @@ class FlowModule(LightningModule):
         # Create an inference-specific interpolant
         interpolant = Interpolant(self.cfg.inference.interpolant)
 
+        task = self.cfg.inference.task
+
         device = (
             batch[bp.num_res].device
             if bp.num_res in batch
@@ -664,6 +670,23 @@ class FlowModule(LightningModule):
         )
         interpolant.set_device(device)
 
+        # Pull out metadata and t=1 values, if defined
+        trans_1 = batch[bp.trans_1] if bp.trans_1 in batch else None
+        rotmats_1 = batch[bp.rotmats_1] if bp.rotmats_1 in batch else None
+        psi_torsions_1 = (
+            batch[bp.torsion_angles_sin_cos_1][..., 2, :]
+            if bp.torsion_angles_sin_cos_1 in batch
+            else None
+        )
+        aatypes_1 = batch[bp.aatypes_1] if bp.aatypes_1 in batch else None
+        sample_pdb_name = batch[bp.pdb_name][0] if bp.pdb_name in batch else None
+
+        # `unconditional` uses LengthSamplingDataset which has some unique values in the batch
+        if task == InferenceTaskEnum.unconditional:
+            sample_length = batch[bp.num_res].item()
+        else:
+            sample_length = trans_1.shape[1] if trans_1 is not None else None
+
         # Handle single-sample and missing sample_id
         if bp.sample_id in batch:
             sample_ids = batch[bp.sample_id].squeeze().tolist()
@@ -672,10 +695,18 @@ class FlowModule(LightningModule):
         sample_ids = [sample_ids] if isinstance(sample_ids, int) else sample_ids
         num_batch = len(sample_ids)
 
-        # TODO - prefer a struct for setting up each task. reduce duplicated logic.
+        # `diffuse_mask` is everything for all tasks except inpainting (loss etc. limited to `res_mask`)
+        if task == InferenceTaskEnum.inpainting:
+            diffuse_mask = batch[bp.diffuse_mask]
 
-        if self.cfg.inference.task == InferenceTaskEnum.unconditional:
-            sample_length = batch[bp.num_res].item()
+            # Handle `unconditional_percent` - If diffusing everything, treat prediction like unconditional
+            if (diffuse_mask == 1).all():
+                task = InferenceTaskEnum.unconditional
+        else:
+            diffuse_mask = torch.ones(num_batch, sample_length, device=device)
+
+        # Task-specific logic for creating output `sample_dirs`
+        if task == InferenceTaskEnum.unconditional:
             sample_dirs = [
                 os.path.join(
                     self.inference_dir,
@@ -684,48 +715,17 @@ class FlowModule(LightningModule):
                 )
                 for sample_id in sample_ids
             ]
-            true_aatypes = true_bb_pos = None
-            trans_1 = rotmats_1 = psi_torsions_1 = diffuse_mask = aatypes_1 = None
-
-        elif self.cfg.inference.task == InferenceTaskEnum.inpainting:
-            sample_pdb_name = batch[bp.pdb_name][0]
-            trans_1 = batch[bp.trans_1]
-            rotmats_1 = batch[bp.rotmats_1]
-            psi_torsions_1 = batch[bp.torsion_angles_sin_cos_1][..., 2, :]
-            aatypes_1 = true_aatypes = batch[bp.aatypes_1]
-
-            diffuse_mask = batch[bp.diffuse_mask]
-            sample_length = batch[bp.trans_1].shape[1]
-
+        elif task == InferenceTaskEnum.inpainting:
+            # For inpainting, we take a known PDB, but may alter its scaffold lengths
             sample_dirs = [
                 os.path.join(
-                    self.inference_dir, sample_pdb_name, f"sample_{str(sample_id)}"
+                    self.inference_dir,
+                    sample_pdb_name,
+                    f"{sample_length}_{str(sample_id)}",
                 )
                 for sample_id in sample_ids
             ]
-            for sample_dir in sample_dirs:
-                os.makedirs(sample_dir, exist_ok=True)
-
-            # true_bb_pos is masked and only defined at the motifs
-            true_bb_pos = all_atom.atom37_from_trans_rot(
-                trans=trans_1,
-                rots=rotmats_1,
-                psi_torsions=psi_torsions_1,
-            )
-            assert true_bb_pos.shape == (1, sample_length, 37, 3)
-            true_bb_pos = true_bb_pos[0]
-
-            write_prot_to_pdb(
-                prot_pos=to_numpy(true_bb_pos),
-                file_path=os.path.join(sample_dirs[0], sample_pdb_name + "_gt.pdb"),
-                aatype=to_numpy(aatypes_1[0]),
-            )
-
-        elif self.cfg.inference.task == InferenceTaskEnum.forward_folding:
-            sample_pdb_name = batch[bp.pdb_name][0]
-            sample_length = batch[bp.trans_1].shape[1]
-            aatypes_1 = batch[bp.aatypes_1]
-
+        elif task == InferenceTaskEnum.forward_folding:
             sample_dirs = [
                 os.path.join(
                     self.inference_dir,
@@ -733,64 +733,102 @@ class FlowModule(LightningModule):
                     sample_pdb_name,
                 )
             ]
-            for sample_dir in sample_dirs:
-                os.makedirs(sample_dir, exist_ok=True)
-
-            true_bb_pos = all_atom.atom37_from_trans_rot(
-                trans=batch[bp.trans_1],
-                rots=batch[bp.rotmats_1],
-                psi_torsions=batch[bp.torsion_angles_sin_cos_1][..., 2, :],
-            )
-            # Ensure only have one valid structure for the batch
-            assert true_bb_pos.shape == (1, sample_length, 37, 3)
-            true_bb_pos = true_bb_pos[0]
-            # save the ground truth as a pdb
-            write_prot_to_pdb(
-                prot_pos=to_numpy(true_bb_pos),
-                file_path=os.path.join(sample_dirs[0], sample_pdb_name + "_gt.pdb"),
-                aatype=to_numpy(aatypes_1[0]),
-            )
-
-            trans_1 = rotmats_1 = psi_torsions_1 = diffuse_mask = true_aatypes = None
-
-        elif self.cfg.inference.task == InferenceTaskEnum.inverse_folding:
-            sample_pdb_name = batch[bp.pdb_name][0]
-            sample_length = batch[bp.trans_1].shape[1]
-            trans_1 = batch[bp.trans_1]
-            rotmats_1 = batch[bp.rotmats_1]
-            psi_torsions_1 = batch[bp.torsion_angles_sin_cos_1][..., 2, :]
-            true_aatypes = batch[bp.aatypes_1]
+        elif task == InferenceTaskEnum.inverse_folding:
             sample_dirs = [
                 os.path.join(
                     self.inference_dir, f"length_{sample_length}", sample_pdb_name
                 )
             ]
-            aatypes_1 = diffuse_mask = true_bb_pos = None
-
         else:
-            raise ValueError(f"Unknown task {self.cfg.inference.task}")
+            raise ValueError(f"Unknown task {task}")
+
+        # Create output directories
+        for sample_dir in sample_dirs:
+            os.makedirs(sample_dir, exist_ok=True)
+
+        # For some tasks, we have a `true_aatypes` sequence for sample metrics
+        # Note for inpainting, only the motifs are defined
+        true_aatypes = None
+        if (
+            task == InferenceTaskEnum.inpainting
+            or task == InferenceTaskEnum.forward_folding
+            or task == InferenceTaskEnum.inverse_folding
+        ):
+            assert aatypes_1 is not None
+
+            true_aatypes = aatypes_1
+
+            # Ensure only have one valid sequence for the batch, extract it
+            assert true_aatypes.shape == (
+                1,
+                sample_length,
+            ), f"true_aa shape {true_aatypes.shape}"
+            true_aatypes = true_aatypes[0]
+            assert true_aatypes.shape == (sample_length,)
+
+        # For some tasks, we have a `true_bb_pos` ground truth structure for sample metrics
+        # Note for inpainting `true_bb_pos` is masked and only defined at the motifs
+        true_bb_pos = None
+        if (
+            task == InferenceTaskEnum.inpainting
+            or task == InferenceTaskEnum.forward_folding
+        ):
+            assert trans_1 is not None
+            assert rotmats_1 is not None
+            assert psi_torsions_1 is not None
+            assert true_aatypes is not None
+
+            # For inpainting, limit true structure to motif positions
+            if task == InferenceTaskEnum.inpainting:
+                mask = 1 - diffuse_mask
+            else:
+                mask = torch.ones(num_batch, sample_length)
+
+            true_bb_pos = all_atom.atom37_from_trans_rot(
+                trans=trans_1,
+                rots=rotmats_1,
+                psi_torsions=psi_torsions_1,
+                res_mask=mask,
+            )
+
+            # Ensure only have one valid structure for the batch, extract it
+            assert true_bb_pos.shape == (1, sample_length, 37, 3)
+            true_bb_pos = true_bb_pos[0]
+            assert true_bb_pos.shape == (sample_length, 37, 3)
 
         # Skip runs if already exist
-        top_sample_csv_paths = [
-            os.path.join(sample_dir, "top_sample.csv") for sample_dir in sample_dirs
+        top_sample_json_paths = [
+            os.path.join(sample_dir, OutputFileName.top_sample_json)
+            for sample_dir in sample_dirs
         ]
-        if all(
-            [
-                os.path.exists(top_sample_csv_path)
-                for top_sample_csv_path in top_sample_csv_paths
-            ]
-        ):
+        if all([os.path.exists(path) for path in top_sample_json_paths]):
             self._log.error(
                 f"instance {sample_ids} length {sample_length} already exists @ {sample_dirs}"
             )
             return
+
+        # Prepare for sampling - zero out some values, depending on task
+        if task == InferenceTaskEnum.unconditional:
+            # Zero-out structure and sequence
+            trans_1 = rotmats_1 = psi_torsions_1 = aatypes_1 = None
+        elif task == InferenceTaskEnum.inpainting:
+            # Keep all t=1 values (though they may be masked to the motifs)
+            pass
+        elif task == InferenceTaskEnum.forward_folding:
+            # Zero-out structure
+            trans_1 = rotmats_1 = psi_torsions_1 = None
+        elif task == InferenceTaskEnum.inverse_folding:
+            # Zero-out sequence
+            aatypes_1 = None
+        else:
+            raise ValueError(f"Unknown task {task}")
 
         # Sample batch
         protein_traj, model_traj = interpolant.sample(
             num_batch=num_batch,
             num_res=sample_length,
             model=self.model,
-            task=self.cfg.inference.task,
+            task=task,
             trans_1=trans_1,
             rotmats_1=rotmats_1,
             psis_1=psi_torsions_1,
@@ -800,20 +838,14 @@ class FlowModule(LightningModule):
             res_idx=batch[bp.res_idx] if bp.res_idx in batch else None,
             separate_t=self.cfg.inference.interpolant.codesign_separate_t,
         )
-        # reset diffuse_mask to those residues sampled for calculating metrics
-        diffuse_mask = (
-            diffuse_mask
-            if diffuse_mask is not None
-            else torch.ones(num_batch, sample_length)
-        )
-
-        bb_trajs = to_numpy(protein_traj.structure)
-        aa_trajs = to_numpy(protein_traj.amino_acids)
 
         model_bb_trajs = to_numpy(model_traj.structure)
         model_aa_trajs = to_numpy(model_traj.amino_acids)
-        # We only emit logits from direct model output (don't simulate logits)
         model_logits_trajs = to_numpy(model_traj.logits)
+
+        bb_trajs = to_numpy(protein_traj.structure)
+        aa_trajs = to_numpy(protein_traj.amino_acids)
+        # (We only emit logits from direct model output - don't simulate logits)
 
         # Check for remaining mask tokens in final step of interpolated trajectory and reset to 0 := alanine
         for i in range(aa_trajs.shape[0]):  # samples
@@ -828,15 +860,15 @@ class FlowModule(LightningModule):
             top_sample_metrics, _, _ = self.compute_sample_metrics(
                 sample_id=sample_id,
                 sample_dir=sample_dir,
-                task=self.cfg.inference.task,
+                task=task,
                 bb_traj=bb_trajs[i],
                 aa_traj=aa_trajs[i],
                 model_bb_traj=model_bb_trajs[i],
                 model_aa_traj=model_aa_trajs[i],
                 model_logits_traj=model_logits_trajs[i],
+                diffuse_mask=to_numpy(diffuse_mask[i]),
                 true_bb_pos=to_numpy(true_bb_pos),
                 true_aa=to_numpy(true_aatypes),
-                diffuse_mask=to_numpy(diffuse_mask[i]),
                 also_fold_pmpnn_seq=self.cfg.inference.also_fold_pmpnn_seq,
                 write_sample_trajectories=self.cfg.inference.write_sample_trajectories,
             )
@@ -855,9 +887,9 @@ class FlowModule(LightningModule):
         model_bb_traj: npt.NDArray,
         model_aa_traj: npt.NDArray,
         model_logits_traj: npt.NDArray,
-        true_bb_pos: Optional[npt.NDArray],  # if relevant. None for unconditional.
-        true_aa: Optional[npt.NDArray],  # if relevant. None for unconditional.
         diffuse_mask: npt.NDArray,
+        true_bb_pos: Optional[npt.NDArray],  # if relevant
+        true_aa: Optional[npt.NDArray],  # if relevant
         also_fold_pmpnn_seq: bool = True,
         write_sample_trajectories: bool = True,
         n_inverse_folds: Optional[int] = None,
@@ -877,12 +909,6 @@ class FlowModule(LightningModule):
             37,
             3,
         ), f"bb_traj shape {bb_traj.shape}"
-        if true_bb_pos is not None:
-            assert true_bb_pos.shape == (
-                sample_length,
-                37,
-                3,
-            ), f"true_bb_pos shape {true_bb_pos.shape}"
         assert aa_traj.shape == (
             noisy_traj_length,
             sample_length,
@@ -899,10 +925,17 @@ class FlowModule(LightningModule):
             models_traj_length,
             sample_length,
         ), f"model_aa_traj shape {model_aa_traj.shape}"
+
         if true_aa is not None:
-            assert true_aa.shape == (1, sample_length), f"true_aa shape {true_aa.shape}"
-            # unwrap single row
-            true_aa = true_aa[0]
+            assert true_aa.shape == (sample_length,), f"true_aa shape {true_aa.shape}"
+        if true_bb_pos is not None:
+            assert true_bb_pos.shape == (
+                sample_length,
+                37,
+                3,
+            ), f"true_bb_pos shape {true_bb_pos.shape}"
+            # require sequence if given structure, so can save accurately
+            assert true_aa is not None, "true_aa required if true_bb_pos given"
 
         os.makedirs(sample_dir, exist_ok=True)
 
@@ -922,6 +955,7 @@ class FlowModule(LightningModule):
 
         top_sample_metrics, folding_validation_paths = (
             self.folding_validator.assess_sample(
+                task=task,
                 sample_name=sample_id,
                 sample_dir=sample_dir,
                 pred_pdb_path=saved_trajectory_files.sample_pdb_path,

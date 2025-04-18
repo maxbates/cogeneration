@@ -253,8 +253,8 @@ class MotifFactory:
         Main entrypoint to get a diffuse_mask for a given set of residues.
         """
         # Some percentage of the time, diffuse everything to effectively do unconditional generation
-        if self.cfg.unconditional_percent < random.random():
-            diffuse_mask = torch.ones_like(res_mask).bool()
+        if random.random() < self.cfg.unconditional_percent:
+            diffuse_mask = torch.ones_like(res_mask)
         else:
             diffuse_mask = self.generate_multiple_motif_diffuse_mask(res_mask)
 

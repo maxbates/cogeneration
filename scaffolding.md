@@ -112,9 +112,11 @@ https://github.com/microsoft/protein-frame-flow
     - [x] confirm existing metrics make sense for inpainting
         - [x] masks used appropriately
         - [x] true sequence and bb positions used sanely
-    - [ ] Update expectations that only doing unconditional `validation_step()`
-        - [ ] pass true_bb_positions and true_aa when appropriate
-        - [ ] update `is_codesign` check in `assess_sample()`
+    - [x] Update expectations that only doing unconditional `validation_step()`
+        - [x] pass true_bb_positions and true_aa when appropriate in `validation_step()`
+        - [x] update `is_codesign` check in `assess_sample()`
+    - [x] Update metrics to support when inpainting actually run like unconditional
+        - Or, just override the task to unconditional if full diffuse_mask
 
 - Misc / Backlog
     - [x] update relevant task switch statements
@@ -127,8 +129,9 @@ https://github.com/microsoft/protein-frame-flow
     - [x] ScaffoldingDataset - diffuse_mask, motif sizes
     - [x] interpolant - corrupt_batch() 
     - [x] interpolant - sample()
-    - [x] inference for inpainting works
-    - [ ] metrics for inpainting
+    - [x] inference for inpainting works 
+    - [ ] evalrunner test for inpainting
+    - [x] metrics for inpainting
 
 ## Future Work
 

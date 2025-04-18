@@ -9,6 +9,7 @@ from cogeneration.data.batch_props import NoisyBatchProps as nbp
 from cogeneration.data.batch_props import PredBatchProps as pbp
 from cogeneration.data.const import rigids_ang_to_nm, rigids_nm_to_ang
 from cogeneration.data.rigid import create_rigid
+from cogeneration.dataset.util import ModelPrediction
 from cogeneration.models.aa_pred import AminoAcidNOOPNet, AminoAcidPredictionNet
 from cogeneration.models.edge_feature_net import EdgeFeatureNet
 from cogeneration.models.ipa_attention import AttentionIPATrunk
@@ -70,7 +71,7 @@ class FlowModel(nn.Module):
             predict_torsions=self.cfg.predict_psi_torsions,
         )
 
-    def forward(self, input_feats) -> Dict[Union[bp, pbp], torch.Tensor]:
+    def forward(self, input_feats) -> ModelPrediction:
         node_mask = input_feats[bp.res_mask]
         edge_mask = node_mask[:, None] * node_mask[:, :, None]
         diffuse_mask = input_feats[bp.diffuse_mask]

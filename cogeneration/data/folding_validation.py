@@ -20,6 +20,7 @@ from cogeneration.data.enum import DatasetProteinColumns as dpc
 from cogeneration.data.enum import MetricName, OutputFileName
 from cogeneration.data.io import write_numpy_json
 from cogeneration.data.metrics import calc_ca_ca_metrics, calc_mdtraj_metrics
+from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restype_order_with_x, restypes_with_x
 from cogeneration.data.superimposition import superimpose
 from cogeneration.dataset.data_utils import parse_pdb_feats
@@ -35,8 +36,9 @@ class SavedFoldingValidation:
     Entries should be None if not written.
     """
 
-    sample_fasta: Optional[str] = None
+    true_pdb: Optional[str] = None
     true_fasta: Optional[str] = None
+    sample_fasta: Optional[str] = None
     inverse_folded_fasta: Optional[str] = None
     codesign_df: Optional[str] = None
     designability_df: Optional[str] = None
@@ -62,17 +64,17 @@ class FoldingValidator:
 
     def assess_sample(
         self,
+        task: InferenceTaskEnum,  # task type to determine which metrics to compute
         sample_name: Union[int, str],
         sample_dir: str,  # directory to write intermediates / outputs to
         pred_pdb_path: str,  # PDB file for predicted / generated structure, atom37.
         pred_bb_positions: npt.NDArray,  # (N, n_bb_atoms, 3) where n_bb_atoms in [3, 5, ?]
         pred_aa: npt.NDArray,  # (N)
         diffuse_mask: npt.NDArray,  # (N)
-        also_fold_pmpnn_seq: bool,  # if generating aa sequences (codesign), also fold inverse folded sequences
         true_bb_positions: Optional[npt.NDArray],  # (N, 37, 3)
         true_aa: Optional[npt.NDArray],  # (N)
+        also_fold_pmpnn_seq: bool = True,  # also fold inverse-folded sequences
         n_inverse_folds: Optional[int] = None,
-        task: InferenceTaskEnum = InferenceTaskEnum.unconditional,  # task type to determine which metrics to compute
     ) -> Tuple[Dict[str, Any], SavedFoldingValidation]:
         """
         Entrypoint validation function.
@@ -119,49 +121,31 @@ class FoldingValidator:
             sample_length,
         ), f"Invalid pred_aa shape {pred_aa.shape}"
 
+        if true_aa is not None:
+            assert true_aa.shape == (
+                sample_length,
+            ), f"Invalid true_aa shape {true_aa.shape}"
         if true_bb_positions is not None:
             assert true_bb_positions.shape == (
                 sample_length,
                 37,
                 3,
             ), f"Invalid true_bb_positions shape {true_bb_positions.shape}"
-        if true_aa is not None:
-            assert true_aa.shape == (
-                sample_length,
-            ), f"Invalid true_aa shape {true_aa.shape}"
+            assert (
+                true_aa is not None
+            ), "true_aa must be provided if true_bb_positions is provided"
 
-        # There are a few things we might want to do, depending on what we have sampled.
-        #
-        # 1) Co-design / hallucination:
-        #   - Run inverse folding on the structure, assess sequence recovery
-        #   - Run folding on the generated sequence, assess RMSD + confidence.
-        #   - (if `also_fold_pmpnn_seq`), run folding on the inverse folded sequences, assess designability.
-        #
-        # 2) Inverse Folding:
-        #    Given `true_bb_positions`. We predict a sequence. We have `true_aa` to compare.
-        #    - Run folding on the sequence, assess RMSD + confidence.
-        #    - Run inverse folding, assess sequence recovery
-        #
-        # 3) Forward Folding:
-        #    Given `true_aa`. We predict a structure. We have `true_bb_positions` to compare.
-        #    - Run folding on the sequence, assess RMSD + confidence.
-        #    - Run inverse folding on the structure, assess sequence recovery
-        #
-        # Thus in all cases we run inverse folding using the backbone, and folding using the sequence.
-        # Only when doing codesign is inverse-folding-then-folding optional, and still likely recommended.
-        #
-        # We also pick a top sample.
-        # In codesign, it's the sample we generated.
-        # For forward/inverse folding, we take the inverse-folded-then-folded sample with the highest RMSD to true_bb.
-        is_codesign = true_bb_positions is None and true_aa is None
+        # Write PDB for true structure, if provided
+        true_pdb_path = None
+        if true_bb_positions is not None:
+            true_pdb_path = os.path.join(sample_dir, OutputFileName.true_structure_pdb)
+            write_prot_to_pdb(
+                prot_pos=true_bb_positions,
+                file_path=true_pdb_path,
+                aatype=true_aa,
+            )
 
-        # Write fasta files for predicted and true (if provided) sequences
-        sample_fasta_path = os.path.join(sample_dir, OutputFileName.sample_sequence_fa)
-        pred_aa_seq = "".join([restypes_with_x[x] for x in pred_aa])
-        with open(sample_fasta_path, "w") as f:
-            f.write(f">{sample_name}\n")
-            f.write(pred_aa_seq)
-
+        # Write fasta for true sequence, if provided
         true_fasta_path = None
         if true_aa is not None:
             true_fasta_path = os.path.join(sample_dir, OutputFileName.true_sequence_fa)
@@ -169,6 +153,47 @@ class FoldingValidator:
             with open(true_fasta_path, "w") as f:
                 f.write(f">{sample_name}\n")
                 f.write(true_aa_seq)
+
+        # Write fasta files for predicted sequences
+        sample_fasta_path = os.path.join(sample_dir, OutputFileName.sample_sequence_fa)
+        pred_aa_seq = "".join([restypes_with_x[x] for x in pred_aa])
+        with open(sample_fasta_path, "w") as f:
+            f.write(f">{sample_name}\n")
+            f.write(pred_aa_seq)
+
+        # Assessment depends on the task:
+        #
+        # - Co-design / hallucination
+        #   - Run inverse folding on the structure, assess sequence recovery
+        #   - Run folding on the generated sequence, assess RMSD + confidence.
+        #   - (if `also_fold_pmpnn_seq`), run folding on the inverse folded sequences, assess designability.
+        #
+        # - Inpainting
+        #    Conditioned on motif-only `true_bb_positions` and `true_aa`
+        #   - Run inverse folding on the structure, assess sequence recovery of motifs
+        #   - Run folding on the generated sequence, assess RMSD + confidence.
+        #   - Run folding on the inverse folded sequences, assess designability.
+        #
+        # - Inverse Folding:
+        #    Conditioned on `true_bb_positions`. We predict a sequence. We have `true_aa` to compare.
+        #    - Run folding on the sequence, assess RMSD + confidence.
+        #    - Run inverse folding, assess sequence recovery
+        #
+        # - Forward Folding:
+        #    Conditioned on `true_aa`. We predict a structure. We have `true_bb_positions` to compare.
+        #    - Run folding on the sequence, assess RMSD + confidence.
+        #    - Run inverse folding on the folded structure, assess sequence recovery
+        #
+        # Thus in all cases we run inverse folding using the backbone, and folding using the sequence.
+        # Only when doing codesign is inverse-folding-then-folding optional, and still likely recommended.
+
+        # `is_codesign` determines how we pick a top sample.
+        # For codesign, we pick the best sample we generated.
+        # For forward/inverse folding, we pick the most designable sample (i.e. inverse folded then folded).
+        is_codesign = (
+            task == InferenceTaskEnum.unconditional
+            or task == InferenceTaskEnum.inpainting
+        )
 
         # Sequence recovery helpers
         def _seq_str_to_np(seq: str) -> npt.NDArray:
@@ -194,7 +219,7 @@ class FoldingValidator:
             num_sequences=n_inverse_folds,
         )
 
-        # Run folding on the original sequence
+        # Run folding on the generated sequence
         codesign_df = self.fold_fasta(
             fasta_path=sample_fasta_path,
             output_dir=folding_dir,
@@ -230,8 +255,9 @@ class FoldingValidator:
                 )
             )
 
-        # If we have the actual sequence (e.g. not hallucinating), assess sequence self-consistency
-        if true_aa is not None:
+        # Calculate sequence-recovery
+        # Skip for forward_folding, since sequence is fixed
+        if true_aa is not None and task != InferenceTaskEnum.forward_folding:
             codesign_df[MetricName.inverse_folding_sequence_recovery_gt] = (
                 _calc_seq_recovery(true_aa, pred_aa)
             )
@@ -350,8 +376,9 @@ class FoldingValidator:
 
         # track validation files
         folding_validation_paths = SavedFoldingValidation(
-            sample_fasta=sample_fasta_path,
+            true_pdb=true_pdb_path,
             true_fasta=true_fasta_path,
+            sample_fasta=sample_fasta_path,
             inverse_folded_fasta=inverse_folded_fasta_path,
             codesign_df=codesign_df_path,
             designability_df=designability_df_path,
@@ -714,7 +741,7 @@ class FoldingValidator:
 
         num_res = sample_bb_pos.shape[0]
         res_mask = torch.ones(num_res)
-        motif_mask = torch.tensor(diffuse_mask == 0)
+        motif_mask = torch.tensor(1 - diffuse_mask)
 
         def _calc_bb_rmsd(
             mask: torch.Tensor,  # (N)

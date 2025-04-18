@@ -1,13 +1,42 @@
 from typing import Any, Dict, Union
 
+import numpy.typing as npt
+import pandas as pd
 import torch
 
 from cogeneration.data.batch_props import BatchProps as bp
 from cogeneration.data.batch_props import NoisyBatchProps as nbp
+from cogeneration.data.batch_props import PredBatchProps as pbp
 from cogeneration.data.const import MASK_TOKEN_INDEX
+from cogeneration.data.enum import DatasetColumns as dc
+from cogeneration.data.enum import DatasetProteinColumns as dpc
+
+# Type aliases
+
+NumpyFeat = Union[npt.NDArray, str, int]
+
+TensorFeat = Union[torch.Tensor, str, int]
+
+# MetadataCSVRow type alias for a single row of the metadata CSV file
+MetadataCSVRow = Dict[dc, NumpyFeat]
+
+# MetadataDataFrame type alias for the metadata CSV file, composed of MetadataCSVRow
+MetadataDataFrame = pd.DataFrame
+
+# ProcessedFile for pre-processed pkl, produced by `parse_pdb_files.py`. Expects numpy values, not Tensors.
+ProcessedFile = Dict[dpc, NumpyFeat]
+
+# ProcessedFeats is a batch, features after featurizing ProcessedFile
+ProcessedFeats = Dict[bp, TensorFeat]
+
+# NoisyFeats is an item of a batch corrupted by Interpolant
+NoisyFeats = Dict[Union[bp, nbp], TensorFeat]
+
+# ModelPrediction is the output of the model, i.e. the predicted features
+ModelPrediction = Dict[pbp, TensorFeat]
 
 
-def empty_feats(N: int) -> Dict[bp, Any]:
+def empty_feats(N: int) -> ProcessedFeats:
     """
     Create empty features for a protein of length N.
     """
@@ -27,7 +56,7 @@ def empty_feats(N: int) -> Dict[bp, Any]:
     }
 
 
-def mock_noisy_feats(N: int, idx: int) -> Dict[Union[bp, nbp], Any]:
+def mock_noisy_feats(N: int, idx: int) -> NoisyFeats:
     """
     Create random + corrupted features for a protein of length N
     """

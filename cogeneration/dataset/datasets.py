@@ -28,19 +28,13 @@ from cogeneration.data.enum import DatasetTransformColumns as dtc
 from cogeneration.data.io import read_pkl
 from cogeneration.dataset.data_utils import parse_chain_feats
 from cogeneration.dataset.motif_factory import Motif, MotifFactory, Segment
-from cogeneration.dataset.util import empty_feats
-
-# MetadataCSVRow type alias for a single row of the metadata CSV file
-MetadataCSVRow = Dict[dc, Any]
-
-# MetadataDataFrame type alias for the metadata CSV file, composed of MetadataCSVRow
-MetadataDataFrame = pd.DataFrame
-
-# ProcessedFile for pre-processed pkl, produced by `parse_pdb_files.py`. Expects numpy values, not Tensors.
-ProcessedFile = Dict[dpc, Any]
-
-# ProcessedFeats for features after featurizing ProcessedFile
-ProcessedFeats = Dict[bp, Any]
+from cogeneration.dataset.util import (
+    MetadataCSVRow,
+    MetadataDataFrame,
+    ProcessedFeats,
+    ProcessedFile,
+    empty_feats,
+)
 
 
 def _read_clusters(cluster_path: Union[Path, str], synthetic=False) -> Dict[str, Any]:
@@ -386,25 +380,27 @@ class BaseDataset(Dataset):
         chain_idx = feats[bp.chain_idx]
         res_idx = feats[bp.res_idx]
 
-        new_res_idx = np.zeros_like(res_idx)
-        new_chain_idx = np.zeros_like(res_idx)
-        all_chain_idx = np.unique(chain_idx).tolist()
+        new_res_idx = torch.zeros_like(res_idx)
+        new_chain_idx = torch.zeros_like(res_idx)
+        all_chain_idx = torch.unique(chain_idx).tolist()
         shuffled_chain_idx = (
-            np.array(random.sample(all_chain_idx, len(all_chain_idx)))
-            - np.min(all_chain_idx)
+            torch.tensor(
+                random.sample(all_chain_idx, len(all_chain_idx)), dtype=torch.long
+            )
+            - torch.min(chain_idx)
             + 1
         )
         for i, chain_id in enumerate(all_chain_idx):
-            chain_mask = (chain_idx == chain_id).astype(int)
-            chain_min_idx = np.min(res_idx + (1 - chain_mask) * 1e3).astype(int)
-            new_res_idx = new_res_idx + (res_idx - chain_min_idx + 1) * chain_mask
+            chain_mask = (chain_idx == chain_id).long()
+            chain_min_idx = torch.min(res_idx + (1 - chain_mask) * 1e3).long()
+            new_res_idx += (res_idx - chain_min_idx + 1) * chain_mask
 
             # Shuffle chain_index
             replacement_chain_id = shuffled_chain_idx[i]
-            new_chain_idx = new_chain_idx + replacement_chain_id * chain_mask
+            new_chain_idx += replacement_chain_id * chain_mask
 
-        feats[bp.chain_idx] = torch.tensor(new_chain_idx).long()
-        feats[bp.res_idx] = torch.tensor(new_res_idx).long()
+        feats[bp.chain_idx] = new_chain_idx
+        feats[bp.res_idx] = new_res_idx
 
     @staticmethod
     def recenter_structure(
@@ -478,6 +474,7 @@ class BaseDataset(Dataset):
     ) -> ProcessedFeats:
         """
         Processes a pickled features from single structure + metadata.
+        Converts numpy feats to tensor feats.
 
         This function should be called as examples are needed, i.e. in `__get_item__`,
         because it adds noise to atom positions, picks motif positions, etc. as defined by cfg.
@@ -502,10 +499,11 @@ class BaseDataset(Dataset):
             raise ValueError(
                 f"Example {csv_row[dc.pdb_name]} @ {csv_row[dc.processed_path]} has only {num_unique_aatypes} unique amino acids."
             )
+        aatypes_1 = torch.tensor(aatypes_1).long()
 
         # Construct an intermediate `chain_feats` for OpenFold pipeline
         chain_feats = {
-            "aatype": torch.tensor(aatypes_1).long(),
+            "aatype": aatypes_1,
             "all_atom_positions": torch.tensor(
                 processed_file[dpc.atom_positions]
             ).double(),
@@ -541,10 +539,10 @@ class BaseDataset(Dataset):
         res_mask = torch.tensor(processed_file[dpc.bb_mask]).int()
 
         # Mask low pLDDT residues
-        res_plddt = processed_file[dpc.b_factors][:, 1]
+        res_plddt = torch.tensor(processed_file[dpc.b_factors][:, 1])
         plddt_mask = torch.ones_like(res_mask)
         if cfg.add_plddt_mask:
-            plddt_mask = torch.tensor(res_plddt > cfg.min_plddt_threshold).int()
+            plddt_mask = (res_plddt > cfg.min_plddt_threshold).int()
 
         # Determine diffuse_mask depending on task
         if task == DataTaskEnum.hallucination:
@@ -565,8 +563,8 @@ class BaseDataset(Dataset):
             bp.trans_1: trans_1,
             bp.rotmats_1: rotmats_1,
             bp.torsion_angles_sin_cos_1: chain_feats[dtc.torsion_angles_sin_cos],
-            bp.chain_idx: processed_file[dpc.chain_index],
-            bp.res_idx: processed_file[dpc.residue_index],
+            bp.chain_idx: torch.tensor(processed_file[dpc.chain_index]),
+            bp.res_idx: torch.tensor(processed_file[dpc.residue_index]),
             bp.res_plddt: res_plddt,
             bp.diffuse_mask: diffuse_mask,
             bp.plddt_mask: plddt_mask,
@@ -698,12 +696,12 @@ class LengthSamplingDataset(Dataset):
     def __getitem__(self, idx):
         num_res, sample_id = self._all_sample_ids[idx]
         item = {
+            bp.sample_id: sample_id,
+            bp.num_res: num_res,
             bp.res_mask: torch.ones(num_res),
             bp.diffuse_mask: torch.ones(num_res),
             bp.res_idx: torch.ones(num_res),
             bp.chain_idx: torch.ones(num_res),
-            bp.num_res: num_res,
-            bp.sample_id: sample_id,
         }
         return item
 

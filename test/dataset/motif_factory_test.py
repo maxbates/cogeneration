@@ -52,11 +52,10 @@ class TestMotifFactory:
         # Expect three segments: scaffold 0-1 (len 2), motif 2-3 (len 2), scaffold 4-4 (len 1)
         diffuse_mask = torch.tensor([1, 1, 0, 0, 1]).int()
 
+        # TODO(multimer) test multiple chains with mask over chain break
         segments = factory.generate_segments_from_diffuse_mask(
             diffuse_mask,
-            chain_idx=torch.tensor(
-                [1, 1, 1, 1, 1]
-            ),  # TODO(multimer) test multiple chains with mask over chain break
+            chain_idx=torch.tensor([1, 1, 1, 1, 1]),
             random_scale_range=(1.0, 1.0),
         )
 

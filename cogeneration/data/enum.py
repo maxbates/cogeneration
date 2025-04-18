@@ -169,6 +169,10 @@ class MetricName(StrEnum):
 
 
 class OutputFileName(StrEnum):
+    # input PDB
+    true_structure_pdb = "true.pdb"
+    true_sequence_fa = "true.fasta"
+
     # trajectory
     sample_pdb = "sample.pdb"
     bb_traj_pdb = "bb_traj.pdb"
@@ -178,7 +182,6 @@ class OutputFileName(StrEnum):
 
     # folding validation
     sample_sequence_fa = "sample.fasta"
-    true_sequence_fa = "true.fasta"
     # inverse_folded_fa determined by MPNN, matches sample name
     # inverse_folded_fa = "inverse_fold.fasta"
     # folded_pdb_path determined by alphafold + model we use
