@@ -659,18 +659,11 @@ class FlowModule(LightningModule):
         # Create an inference-specific interpolant
         interpolant = Interpolant(self.cfg.inference.interpolant)
 
-        task = self.cfg.inference.task
-
-        device = (
-            batch[bp.num_res].device
-            if bp.num_res in batch
-            else (
-                batch[bp.trans_1].device
-                if bp.trans_1 in batch
-                else f"cuda:{torch.cuda.current_device()}"
-            )
-        )
+        device = batch[bp.res_mask].device
         interpolant.set_device(device)
+
+        task = self.cfg.inference.task
+        num_batch, sample_length = batch[bp.res_mask].shape
 
         # Pull out metadata and t=1 values, if defined
         trans_1 = batch[bp.trans_1] if bp.trans_1 in batch else None
@@ -683,19 +676,13 @@ class FlowModule(LightningModule):
         aatypes_1 = batch[bp.aatypes_1] if bp.aatypes_1 in batch else None
         sample_pdb_name = batch[bp.pdb_name][0] if bp.pdb_name in batch else None
 
-        # `unconditional` uses LengthSamplingDataset which has some unique values in the batch
-        if task == InferenceTaskEnum.unconditional:
-            sample_length = batch[bp.num_res].item()
-        else:
-            sample_length = trans_1.shape[1] if trans_1 is not None else None
-
         # Handle single-sample and missing sample_id
         if bp.sample_id in batch:
             sample_ids = batch[bp.sample_id].squeeze().tolist()
         else:
             sample_ids = [0]
         sample_ids = [sample_ids] if isinstance(sample_ids, int) else sample_ids
-        num_batch = len(sample_ids)
+        assert num_batch == len(sample_ids)
 
         # `diffuse_mask` is everything for all tasks except inpainting (loss etc. limited to `res_mask`)
         if task == InferenceTaskEnum.inpainting:

@@ -33,9 +33,6 @@ class BatchProps(StrEnum):
     pdb_name = "pdb_name"  # source PDB id
     csv_idx = "csv_idx"  # index of the protein in the csv file, for debugging
     # inference only
-    num_res = (
-        "num_res"  # number of residues in the protein  # TODO drop, just use res_mask
-    )
     sample_id = "sample_id"  # inference sample id
 
 
@@ -104,5 +101,8 @@ def empty_feats(N: int) -> BatchFeatures:
         BatchProps.diffuse_mask: torch.ones(N),
         BatchProps.plddt_mask: torch.ones(N),
         BatchProps.pdb_name: "",
+        # metadata
         BatchProps.csv_idx: torch.tensor([1], dtype=torch.long),
+        # inference only
+        BatchProps.sample_id: 0,
     }

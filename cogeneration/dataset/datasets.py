@@ -21,7 +21,7 @@ from cogeneration.dataset.data_utils import parse_chain_feats
 from cogeneration.dataset.motif_factory import Motif, MotifFactory, Segment
 from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProps as bp
-from cogeneration.type.batch import empty_feats
+from cogeneration.type.batch import InferenceFeatures, empty_feats
 from cogeneration.type.dataset import DatasetColumns as dc
 from cogeneration.type.dataset import DatasetProteinColumns as dpc
 from cogeneration.type.dataset import DatasetTransformColumns as dtc
@@ -616,7 +616,7 @@ class BaseDataset(Dataset):
         )
         return processed_row
 
-    def __getitem__(self, row_idx):
+    def __getitem__(self, row_idx) -> BatchFeatures:
         csv_row = self.csv.iloc[row_idx]
         feats = self.process_csv_row(csv_row)
 
@@ -685,14 +685,13 @@ class LengthSamplingDataset(Dataset):
     def __len__(self):
         return len(self._all_sample_ids)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx) -> InferenceFeatures:
         num_res, sample_id = self._all_sample_ids[idx]
         item = {
             bp.sample_id: sample_id,
-            bp.num_res: num_res,
             bp.res_mask: torch.ones(num_res),
             bp.diffuse_mask: torch.ones(num_res),
-            bp.res_idx: torch.ones(num_res),
+            bp.res_idx: torch.arange(num_res),
             bp.chain_idx: torch.ones(num_res),
         }
         return item

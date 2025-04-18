@@ -170,11 +170,7 @@ def mock_folding_validation(tmp_path):
                 )
 
             # determine size of batch and residues, handling conditional and unconditional batches
-            if bp.res_mask in batch:
-                batch_size, num_res = batch[bp.res_mask].shape
-            else:
-                batch_size = batch[bp.num_res].shape[0]
-                num_res = batch[bp.num_res][0].item()
+            batch_size, num_res = batch[bp.res_mask].shape
 
             # Prep return values
             mock_run_protein_mpnn_calls = []

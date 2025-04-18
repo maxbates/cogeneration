@@ -34,8 +34,7 @@ def mock_noisy_feats(N: int, idx: int) -> NoisyFeatures:
     feats[bp.diffuse_mask] = torch.ones(N)
     feats[bp.csv_idx] = torch.tensor([0])
 
-    # inference feats  # TODO remove, dedicated mock function
-    feats[bp.num_res] = torch.tensor([N])
+    # inference-only feats  # TODO remove, dedicated mock function
     feats[bp.sample_id] = f"test_{idx}"
 
     # generate corrupted noisy values for input_feats
