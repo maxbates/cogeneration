@@ -11,7 +11,7 @@ class TestEvalRunner:
     def test_mock_init(
         self, mock_cfg, mock_checkpoint, mock_folding_validation, tmp_path
     ):
-        cfg, ckpt_path = mock_checkpoint(cfg=mock_cfg, path=tmp_path)
+        cfg, ckpt_path = mock_checkpoint(cfg=mock_cfg)
         _ = EvalRunner(cfg=cfg)
 
     def test_public_multiflow_init(self):
@@ -49,7 +49,7 @@ class TestEvalRunner:
         # This is a long-running end-to-end test that performs sampling and computes metrics.
 
         # create a dummy checkpoint
-        cfg, ckpt_path = mock_checkpoint(cfg=mock_cfg, path=tmp_path)
+        cfg, ckpt_path = mock_checkpoint(cfg=mock_cfg)
 
         # only sample one sample
         # TODO - support multiple samples

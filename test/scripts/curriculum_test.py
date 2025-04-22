@@ -1,0 +1,79 @@
+import os
+
+from cogeneration.config.base import Config
+from cogeneration.scripts.curriculum import Curriculum, TrainingStep
+from cogeneration.scripts.train import Experiment
+
+
+class TestCurriculum:
+    def test_run(self, tmp_path, monkeypatch):
+        # Patch Experiment to avoid heavy initialization and training
+        monkeypatch.setattr(Experiment, "__init__", lambda self, cfg: None)
+        monkeypatch.setattr(Experiment, "train", lambda self: None)
+
+        # Create two dummy configs with unique IDs and checkpoint directories
+        # we need to override the `checkpointer.dirpath` because `test_interpolated` disrupts the template.
+        cfg1 = Config.test_uninterpolated(tmp_path=tmp_path)
+        cfg1.shared.id = "step1"
+        cfg1.experiment.checkpointer.dirpath = str((tmp_path / "step1").absolute())
+        cfg2 = Config.test_uninterpolated(tmp_path=tmp_path)
+        cfg2.shared.id = "step2"
+        cfg2.experiment.checkpointer.dirpath = str((tmp_path / "step2").absolute())
+
+        # Instantiate Curriculum, which should coordinate checkpoints
+        curriculum = Curriculum(
+            steps=[
+                TrainingStep(name="step1", cfg=cfg1),
+                TrainingStep(name="step2", cfg=cfg2),
+            ]
+        )
+
+        # Verify that the second step warm_start_ckpt is set to the first step's last.ckpt
+        expected_ckpt = os.path.join(cfg1.experiment.checkpointer.dirpath, "last.ckpt")
+        assert curriculum.steps[1].cfg.experiment.warm_start_ckpt == expected_ckpt
+        assert curriculum.steps[1].cfg.experiment.warm_start_cfg_override is True
+
+        # Running the curriculum should invoke our patched Experiment without errors
+        curriculum.run()
+
+    def test_resume(self, tmp_path, monkeypatch, mock_checkpoint):
+        cfg1 = Config.test_uninterpolated(tmp_path=tmp_path)
+        cfg1.shared.id = "step1"
+        cfg1.experiment.checkpointer.dirpath = str(tmp_path / "step1")
+        cfg1 = cfg1.interpolate()
+
+        cfg2 = Config.test_uninterpolated(tmp_path=tmp_path)
+        cfg2.shared.id = "step2"
+        cfg2.experiment.checkpointer.dirpath = str(tmp_path / "step2")
+        cfg2 = cfg2.interpolate()
+
+        # Create a dummy checkpoint for step1
+        cfg1, ckpt1 = mock_checkpoint(cfg=cfg1)
+
+        # Monkeypatch Experiment
+        called = []
+        def fake_init(self, cfg):
+            called.append(cfg)
+        monkeypatch.setattr(Experiment, "__init__", fake_init)
+        def fake_train(self):
+            pass
+        monkeypatch.setattr(Experiment, "train", fake_train)
+
+        curriculum = Curriculum(
+            steps=[
+                TrainingStep(name="step1", cfg=cfg1),
+                TrainingStep(name="step2", cfg=cfg2),
+            ],
+            # skip interpolation so maintain reference and can confirm ckpt configuration
+            interpolate=False,
+        )
+
+        # Execute curriculum; step1 should be skipped, step2 runs
+        curriculum.run()
+
+        # Only step2 should have been initialized
+        # can't compare directly because some paths will be modified
+        assert len(called) == 1
+        assert called[0].shared.id == cfg2.shared.id
+        # Step2 warm_start should equal the checkpoint from step1
+        assert cfg2.experiment.warm_start_ckpt == ckpt1

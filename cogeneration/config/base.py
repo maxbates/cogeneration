@@ -43,17 +43,18 @@ class SharedConfig:
     shared config, system "flags", metadata
     """
 
-    # `local` to train locally on a Mac. use `mps` not `gpu` with `ddp`, etc.
-    local: bool = True
-    # now timestamp
-    now: str = field(
+    # identifier
+    id: str = field(
         default_factory=lambda: datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     )
+    # `local` to train locally on a Mac. use `mps` not `gpu` with `ddp`, etc.
+    local: bool = True
     # randomness / stochastic paths
     stochastic: bool = True
-    seed: int = 123
     # project root path
     project_root: str = str(PATH_PROJECT_ROOT)
+    # random number generator shared seed
+    seed: int = 123
 
     # TODO - `size` argument to determine model hyperparameters
     # TODO - gpu size argument to determine batch size, etc.
@@ -580,7 +581,7 @@ class ExperimentTrainingConfig:
     bb_atom_scale: float = 0.1
     trans_scale: float = 0.1
     aatypes_loss_weight: float = 0.25  # default 0.0 in multiflow
-    aatypes_label_smoothing: float = 0.0
+    aatypes_label_smoothing: float = 0.0  # TODO drop
     aatypes_loss_mean_or_sum: str = "mean"
     aatypes_loss_use_likelihood_weighting: bool = False
     translation_loss_weight: float = 2.0
@@ -597,7 +598,7 @@ class ExperimentTrainingConfig:
 class ExperimentWandbConfig:
     """W&B configuration. Some properties are kwargs to logger"""
 
-    name: str = "${data.task}_${data.dataset}_${shared.now}"
+    name: str = "${data.task}_${data.dataset}_${shared.id}"
     project: str = "cogeneration"
     # offline if `local` (not copied to W&B)
     offline: bool = "${ternary:${equals: ${shared.local}, True}, True, False}"
@@ -640,15 +641,23 @@ class ExperimentTrainerConfig:
 
 @dataclass
 class ExperimentCheckpointerConfig:
-    """Arguments to ModelCheckpoint()"""
+    """
+    Arguments to ModelCheckpoint()
+    https://lightning.ai/docs/pytorch/stable/api/lightning.pytorch.callbacks.ModelCheckpoint.html
+
+    By default, save a `last.ckpt` `every_n_epochs` into `dirpath`.
+    `ExperimentConfig` can save a `final.ckpt` .
+    """
 
     dirpath: str = (
-        "ckpt/${experiment.wandb.project}/${experiment.wandb.name}/${shared.now}"
+        "ckpt/${experiment.wandb.project}/${experiment.wandb.name}/${shared.id}"
     )
+    # `save_last` ensures a `last.ckpt` copy is always created
     save_last: bool = True
-    save_top_k: int = 3
     # recommend checkpoint on some multiple of validation epoch interval. too frequent will eat up disk.
     every_n_epochs: int = 8
+    # save `k` best models according to some metric
+    save_top_k: int = 2
     monitor: str = "valid/codesign_bb_rmsd"
     mode: str = "min"
 
@@ -662,8 +671,8 @@ class ExperimentConfig:
     debug: bool = False
     # num GPU devices TODO support more than one, esp for GPUs
     num_devices: int = 1
-    # directory, checkpoint path
-    warm_start: Optional[str] = None
+    # checkpoint path, parent directory expected to contain `config.yaml`
+    warm_start_ckpt: Optional[str] = None
     # override config with warm start config
     warm_start_cfg_override: bool = False
     # force reload module config, provide path
@@ -672,6 +681,9 @@ class ExperimentConfig:
     profiler: Optional[str] = None
     # enable torch.compile(), requires no graph breaks TODO make it work
     torch_compile: bool = False
+    # save a `final.ckpt` when training is complete, defaults to symlink sentinel
+    save_final_ckpt: bool = True
+    final_ckpt_symlink: bool = True
 
     # sub-modules
     training: ExperimentTrainingConfig = field(default_factory=ExperimentTrainingConfig)
@@ -717,7 +729,7 @@ class InferenceConfig:
     use_gpu: bool = True
     num_gpus: int = 1
     predict_dir: str = str(PATH_PROJECT_ROOT / "inference_outputs")
-    inference_subdir: str = "${shared.now}"
+    inference_subdir: str = "${shared.id}"
 
     # checkpoints
     saved_ckpt_dir: str = "${shared.project_root}/ckpt/${experiment.wandb.project}"

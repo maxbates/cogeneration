@@ -82,10 +82,10 @@ class EdgeFeatureNet(nn.Module):
         relpos_feats = self.embed_relpos(r)
 
         dist_feats = calc_distogram(
-            trans, min_bin=1e-3, max_bin=20.0, num_bins=self.cfg.num_bins
+            trans, min_bin=1e-4, max_bin=20.0, num_bins=self.cfg.num_bins
         )
         sc_feats = calc_distogram(
-            trans_sc, min_bin=1e-3, max_bin=20.0, num_bins=self.cfg.num_bins
+            trans_sc, min_bin=1e-4, max_bin=20.0, num_bins=self.cfg.num_bins
         )
 
         all_edge_feats = [cross_node_feats, relpos_feats, dist_feats, sc_feats]

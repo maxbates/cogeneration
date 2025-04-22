@@ -2,7 +2,7 @@ import logging
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from unittest.mock import patch
 
 import numpy as np
@@ -294,19 +294,22 @@ def mock_folding_validation(tmp_path):
 def mock_checkpoint(mock_folding_validation):
     """
     Save a dummy checkpoint and config that we can load into EvalRunner
-    Returns updated cfg, with the checkpoint path set, and the path to ckpt
+    Returns updated cfg, with the checkpoint path set, and the path to ckpt.
+    Provide `path` to save the checkpoint if improperly set in `cfg`, defaults to `cfg.experiment.checkpointer.dirpath`
 
     Note this is sort of slow, because we actually have to call `Trainer.fit()`
-    to save the checkpoint, though we only train for one step.
+    to save the checkpoint, though we only train for one step, which takes ~30-60s on a Mac with MPS.
 
-    TODO - memoize, maybe if path is not provided?
+    TODO - memoize, maybe if by hashing `cfg.model`?
     #   Need to confirm cfg is equivalent enough to use as checkpoint? or overwrite when changes made?
-    #   Maybe we can hash the config (ignoring fields like `now`)
+    #   Maybe we can hash the config (ignoring fields like `shared.id`)
     """
 
-    def create_mock_checkpoint(cfg: Config, path: Path) -> Tuple[Config, str]:
-        ckpt_cfg_path = str(path / "config.yaml")
-        ckpt_path = str(path / "last.ckpt")
+    def create_mock_checkpoint(cfg: Config, path: Optional[Path] = None) -> Tuple[Config, str]:
+        ckpt_dir = path if path is not None else Path(cfg.experiment.checkpointer.dirpath)
+        ckpt_cfg_path = str(ckpt_dir / "config.yaml")
+        ckpt_path = str(ckpt_dir / "last.ckpt")
+        final_ckpt_path = str(ckpt_dir / "final.ckpt")
 
         # update config with the checkpoint
         assert cfg.inference.task == InferenceTaskEnum.unconditional
@@ -316,6 +319,7 @@ def mock_checkpoint(mock_folding_validation):
         cfg.inference.inverse_folding_ckpt_path = str(ckpt_path)
 
         # save config
+        os.makedirs(ckpt_dir, exist_ok=True)
         with open(ckpt_cfg_path, "w") as f:
             OmegaConf.save(config=cfg, f=f)
 
@@ -365,6 +369,10 @@ def mock_checkpoint(mock_folding_validation):
 
         # finally, save checkpoint
         trainer.save_checkpoint(ckpt_path)
+
+        # save final checkpoint sentinel, just a symlink
+        if cfg.experiment.save_final_ckpt:
+            os.link(ckpt_path, final_ckpt_path)
 
         return cfg, ckpt_path
 

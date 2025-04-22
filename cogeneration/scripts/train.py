@@ -28,8 +28,8 @@ class Experiment:
         self.cfg = cfg
 
         # Warm start
-        if cfg.experiment.warm_start is not None:
-            ckpt_dir = os.path.dirname(cfg.experiment.warm_start)
+        if cfg.experiment.warm_start_ckpt is not None:
+            ckpt_dir = os.path.dirname(cfg.experiment.warm_start_ckpt)
             log.info(f"Warm starting from {ckpt_dir}")
             assert os.path.exists(
                 ckpt_dir
@@ -179,8 +179,31 @@ class Experiment:
         trainer.fit(
             model=model,
             datamodule=self._datamodule,
-            ckpt_path=self.cfg.experiment.warm_start,
+            ckpt_path=self.cfg.experiment.warm_start_ckpt,
         )
+
+        # Save final ckpt. Defaults to symlink if possible, but can save final ckpt explicitly.
+        if self.cfg.experiment.save_final_ckpt:
+            log.info("Saving final checkpoint...")
+            last_ckpt_path = os.path.join(
+                self.cfg.experiment.checkpointer.dirpath, "last.ckpt"
+            )
+            final_ckpt_path = os.path.join(
+                self.cfg.experiment.checkpointer.dirpath, "final.ckpt"
+            )
+            if self.cfg.experiment.final_ckpt_symlink:
+                if not os.path.exists(last_ckpt_path):
+                    log.error(
+                        f"Final checkpoint symlink requested, but last checkpoint does not at exist: {last_ckpt_path}."
+                        + f"Set `cfg.experiment.checkpointer.save_last == True`. Saving copy."
+                    )
+                    trainer.save_checkpoint(final_ckpt_path)
+                else:
+                    if os.path.exists(final_ckpt_path):
+                        os.remove(final_ckpt_path)
+                    os.link(last_ckpt_path, final_ckpt_path)
+            else:
+                trainer.save_checkpoint(final_ckpt_path)
 
 
 @hydra.main(version_base=None, config_path="../config", config_name="base")

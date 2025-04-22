@@ -75,3 +75,41 @@ class TestMotifFactory:
         # Total new length equals original mask length
         total_length = sum(seg.length for seg in segments)
         assert total_length == diffuse_mask.size(0)
+
+    def test_segments_from_contigmap(self):
+        cfg = DatasetInpaintingConfig()
+        rng = default_rng(0)
+        factory = MotifFactory(cfg=cfg, rng=rng)
+
+        contigmap = "2/B4-6/C7-8"
+        segments = factory.segments_from_contigmap(contigmap)
+        assert len(segments) == 3
+
+        seg0 = segments[0]
+        assert isinstance(seg0, Scaffold)
+        assert seg0.start == 0 and seg0.end == 0
+        assert seg0.new_length == 2
+
+        seg1 = segments[1]
+        assert isinstance(seg1, Motif)
+        assert seg1.chain == "B"
+        assert seg1.start == 4 and seg1.end == 6
+        assert seg1.length == 3
+
+        seg2 = segments[2]
+        assert isinstance(seg2, Motif)
+        assert seg2.chain == "C"
+        assert seg2.start == 7 and seg2.end == 8
+        assert seg2.length == 2
+
+    def test_segments_from_contigmap_invalid_token_raises(self):
+        cfg = DatasetInpaintingConfig()
+        rng = default_rng(0)
+        factory = MotifFactory(cfg=cfg, rng=rng)
+
+        invalid = "foo"
+        try:
+            factory.segments_from_contigmap(invalid)
+            assert False, "Expected ValueError for invalid token"
+        except ValueError as e:
+            assert "Invalid token" in str(e)

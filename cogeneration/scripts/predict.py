@@ -163,7 +163,7 @@ class EvalRunner:
             )
 
             # Define new checkpoint directory
-            ckpt_dir = f"{merged_cfg.experiment.checkpointer.dirpath}_mapped_{merged_cfg.shared.now}"
+            ckpt_dir = f"{merged_cfg.experiment.checkpointer.dirpath}_mapped_{merged_cfg.shared.id}"
             ckpt_path = os.path.join(ckpt_dir, "mapped.ckpt")
 
             # Map modules in state_dict
