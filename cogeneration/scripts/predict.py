@@ -1,13 +1,11 @@
 import copy
 import os
-from collections import OrderedDict
-from dataclasses import asdict
 from typing import Optional, Tuple
 
 import hydra
 import pandas as pd
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning.utilities.model_summary import ModelSummary
 
@@ -44,10 +42,15 @@ class EvalRunner:
             raise ValueError(f"Unknown task {cfg.inference.task}")
 
         # Merge the checkpoint config into the current config
-        merged_cfg, ckpt_path = self.merge_checkpoint_cfg(cfg=cfg, ckpt_path=ckpt_path)
-        # Save the merged cfg
-        # Note that it is a DictConfig, because it may contain keys not defined in the Config dataclass
-        self.cfg: DictConfig = merged_cfg
+        log.info(f"Loading checkpoint from {ckpt_path}")
+        merged_cfg, merged_ckpt_path = self._input_cfg.merge_checkpoint_cfg(
+            ckpt_path=ckpt_path,
+            preserve_inference_cfg=True,
+        )
+        self.cfg = merged_cfg
+        if merged_ckpt_path != ckpt_path:
+            log.info(f"Checkpoint path changed to {merged_ckpt_path}")
+            ckpt_path = merged_ckpt_path
 
         local_rank = DDPInfo.from_env().local_rank
 
@@ -94,99 +97,6 @@ class EvalRunner:
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
 
-    @staticmethod
-    def merge_checkpoint_cfg(
-        cfg: Config,
-        ckpt_path: str,
-    ) -> Tuple[DictConfig, str]:
-        """
-        Load and merge checkpoint config from `ckpt_path` into current Config `cfg`.
-        Also maps state_dict to new module names for public MultiFlow compatibility.
-        Returns:
-            merged config, which must be a DictConfig, not Config dataclass, to handle new keys from MultiFlow
-            ckpt_path, which may be the same as input, or a new path if the checkpoint was modified.
-
-        Maintain some important behavior configuration specified in `cfg`, i.e. for the current run,
-        and avoid being overwritten by however the checkpoint was configured.
-
-        To support using Multiflow, we need to:
-        1) Rename the keys in the state_dict to match new network module names.
-        We attempt to map the state_dict to the new module names, and save a new checkpoint, which we then load.
-        This requires that the model architecture matches MultiFlow, i.e. the same modules and shapes.
-
-        2) Support merging a YAML-style config with a structured config.
-        Since structured configs are dataclasses, and the MultiFlow config has some different fields,
-        we need to merge into a DictConfig. So, in this file, we lose the "type-safety" of the structured config.
-
-        We may have to deprecate this backwards compatibility in the future,
-        but it's nice to support inference from the public checkpoint.
-        """
-        if not ckpt_path.endswith(".ckpt"):
-            raise ValueError(
-                f"Invalid checkpoint path {ckpt_path}, should end with .ckpt"
-            )
-        assert os.path.exists(ckpt_path), f"Checkpoint {ckpt_path} does not exist."
-
-        ckpt_dir = os.path.dirname(ckpt_path)
-        log.info(f"Loading checkpoint from {ckpt_dir}")
-        ckpt_cfg = OmegaConf.load(os.path.join(ckpt_dir, "config.yaml"))
-
-        # Use `set_struct` to prevent creation of fields not defined in the configs
-        OmegaConf.set_struct(OmegaConf.structured(cfg), False)
-        OmegaConf.set_struct(ckpt_cfg, False)
-
-        # TODO - better support for merging structured configs
-        #   To merge into a dataclass, all fields must exist. Or we merge into a base DictConfig.
-        #   We should merge `ckpt_cfg` into `cfg`.
-        #   However, some fields, which determine behavior (like run `local`), should not be overridden.
-        #   Note that interpolations don't apply here, since we are creating a dict (~already interpolated).
-        merged_cfg = OmegaConf.merge(ckpt_cfg, cfg, ckpt_cfg)
-
-        # Overwrite certain fields from the checkpoint config
-        # Model size etc. should match, but explicitly override some fields with specified config.
-        # TODO - we may need to add more here
-        # inference, folding validation take priority
-        merged_cfg.inference = OmegaConf.merge(merged_cfg.inference, cfg.inference)
-        merged_cfg.folding = OmegaConf.merge(merged_cfg.folding, cfg.folding)
-        # datasets not relevant, either sample lengths or `pdb_test` dataset
-        # training + validation cfg
-        merged_cfg.experiment.checkpointer.dirpath = cfg.experiment.checkpointer.dirpath
-        merged_cfg.experiment.trainer.strategy = cfg.experiment.trainer.strategy
-
-        # In an attempt (that probably won't last) to support MultiFlow,
-        # if we got a config from MultiFlow, we need to map to our new module names.
-        # We'll map, and save a new checkpoint, and then load that checkpoint.
-        if "interpolant" in ckpt_cfg and "twisting" in ckpt_cfg.interpolant:
-            log.info("Mapping MultiFlow state dict")
-            ckpt = torch.load(
-                ckpt_path, map_location=torch.device("cpu"), weights_only=False
-            )
-
-            # Define new checkpoint directory
-            ckpt_dir = f"{merged_cfg.experiment.checkpointer.dirpath}_mapped_{merged_cfg.shared.id}"
-            ckpt_path = os.path.join(ckpt_dir, "mapped.ckpt")
-
-            # Map modules in state_dict
-            # Assumes that these modules are active in the network, i.e. network shape is the same as MultiFlow.
-            state_dict = ckpt["state_dict"]
-            new_state_dict = OrderedDict()
-            replacements = {
-                "model.trunk.": "model.attention_ipa_trunk.trunk.",
-                "model.aatype_pred_net.": "model.aa_pred_net.aatype_pred_net.",
-            }
-            for key, value in state_dict.items():
-                for old, new in replacements.items():
-                    key = key.replace(old, new)
-                new_state_dict[key] = value
-
-            # Save new checkpoint
-            os.makedirs(ckpt_dir, exist_ok=True)
-            ckpt["state_dict"] = new_state_dict
-            torch.save(ckpt, ckpt_path)
-            log.info(f"Saved mapped checkpoint to {ckpt_path}")
-
-        return merged_cfg, ckpt_path
-
     @property
     def dataloader(self):
         """
@@ -206,13 +116,13 @@ class EvalRunner:
             # We want to use the input cfg inference settings for the pdb dataset,
             # not what was in the ckpt config
             # TODO - actually read the config, rather than using constructor to get new instance
-            pdb_test_cfg = self._input_cfg.dataset.PDBPost2021()
+            pdb_test_cfg = self.cfg.dataset.PDBPost2021()
 
             # The dataset will behave differently depending on the task
             # i.e. for inpainting, we generate motifs.
             dataset_constructor = DatasetConstructor.pdb_dataset(
                 dataset_cfg=pdb_test_cfg,
-                task=self.cfg.inference.task,
+                task=InferenceTaskEnum.to_data_task(self.cfg.inference.task),
             )
             _, eval_dataset = dataset_constructor.create_datasets()
         else:
@@ -238,14 +148,8 @@ class EvalRunner:
         devices = get_available_device(device_limit=self.cfg.experiment.num_devices)
         log.info(f"Using devices: {devices}")
 
-        # Due to cfg merge above, cfg may be a structured config (dataclass) or a DictConfig
-        trainer_cfg = (
-            asdict(self.cfg.experiment.trainer)
-            if hasattr(self.cfg.experiment.trainer, "__dataclass_fields__")
-            else self.cfg.experiment.trainer
-        )
         self._trainer = Trainer(
-            **trainer_cfg,
+            **self.cfg.experiment.trainer.asdict(),
             devices=devices,
         )
         return self._trainer

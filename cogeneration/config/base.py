@@ -1,44 +1,115 @@
 import datetime
 import os
-from dataclasses import dataclass, field
+from collections import OrderedDict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple, TypeVar, Union
 
+import torch
 from hydra.core.config_store import ConfigStore
 from omegaconf import OmegaConf
 
+from cogeneration.config.dict_utils import (
+    deep_merge_dicts,
+    flatten_dict,
+    prune_unknown_dataclass_fields,
+)
 from cogeneration.type.str_enum import StrEnum
 from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
 
 """
 Structured configurations for cogeneration.
 
-See __init__.py for extensions to OmegaConf, e.g. `ternary`.
-
+# Public Multiflow
 Several parameters from Multiflow appear to be unused in the public code.
 Many are marked with `# DROP`.
+
+# extensions / resolvers 
+See __init__.py for extensions to OmegaConf, e.g. `ternary`.
+
+# Enums 
+hydra does not currently support `Literal` and suggests using Enums instead.
+https://github.com/omry/omegaconf/issues/422
 """
 
-PATH_PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
-PATH_PUBLIC_WEIGHTS = PATH_PROJECT_ROOT / "multiflow_weights"
 
 # TODO - support default configs for `forward_folding` and `inverse folding`
 #   There are a handful of values across the config that need to have other defaults.
 #   i.e. instead of the current `ternary` paradigm
 #   to better differentate the training vs inference interpolant
 
-# hydra does not currently support `Literal` and suggests using Enums instead.
-# https://github.com/omry/omegaconf/issues/422
+PATH_PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
+PATH_PUBLIC_WEIGHTS = PATH_PROJECT_ROOT / "multiflow_weights"
 
-
-class DatasetEnum(StrEnum):
-    """dataset for training"""
-
-    pdb = "pdb"
+GenericConfig = TypeVar("GenericConfig", bound="BaseConfig")
 
 
 @dataclass
-class SharedConfig:
+class BaseClassConfig:
+    """
+    Base class for *Config objects. Can be nested.
+    """
+
+    def interpolate(self: GenericConfig) -> GenericConfig:
+        """
+        Interpolate Config with OmegaConf, yielding an interpolated Config class
+
+        OmegaConf supports interpolated fields like `my_field: int = "${my_other_field}"`.
+        This function interpolates those fields, yielding a new Config object.
+
+        Intermediate fields are dataclasses, not DictConfig.
+        """
+        # use `to_object()` so intermediate fields are dataclasses, not DictConfig
+        # `create()` interpolates the fields
+        # TODO consider using `hydra.instantiate` to interpolate the config?
+        return OmegaConf.to_object(OmegaConf.create(self))
+
+    def asdict(self, interpolate: bool = False) -> Dict[str, Any]:
+        if interpolate:
+            return asdict(self.interpolate())
+        return asdict(self)
+
+    def flatdict(self, interpolate: bool = False) -> Dict[str, Any]:
+        """
+        Flatten the dataclass into a dictionary.
+        """
+        # Use flatten_dict to flatten the dataclass
+        return dict(flatten_dict(self.asdict(interpolate=interpolate)))
+
+    def merge_dict(
+        self: GenericConfig,
+        other: Dict[str, Any],
+        interpolate: bool = True,
+    ) -> GenericConfig:
+        """
+        Merge a dictionary config with the current config, optionally interpolating `self` first.
+        Returns a new config of the same type as self.
+        """
+        # merge configs as dictionary, interpolating self if requested
+        merged_dict = deep_merge_dicts(self.asdict(interpolate=interpolate), other)
+
+        # Rebuild a typed config of the same class as self
+        schema = OmegaConf.structured(type(self))
+        merged_conf = OmegaConf.merge(schema, OmegaConf.create(merged_dict))
+        return OmegaConf.to_object(merged_conf)
+
+    def merge(
+        self: GenericConfig,
+        other: GenericConfig,
+        interpolate: bool = True,
+    ) -> GenericConfig:
+        """
+        Standard overwriting merge of two configs: fields in `other` override those in `self`.
+        Returns new instance of same class as `self`.
+        """
+        other_cfg = other.interpolate() if interpolate else other
+        return self.merge_dict(
+            other=other_cfg.asdict(),
+        )
+
+
+@dataclass
+class SharedConfig(BaseClassConfig):
     """
     shared config, system "flags", metadata
     """
@@ -61,7 +132,7 @@ class SharedConfig:
 
 
 @dataclass
-class ModelHyperParamsConfig:
+class ModelHyperParamsConfig(BaseClassConfig):
     """
     Shared hyperparameters for the model.
     Use a structured config for hyperparameters so easy to reference in templates.
@@ -113,7 +184,7 @@ class ModelHyperParamsConfig:
 
 
 @dataclass
-class ModelNodeFeaturesConfig:
+class ModelNodeFeaturesConfig(BaseClassConfig):
     """
     Node features (residue, sequence)
     """
@@ -137,7 +208,7 @@ class ModelNodeFeaturesConfig:
 
 
 @dataclass
-class ModelEdgeFeaturesConfig:
+class ModelEdgeFeaturesConfig(BaseClassConfig):
     """
     Edge features (structure, residue distances / orientations)
     """
@@ -160,7 +231,7 @@ class ModelEdgeFeaturesConfig:
 
 
 @dataclass
-class ModelIPAConfig:
+class ModelIPAConfig(BaseClassConfig):
     """
     Invariant Point Attention configuration.
     Keys match ported OpenFold's IPA module.
@@ -184,7 +255,7 @@ class ModelIPAConfig:
 
 
 @dataclass
-class ModelAAPredConfig:
+class ModelAAPredConfig(BaseClassConfig):
     """
     Amino acid prediction configuration using simple linear layers.
     """
@@ -196,7 +267,7 @@ class ModelAAPredConfig:
 
 
 @dataclass
-class ModelSequenceIPANetConfig:
+class ModelSequenceIPANetConfig(BaseClassConfig):
     """
     IPA style transformer, predicting logits instead of backbone update.
 
@@ -242,7 +313,7 @@ class ModelSequencePredictionEnum(StrEnum):
 
 
 @dataclass
-class ModelConfig:
+class ModelConfig(BaseClassConfig):
     symmetric: bool = False
 
     hyper_params: ModelHyperParamsConfig = field(default_factory=ModelHyperParamsConfig)
@@ -277,7 +348,7 @@ class InterpolantRotationsScheduleEnum(StrEnum):
 
 
 @dataclass
-class InterpolantRotationsConfig:
+class InterpolantRotationsConfig(BaseClassConfig):
     # corrupt rotations (unless inverse folding)
     corrupt: bool = (
         "${ternary:${equals: ${inference.task}, 'inverse_folding'}, False, True}"
@@ -306,7 +377,7 @@ class InterpolantTranslationsScheduleEnum(StrEnum):
 
 
 @dataclass
-class InterpolantTranslationsConfig:
+class InterpolantTranslationsConfig(BaseClassConfig):
     # corrupt translations (unless inverse folding)
     corrupt: bool = (
         "${ternary:${equals: ${inference.task}, 'inverse_folding'}, False, True}"
@@ -350,7 +421,7 @@ class InterpolantAATypesInterpolantTypeEnum(StrEnum):
 
 
 @dataclass
-class InterpolantAATypesConfig:
+class InterpolantAATypesConfig(BaseClassConfig):
     """
     Interpolant for amino acids.
 
@@ -388,13 +459,13 @@ class InterpolantAATypesConfig:
 
 
 @dataclass
-class InterpolantSamplingConfig:
+class InterpolantSamplingConfig(BaseClassConfig):
     # training takes a random t. Sampling runs over t timestemps.
     num_timesteps: int = 500
 
 
 @dataclass
-class InterpolantConfig:
+class InterpolantConfig(BaseClassConfig):
     min_t: float = 1e-2
     # kappa allows scaling rotation t exponentially during sampling
     provide_kappa: bool = True
@@ -424,20 +495,26 @@ class InterpolantConfig:
 
 
 @dataclass
-class DataLoaderConfig:
+class DataLoaderConfig(BaseClassConfig):
     num_workers: int = 8
     prefetch_factor: int = 10
 
 
 @dataclass
-class DataSamplerConfig:
+class DataSamplerConfig(BaseClassConfig):
     # Setting for 40GB GPUs
     max_batch_size: int = 80  # 128 for 80GB GPUs
     max_num_res_squared: int = 400_000  # 1_000_000 for 80GB GPUs
 
 
+class DatasetEnum(StrEnum):
+    """dataset for training"""
+
+    pdb = "pdb"
+
+
 @dataclass
-class DataConfig:
+class DataConfig(BaseClassConfig):
     task: DataTaskEnum = DataTaskEnum.hallucination
     dataset: DatasetEnum = DatasetEnum.pdb
     loader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
@@ -445,7 +522,7 @@ class DataConfig:
 
 
 @dataclass
-class DatasetFilterConfig:
+class DatasetFilterConfig(BaseClassConfig):
     max_num_res: int = 384
     min_num_res: int = 60
     max_coil_percent: float = 0.667  # was 0.5 in public MultiFlow
@@ -465,7 +542,7 @@ class DatasetFilterConfig:
 
 
 @dataclass
-class DatasetInpaintingConfig:
+class DatasetInpaintingConfig(BaseClassConfig):
     """
     Configuration for generating motifs / scaffolding
     """
@@ -490,7 +567,7 @@ dataset_metadata_dir_path = PATH_PROJECT_ROOT / "cogeneration" / "datasets" / "m
 
 
 @dataclass
-class DatasetConfig:
+class DatasetConfig(BaseClassConfig):
     """
     Information about the Dataset of protein structures and sequences.
     Assumes a structure matching the data provided by public Multiflow,
@@ -576,7 +653,7 @@ class DatasetConfig:
 
 
 @dataclass
-class ExperimentTrainingConfig:
+class ExperimentTrainingConfig(BaseClassConfig):
     mask_plddt: bool = True
     bb_atom_scale: float = 0.1
     trans_scale: float = 0.1
@@ -595,7 +672,7 @@ class ExperimentTrainingConfig:
 
 
 @dataclass
-class ExperimentWandbConfig:
+class ExperimentWandbConfig(BaseClassConfig):
     """W&B configuration. Some properties are kwargs to logger"""
 
     name: str = "${data.task}_${data.dataset}_${shared.id}"
@@ -605,12 +682,12 @@ class ExperimentWandbConfig:
 
 
 @dataclass
-class ExperimentOptimizerConfig:
+class ExperimentOptimizerConfig(BaseClassConfig):
     lr: float = 1e-4
 
 
 @dataclass
-class ExperimentTrainerConfig:
+class ExperimentTrainerConfig(BaseClassConfig):
     """
     Arguments to Pytorch Lightning Trainer()
     """
@@ -640,7 +717,7 @@ class ExperimentTrainerConfig:
 
 
 @dataclass
-class ExperimentCheckpointerConfig:
+class ExperimentCheckpointerConfig(BaseClassConfig):
     """
     Arguments to ModelCheckpoint()
     https://lightning.ai/docs/pytorch/stable/api/lightning.pytorch.callbacks.ModelCheckpoint.html
@@ -663,7 +740,7 @@ class ExperimentCheckpointerConfig:
 
 
 @dataclass
-class ExperimentConfig:
+class ExperimentConfig(BaseClassConfig):
     """Training Experiment configuration."""
 
     seed: int = "${shared.seed}"
@@ -698,7 +775,7 @@ class ExperimentConfig:
 
 
 @dataclass
-class InferenceSamplesConfig:
+class InferenceSamplesConfig(BaseClassConfig):
     """
     Inference sampling configuration.
     Can define either `length_subset` or `min_length`, `max_length`, `length_step`.
@@ -722,7 +799,7 @@ class InferenceSamplesConfig:
 
 
 @dataclass
-class InferenceConfig:
+class InferenceConfig(BaseClassConfig):
     task: InferenceTaskEnum = InferenceTaskEnum.unconditional
 
     seed: int = "${shared.seed}"
@@ -732,7 +809,7 @@ class InferenceConfig:
     inference_subdir: str = "${shared.id}"
 
     # checkpoints
-    saved_ckpt_dir: str = "${shared.project_root}/ckpt/${experiment.wandb.project}"
+    saved_ckpt_dir: str = "${shared.project_root}/ckpt/${shared.id}"
 
     unconditional_ckpt_path: Optional[str] = str(PATH_PUBLIC_WEIGHTS / "last.ckpt")
     forward_folding_ckpt_path: Optional[str] = str(PATH_PUBLIC_WEIGHTS / "last.ckpt")
@@ -751,7 +828,7 @@ class InferenceConfig:
 
 
 @dataclass
-class FoldingConfig:
+class FoldingConfig(BaseClassConfig):
     seq_per_sample: int = 8
     folding_model: str = "af2"  # "af2" only at the moment, maybe "esm" in the future
     # dedicated device for folding. decrement other devices by 1 if True
@@ -765,7 +842,7 @@ class FoldingConfig:
 
 
 @dataclass
-class Config:
+class Config(BaseClassConfig):
     """
     We use dataclasses as part of hydra's structured config system, to enable type checking and default values.
     This is the base class and default config.
@@ -780,19 +857,131 @@ class Config:
     interpolant: InterpolantConfig = field(default_factory=InterpolantConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
 
-    def interpolate(self) -> "Config":
+    @classmethod
+    def load_dict_from_file(
+        cls,
+        filepath: Union[str, Path],
+        remove_unknown_fields: bool = True,
+    ) -> Tuple[Dict[str, Any], bool]:
         """
-        Interpolate Config with OmegaConf, yielding an interpolated Config class
+        Load a Config saved as yaml as a Dict, and check if it appears to be a public Multiflow checkpoint.
 
-        OmegaConf supports interpolated fields like `my_field: int = "${my_other_field}"`.
-        This function interpolates those fields, yielding a new Config object.
+        Specify `remove_unknown_fields` to remove any fields not in the current schema.
 
-        Intermediate fields are dataclasses, not DictConfig.
+        Returns a dict, rather than Config, to avoid setting inappropriate defaults,
+        since it is likely to be merged after calling this function.
         """
-        # use `to_object()` so intermediate fields are dataclasses, not DictConfig
-        # `create()` interpolates the fields
-        # TODO consider using `hydra.instantiate` to interpolate the config?
-        return OmegaConf.to_object(OmegaConf.create(self))
+        yml_cfg = OmegaConf.load(filepath)
+        # `resolve` required for public Multiflow - they include templates in the saved cfg
+        # If an interpolated cfg is saved, should be idempotent.
+        yml_dict = OmegaConf.to_container(yml_cfg, resolve=True)
+
+        # Check if it appears to be a public Multiflow checkpoint, so can handle accordingly
+        is_multiflow = (
+            "interpolant" in yml_dict and "twisting" in yml_dict["interpolant"]
+        )
+
+        # remove fields not in current schema to avoid problems merging, e.g. if an old key is present.
+        if remove_unknown_fields:
+            yml_dict = prune_unknown_dataclass_fields(cls=cls, obj=yml_dict)
+
+        return yml_dict, is_multiflow
+
+    def merge_checkpoint_cfg(
+        self,
+        ckpt_path: str,
+        preserve_inference_cfg: bool = True,
+        remove_unknown_fields: bool = True,
+    ) -> Tuple["Config", str]:
+        """
+        Loads and merges a checkpoint config into the current config.
+
+        The checkpoint config is merged into the current config,
+        but inference-specific fields from the current config are preserved.
+
+        `ckpt_path` should be the path to a checkpoint file, e.g. `last.ckpt`, with a sibling `config.yaml`.
+        `remove_unknown_fields` specifies whether to remove fields not in the current schema.
+        If false, and there are unknown fields, an error is raised.
+        `preserve_inference_cfg` specifies whether to preserve the inference config from the current config,
+        e.g. if loading a checkpoint from training and beginning inference
+
+        We also attempt to support MultiFlow checkpoints, which are only partially compatible with all our options.
+        We attempt to map the state_dict to the new module names, and save a new checkpoint, which can be loaded.
+        This requires that the model architecture matches MultiFlow, i.e. the same modules and shapes, which
+        will be enforced by using the `ckpt` configuration for `cfg.model`.
+        However, all config options not in our current schemas are dropped, and we'll just assume our defaults are ok.
+        There are some cases where that may not be the case! Use the `Config.public_multiflow()` constructor.
+        """
+        if not ckpt_path.endswith(".ckpt"):
+            raise ValueError(
+                f"Invalid checkpoint path {ckpt_path}, should end with .ckpt"
+            )
+        assert os.path.exists(ckpt_path), f"Checkpoint {ckpt_path} does not exist."
+
+        ckpt_dir = os.path.dirname(ckpt_path)
+        ckpt_cfg_path = os.path.join(ckpt_dir, "config.yaml")
+        assert os.path.exists(
+            ckpt_cfg_path
+        ), f"Checkpoint {ckpt_cfg_path} does not exist."
+        ckpt_cfg_dict, is_multiflow = Config.load_dict_from_file(
+            ckpt_cfg_path, remove_unknown_fields=remove_unknown_fields
+        )
+
+        # Hang on to the original config, we'll override some fields in the merged config
+        orig_cfg = self.interpolate()
+
+        # Merge the checkpoint config into the current config
+        merged_cfg = self.merge_dict(ckpt_cfg_dict, interpolate=True)
+
+        # For inference, overwrite certain fields from the checkpoint config.
+        # We want to inherit the model specification etc. to match what was saved
+        # but preserve current cfg for inference, validation, etc.
+        if preserve_inference_cfg:
+            # metadata (even though already interpolated)
+            merged_cfg.shared.id = orig_cfg.shared.id
+            # inference (and inference interpolant), folding validation take priority
+            merged_cfg.inference = orig_cfg.inference
+            merged_cfg.folding = orig_cfg.folding
+            # datasets, if used for inference
+            merged_cfg.dataset = orig_cfg.dataset
+            # trainer cfg
+            merged_cfg.experiment.trainer = orig_cfg.experiment.trainer
+            merged_cfg.experiment.num_devices = orig_cfg.experiment.num_devices
+
+        # Special handling for public Multiflow checkpoints.
+        # If we got a config from MultiFlow, we need to map to our new module names.
+        # We'll map, and save a new checkpoint, and then load that checkpoint.
+        # TODO move to separate function
+        if is_multiflow:
+            ckpt = torch.load(
+                ckpt_path, map_location=torch.device("cpu"), weights_only=False
+            )
+
+            # Define new checkpoint directory
+            ckpt_dir = (
+                f"{merged_cfg.inference.saved_ckpt_dir}/mapped_{merged_cfg.shared.id}"
+            )
+            ckpt_path = os.path.join(ckpt_dir, "mapped.ckpt")
+
+            # Map modules in state_dict
+            # Assumes that these modules are active in the network, i.e. network shape is the same as MultiFlow.
+            state_dict = ckpt["state_dict"]
+            new_state_dict = OrderedDict()
+            replacements = {
+                "model.trunk.": "model.attention_ipa_trunk.trunk.",
+                "model.aatype_pred_net.": "model.aa_pred_net.aatype_pred_net.",
+            }
+            for key, value in state_dict.items():
+                for old, new in replacements.items():
+                    key = key.replace(old, new)
+                new_state_dict[key] = value
+
+            # Save new checkpoint
+            os.makedirs(ckpt_dir, exist_ok=True)
+            ckpt["state_dict"] = new_state_dict
+            torch.save(ckpt, ckpt_path)
+
+        return merged_cfg, ckpt_path
 
     @classmethod
     def test_uninterpolated(cls, tmp_path: Path) -> "Config":

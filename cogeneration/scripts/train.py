@@ -1,5 +1,4 @@
 import os
-from dataclasses import asdict
 
 import hydra
 import torch
@@ -15,7 +14,7 @@ from cogeneration.config.base import Config
 from cogeneration.dataset.datasets import DatasetConstructor
 from cogeneration.dataset.protein_dataloader import ProteinData
 from cogeneration.models.module import FlowModule
-from cogeneration.scripts.utils import flatten_dict, get_available_device, print_timing
+from cogeneration.scripts.utils import get_available_device, print_timing
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
 from cogeneration.util.log import rank_zero_logger
 
@@ -38,12 +37,16 @@ class Experiment:
             # If specified, load model and merge in model config (to ensure all fields present)
             if cfg.experiment.warm_start_cfg_override:
                 ckpt_cfg_path = os.path.join(ckpt_dir, "config.yaml")
-                ckpt_cfg = OmegaConf.load(ckpt_cfg_path)
-                OmegaConf.set_struct(cfg.model, False)
-                OmegaConf.set_struct(ckpt_cfg.model, False)
-                cfg.model = OmegaConf.merge(cfg.model, ckpt_cfg.model)
-                OmegaConf.set_struct(cfg.model, True)
-                log.info(f"Loaded warm start config from {ckpt_cfg_path}")
+                log.info(f"Loading warm start config from {ckpt_cfg_path}")
+
+                merged_cfg, merged_ckpt_path = self.cfg.merge_checkpoint_cfg(
+                    ckpt_cfg_path,
+                    preserve_inference_cfg=False,
+                )
+                self.cfg = merged_cfg
+                if merged_ckpt_path != ckpt_cfg_path:
+                    log.info(f"Checkpoint path changed to {merged_ckpt_path}")
+                    cfg.experiment.warm_start_ckpt = merged_ckpt_path
 
         # Ensure DDP is set up for scenarios were pytorch lightning doesn't handle it
         # (e.g. debugging on mac laptop)
@@ -124,10 +127,10 @@ class Experiment:
             )
         else:
             # Set up w&b logging
-            logger = WandbLogger(**asdict(self.cfg.experiment.wandb))
+            logger = WandbLogger(**self.cfg.experiment.wandb.asdict())
             # Model checkpoints
             callbacks.append(
-                ModelCheckpoint(**asdict(self.cfg.experiment.checkpointer))
+                ModelCheckpoint(**self.cfg.experiment.checkpointer.asdict())
             )
 
         # Save config, only for main process.
@@ -143,12 +146,11 @@ class Experiment:
 
             # write to w&b
             if logger is not None and isinstance(logger, WandbLogger):
-                flat_cfg = dict(flatten_dict(asdict(self.cfg)))
-                logger.experiment.config.update(flat_cfg)
+                logger.experiment.config.update(self.cfg.flatdict())
 
         log.info("Setting up Trainer...")
         trainer = Trainer(
-            **asdict(self.cfg.experiment.trainer),
+            self.cfg.experiment.trainer.asdict(),
             callbacks=callbacks,
             logger=logger,  # pass w&b logger
             use_distributed_sampler=False,
@@ -212,7 +214,7 @@ def run(cfg: Config) -> None:
 
     # Instantiate static config with dataclass as nested objects
     # to avoid dynamic DictConfig lookups for torch dynamo
-    cfg = OmegaConf.to_object(cfg)
+    cfg = cfg.interpolate()
 
     trainer = Experiment(cfg=cfg)
     trainer.train()

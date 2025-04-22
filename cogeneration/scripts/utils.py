@@ -1,6 +1,6 @@
 from functools import wraps
 from time import time
-from typing import Any, List, Tuple, Union
+from typing import List, Union
 
 import GPUtil
 
@@ -19,17 +19,6 @@ def get_available_device(device_limit: int) -> List[Union[int, str]]:
         device_ids = [0]
 
     return device_ids
-
-
-def flatten_dict(raw_dict) -> List[Tuple[str, Any]]:
-    """Flattens a nested dict, where nested keys are colon-separated"""
-    flattened = []
-    for k, v in raw_dict.items():
-        if isinstance(v, dict):
-            flattened.extend([(f"{k}:{i}", j) for i, j in flatten_dict(v)])
-        else:
-            flattened.append((k, v))
-    return flattened
 
 
 def print_timing(f):

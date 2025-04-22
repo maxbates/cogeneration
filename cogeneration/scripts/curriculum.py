@@ -2,9 +2,6 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-import torch
-from omegaconf import OmegaConf
-
 from cogeneration.config.base import Config, ModelConfig
 from cogeneration.scripts.train import Experiment
 from cogeneration.util.log import rank_zero_logger
@@ -33,7 +30,7 @@ class Curriculum:
     """
 
     steps: List[TrainingStep] = field(default_factory=list)
-    interpolate: bool = True  # TODO drop if idempotent
+    interpolate: bool = True
 
     def __post_init__(self):
         """
@@ -49,10 +46,13 @@ class Curriculum:
         """
         Interpolates each step config to replace template strings etc.
         """
-        self.steps = [
-            TrainingStep(name=step.name, cfg=step.cfg.interpolate())
-            for step in self.steps
-        ]
+        for step in self.steps:
+            try:
+                step.cfg = step.cfg.interpolate()
+            except Exception as e:
+                raise ValueError(
+                    f"Interpolation failed for step '{step.name}': {e}"
+                ) from e
 
     def validate_steps(self):
         """
@@ -82,9 +82,10 @@ class Curriculum:
             )
 
         # Ensure models are compatible
+        # Assumes interpolated, otherwise template values may equal each other
         seen_model_cfg: Optional[ModelConfig] = None
         for step in self.steps:
-            model_cfg = OmegaConf.to_object(OmegaConf.create(step.cfg.model))
+            model_cfg = step.cfg.model
             if seen_model_cfg is None:
                 seen_model_cfg = model_cfg
             elif model_cfg != seen_model_cfg:

@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from omegaconf import OmegaConf
 
 # Custom resolvers
@@ -17,5 +19,12 @@ OmegaConf.register_new_resolver(
 OmegaConf.register_new_resolver(
     "equals",
     lambda x, y: x == y,
+    replace=True,
+)
+
+# now timestamp (used in Public Multiflow, needed to load ckpt)
+OmegaConf.register_new_resolver(
+    "now",
+    lambda fmt: datetime.now().strftime(fmt),
     replace=True,
 )

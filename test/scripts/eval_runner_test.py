@@ -24,8 +24,7 @@ class TestEvalRunner:
         cfg = Config.public_multiflow().interpolate()
 
         # create EvalRunner, merge configs, which creates merged checkpoint
-        merged_cfg, merged_ckpt_path = EvalRunner.merge_checkpoint_cfg(
-            cfg=cfg,
+        merged_cfg, merged_ckpt_path = cfg.merge_checkpoint_cfg(
             ckpt_path=str(public_weights_path / "last.ckpt"),
         )
         print(f"Merged checkpoint path: {merged_ckpt_path}")
@@ -35,7 +34,7 @@ class TestEvalRunner:
         ), f"Merged ckpt not found at {merged_ckpt_path}"
 
         # inspect merged_cfg
-        assert not isinstance(merged_cfg, Config), f"Should not get Config instance"
+        assert isinstance(merged_cfg, Config), f"Should get Config instance"
 
         # ensure can load new checkpoint
         FlowModule.load_from_checkpoint(

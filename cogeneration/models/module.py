@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, fields
+from dataclasses import dataclass, fields
 from random import random
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -29,7 +29,6 @@ from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import mask_blend_2d
 from cogeneration.data.trajectory import SavedTrajectory, save_trajectory
 from cogeneration.models.model import FlowModel
-from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProps as bp
 from cogeneration.type.batch import InferenceFeatures
 from cogeneration.type.batch import NoisyBatchProps as nbp
@@ -162,7 +161,7 @@ class FlowModule(LightningModule):
     def configure_optimizers(self):
         return torch.optim.AdamW(
             params=self.model.parameters(),
-            **asdict(self.cfg.experiment.optimizer),
+            **self.cfg.experiment.optimizer.asdict(),
         )
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
@@ -569,15 +568,9 @@ class FlowModule(LightningModule):
         diffuse_mask = batch[bp.diffuse_mask]
 
         # Pick inference task corresponding to training task
-        if self.cfg.data.task == DataTaskEnum.inpainting:
-            # Handle `unconditional_percent` -> unconditional generation
-            if (diffuse_mask == 1).all():
-                inference_task = InferenceTaskEnum.unconditional
-            else:
-                inference_task = InferenceTaskEnum.inpainting
-        elif self.cfg.data.task == DataTaskEnum.hallucination:
-            inference_task = InferenceTaskEnum.unconditional
-        else:
+        inference_task = InferenceTaskEnum.from_data_task(task=self.cfg.data.task)
+        # Handle `unconditional_percent` -> unconditional generation
+        if (diffuse_mask == 1).all() and inference_task == InferenceTaskEnum.inpainting:
             inference_task = InferenceTaskEnum.unconditional
 
         # Validation can run either unconditional generation, or inpainting

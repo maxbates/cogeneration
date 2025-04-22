@@ -1,6 +1,6 @@
 import logging
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 from unittest.mock import patch
@@ -376,7 +376,7 @@ def mock_checkpoint(mock_folding_validation):
         module = FlowModule(cfg)
         trainer_cfg = {
             "max_steps": 1,  # curtail actual training
-            **asdict(cfg.experiment.trainer),
+            **cfg.experiment.trainer.asdict(),
         }
         trainer = Trainer(**trainer_cfg)
 
