@@ -2,7 +2,7 @@ import logging
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 from unittest.mock import patch
 
 import numpy as np
@@ -305,8 +305,12 @@ def mock_checkpoint(mock_folding_validation):
     #   Maybe we can hash the config (ignoring fields like `shared.id`)
     """
 
-    def create_mock_checkpoint(cfg: Config, path: Optional[Path] = None) -> Tuple[Config, str]:
-        ckpt_dir = path if path is not None else Path(cfg.experiment.checkpointer.dirpath)
+    def create_mock_checkpoint(
+        cfg: Config, path: Optional[Path] = None
+    ) -> Tuple[Config, str]:
+        ckpt_dir = (
+            path if path is not None else Path(cfg.experiment.checkpointer.dirpath)
+        )
         ckpt_cfg_path = str(ckpt_dir / "config.yaml")
         ckpt_path = str(ckpt_dir / "last.ckpt")
         final_ckpt_path = str(ckpt_dir / "final.ckpt")
@@ -322,6 +326,18 @@ def mock_checkpoint(mock_folding_validation):
         os.makedirs(ckpt_dir, exist_ok=True)
         with open(ckpt_cfg_path, "w") as f:
             OmegaConf.save(config=cfg, f=f)
+
+        # We cache a checkpoint across test runs, hashing on `cfg.model` to ensure compatibility
+        cache_dir = os.path.join(os.path.dirname(__file__), ".cache", "model_ckpt")
+        model_hash = hash(str(cfg.model))
+        cache_ckpt_path = os.path.join(cache_dir, f"{model_hash}.ckpt")
+        if os.path.exists(cache_ckpt_path):
+            print(f"Using cached model checkpoint at {cache_ckpt_path}")
+            # copy the cached checkpoint to the new location
+            os.makedirs(ckpt_dir, exist_ok=True)
+            os.link(cache_ckpt_path, ckpt_path)
+            os.link(cache_ckpt_path, final_ckpt_path)
+            return cfg, ckpt_path
 
         # saving a checkpoint with pytorch lightning is annoying.
         # We need to use a lightning `Trainer`, and call `fit()` on it, which requires a datamodule.
@@ -373,6 +389,10 @@ def mock_checkpoint(mock_folding_validation):
         # save final checkpoint sentinel, just a symlink
         if cfg.experiment.save_final_ckpt:
             os.link(ckpt_path, final_ckpt_path)
+
+        # and save to the ckpt cache
+        os.makedirs(os.path.dirname(cache_ckpt_path), exist_ok=True)
+        trainer.save_checkpoint(cache_ckpt_path)
 
         return cfg, ckpt_path
 

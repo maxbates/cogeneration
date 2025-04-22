@@ -52,11 +52,15 @@ class TestCurriculum:
 
         # Monkeypatch Experiment
         called = []
+
         def fake_init(self, cfg):
             called.append(cfg)
+
         monkeypatch.setattr(Experiment, "__init__", fake_init)
+
         def fake_train(self):
             pass
+
         monkeypatch.setattr(Experiment, "train", fake_train)
 
         curriculum = Curriculum(
