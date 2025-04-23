@@ -314,8 +314,6 @@ class ModelSequencePredictionEnum(StrEnum):
 
 @dataclass
 class ModelConfig(BaseClassConfig):
-    symmetric: bool = False
-
     hyper_params: ModelHyperParamsConfig = field(default_factory=ModelHyperParamsConfig)
     node_features: ModelNodeFeaturesConfig = field(
         default_factory=ModelNodeFeaturesConfig
@@ -560,9 +558,11 @@ class DatasetInpaintingConfig(BaseClassConfig):
 
     # % of time unconditional, i.e. not motif selected. 0% in FoldFlow.
     unconditional_percent: float = 0.2
-    # fraction of residues to be in motif (remainder to be diffused)
+    # target fraction of residues to be in motif (remainder to be diffused)
     min_percent_motifs: float = 0.10
     max_percent_motifs: float = 0.70
+    # try to trim low plddt ends from structures, see `dataset.min_plddt_threshold`
+    trim_low_plddt_ends: bool = True
     # there are several methods supported for picking motifs
     # TODO allow specifying multiple, with a weighting for each
     strategy: DatasetInpaintingMotifStrategy = (

@@ -2,7 +2,7 @@ import random
 import re
 from dataclasses import dataclass
 from math import ceil, floor
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -85,8 +85,6 @@ class MotifFactory:
         Motifs are defined by diffuse_mask == 0, scaffolds are defined by diffuse_mask == 1
         Scaffold regions are randomly scaled by a factor in random_scale_range.
         """
-        rng = self.rng
-
         # TODO(multimer) handle multiple chains i.e. diffuse mask over multiple chains
 
         segments = []
@@ -98,7 +96,7 @@ class MotifFactory:
                 # 1 = scaffold region
                 if current_val:
                     length = seg_end - seg_start + 1
-                    factor = rng.uniform(*random_scale_range)  # random scale
+                    factor = self.rng.uniform(*random_scale_range)  # random scale
                     target_length = int(round(length * factor))
                     segments.append(
                         Scaffold(start=seg_start, end=seg_end, new_length=target_length)
@@ -119,36 +117,89 @@ class MotifFactory:
         seg_end = len(diffuse_mask) - 1
         length = seg_end - seg_start + 1
         if current_val:
-            factor = rng.uniform(*random_scale_range)
+            factor = self.rng.uniform(*random_scale_range)
             target_length = int(round(length * factor))
             segments.append(
                 Scaffold(start=seg_start, end=seg_end, new_length=target_length)
             )
         else:
-            segments.append(Motif(start=seg_start, end=seg_end))
+            segments.append(
+                Motif(
+                    start=seg_start, end=seg_end, chain_idx=chain_idx[seg_start].item()
+                )
+            )
 
         return segments
 
+    def _plddt_start_stop(
+        self, res_mask: torch.Tensor, plddt_mask: torch.Tensor
+    ) -> Tuple[int, int, int]:
+        """
+        Trim low pLDDT residues to get start / stop bounds and length
+        Returns positions of first and last `1` in `res_mask * plddt_mask`
+        """
+        N = plddt_mask.shape[-1]
+        idx = torch.nonzero(plddt_mask * res_mask, as_tuple=False).squeeze()
+
+        # if no residues pass the mask, return empty bounds
+        if idx.numel() == 0:
+            return 0, N, N
+
+        # start = first index, stop = last index + 1 for slicing
+        start = int(idx.min().item())
+        stop = int(idx.max().item()) + 1
+        length = stop - start
+        return start, stop, length
+
+    def _determine_bounds(
+        self, res_mask: torch.Tensor, plddt_mask: torch.Tensor
+    ) -> Tuple[int, int, int, int]:
+        """
+        Determine the acceptable bounds of the motif.
+        If `cfg.trim_low_plddt_ends` is set, it will trim the ends of the motif based on pLDDT scores.
+        Otherwise, it will use the full range of the res_mask.
+
+        Returns: (bound_start, bound_stop, bound_length, num_res)
+        """
+        N = len(res_mask)
+
+        if self.cfg.trim_low_plddt_ends:
+            plddt_start, plddt_stop, plddt_length = self._plddt_start_stop(
+                res_mask=res_mask, plddt_mask=plddt_mask
+            )
+            return plddt_start, plddt_stop, plddt_length, N
+
+        # If not trimming, use the full range of the res_mask
+        return 0, N, N, N
+
     def generate_single_motif_diffuse_mask(
-        self, res_mask: torch.Tensor
+        self,
+        res_mask: torch.Tensor,
+        plddt_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         Generate a `diffuse_mask` for a single motif in a sequence.
         """
-        num_res = len(res_mask)
-        cfg = self.cfg
-        rng = self.rng
+        bound_start, bound_stop, bound_length, num_res = self._determine_bounds(
+            res_mask=res_mask, plddt_mask=plddt_mask
+        )
 
-        motif_length = rng.integers(
+        motif_length = self.rng.integers(
+            # lower bound exceeding `min_motif_length`, `min_percent_motifs`
             max(self.cfg.min_motif_len, floor(num_res * self.cfg.min_percent_motifs)),
+            # upper bound capped by `max_motif_length`, `max_percent_motifs`, max width of diffusable residues
             min(
-                self.cfg.max_motif_len + 1, ceil(num_res * self.cfg.max_percent_motifs)
+                self.cfg.max_motif_len + 1,
+                ceil(num_res * self.cfg.max_percent_motifs),
+                bound_length,
             ),
         )
 
-        motif_start = rng.integers(
-            low=self.cfg.min_padding,
-            high=num_res - motif_length - self.cfg.min_padding + 1,
+        motif_start = self.rng.integers(
+            low=max(bound_start, self.cfg.min_padding),
+            high=min(
+                bound_stop, bound_length - motif_length - self.cfg.min_padding + 1
+            ),
         )
         motif_end = motif_start + motif_length
 
@@ -159,20 +210,24 @@ class MotifFactory:
         return diffuse_mask
 
     def generate_multiple_motif_diffuse_mask(
-        self, res_mask: torch.Tensor
+        self,
+        res_mask: torch.Tensor,
+        plddt_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         Generate a `diffuse_mask` for 1 or more motifs.
 
-        This is a relatively simple scaffolding strategy which is similar to FrameFlow.
+        This is a relatively simple scaffolding strategy, similar to FrameFlow.
+        The primary difference from FrameFlow is the skew toward a smaller number of motifs.
         We pick some number of residues to be motifs, pick some number of motifs, then define the windows.
-        The primary difference is the skew toward a smaller number of motifs.
         The selection of window size + positions is also less random, and so shouldn't fail.
         We also allow for bounds on the motif length.
         However, note that `diffuse_mask` may select residues not in `res_mask`,
         which would subsequently be masked out.
         """
-        num_res = len(res_mask)
+        bound_start, bound_stop, bound_length, num_res = self._determine_bounds(
+            res_mask=res_mask, plddt_mask=plddt_mask
+        )
 
         # Choose how many motifs to create (skewed toward small numbers)
         possible_num_motifs = list(
@@ -183,23 +238,26 @@ class MotifFactory:
         num_motifs = self.rng.choice(possible_num_motifs, p=probs)
 
         # Compute how many residues in total will become motifs
-        min_motif_total = max(
+        min_motif_total_length = max(
             # lower bound target percentage
             floor(self.cfg.min_percent_motifs * num_res),
             # require minimum motif length for each motif
             num_motifs * self.cfg.min_motif_len,
         )
-        max_motif_total = min(
+        # ensure min <= bound
+        min_motif_total_length = min(min_motif_total_length, bound_length)
+        max_motif_total_length = min(
             # upper bound target percentage
             ceil(self.cfg.max_percent_motifs * num_res),
             # cap at maximum motif length
             num_motifs * self.cfg.max_motif_len,
             # cap at remaining sequence for motifs accounting for padding
-            num_res - (num_motifs - 1) * self.cfg.min_padding,
+            bound_length - (num_motifs - 1) * self.cfg.min_padding,
         )
-        max_motif_total = max(max_motif_total, min_motif_total)  # ensure max >= min
+        # ensure max >= min
+        max_motif_total_length = max(max_motif_total_length, min_motif_total_length)
         total_motif_length = self.rng.integers(
-            low=min_motif_total, high=max_motif_total + 1
+            low=min_motif_total_length, high=max_motif_total_length + 1
         )
 
         # Break total_motif_length into lengths for each motif
@@ -212,7 +270,7 @@ class MotifFactory:
                     leftover - (num_motifs - i - 1) * self.cfg.min_motif_len
                 )
                 length = self.rng.integers(
-                    low=self.cfg.min_motif_len,
+                    low=min(max_len_for_current, self.cfg.min_motif_len),
                     high=min(self.cfg.max_motif_len, max_len_for_current) + 1,
                 )
                 leftover -= length
@@ -262,22 +320,30 @@ class MotifFactory:
     def generate_masked_neighbors_diffuse_mask(
         self,
         res_mask: torch.Tensor,
+        plddt_mask: torch.Tensor,
         trans_1: torch.Tensor,
     ) -> torch.Tensor:
         """
         Pick a residue, mask N closest residues as scaffold, remaining structure as motif
         This method is similar to the published FoldFold2 method
         """
-        num_res = len(res_mask)
+        bound_start, bound_stop, bound_length, num_res = self._determine_bounds(
+            res_mask=res_mask, plddt_mask=plddt_mask
+        )
 
         dist2d = torch.linalg.norm(trans_1[:, None, :] - trans_1[None, :, :], dim=-1)
 
-        # pick a random residue
-        seed_idx = self.rng.integers(low=0, high=num_res)
+        # pick a random residue within bounds
+        seed_idx = self.rng.integers(low=bound_start, high=bound_stop)
         # sample a number of residues that will be scaffolded. ignore `motif_length` criteria, go off percentage.
+        min_scaffold_length = min(
+            bound_length, num_res - ceil(num_res * self.cfg.max_percent_motifs)
+        )
+        max_scaffold_length = max(
+            bound_length, num_res - floor(num_res * self.cfg.min_percent_motifs)
+        )
         scaffold_length = self.rng.integers(
-            num_res - ceil(num_res * self.cfg.max_percent_motifs),
-            num_res - floor(num_res * self.cfg.min_percent_motifs),
+            min_scaffold_length, max_scaffold_length + 1
         )
 
         # get a distance cut off
@@ -291,12 +357,15 @@ class MotifFactory:
     def generate_densest_neighbors_diffuse_mask(
         self,
         res_mask: torch.Tensor,
+        plddt_mask: torch.Tensor,
         trans_1: torch.Tensor,
     ) -> torch.Tensor:
         """
         Sample a residue with many neighbors, mask all neighbors within a distance threshold
         """
-        num_res = len(res_mask)
+        bound_start, bound_stop, bound_length, num_res = self._determine_bounds(
+            res_mask=res_mask, plddt_mask=plddt_mask
+        )
 
         # use 8.0 instead of 6.0 to allow picking up residues just outside "interaction" range
         interaction_distance_threshold = 8.0
@@ -315,6 +384,9 @@ class MotifFactory:
         else:
             weights = neighbor_counts.clone().float() ** 1.5
             weights[~valid] = 0.0
+            # only pick residues within bounds
+            weights[:bound_start] = 0.0
+            weights[bound_stop:] = 0.0
             probs = weights / weights.sum()
 
         # sample a seed residue index
@@ -350,16 +422,22 @@ class MotifFactory:
             return torch.ones_like(res_mask)
 
         if self.cfg.strategy == DatasetInpaintingMotifStrategy.single_motif:
-            return self.generate_single_motif_diffuse_mask(res_mask=res_mask)
+            return self.generate_single_motif_diffuse_mask(
+                res_mask=res_mask,
+                plddt_mask=plddt_mask,
+            )
         elif self.cfg.strategy == DatasetInpaintingMotifStrategy.variable_motifs:
-            return self.generate_multiple_motif_diffuse_mask(res_mask=res_mask)
+            return self.generate_multiple_motif_diffuse_mask(
+                res_mask=res_mask,
+                plddt_mask=plddt_mask,
+            )
         elif self.cfg.strategy == DatasetInpaintingMotifStrategy.random_neighbors:
             return self.generate_masked_neighbors_diffuse_mask(
-                res_mask=res_mask, trans_1=trans_1
+                res_mask=res_mask, plddt_mask=plddt_mask, trans_1=trans_1
             )
         elif self.cfg.strategy == DatasetInpaintingMotifStrategy.densest_neighbors:
             return self.generate_densest_neighbors_diffuse_mask(
-                res_mask=res_mask, trans_1=trans_1
+                res_mask=res_mask, plddt_mask=plddt_mask, trans_1=trans_1
             )
         else:
             raise ValueError(f"Unknown motif selection strategy: {self.cfg.strategy}")

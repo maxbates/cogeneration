@@ -135,14 +135,16 @@ https://github.com/microsoft/protein-frame-flow
 
 ## Future Work
 
+- [ ] Do `forward_folding` (full sequence conditioning) some percentage of the time
+
 - Motif Selection
     - [x] set up to allow other methods. abstract into class.
-    - [ ] allow trimming low pLDDT ends before selection
-    - [x] interacting residues or potential active sites 
+    - [x] allow trimming low pLDDT ends before selection
+    - [x] interacting residues or potential active sites
+    - [x] Allow selecting a residue and then removing / keeping residues within some distance
     - [ ] cross-chain interactions
         - can we augment dataset looking for large monomers with interacting motifs?
     - [ ] based on secondary structure? e.g. enrich for beta sheets
-    - [x] Allow selecting a residue and then removing / keeping residues within some distance
 
 - Amino acid corruption
     - [ ] Currently, sequence is fixed, i.e. whole process is motif-sequence-conditioned

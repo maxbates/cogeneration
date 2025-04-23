@@ -12,20 +12,20 @@ class TestMotifFactory:
         cfg = DatasetInpaintingConfig(
             min_motif_len=5,
             max_motif_len=5,
-            min_num_motifs=1,
-            max_num_motifs=1,
             min_percent_motifs=0.0,
             max_percent_motifs=1.0,
             min_padding=0,
         )
 
-        # Use a fixed random seed for reproducibility
         rng = default_rng(0)
         factory = MotifFactory(cfg=cfg, rng=rng)
 
         N = 20
         res_mask = torch.ones(N, dtype=torch.float32)
-        mask = factory.generate_single_motif_diffuse_mask(res_mask)
+        plddt_mask = torch.ones(N, dtype=torch.float32)
+        mask = factory.generate_single_motif_diffuse_mask(
+            res_mask=res_mask, plddt_mask=plddt_mask
+        )
         assert isinstance(mask, torch.Tensor)
         assert mask.shape == (N,)
         assert mask.dtype == torch.float32
@@ -87,10 +87,12 @@ class TestMotifFactory:
 
         N = 20
         res_mask = torch.ones(N, dtype=torch.float32)
+        plddt_mask = torch.ones(N, dtype=torch.float32)
         trans_1 = torch.randn((N, 3), dtype=torch.float32) * 10
 
         diffuse_mask = factory.generate_masked_neighbors_diffuse_mask(
             res_mask=res_mask,
+            plddt_mask=plddt_mask,
             trans_1=trans_1,
         )
 
@@ -113,15 +115,17 @@ class TestMotifFactory:
 
         N = 20
         res_mask = torch.ones(N, dtype=torch.float32)
+        plddt_mask = torch.ones(N, dtype=torch.float32)
         trans_1 = torch.randn((N, 3), dtype=torch.float32) * 10
 
         diffuse_mask = factory.generate_densest_neighbors_diffuse_mask(
             res_mask=res_mask,
+            plddt_mask=plddt_mask,
             trans_1=trans_1,
         )
 
         assert (
-                diffuse_mask.shape == res_mask.shape
+            diffuse_mask.shape == res_mask.shape
         ), "Output mask shape should match input mask shape"
         assert (
             diffuse_mask == 1.0
