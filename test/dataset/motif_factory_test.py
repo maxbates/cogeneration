@@ -76,6 +76,60 @@ class TestMotifFactory:
         total_length = sum(seg.length for seg in segments)
         assert total_length == diffuse_mask.size(0)
 
+    def test_generate_masked_neighbors_diffuse_mask(self):
+        """
+        Test that generate_segments_from_diffuse_mask produces correct segments
+        when using a fixed scale factor of 1.0 (no length change).
+        """
+        rng = default_rng(0)
+        cfg = DatasetInpaintingConfig()
+        factory = MotifFactory(cfg=cfg, rng=rng)
+
+        N = 20
+        res_mask = torch.ones(N, dtype=torch.float32)
+        trans_1 = torch.randn((N, 3), dtype=torch.float32) * 10
+
+        diffuse_mask = factory.generate_masked_neighbors_diffuse_mask(
+            res_mask=res_mask,
+            trans_1=trans_1,
+        )
+
+        assert (diffuse_mask == 0.0).sum() <= N * cfg.max_percent_motifs
+        assert (diffuse_mask == 0.0).sum() >= N * cfg.min_percent_motifs
+        assert (
+            diffuse_mask.shape == res_mask.shape
+        ), "Output mask shape should match input mask shape"
+        assert (
+            diffuse_mask == 1.0
+        ).any(), "At least one residue should remain scaffolded"
+        assert (
+            diffuse_mask == 0.0
+        ).any(), "At least one residue should be part of the motif"
+
+    def test_generate_densest_neighbors_diffuse_mask(self):
+        cfg = DatasetInpaintingConfig()
+        rng = default_rng(seed=0)
+        factory = MotifFactory(cfg=cfg, rng=rng)
+
+        N = 20
+        res_mask = torch.ones(N, dtype=torch.float32)
+        trans_1 = torch.randn((N, 3), dtype=torch.float32) * 10
+
+        diffuse_mask = factory.generate_densest_neighbors_diffuse_mask(
+            res_mask=res_mask,
+            trans_1=trans_1,
+        )
+
+        assert (
+                diffuse_mask.shape == res_mask.shape
+        ), "Output mask shape should match input mask shape"
+        assert (
+            diffuse_mask == 1.0
+        ).any(), "At least one residue should remain scaffolded"
+        assert (
+            diffuse_mask == 0.0
+        ).any(), "At least one residue should be part of the motif"
+
     def test_segments_from_contigmap(self):
         cfg = DatasetInpaintingConfig()
         rng = default_rng(0)

@@ -541,6 +541,17 @@ class DatasetFilterConfig(BaseClassConfig):
     num_chains: List[int] = field(default_factory=lambda: [1])
 
 
+class DatasetInpaintingMotifStrategy(StrEnum):
+    # single motif
+    single_motif = "single_motif"
+    # [min_num_motifs, max_num_motifs], skewed toward fewer
+    variable_motifs = "variable_motifs"
+    # sample 1 res position, sample N, mask closest N neighbors
+    random_neighbors = "random_neighbors"
+    # sample highly interacting res, mask neighbors < distance threshold
+    densest_neighbors = "densest_neighbors"
+
+
 @dataclass
 class DatasetInpaintingConfig(BaseClassConfig):
     """
@@ -549,17 +560,23 @@ class DatasetInpaintingConfig(BaseClassConfig):
 
     # % of time unconditional, i.e. not motif selected. 0% in FoldFlow.
     unconditional_percent: float = 0.2
-    # number of possible motifs
-    min_num_motifs: int = 1
-    max_num_motifs: int = 5
-    # fraction of residues to be in motif
-    min_percent_motifs: float = 0.05
-    max_percent_motifs: float = 0.50
+    # fraction of residues to be in motif (remainder to be diffused)
+    min_percent_motifs: float = 0.10
+    max_percent_motifs: float = 0.70
+    # there are several methods supported for picking motifs
+    # TODO allow specifying multiple, with a weighting for each
+    strategy: DatasetInpaintingMotifStrategy = (
+        DatasetInpaintingMotifStrategy.variable_motifs
+    )
+    # Strategy-dependent parameters
     # motif length bounds
     min_motif_len: int = 8
     max_motif_len: int = 768
     # minimal spacing between motifs (i.e. min scaffold length)
     min_padding: int = 3
+    # for variable number of motifs
+    min_num_motifs: int = 1
+    max_num_motifs: int = 5
 
 
 # dataset_metadata_dir_path is the root directory for dataset / metadata files

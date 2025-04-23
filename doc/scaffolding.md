@@ -130,34 +130,19 @@ https://github.com/microsoft/protein-frame-flow
     - [x] interpolant - corrupt_batch() 
     - [x] interpolant - sample()
     - [x] inference for inpainting works 
-    - [ ] evalrunner test for inpainting
+    - [-] evalrunner test for inpainting -- unnecessary
     - [x] metrics for inpainting
 
 ## Future Work
 
-- ESM embeddings
-    - Particularly if only sequence is fixed, and structure is interpolated, should get embedding given sequence + structure. Currently, its primarily structure.
-    - Because some sequence is always defined (the motifs), and the intermediate sequence is discrete, can use ESM to get an embedding
-    - Can get both a single and pair representation, replacing `node_feature_net` and `edge_feature_net`
-    - In theory, should improve our ability to unmask sequences...
-    - FoldFlow2 also uses FoldingBlocks instead of IPA...
-    - [ ] Replace `node_feature_net` and `edge_feature_net` with ESM embeddings
-        - ESM should be frozen
-    - [ ] Improve sequence prediction using ESM embeddings. How different is unmasking in ESM using logits?
-    - [ ] Cfg option to use ESM
-        - [ ] Specify ESM model size
-    - Should only work with tasks where sequence is provided, e.g. inpainting and forward_folding
-        - [ ] validate approach with forward_folding
-        - [ ] compare IPA to folding blocks approach
-
 - Motif Selection
     - [x] set up to allow other methods. abstract into class.
     - [ ] allow trimming low pLDDT ends before selection
-    - [ ] interacting residues or potential active sites 
+    - [x] interacting residues or potential active sites 
     - [ ] cross-chain interactions
         - can we augment dataset looking for large monomers with interacting motifs?
     - [ ] based on secondary structure? e.g. enrich for beta sheets
-    - [ ] Allow selecting a residue and then removing / keeping residues within some distance
+    - [x] Allow selecting a residue and then removing / keeping residues within some distance
 
 - Amino acid corruption
     - [ ] Currently, sequence is fixed, i.e. whole process is motif-sequence-conditioned
@@ -170,14 +155,20 @@ https://github.com/microsoft/protein-frame-flow
     
 - Inference
     - [ ] make inference easier, e.g. to sample around some motif taken from a protein
-    - [ ] support parsing RFDiffusion style contigmaps. See FrameFlow.
+    - [x] support parsing RFDiffusion style contigmaps. See FrameFlow.
+    - [ ] script to take contigmap and sample
     
 - Metrics
     - [ ] secondary structure of scaffolds, clashes in scaffolds
+    - [ ] novelty - foldseek against PDB (cluster designs first)
+
+- Time embeddings
+    - [ ] set time to ~t=1 (e.g. t = 1-1e-5) in embedding sequence or structure  ?
 
 - Benchmarks
     - [ ] Take benchmark dataset + dataloader from FrameFlow
         - https://github.com/microsoft/protein-frame-flow/blob/main/experiments/utils.py#L45
+    - [ ] look at MotifBench
     
 - Scaffolding modeling Features
     - [ ] Option to only fix structure, not sequence

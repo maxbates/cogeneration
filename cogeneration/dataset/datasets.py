@@ -529,6 +529,9 @@ class BaseDataset(Dataset):
 
         # res_mask for residues under consideration
         res_mask = torch.tensor(processed_file[dpc.bb_mask]).int()
+        # pull out res_idx and chain_idx
+        res_idx = torch.tensor(processed_file[dpc.residue_index])
+        chain_idx = torch.tensor(processed_file[dpc.chain_index])
 
         # Mask low pLDDT residues
         res_plddt = torch.tensor(processed_file[dpc.b_factors][:, 1])
@@ -540,7 +543,15 @@ class BaseDataset(Dataset):
         if task == DataTaskEnum.hallucination:
             diffuse_mask = torch.ones_like(res_mask).bool()
         elif task == DataTaskEnum.inpainting:
-            diffuse_mask = motif_factory.generate_diffuse_mask(res_mask=res_mask)
+            diffuse_mask = motif_factory.generate_diffuse_mask(
+                res_mask=res_mask,
+                plddt_mask=plddt_mask,
+                chain_idx=chain_idx,
+                res_idx=res_idx,
+                trans_1=trans_1,
+                rotmats_1=rotmats_1,
+                aatypes_1=aatypes_1,
+            )
         else:
             raise ValueError(f"Unknown task {task}")
 
@@ -555,8 +566,8 @@ class BaseDataset(Dataset):
             bp.trans_1: trans_1,
             bp.rotmats_1: rotmats_1,
             bp.torsion_angles_sin_cos_1: chain_feats[dtc.torsion_angles_sin_cos],
-            bp.chain_idx: torch.tensor(processed_file[dpc.chain_index]),
-            bp.res_idx: torch.tensor(processed_file[dpc.residue_index]),
+            bp.chain_idx: chain_idx,
+            bp.res_idx: res_idx,
             bp.res_plddt: res_plddt,
             bp.diffuse_mask: diffuse_mask,
             bp.plddt_mask: plddt_mask,

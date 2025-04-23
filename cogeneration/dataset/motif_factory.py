@@ -7,7 +7,10 @@ from typing import List, Optional
 import numpy as np
 import torch
 
-from cogeneration.config.base import DatasetInpaintingConfig
+from cogeneration.config.base import (
+    DatasetInpaintingConfig,
+    DatasetInpaintingMotifStrategy,
+)
 
 
 @dataclass
@@ -137,12 +140,15 @@ class MotifFactory:
         rng = self.rng
 
         motif_length = rng.integers(
-            max(cfg.min_motif_len, floor(num_res * cfg.min_percent_motifs)),
-            min(cfg.max_motif_len + 1, ceil(num_res * cfg.max_percent_motifs)),
+            max(self.cfg.min_motif_len, floor(num_res * self.cfg.min_percent_motifs)),
+            min(
+                self.cfg.max_motif_len + 1, ceil(num_res * self.cfg.max_percent_motifs)
+            ),
         )
 
         motif_start = rng.integers(
-            low=cfg.min_padding, high=num_res - motif_length - cfg.min_padding + 1
+            low=self.cfg.min_padding,
+            high=num_res - motif_length - self.cfg.min_padding + 1,
         )
         motif_end = motif_start + motif_length
 
@@ -167,32 +173,34 @@ class MotifFactory:
         which would subsequently be masked out.
         """
         num_res = len(res_mask)
-        cfg = self.cfg
-        rng = self.rng
 
         # Choose how many motifs to create (skewed toward small numbers)
-        possible_motifs = list(range(cfg.min_num_motifs, cfg.max_num_motifs + 1))
-        weights = [1.0 / ((m + 1) ** 1.5) for m in possible_motifs]
+        possible_num_motifs = list(
+            range(self.cfg.min_num_motifs, self.cfg.max_num_motifs + 1)
+        )
+        weights = [1.0 / ((m + 1) ** 1.5) for m in possible_num_motifs]
         probs = [w / sum(weights) for w in weights]
-        num_motifs = rng.choice(possible_motifs, p=probs)
+        num_motifs = self.rng.choice(possible_num_motifs, p=probs)
 
         # Compute how many residues in total will become motifs
         min_motif_total = max(
             # lower bound target percentage
-            floor(cfg.min_percent_motifs * num_res),
+            floor(self.cfg.min_percent_motifs * num_res),
             # require minimum motif length for each motif
-            num_motifs * cfg.min_motif_len,
+            num_motifs * self.cfg.min_motif_len,
         )
         max_motif_total = min(
             # upper bound target percentage
-            ceil(cfg.max_percent_motifs * num_res),
+            ceil(self.cfg.max_percent_motifs * num_res),
             # cap at maximum motif length
-            num_motifs * cfg.max_motif_len,
+            num_motifs * self.cfg.max_motif_len,
             # cap at remaining sequence for motifs accounting for padding
-            num_res - (num_motifs - 1) * cfg.min_padding,
+            num_res - (num_motifs - 1) * self.cfg.min_padding,
         )
         max_motif_total = max(max_motif_total, min_motif_total)  # ensure max >= min
-        total_motif_length = rng.integers(low=min_motif_total, high=max_motif_total + 1)
+        total_motif_length = self.rng.integers(
+            low=min_motif_total, high=max_motif_total + 1
+        )
 
         # Break total_motif_length into lengths for each motif
         lengths = []
@@ -201,11 +209,11 @@ class MotifFactory:
             if i < num_motifs - 1:
                 # Ensure there's enough room left for the remaining motifs (min lengths)
                 max_len_for_current = (
-                    leftover - (num_motifs - i - 1) * cfg.min_motif_len
+                    leftover - (num_motifs - i - 1) * self.cfg.min_motif_len
                 )
-                length = rng.integers(
-                    low=cfg.min_motif_len,
-                    high=min(cfg.max_motif_len, max_len_for_current) + 1,
+                length = self.rng.integers(
+                    low=self.cfg.min_motif_len,
+                    high=min(self.cfg.max_motif_len, max_len_for_current) + 1,
                 )
                 leftover -= length
             else:
@@ -216,11 +224,11 @@ class MotifFactory:
 
         # Pick start positions
         # Count remaining residues after motifs + minimal padding
-        total_padding = (num_motifs - 1) * cfg.min_padding
+        total_padding = (num_motifs - 1) * self.cfg.min_padding
         leftover_space = max(num_res - (total_motif_length + total_padding), 0)
         # Pick num_motifs random positions within [0, leftover_space] to use as starts
         if leftover_space > 0:
-            offsets = rng.choice(
+            offsets = self.rng.choice(
                 range(leftover_space + 1), size=num_motifs, replace=False
             )
         else:
@@ -233,7 +241,10 @@ class MotifFactory:
             previous_motif_length = lengths[i - 1]
             position_gap = offsets[i] - offsets[i - 1]
             next_start = (
-                previous_start + previous_motif_length + cfg.min_padding + position_gap
+                previous_start
+                + previous_motif_length
+                + self.cfg.min_padding
+                + position_gap
             )
             motif_starts.append(next_start)
 
@@ -248,14 +259,107 @@ class MotifFactory:
 
         return diffuse_mask
 
-    def generate_diffuse_mask(self, res_mask: torch.Tensor) -> torch.Tensor:
+    def generate_masked_neighbors_diffuse_mask(
+        self,
+        res_mask: torch.Tensor,
+        trans_1: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Pick a residue, mask N closest residues as scaffold, remaining structure as motif
+        This method is similar to the published FoldFold2 method
+        """
+        num_res = len(res_mask)
+
+        dist2d = torch.linalg.norm(trans_1[:, None, :] - trans_1[None, :, :], dim=-1)
+
+        # pick a random residue
+        seed_idx = self.rng.integers(low=0, high=num_res)
+        # sample a number of residues that will be scaffolded. ignore `motif_length` criteria, go off percentage.
+        scaffold_length = self.rng.integers(
+            num_res - ceil(num_res * self.cfg.max_percent_motifs),
+            num_res - floor(num_res * self.cfg.min_percent_motifs),
+        )
+
+        # get a distance cut off
+        seed_dists = dist2d[seed_idx]
+        dist_cutoff = torch.sort(seed_dists)[0][scaffold_length]
+
+        # set the mask to all residues within the cutoff
+        diffuse_mask = (seed_dists <= dist_cutoff).float()
+        return diffuse_mask
+
+    def generate_densest_neighbors_diffuse_mask(
+        self,
+        res_mask: torch.Tensor,
+        trans_1: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Sample a residue with many neighbors, mask all neighbors within a distance threshold
+        """
+        num_res = len(res_mask)
+
+        # use 8.0 instead of 6.0 to allow picking up residues just outside "interaction" range
+        interaction_distance_threshold = 8.0
+        # larger distance for mask
+        mask_distance_threshold = 12.0
+
+        dist2d = torch.linalg.norm(trans_1[:, None, :] - trans_1[None, :, :], dim=-1)
+
+        # weight each residue by the number of neighbors within the interaction distance
+        # count neighbors within interaction threshold (exclude self)
+        neighbor_counts = (dist2d <= interaction_distance_threshold).sum(dim=1) - 1
+        # only keep residues with at least 3 neighbors (at least one more than immediate neighbors)
+        valid = neighbor_counts >= 3
+        if valid.sum() == 0:
+            probs = torch.ones_like(neighbor_counts, dtype=torch.float)
+        else:
+            weights = neighbor_counts.clone().float() ** 1.5
+            weights[~valid] = 0.0
+            probs = weights / weights.sum()
+
+        # sample a seed residue index
+        seed_idx = int(torch.multinomial(probs, num_samples=1).item())
+
+        # cap `mask_distance_threshold` using maximum scaffold length
+        seed_dists = dist2d[seed_idx]
+        max_scaffold_length = num_res - ceil(self.cfg.min_percent_motifs * num_res)
+        max_scaffold_length_dist_cutoff = torch.sort(seed_dists)[0][max_scaffold_length]
+        mask_distance_threshold = min(
+            max_scaffold_length_dist_cutoff, mask_distance_threshold
+        )
+
+        # mask all residues within the mask threshold of that seed
+        diffuse_mask = (dist2d[seed_idx] <= mask_distance_threshold).float()
+        return diffuse_mask
+
+    def generate_diffuse_mask(
+        self,
+        res_mask: torch.Tensor,
+        plddt_mask: torch.Tensor,
+        chain_idx: torch.Tensor,
+        res_idx: torch.Tensor,
+        trans_1: torch.Tensor,
+        rotmats_1: torch.Tensor,
+        aatypes_1: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Main entrypoint to get a diffuse_mask for a given set of residues.
         """
         # Some percentage of the time, diffuse everything to effectively do unconditional generation
         if random.random() < self.cfg.unconditional_percent:
-            diffuse_mask = torch.ones_like(res_mask)
-        else:
-            diffuse_mask = self.generate_multiple_motif_diffuse_mask(res_mask)
+            return torch.ones_like(res_mask)
 
-        return diffuse_mask
+        if self.cfg.strategy == DatasetInpaintingMotifStrategy.single_motif:
+            return self.generate_single_motif_diffuse_mask(res_mask=res_mask)
+        elif self.cfg.strategy == DatasetInpaintingMotifStrategy.variable_motifs:
+            return self.generate_multiple_motif_diffuse_mask(res_mask=res_mask)
+        elif self.cfg.strategy == DatasetInpaintingMotifStrategy.random_neighbors:
+            return self.generate_masked_neighbors_diffuse_mask(
+                res_mask=res_mask, trans_1=trans_1
+            )
+        elif self.cfg.strategy == DatasetInpaintingMotifStrategy.densest_neighbors:
+            return self.generate_densest_neighbors_diffuse_mask(
+                res_mask=res_mask, trans_1=trans_1
+            )
+        else:
+            raise ValueError(f"Unknown motif selection strategy: {self.cfg.strategy}")
