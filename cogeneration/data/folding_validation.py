@@ -748,7 +748,7 @@ class FoldingValidator:
             mask: torch.Tensor,  # (N)
             pos_1: npt.NDArray,  # (N, 3, 3)
             pos_2: npt.NDArray,  # (N, 3, 3)
-        ):
+        ) -> float:
             aligned_rmsd = superimpose(
                 torch.tensor(pos_1).reshape(-1, 3)[None],  # (1, N*3, 3)
                 torch.tensor(pos_2).reshape(-1, 3)[None],  # (1, N*3, 3)

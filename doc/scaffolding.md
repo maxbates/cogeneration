@@ -136,6 +136,10 @@ https://github.com/microsoft/protein-frame-flow
 ## Future Work
 
 - [ ] Do `forward_folding` (full sequence conditioning) some percentage of the time
+    - [ ] add to config
+    - [ ] handle alongside `unconditional_percentage`
+    - [ ] Update special-casing logic like for unconditional generation
+       - if `(diffuse_mask == 1.0).all()`, need another flag to indicate `aatypes_1` fixed
 
 - Motif Selection
     - [x] set up to allow other methods. abstract into class.

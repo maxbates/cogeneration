@@ -1,6 +1,5 @@
 """
-# TODO - support multimers, more complete port from OpenFold. Or just use Openfold's directly?
-Fork of MultiFlow's IPA, which only supports monomers and drops some modules like PointProjection.
+Fork of MultiFlow's IPA, which only supports monomers (?) and drops some modules like PointProjection.
 Fork of Openfold's IPA.
 https://github.com/aqlaboratory/openfold/blob/main/openfold/model/structure_module.py
 
