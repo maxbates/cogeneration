@@ -536,6 +536,7 @@ class FlowModule(LightningModule):
         self._log_scalar("train/examples_per_second", num_batch / step_time)
 
         # inpainting / scaffolding metrics
+        # note that depending on `cfg.interpolant` some examples may be set to different subtasks.
         if self.cfg.data.task == DataTaskEnum.inpainting:
             diffuse_mask = batch[bp.diffuse_mask].float()
             scaffold_percent = torch.mean(diffuse_mask).item()
@@ -567,11 +568,17 @@ class FlowModule(LightningModule):
         csv_idx = batch[bp.csv_idx]
         diffuse_mask = batch[bp.diffuse_mask]
 
-        # Pick inference task corresponding to training task
+        # Get inference task corresponding to training task
         inference_task = InferenceTaskEnum.from_data_task(task=self.cfg.data.task)
-        # Handle `unconditional_percent` -> unconditional generation
-        if (diffuse_mask == 1).all() and inference_task == InferenceTaskEnum.inpainting:
-            inference_task = InferenceTaskEnum.unconditional
+
+        # TODO(inpainting) consider running validation for inpainting and unconditional generation.
+        #   However, don't jump between tasks - perhaps run both, if `prop` > 0.
+        # Like training, some proportion of batches convert `inpainting` -> `unconditional`
+        # if (
+        #     inference_task == InferenceTaskEnum.inpainting and
+        #     random() < self.cfg.interpolant.inpainting_unconditional_prop
+        # ):
+        #     inference_task = InferenceTaskEnum.unconditional
 
         # Validation can run either unconditional generation, or inpainting
         self.interpolant.set_device(res_mask.device)
@@ -648,15 +655,16 @@ class FlowModule(LightningModule):
 
         return batch_metrics_df
 
-    def predict_step(self, batch: InferenceFeatures, batch_idx: Any) -> pd.DataFrame:
+    def predict_step(
+        self, batch: InferenceFeatures, batch_idx: Any
+    ) -> Optional[pd.DataFrame]:
+        task = self.cfg.inference.task
+        res_mask = batch[bp.res_mask]
+        num_batch, sample_length = res_mask.shape
+
         # Create an inference-specific interpolant
         interpolant = Interpolant(self.cfg.inference.interpolant)
-
-        device = batch[bp.res_mask].device
-        interpolant.set_device(device)
-
-        task = self.cfg.inference.task
-        num_batch, sample_length = batch[bp.res_mask].shape
+        interpolant.set_device(res_mask.device)
 
         # Pull out metadata and t=1 values, if defined
         trans_1 = batch[bp.trans_1] if bp.trans_1 in batch else None
@@ -669,6 +677,9 @@ class FlowModule(LightningModule):
         aatypes_1 = batch[bp.aatypes_1] if bp.aatypes_1 in batch else None
         sample_pdb_name = batch[bp.pdb_name][0] if bp.pdb_name in batch else None
 
+        # `(diffuse_mask == 1.0).all()` for all tasks except inpainting (though loss etc. limited to `res_mask`)
+        diffuse_mask = batch[bp.diffuse_mask]
+
         # Handle single-sample and missing sample_id
         if bp.sample_id in batch:
             sample_ids = batch[bp.sample_id].squeeze().tolist()
@@ -676,16 +687,6 @@ class FlowModule(LightningModule):
             sample_ids = [0]
         sample_ids = [sample_ids] if isinstance(sample_ids, int) else sample_ids
         assert num_batch == len(sample_ids)
-
-        # `diffuse_mask` is everything for all tasks except inpainting (loss etc. limited to `res_mask`)
-        if task == InferenceTaskEnum.inpainting:
-            diffuse_mask = batch[bp.diffuse_mask]
-
-            # Handle `unconditional_percent` - If diffusing everything, treat prediction like unconditional
-            if (diffuse_mask == 1).all():
-                task = InferenceTaskEnum.unconditional
-        else:
-            diffuse_mask = torch.ones(num_batch, sample_length, device=device)
 
         # Task-specific logic for creating output `sample_dirs`
         if task == InferenceTaskEnum.unconditional:
@@ -749,7 +750,7 @@ class FlowModule(LightningModule):
             assert true_aatypes.shape == (sample_length,)
 
         # For some tasks, we have a `true_bb_pos` ground truth structure for sample metrics
-        # Note for inpainting `true_bb_pos` is masked and only defined at the motifs
+        # Note for inpainting, `true_bb_pos` is masked and only defined at the motifs
         true_bb_pos = None
         if (
             task == InferenceTaskEnum.inpainting
@@ -764,7 +765,7 @@ class FlowModule(LightningModule):
             if task == InferenceTaskEnum.inpainting:
                 mask = 1 - diffuse_mask
             else:
-                mask = torch.ones(num_batch, sample_length)
+                mask = res_mask
 
             true_bb_pos = all_atom.atom37_from_trans_rot(
                 trans=trans_1,
@@ -818,7 +819,6 @@ class FlowModule(LightningModule):
             diffuse_mask=diffuse_mask,
             chain_idx=batch[bp.chain_idx] if bp.chain_idx in batch else None,
             res_idx=batch[bp.res_idx] if bp.res_idx in batch else None,
-            separate_t=self.cfg.inference.interpolant.codesign_separate_t,
         )
 
         model_bb_trajs = to_numpy(model_traj.structure)

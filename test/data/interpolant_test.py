@@ -130,11 +130,11 @@ class TestInterpolant:
             noisy_batch[nbp.aatypes_sc] == 0
         ), "aatypes_sc should be zeroed"
 
-        # Check that t values are within expected range [min_t, 1-min_t]
+        # Check that t values are within expected range [min_t, 1]
         min_t = cfg.interpolant.min_t
         t_vals = noisy_batch[nbp.r3_t]
         assert torch.all(t_vals >= min_t - 1e-6)
-        assert torch.all(t_vals <= (1 - min_t) + 1e-6)
+        assert torch.all(t_vals <= 1 + 1e-6)
 
         # Corrupted translations and rotations should differ from originals
         trans_diff = noisy_batch[nbp.trans_t] - batch[bp.trans_1]
@@ -178,14 +178,15 @@ class TestInterpolantSample:
     """Test suite for Interpolant.sample()."""
 
     def _run_sample(self, cfg: Config, batch, task: InferenceTaskEnum):
-        cfg.interpolant.sampling.num_timesteps = 2  # run quickly with few timesteps
+        cfg.inference.interpolant.sampling.num_timesteps = 2  # run quickly with few timesteps
+        cfg.interpolant.sampling.num_timesteps = 4  # ensure don't use training interpolant
 
-        interpolant = Interpolant(cfg.interpolant)
+        interpolant = Interpolant(cfg.inference.interpolant)
         interpolant.set_device(torch.device("cpu"))
 
         B, N = batch[bp.res_mask].shape
         num_tokens = interpolant.num_tokens
-        T = cfg.interpolant.sampling.num_timesteps
+        T = cfg.inference.interpolant.sampling.num_timesteps
 
         # Dummy model
         class ModelStub:

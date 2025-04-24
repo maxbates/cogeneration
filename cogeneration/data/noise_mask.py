@@ -8,7 +8,7 @@ from cogeneration.data.const import MASK_TOKEN_INDEX
 def centered_gaussian(num_batch, num_res, device: torch.device, n_bb_atoms: int = 3):
     """
     Generates a tensor of shape (num_batch, num_res, 3) with values sampled from a centered Gaussian distribution.
-    e.g. t=0 translations
+    e.g. t=0 translations, in nanometer scale.
     """
     noise = torch.randn(num_batch, num_res, n_bb_atoms, device=device)
     return noise - torch.mean(noise, dim=-2, keepdims=True)

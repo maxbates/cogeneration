@@ -133,13 +133,18 @@ https://github.com/microsoft/protein-frame-flow
     - [-] evalrunner test for inpainting -- unnecessary
     - [x] metrics for inpainting
 
+- [x] Do `forward_folding` (full sequence conditioning) some percentage of the time
+    - [x] add to config
+    - [x] handle alongside `unconditional_percentage`
+    - [x] Update special-casing logic like for unconditional generation
+       - if `(diffuse_mask == 1.0).all()`, need another flag to indicate `aatypes_1` fixed
+
 ## Future Work
 
-- [ ] Do `forward_folding` (full sequence conditioning) some percentage of the time
-    - [ ] add to config
-    - [ ] handle alongside `unconditional_percentage`
-    - [ ] Update special-casing logic like for unconditional generation
-       - if `(diffuse_mask == 1.0).all()`, need another flag to indicate `aatypes_1` fixed
+- Consider setting separate `diffuse_mask` for sequence and structure explicitly
+    - Currently, the model is taking `diffuse_mask` for the scaffolds only, but the motifs are diffusing at the same time
+    - Might simplify some of the special handling in `corrupt_batch()` and `sample()`...
+    - Want to maintain compatibility with MultiFlow...
 
 - Motif Selection
     - [x] set up to allow other methods. abstract into class.

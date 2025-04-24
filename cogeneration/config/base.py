@@ -464,22 +464,36 @@ class InterpolantSamplingConfig(BaseClassConfig):
 
 @dataclass
 class InterpolantConfig(BaseClassConfig):
+    """
+    Interpolant configuration.
+    Note there is a training interpolant, and a sampling interpolant, with their own configs.
+
+    Note on `codesign_separate_t`:
+    During training we can "overload" the training tasks by specifying `codesign_separate_t`,
+    such that some proportion of the batch is allocated to other tasks like `forward_folding` or `inverse_folding`,
+    by fixing the sequence or structure, respectively, at t=1.
+    During training in `corrupt_batch()`, effectively sets some proportion of the batch to be
+        `forward_folding` or `inverse_folding` (i.e. structure if inverse, sequence if forward)
+        to enable these tasks in inference (proportions cfg below).
+        In addition, the remainder of the time, the structure and sequence are given a different `t`.
+    During sampling in `sample()`, for tasks with fixed domains (i.e. forward/inverse folding),
+        those domains are fixed at ~t=1. Value should match how the model was trained for these tasks.
+    """
+
     min_t: float = 1e-2
-    # kappa allows scaling rotation t exponentially during sampling
-    provide_kappa: bool = True
-    hierarchical_t: bool = False
-    separate_t: bool = False  # TODO drop, unused / refactor into rots/trans/aa
-    # Use separate t times for rots / trans / aatypes in batch corruption
-    # Effectively sets some proportion of the batch to be forward_folding / inverse_folding
-    codesign_separate_t: bool = (
-        "${ternary:${equals: ${inference.task}, 'unconditional'}, False, True}"
-    )
-    # proportion of samples allocated to forward or inverse folding, if using codesign_separate_t
-    codesign_forward_fold_prop: float = 0.1
-    codesign_inverse_fold_prop: float = 0.1
+    # `codesign_separate_t` allows separate `t` times for rots / trans / aatypes so fixed domains are at ~t=1.
+    codesign_separate_t: bool = True
+    # `forward_folding` proportion of samples; requires `codesign_separate_t`
+    codesign_forward_fold_prop: float = 0.1  # default 0.1 in public MultiFlow
+    # `inverse_folding` proportion of samples; requires `codesign_separate_t`
+    codesign_inverse_fold_prop: float = 0.1  # default 0.1 in public MultiFlow
+    # `inpainting_unconditional_prop` in training converts some `inpainting` to `unconditional` batches.
+    inpainting_unconditional_prop: float = 0.2
     # enable self-conditioning
     self_condition: bool = "${model.edge_features.self_condition}"
     self_condition_prob: float = 0.5  # 0.5 in public MultiFlow
+    # kappa allows scaling rotation t exponentially during sampling
+    provide_kappa: bool = True
 
     # sub-modules
     rots: InterpolantRotationsConfig = field(default_factory=InterpolantRotationsConfig)
@@ -556,8 +570,6 @@ class DatasetInpaintingConfig(BaseClassConfig):
     Configuration for generating motifs / scaffolding
     """
 
-    # % of time unconditional, i.e. not motif selected. 0% in FoldFlow.
-    unconditional_percent: float = 0.2
     # target fraction of residues to be in motif (remainder to be diffused)
     min_percent_motifs: float = 0.10
     max_percent_motifs: float = 0.70
@@ -1044,7 +1056,7 @@ class Config(BaseClassConfig):
         raw_cfg.dataset.max_eval_length = 63
 
         # inpainting, always generate motifs
-        raw_cfg.dataset.inpainting.unconditional_percent = 0.0
+        raw_cfg.interpolant.inpainting_unconditional_prop = 0.0
 
         return raw_cfg
 
@@ -1072,6 +1084,8 @@ class Config(BaseClassConfig):
         # Other parameters as defined by public codebase
         raw_cfg.model.node_features.embed_chain = False
         raw_cfg.model.edge_features.embed_chain = False
+        raw_cfg.interpolant.provide_kappa = False
+        raw_cfg.inference.interpolant.provide_kappa = False
 
         # Weights
         # assume we have public weights available, use as default checkpoint

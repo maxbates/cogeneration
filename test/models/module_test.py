@@ -1,14 +1,9 @@
 import numpy as np
 import pandas as pd
-from torch.utils.data import DataLoader
 
 from cogeneration.config.base import InterpolantTranslationsScheduleEnum
 from cogeneration.data.residue_constants import restypes_with_x
-from cogeneration.dataset.datasets import DatasetConstructor
-from cogeneration.dataset.test_utils import (
-    create_pdb_dataloader,
-    create_pdb_noisy_batch,
-)
+from cogeneration.dataset.test_utils import create_pdb_noisy_batch
 from cogeneration.models.module import FlowModule, TrainingLosses
 from cogeneration.type.batch import BatchProps as bp
 from cogeneration.type.metrics import MetricName
@@ -42,6 +37,29 @@ class TestFlowModule:
 
         # create batch using stochastic paths
         pdb_noisy_batch = create_pdb_noisy_batch(mock_cfg)
+
+        module = FlowModule(mock_cfg)
+        module.training_step(pdb_noisy_batch)
+
+    def test_training_step_inpainting(self, mock_cfg_uninterpolated):
+        mock_cfg_uninterpolated.data.task = DataTaskEnum.inpainting
+        mock_cfg_uninterpolated.interpolant.inpainting_unconditional_prop = 0.0
+        mock_cfg = mock_cfg_uninterpolated.interpolate()
+
+        pdb_noisy_batch = create_pdb_noisy_batch(mock_cfg)
+        assert pdb_noisy_batch[bp.diffuse_mask].mean() > 0.1
+        assert pdb_noisy_batch[bp.diffuse_mask].mean() < 0.9
+
+        module = FlowModule(mock_cfg)
+        module.training_step(pdb_noisy_batch)
+
+    def test_training_step_inpainting_but_actually_unconditional(self, mock_cfg_uninterpolated):
+        mock_cfg_uninterpolated.data.task = DataTaskEnum.inpainting
+        mock_cfg_uninterpolated.interpolant.inpainting_unconditional_prop = 1.0
+        mock_cfg = mock_cfg_uninterpolated.interpolate()
+
+        pdb_noisy_batch = create_pdb_noisy_batch(mock_cfg)
+        assert (pdb_noisy_batch[bp.diffuse_mask] == 1.0).all()
 
         module = FlowModule(mock_cfg)
         module.training_step(pdb_noisy_batch)
@@ -168,40 +186,6 @@ class TestFlowModule:
 
         module = FlowModule(mock_cfg)
         batch = next(iter(mock_pred_inpainting_dataloader))
-
-        mock_folding_validation(
-            batch=batch,
-            cfg=mock_cfg,
-            n_inverse_folds=mock_cfg.folding.seq_per_sample,
-        )
-
-        # just test that it works
-        _ = module.predict_step(batch, 0)
-
-    def test_predict_step_inpainting_but_actually_unconditional_works(
-        self,
-        mock_cfg_uninterpolated,
-        mock_folding_validation,
-    ):
-        # modify config for inpainting, but actually unconditional
-        mock_cfg_uninterpolated.inference.task = InferenceTaskEnum.inpainting
-        mock_cfg_uninterpolated.dataset.inpainting.unconditional_percent = 1.0
-        mock_cfg = mock_cfg_uninterpolated.interpolate()
-        assert mock_cfg.dataset.inpainting.unconditional_percent == 1.0
-
-        # Explicitly create dataset, to pass mock_cfg
-        dataloader = create_pdb_dataloader(
-            cfg=mock_cfg,
-            task=DataTaskEnum.inpainting,
-            training=False,
-            eval_batch_size=1,
-        )
-        batch = next(iter(dataloader))
-
-        # ensure get an unconditional-like diffuse mask
-        assert (batch[bp.diffuse_mask] == 1).all()
-
-        module = FlowModule(mock_cfg)
 
         mock_folding_validation(
             batch=batch,

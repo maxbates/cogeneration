@@ -541,7 +541,7 @@ class BaseDataset(Dataset):
 
         # Determine diffuse_mask depending on task
         if task == DataTaskEnum.hallucination:
-            diffuse_mask = torch.ones_like(res_mask).bool()
+            diffuse_mask = torch.ones_like(res_mask)
         elif task == DataTaskEnum.inpainting:
             diffuse_mask = motif_factory.generate_diffuse_mask(
                 res_mask=res_mask,
@@ -556,7 +556,7 @@ class BaseDataset(Dataset):
             raise ValueError(f"Unknown task {task}")
 
         # Ensure have a valid `diffuse_mask` for modeling
-        if torch.sum(diffuse_mask) < 1:
+        if torch.sum(diffuse_mask) == 0:
             diffuse_mask = torch.ones_like(diffuse_mask)
         diffuse_mask = diffuse_mask.int()
 

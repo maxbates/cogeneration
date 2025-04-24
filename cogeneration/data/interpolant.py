@@ -1,6 +1,7 @@
 import copy
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from random import random
 from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
@@ -134,9 +135,9 @@ class Interpolant:
     """
     Interpolant is responsible for generating noise, corrupting samples, and sampling from learned vector fields.
 
-    It's primary roles are to:
+    It has two almost-but-not-quite separate roles:
     (1) corrupt batches with noise, generating intermediate samples at some time `t`
-    (2) generates samples, interpolating each modality using the learned vector fields over t=[0, 1]
+    (2) generates samples, interpolating each modality using the learned vector fields over t=[0, 1] from noise to sample.
 
     Works across 3 modalties: translations and rotations (i.e. backbone frames), and amino acid types (i.e. sequence).
 
@@ -366,78 +367,133 @@ class Interpolant:
         # only corrupt residues in `diffuse_mask`
         return mask_blend_1d(aatypes_t, aatypes_1, diffuse_mask)
 
-    def corrupt_batch(self, batch: BatchFeatures, task: DataTaskEnum) -> NoisyFeatures:
-        """
-        Sample t to generate a noisy batch from the input batch.
-        """
-        noisy_batch: NoisyFeatures = copy.deepcopy(batch)
-
-        trans_1 = batch[bp.trans_1]  # [B, N, 3] in Angstroms
-        rotmats_1 = batch[bp.rotmats_1]  # [B, N, 3, 3]
-        aatypes_1 = batch[bp.aatypes_1]  # [B, N]
-        res_mask = batch[bp.res_mask]  # [B, N]
-        diffuse_mask = batch[bp.diffuse_mask]  # [B, N]
+    def _set_corruption_times(
+        self,
+        noisy_batch: NoisyFeatures,
+        task: DataTaskEnum,
+    ):
+        res_mask = noisy_batch[bp.res_mask]  # (B, N)
         num_batch, num_res = res_mask.shape
 
-        # For inpainting, the motifs are interpolated over time, so we corrupt the entire structure.
-        # Only the motif sequence is fixed.
-        # HACK - should be a better way to pass this in than `task` argument.
-        # TODO(inpainting-fixed) support fixed motifs
-        if task == DataTaskEnum.inpainting:
-            diffuse_mask_structure = res_mask
-        else:
-            diffuse_mask_structure = diffuse_mask
-
         if self.cfg.codesign_separate_t:
-            # Generate random values `u` to determine the type of corruption
             u = torch.rand((num_batch,), device=self._device)
-            # Assign the type of corruption based on `u` and proportion for forward/inverse folding
-            forward_fold_mask = (u < self.cfg.codesign_forward_fold_prop).float()
-            inverse_fold_mask = (
-                u
-                < self.cfg.codesign_inverse_fold_prop
-                + self.cfg.codesign_forward_fold_prop
-            ).float() * (u >= self.cfg.codesign_forward_fold_prop).float()
 
-            # Sample t values for normal structure and categorical corruption
+            # Sample t values for normal structure and categorical corruption.
+            # In `codesign_separate_t` each has its own `t`, separate from fixed domains set to t=1.
             normal_structure_t = self.sample_t(num_batch)
-            inverse_fold_structure_t = torch.ones((num_batch,), device=self._device)
             normal_cat_t = self.sample_t(num_batch)
-            forward_fold_cat_t = torch.ones((num_batch,), device=self._device)
+            ones_t = torch.ones((num_batch,), device=self._device)
+
+            # determine multi-task allocations. Each DataTaskEnum supports different multi-tasks.
+            if task == DataTaskEnum.inpainting:
+                # proportions: unconditional, forward, inverse, rest = normal inpainting
+                unc = self.cfg.inpainting_unconditional_prop
+                fwd = self.cfg.codesign_forward_fold_prop
+                inv = self.cfg.codesign_inverse_fold_prop
+                unconditional_mask = (u < unc).bool()
+                forward_fold_mask = ((u >= unc) & (u < unc + fwd)).float()
+                inverse_fold_mask = ((u >= unc + fwd) & (u < unc + fwd + inv)).float()
+
+                # for `inpainting -> unconditional` examples, override `diffuse_mask` to 1.0
+                orig_diffuse = noisy_batch[bp.diffuse_mask]
+                noisy_batch[bp.diffuse_mask] = torch.where(
+                    unconditional_mask[:, None],
+                    torch.ones_like(orig_diffuse),
+                    orig_diffuse,
+                ).float()
+
+            elif task == DataTaskEnum.hallucination:
+                # proportions: forward, inverse, rest = normal unconditional
+                fwd = self.cfg.codesign_forward_fold_prop
+                inv = self.cfg.codesign_inverse_fold_prop
+                forward_fold_mask = (u < fwd).float()
+                inverse_fold_mask = ((u >= fwd) & (u < fwd + inv)).float()
+
+            else:
+                raise ValueError(f"Unknown task {task}")
 
             # If we are forward folding, then cat_t should be 1 (i.e. data, sequence)
             # If we are inverse folding or codesign then cat_t should be uniform
-            cat_t = (
-                forward_fold_mask * forward_fold_cat_t
-                + (1 - forward_fold_mask) * normal_cat_t
-            )
+            cat_t = forward_fold_mask * ones_t + (1 - forward_fold_mask) * normal_cat_t
 
             # If we are inverse folding, then structure_t should be 1 (i.e. data, structure)
             # If we are forward folding or codesign then structure_t should be uniform
             structure_t = (
-                inverse_fold_mask * inverse_fold_structure_t
+                inverse_fold_mask * ones_t
                 + (1 - inverse_fold_mask) * normal_structure_t
             )
+
+            # TODO(inpainting-fixed) support fixed motifs
+            #   Requires we have a sane way to center the structures, and tension of doing here vs in dataset.
+            #   See `scaffolding.md` for discussion.
 
             so3_t = structure_t[:, None]
             r3_t = structure_t[:, None]
             cat_t = cat_t[:, None]
 
+        # Default: single `t` time is shared by each domain
+        # TODO(inpainting) up for debate what the appropriate `t` is for the sequence.
+        #   Maybe `t + (1-t) * (1-diffuse_mask.mean())` could make sense...
         else:
-            # t is shared by each domain
             t = self.sample_t(num_batch)[:, None]
             so3_t = t
             r3_t = t
             cat_t = t
+
         noisy_batch[nbp.so3_t] = so3_t  # [B, 1]
         noisy_batch[nbp.r3_t] = r3_t  # [B, 1]
         noisy_batch[nbp.cat_t] = cat_t  # [B, 1]
+
+    def corrupt_batch(self, batch: BatchFeatures, task: DataTaskEnum) -> NoisyFeatures:
+        """
+        Corrupt `t=1` data into a noisy batch at sampled `t`.
+
+        Supports within-batch multi-task learning if `codesign_separate_t == True`.
+        This allows a wider set of tasks during inference.
+
+        Some examples in the batch are assigned t=1 values (sequence for forward_folding, structure for inverse_folding),
+        or modify the `diffuse_mask` (inpainting -> unconditional).
+
+        Fixing at t=1 has the effect of not corrupting the domain.
+        """
+        noisy_batch: NoisyFeatures = copy.deepcopy(batch)
+
+        # set t values for each domain, i.e. `bp.so3_t`, `bp.r3_t`, `bp.cat_t`, and potentially modify `diffuse_mask`.
+        self._set_corruption_times(
+            noisy_batch=noisy_batch,
+            task=task,
+        )
+
+        trans_1 = batch[bp.trans_1]  # (B, N, 3) in Angstroms
+        rotmats_1 = batch[bp.rotmats_1]  # (B, N, 3, 3)
+        aatypes_1 = batch[bp.aatypes_1]  # (B, N)
+        res_mask = batch[bp.res_mask]  # (B, N)
+        diffuse_mask = batch[bp.diffuse_mask]  # (B, N)
+        r3_t = noisy_batch[nbp.r3_t]  # (B, 1)
+        so3_t = noisy_batch[nbp.so3_t]  # (B, 1)
+        cat_t = noisy_batch[nbp.cat_t]  # (B, 1)
+
+        # Determine sequence and structure corruption masks.
+        # Inpainting:
+        #   The motifs are interpolated over time, so we corrupt the entire structure. We explicitly fix the motif.
+        #   The motif sequence is fixed. However, the rest is not, and t should be in sync across domains.
+        # For other tasks, everything is corrupted i.e. `(diffuse_mask == 1.0).all()`
+        #   Though values at t=1 effectively won't be corrupted.
+        corruption_mask_structure = diffuse_mask.clone()
+        corruption_mask_sequence = diffuse_mask
+        if task == DataTaskEnum.inpainting:
+            # any rows with a fixed motif have a `diffuse_mask.mean() < 1.0`
+            is_inpainting_mask = diffuse_mask.float().mean(dim=1) < 1.0
+            corruption_mask_structure[is_inpainting_mask] = 1.0
 
         # Apply corruptions
 
         if self.cfg.trans.corrupt:
             trans_t = self._corrupt_trans(
-                trans_1, r3_t, res_mask=res_mask, diffuse_mask=diffuse_mask_structure
+                trans_1,
+                t=r3_t,
+                res_mask=res_mask,
+                diffuse_mask=corruption_mask_structure,
             )
         else:
             trans_t = trans_1
@@ -447,7 +503,10 @@ class Interpolant:
 
         if self.cfg.rots.corrupt:
             rotmats_t = self._corrupt_rotmats(
-                rotmats_1, so3_t, res_mask=res_mask, diffuse_mask=diffuse_mask_structure
+                rotmats_1,
+                t=so3_t,
+                res_mask=res_mask,
+                diffuse_mask=corruption_mask_structure,
             )
         else:
             rotmats_t = rotmats_1
@@ -457,7 +516,10 @@ class Interpolant:
 
         if self.cfg.aatypes.corrupt:
             aatypes_t = self._corrupt_aatypes(
-                aatypes_1, cat_t, res_mask=res_mask, diffuse_mask=diffuse_mask
+                aatypes_1,
+                t=cat_t,
+                res_mask=res_mask,
+                diffuse_mask=corruption_mask_sequence,
             )
         else:
             aatypes_t = aatypes_1
@@ -774,7 +836,6 @@ class Interpolant:
         num_res: int,
         model,
         task: InferenceTaskEnum,
-        num_timesteps: Optional[int] = None,
         trans_0: Optional[torch.Tensor] = None,
         rotmats_0: Optional[torch.Tensor] = None,
         psis_0: Optional[torch.Tensor] = None,
@@ -788,11 +849,18 @@ class Interpolant:
         res_idx: Optional[torch.Tensor] = None,
         # t_nn is model/function that generates explicit time steps (r3, so3, cat) given t
         t_nn: Union[Callable[[torch.Tensor], torch.Tensor], Any] = None,
-        separate_t: bool = False,
     ) -> Tuple[SamplingTrajectory, SamplingTrajectory]:
         """
         Generate samples using the learned vector fields.
-        Special handling for forward folding, reverse folding, and separate t.
+
+        In theory, sampling is fairly straight-forward: integrate over a bunch of time steps.
+        However, there is a lot of special handling to:
+        - generate t=0 values if not provided
+        - handling each task, setting up t=0 and t=1 values, and during interpolating
+        - handling `codesign_separate_t` for fixed domains
+        - supporting self-conditioning
+        - saving each step of the trajectory (direct model output and integrated output)
+        - special handling for the final timestep
 
         Returns two trajectories:
         1) protein_trajectory / predicted states - sampled trajectory.
@@ -801,7 +869,7 @@ class Interpolant:
         2) model_trajectory / clean states - direct model output.
             Without masking or added noise. Does not involve integrating. Includes logits.
 
-        Note that while sample operates on backbones, the emitted structures are all-atom (i.e. atom37).
+        Note that while sampling operates on backbones, the emitted structures are all-atom (i.e. atom37).
 
         The general process is:
         - generate the initial noisy batch, using optional inputs if provided
@@ -810,7 +878,7 @@ class Interpolant:
             - generate rigids from the updated frames
         - perform the final step after the loop
         """
-        # task specific input checks
+        # task-specific input checks
         if task == InferenceTaskEnum.unconditional:
             assert self.cfg.trans.corrupt
             assert self.cfg.rots.corrupt
@@ -849,17 +917,20 @@ class Interpolant:
         # for inference, all residues under consideration
         res_mask = torch.ones(num_batch, num_res, device=self._device)
 
+        if chain_idx is None:
+            # Default: assumes fully-considered monomer (i.e. ~ `torch.ones`)
+            # TODO(multimer) drop monomer assumption
+            chain_idx = res_mask
         if res_idx is None:
             # Generate residue indices (shape: [num_batch, num_res])
             # Each generated sample will be the same length
+            # TODO(multimer) drop monomer assumption - util to get `res_idx` given `chain_idx`
             res_idx = torch.arange(num_res, device=self._device, dtype=torch.float32)[
                 None
             ].repeat(num_batch, 1)
-        if chain_idx is None:
-            # Default: assumes fully-considered monomer (i.e. ~ `torch.ones`)
-            chain_idx = res_mask
         if diffuse_mask is None:
             # Default: diffuse all residues under consideration
+            # TODO require argument
             diffuse_mask = res_mask
 
         # Initialize t=1 values for translations, rotations, psi, and aatypes, if not defined
@@ -915,12 +986,13 @@ class Interpolant:
             # rotmats_0 = mask_blend_3d(rotmats_0, rotmats_1, diffuse_mask)
             aatypes_0 = mask_blend_1d(aatypes_0, aatypes_1, diffuse_mask)
 
-        # Handle separate_t, i.e. when each domain has its own t
-        if separate_t:
+        # Handle `codesign_separate_t`
+        # t=0 values will be fixed to t=1 values throughout where appropriate
+        if self.cfg.codesign_separate_t:
             if task == InferenceTaskEnum.unconditional:
                 pass
             elif task == InferenceTaskEnum.inpainting:
-                pass  # treat like `unconditional`
+                pass
             elif task == InferenceTaskEnum.forward_folding:
                 aatypes_0 = aatypes_1
             elif task == InferenceTaskEnum.inverse_folding:
@@ -976,9 +1048,7 @@ class Interpolant:
         )
 
         # Set-up time
-        if num_timesteps is None:
-            num_timesteps = self.cfg.sampling.num_timesteps
-        ts = torch.linspace(self.cfg.min_t, 1.0, num_timesteps)  # cpu
+        ts = torch.linspace(self.cfg.min_t, 1.0, self.cfg.sampling.num_timesteps)  # cpu
         t_1 = ts[0]
 
         # We will integrate in a loop over ts (handling the last step after the loop)
@@ -989,12 +1059,14 @@ class Interpolant:
         aatypes_t_1 = aatypes_0
 
         for t_2 in ts[1:]:
+            # update batch values
             batch[nbp.trans_t] = trans_t_1 if self.cfg.trans.corrupt else trans_1
             batch[nbp.rotmats_t] = rotmats_t_1 if self.cfg.rots.corrupt else rotmats_1
             batch[nbp.aatypes_t] = (
                 aatypes_t_1 if self.cfg.aatypes.corrupt else aatypes_1
             )
 
+            # determine time for each domain
             t = torch.ones((num_batch, 1), device=self._device) * t_1
             if t_nn is not None:
                 (
@@ -1010,23 +1082,21 @@ class Interpolant:
                 batch[nbp.r3_t] = t
                 batch[nbp.cat_t] = t
 
-            # handle `separate_t`
-            if separate_t:
+            # If `codesign_separate_t`, fixed domains set to ~t=1 (penultimate step, take final step later)
+            if self.cfg.codesign_separate_t:
+                # TODO consider setting to t=1 to match how `codesign_separate_t` sets values in `corrupt_batch()`
+                t_minus_1 = (1 - self.cfg.min_t) * torch.ones(
+                    (num_batch, 1), device=self._device
+                )
                 if task == InferenceTaskEnum.unconditional:
                     pass
                 elif task == InferenceTaskEnum.inpainting:
                     pass
                 elif task == InferenceTaskEnum.forward_folding:
-                    batch[nbp.cat_t] = (1 - self.cfg.min_t) * torch.ones_like(
-                        batch[nbp.cat_t]
-                    )
+                    batch[nbp.cat_t] = t_minus_1
                 elif task == InferenceTaskEnum.inverse_folding:
-                    batch[nbp.r3_t] = (1 - self.cfg.min_t) * torch.ones_like(
-                        batch[nbp.r3_t]
-                    )
-                    batch[nbp.so3_t] = (1 - self.cfg.min_t) * torch.ones_like(
-                        batch[nbp.so3_t]
-                    )
+                    batch[nbp.r3_t] = t_minus_1
+                    batch[nbp.so3_t] = t_minus_1
                 else:
                     raise ValueError(f"Unknown task {task}")
 
@@ -1049,7 +1119,7 @@ class Interpolant:
                 )
             )
 
-            # Prepare for integration and update the batch for next step. Mask fixed values.
+            # Mask fixed values to prepare for integration and update the batch for next step.
             if task == InferenceTaskEnum.unconditional:
                 pass
             elif task == InferenceTaskEnum.inpainting:
@@ -1090,8 +1160,10 @@ class Interpolant:
                     batch[nbp.trans_sc] = mask_blend_2d(
                         pred_trans_1, trans_1, diffuse_mask
                     )
-                    batch[nbp.aatypes_sc] = logits_1  # sequence fixed
+                    # sequence fixed for self-conditioning
+                    batch[nbp.aatypes_sc] = logits_1
                 elif task == InferenceTaskEnum.inverse_folding:
+                    # matching Multiflow, `trans_sc` not fixed
                     batch[nbp.trans_sc] = mask_blend_2d(
                         pred_trans_1, trans_1, diffuse_mask
                     )
@@ -1156,9 +1228,11 @@ class Interpolant:
             aatypes_t_1 = aatypes_t_2
             t_1 = t_2
 
-        # We only integrated to min_t, so need to make a final step
-        t_1 = ts[-1]
-        batch["t"] = torch.ones((num_batch, 1), device=self._device) * t_1
+        # We only integrated to 1-min_t, so need to make a final step
+        t = torch.ones((num_batch, 1), device=self._device) * ts[-1]
+        batch[nbp.so3_t] = t
+        batch[nbp.r3_t] = t
+        batch[nbp.cat_t] = t
 
         batch[nbp.trans_t] = trans_t_1 if self.cfg.trans.corrupt else trans_1
         batch[nbp.rotmats_t] = rotmats_t_1 if self.cfg.rots.corrupt else rotmats_1

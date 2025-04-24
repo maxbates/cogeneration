@@ -13,27 +13,29 @@ class BatchProps(StrEnum):
     Properties at time `1` (i.e. `"_1"`) are the ground truth, i.e. the original data.
     """
 
-    res_mask = "res_mask"  # backbone positions in the original structure
+    res_mask = "res_mask"  # (B, N) residues under consideration (e.g. not UNK, non-residues, etc.)
     # ground truth properties
-    aatypes_1 = "aatypes_1"  # amino acid sequence
-    trans_1 = "trans_1"  # frame translations
-    rotmats_1 = "rotmats_1"  # frame rotations
+    aatypes_1 = "aatypes_1"  # (B, N) amino acid sequence, as ints (0-20)
+    trans_1 = "trans_1"  # (B, N, 3) frame translations
+    rotmats_1 = "rotmats_1"  # (B, N, 3, 3) frame rotations
     # torsion angles: only predict 1 in model to guide frames; take `[..., 2, :]` from ground truth.
     torsion_angles_sin_cos_1 = "torsion_angles_sin_cos_1"
     # structure metadata
-    chain_idx = "chain_idx"  # re-indexed chain index (chains are shuffled)
-    res_idx = "res_idx"  # re-indexed residue index (residues are re-numbered contiguously 1-indexed)
-    res_plddt = "res_plddt"  # aka b-factors
+    chain_idx = "chain_idx"  # (B, N) re-indexed chain index (chains are shuffled)
+    res_idx = "res_idx"  # (B, N) re-indexed residue index (residues are re-numbered contiguously 1-indexed)
+    res_plddt = "res_plddt"  # (B, N) aka b-factors
     # defined / computed properties
     diffuse_mask = (
-        "diffuse_mask"  # hallucination mask, residue positions that are noised
+        "diffuse_mask"  # (B, N) hallucination mask, residue positions that are noised
     )
-    plddt_mask = "plddt_mask"  # mask, residue positions above pLDDT threshold
+    plddt_mask = (
+        "plddt_mask"  # (B, N) pLDDT mask, residue positions above pLDDT threshold
+    )
     # metadata
-    pdb_name = "pdb_name"  # source PDB id
-    csv_idx = "csv_idx"  # index of the protein in the csv file, for debugging
+    pdb_name = "pdb_name"  # (B) source PDB id string/int
+    csv_idx = "csv_idx"  # (B) index of the protein in the csv file, for debugging
     # inference only
-    sample_id = "sample_id"  # inference sample id
+    sample_id = "sample_id"  # (B) inference sample id
 
 
 class NoisyBatchProps(StrEnum):
@@ -48,7 +50,7 @@ class NoisyBatchProps(StrEnum):
     r3_t = "r3_t"  # (B, N, 1) tensor, t for R3 (translations)
     trans_t = "trans_t"  # (B, N, 3) tensor, translations @ t
     rotmats_t = "rotmats_t"  # (B, N, 3, 3) tensor, rotations @ t
-    aatypes_t = "aatypes_t"  # (B, N) tensor, predicted amino acids @ t
+    aatypes_t = "aatypes_t"  # (B, N) tensor, predicted amino acids @ t as ints (0-21)
     trans_sc = "trans_sc"  # (B, N, 3) tensor, self-conditioned pred translations @ t
     aatypes_sc = "aatypes_sc"  # (B, N, 21) tensor, self-conditioned pred sequence @ t, including mask token
 

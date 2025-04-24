@@ -94,7 +94,7 @@ class MockDataloader(DataLoader):
 
 def create_pdb_dataloader(
     cfg: Config,
-    task: DataTaskEnum = DataTaskEnum.hallucination,
+    task: Optional[DataTaskEnum] = None,
     training: bool = True,
     eval_batch_size: int = 1,
 ) -> DataLoader:
@@ -102,6 +102,9 @@ def create_pdb_dataloader(
     Creates a Dataloader for PDB dataset given `cfg`
     Returns `train_dataset` if `training` is True, else `eval_dataset`.
     """
+    if task is None:
+        task = cfg.data.task
+
     dataset_constructor = DatasetConstructor.pdb_dataset(
         dataset_cfg=cfg.dataset,
         task=task,
@@ -142,7 +145,7 @@ def create_pdb_batch(
     Creates a single training batch of a PDB dataset given `cfg`
     """
     dataloader = create_pdb_dataloader(
-        cfg=cfg, training=training, eval_batch_size=eval_batch_size
+        cfg=cfg, task=cfg.data.task, training=training, eval_batch_size=eval_batch_size
     )
 
     raw_feats = next(iter(dataloader))

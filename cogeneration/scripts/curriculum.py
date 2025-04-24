@@ -107,11 +107,11 @@ class Curriculum:
         Tie model checkpoints between step cfgs
         """
         # `cfg.experiment.checkpointer.dirpath` is used to save the checkpoint and is name spaced by `cfg.shared.id`
-        # `cfg.experiment.warm_start_ckpt` is used to load a checkpoint from the previous step
+        # `cfg.experiment.warm_start_ckpt` is used to load a checkpoint from a previous step
         last_ckpt = None
         for step in self.steps:
-            # Set the warm start checkpoint for the next step
-            if last_ckpt:
+            # Set the warm start checkpoint for the next step, if one isn't defined
+            if last_ckpt and step.cfg.experiment.warm_start_ckpt is None:
                 step.cfg.experiment.warm_start_ckpt = last_ckpt
                 step.cfg.experiment.warm_start_cfg_override = True
 
