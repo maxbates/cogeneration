@@ -607,6 +607,26 @@ class Interpolant:
 
         return rotmats_next
 
+    def _psi_euler_step(self, d_t, t, psi_1, psi_t):
+        """
+        Perform an Euler step to update psi angles.
+        Note that only the model predicts psi angles, but they are not an input to the model.
+        Primary use is for inpainting to step towards known psi angles in motifs.
+        """
+        psi_vf = (psi_1 - psi_t) / (1 - t)
+        psi_next = psi_t + psi_vf * d_t
+
+        # HACK piggyback on `trans.stochastic`
+        if self.cfg.trans.stochastic:
+            # add gaussian noise scaled by sqrt(dt)
+            psi_next += (
+                torch.randn_like(psi_next)
+                * np.sqrt(d_t)
+                * self.cfg.trans.stochastic_noise_intensity
+            )
+
+        return psi_next
+
     def _regularize_step_probs(self, step_probs, aatypes_t):
         """
         Regularize the step probabilities to ensure they conform to the requirements of a rate matrix.
@@ -949,7 +969,7 @@ class Interpolant:
             aatypes_1, num_classes=self.num_tokens
         ).float()
 
-        # Initialize t=0 prior samples i.e. noise
+        # Initialize t=0 prior samples i.e. noise (technically `t=cfg.min_t`)
 
         if trans_0 is None:
             # Generate centered Gaussian noise for translations (shape: [num_batch, num_res, 3])
@@ -978,6 +998,10 @@ class Interpolant:
                 raise ValueError(
                     f"Unknown aatypes interpolant type {self.cfg.aatypes.interpolant_type}"
                 )
+        if psis_0 is None:
+            # Generate initial psi angles
+            # TODO a better prior, reflecting these are angles
+            psis_0 = torch.randn((num_batch, num_res, 2), device=self._device)
 
         # For inpainting, fix motif sequence. Translations and rotations will be sampled.
         # TODO(inpainting-fixed) support fixed motifs
@@ -1056,6 +1080,7 @@ class Interpolant:
         # t_1 starts at t=0
         trans_t_1 = trans_0
         rotmats_t_1 = rotmats_0
+        psis_t_1 = psis_0
         aatypes_t_1 = aatypes_0
 
         for t_2 in ts[1:]:
@@ -1179,35 +1204,33 @@ class Interpolant:
             trans_t_2 = self._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
             rotmats_t_2 = self._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
             aatypes_t_2 = self._aatypes_euler_step(d_t, t_1, pred_logits_1, aatypes_t_1)
-            # HACK: We do not have a vector field for psi angles, so just use model output at t_1
-            psi_t_2 = pred_psis_1
+            psi_t_2 = (
+                self._psi_euler_step(d_t, t_1, pred_psis_1, psis_t_1)
+                if pred_psis_1 is not None
+                else None
+            )
 
-            # For inpainting, fix motif sequence; set motif structure by interpolating
+            # For inpainting, fix motif sequence; set motif structure by interpolating motif toward known t=1.
             # TODO(inpainting-fixed) support fixed motifs
             if task == InferenceTaskEnum.inpainting:
+                # Sequence is fixed for motifs at t=1
+                aatypes_t_2 = mask_blend_1d(aatypes_t_2, aatypes_1, diffuse_mask)
+
                 # Get interpolated values for motif translations and rotations
-                t_motif = torch.tensor([t_2])[:, None]
-                trans_t_2_motif = self._corrupt_trans(
-                    trans_1,
-                    t=t_motif,
-                    res_mask=res_mask,
-                    diffuse_mask=res_mask,  # interpolate all residues
-                )
-                rotmats_t_2_motif = self._corrupt_rotmats(
-                    rotmats_1,
-                    t=t_motif,
-                    res_mask=res_mask,
-                    diffuse_mask=res_mask,  # interpolate all residues
+                trans_t_2_motif = self._trans_euler_step(d_t, t_1, trans_1, trans_t_1)
+                rotmats_t_2_motif = self._rots_euler_step(
+                    d_t, t_1, rotmats_1, rotmats_t_1
                 )
                 # Set motif positions to interpolated values
                 trans_t_2 = mask_blend_2d(trans_t_2, trans_t_2_motif, diffuse_mask)
                 rotmats_t_2 = mask_blend_3d(
                     rotmats_t_2, rotmats_t_2_motif, diffuse_mask
                 )
-                # Sequence is fixed for motifs at t=1
-                aatypes_t_2 = mask_blend_1d(aatypes_t_2, aatypes_1, diffuse_mask)
+
+                # For psi angles, take an Euler step toward known values
                 if psi_t_2 is not None:
-                    psi_t_2 = mask_blend_2d(psi_t_2, psis_1, diffuse_mask)
+                    psi_t_2_motif = self._psi_euler_step(d_t, t_1, psis_1, pred_psis_1)
+                    psi_t_2 = mask_blend_2d(psi_t_2, psi_t_2_motif, diffuse_mask)
 
             # Center diffused residues to maintain translation invariance
             # Definitely should center if inpainting or stochastic, but might as well if unconditional too
@@ -1226,6 +1249,7 @@ class Interpolant:
             trans_t_1 = trans_t_2
             rotmats_t_1 = rotmats_t_2
             aatypes_t_1 = aatypes_t_2
+            psis_t_1 = psi_t_2
             t_1 = t_2
 
         # We only integrated to 1-min_t, so need to make a final step
@@ -1244,7 +1268,7 @@ class Interpolant:
             model_out = model(batch)
         pred_trans_1 = model_out[pbp.pred_trans]
         pred_rotmats_1 = model_out[pbp.pred_rotmats]
-        pred_psis_1 = model_out[pbp.pred_psi]
+        pred_psis_1 = model_out[pbp.pred_psi]  # may be None, if not predicting
         pred_aatypes_1 = model_out[pbp.pred_aatypes]
         pred_logits_1 = model_out[pbp.pred_logits]
 
@@ -1267,12 +1291,18 @@ class Interpolant:
             pred_aatypes_1 = mask_blend_1d(pred_aatypes_1, aatypes_1, diffuse_mask)
             pred_trans_1 = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
             pred_rotmats_1 = mask_blend_3d(pred_rotmats_1, rotmats_1, diffuse_mask)
+            pred_psis_1 = (
+                mask_blend_2d(pred_psis_1, psis_1, diffuse_mask)
+                if pred_psis_1 is not None
+                else None
+            )
         elif task == InferenceTaskEnum.forward_folding:
             pred_logits_1 = logits_1
             pred_aatypes_1 = aatypes_1
         elif task == InferenceTaskEnum.inverse_folding:
             pred_trans_1 = trans_1
             pred_rotmats_1 = rotmats_1
+            pred_psis_1 = psis_1
         else:
             raise ValueError(f"Unknown task {task}")
 

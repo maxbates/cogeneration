@@ -107,6 +107,7 @@ https://github.com/microsoft/protein-frame-flow
         - [x] add noise to all residues
         - [x] Final time step, fix motifs
         - [x] For amino acids, keep them fixed
+        - [x] Rather than re-sampling at `t_2` every time step, interpolate from `t_1` towards `t=1` and add noise
 
 - Folding Validation
     - [x] confirm existing metrics make sense for inpainting
