@@ -5,10 +5,11 @@ import numpy as np
 import pandas as pd
 
 from cogeneration.config.base import DatasetConfig, DatasetFilterConfig
-from cogeneration.dataset.data_utils import parse_chain_feats
 from cogeneration.dataset.datasets import BaseDataset
-from cogeneration.dataset.process_pdb_files import process_file
+from cogeneration.dataset.process_pdb import read_processed_file
+from cogeneration.scripts.process_pdb_files import process_pdb_with_metadata
 from cogeneration.type.dataset import DatasetColumns as dc
+from cogeneration.type.dataset import DatasetProteinColumns
 from cogeneration.type.dataset import DatasetProteinColumns as dpc
 from cogeneration.type.task import DataTaskEnum
 
@@ -18,8 +19,8 @@ example_pdb_path = Path(__file__).parent / "2qlw.pdb"
 
 class TestProcessPDBFiles:
     def test_process_file(self, tmp_path):
-        metadata = process_file(
-            file_path=str(example_pdb_path.absolute()),
+        metadata, _ = process_pdb_with_metadata(
+            pdb_file_path=str(example_pdb_path.absolute()),
             write_dir=str(tmp_path),
         )
 
@@ -45,20 +46,26 @@ class TestProcessPDBFiles:
         # modeled positions only for valid residues
         assert len(pkl[dpc.modeled_idx]) == metadata[dc.moduled_num_res]
 
+        # check all expected keys are present
+        expected_keys = [key for key in DatasetProteinColumns]
+        observed_keys = list(pkl.keys())
+        extra_keys = set(observed_keys) - set(expected_keys)
+        missing_keys = set(expected_keys) - set(observed_keys)
+        assert (
+            len(extra_keys) == 0 and len(missing_keys) == 0
+        ), f"Extra keys: {extra_keys}, Missing keys: {missing_keys}"
+
     def test_parsing_processed_file(self, tmp_path):
-        metadata = process_file(
-            file_path=str(example_pdb_path.absolute()),
+        metadata, _ = process_pdb_with_metadata(
+            pdb_file_path=str(example_pdb_path.absolute()),
             write_dir=str(tmp_path),
         )
-        with open(metadata[dc.processed_path], "rb") as f:
-            pkl = pickle.load(f)
-
         # Test can load and process
-        parse_chain_feats(pkl)
+        _ = read_processed_file(processed_file_path=metadata[dc.processed_path])
 
     def test_dataset_using_processed_file(self, tmp_path):
-        metadata = process_file(
-            file_path=str(example_pdb_path.absolute()),
+        metadata, _ = process_pdb_with_metadata(
+            pdb_file_path=str(example_pdb_path.absolute()),
             write_dir=str(tmp_path),
         )
 
@@ -89,7 +96,7 @@ class TestProcessPDBFiles:
         assert len(dataset) > 0
 
         # just test it works
-        processed_file = dataset.load_processed_path(
+        processed_file = read_processed_file(
             processed_file_path=metadata[dc.processed_path]
         )
         _ = dataset.process_processed_file(

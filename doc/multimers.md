@@ -8,20 +8,31 @@ However, probably want to continue training from a checkpoint trained on generat
 
 ## Current State + Questions
 
-We already pass around `chain_idx` alongside `res_idx`.
 There are many aspects of the model and framework that should already support multiple chains.
-However, there are several assumptions we make that we are working with monomers.
+For example, We already pass around `chain_idx` alongside `res_idx`.
+However, There are some assumptions we make that we are working with monomers.
+Most of these assumptions are in the `data` and `dataset` side of things.
 
-Items in the dataset are currently single chains. 
+Items in the `dataset` are currently single chains. 
 When we load a PDB, we currently take out chain `"A"` in `parse_pdb_feats()`
 We pass around `chain_feats` but need to move to `all_chain_feats` which is a dictionary of chains.
+Or, `ProcessedFile` needs to represent the chains mashed together appropriately.
+
+Conversely, `process_pdb_files()` already merges multiple chains. 
+We need to inspect the multimer files available and see how they were encoded (presumably by `process_pdb_files()`).
+We need to see what the indexing looks like in those multi-chain files.
+We need to merge this behavior with `parse_pdb_feats()`.
 
 Currently, we center the monomer to maintain translation invariance.
 We instead need to center the multimer i.e. center of mass of all chains. 
-There is an option to do this in `parse_pdb_feats()`
+There is an option to do this in `parse_pdb_feats()` for the dataset.
+During sampling, Interpolant's current centering procedure using COM should be fine.
 
 We currently start with centered guassian noise.
 (?) We could instead use the "harmonic prior" from EigenFold / ESMFlow.
+
+The model and module should mostly "just work."
+We probably need to update how we embed things. Changing the `idx` may be sufficient.
 
 Validation etc. assumes a single chain, and will be a reasonable lift to update where appropriate.
 
@@ -30,27 +41,33 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
 - Theory
     - read RFDiffusion2
     - read AlphaFold-Multimer chain-break handling and relative positional embeddings
+        - What is a `Protein`, what is a `Complex`, what should we use
     - read ESM-Flow / EigenFold "harmonic prior"      
 
 - Config
     - [ ] `chain_gap`: integer offset between chains
-    - [ ] `noise.type`: “gaussian” vs “harmonic”
     - [ ] `dataset.filter.min_chains` / `dataset.filter.max_chains`
-    - [ ] sampling weights for homo vs hetero
+    - [ ] dataset sampling weights for homo vs hetero
+    - [ ] `noise.type`: “gaussian” vs “harmonic”
   
+- AlphaFold / OpenFold code
+    - [ ] update `protein.py`, need multi-chain version of `process_chain() -> Protein`
+
 - Data
     - Parsing
-        - [ ] update `parse_pdb_feats()`
-            - [ ] remove default `chain="A"` argument, require passing it
+        - [x] refactor `parse_chain_feats` to take `Protein` and handle multiple chains
+        - [x] update `parse_pdb_feats()`
+            - [x] remove default `chain="A"` argument, require passing it
+        - [x] center all chains, not single chain
+        - [ ] Parse `all_chain_feats` -> batch
         - [ ] update indexing, choose some strategy for chain gaps
              - [ ] include a gap (like ~200 AlphaFold Multimer) between chains
-        - [ ] center all chains, not single chain
-        - [ ] Parse `all_chain_feats` -> batch
+        - [ ] inspect public multiflow multimer files, see how they are written, how non-residues handled
+        - [ ] expose per-chain metadata (chain IDs, lengths)   
     - Dataset
         - [ ] Establish options for multiple chains in dataset filter (`min_chains`, `max_chains`)
-        - [ ] Differentiate oligomers vs heteromers; sampling weights
+        - [ ] Differentiate oligomers vs heteromers; sampling weights per class
         - [ ] support dynamic padding/cropping for variable total residues
-        - [ ] expose per-chain metadata (chain IDs, lengths)   
     
 - Interpolant
     - Noise
@@ -114,6 +131,7 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
 
 - Tests
     - [ ] multi-chain `parse_pdb_feats()`
+    - [ ] `process_pdb_file()` -> `read_processed_file()`
     - [ ] fixture for dummy/real multimer batch 
     - [ ] dataset loader multimers
     - [ ] `model.forward()` multimer

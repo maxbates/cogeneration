@@ -178,8 +178,12 @@ class TestInterpolantSample:
     """Test suite for Interpolant.sample()."""
 
     def _run_sample(self, cfg: Config, batch, task: InferenceTaskEnum):
-        cfg.inference.interpolant.sampling.num_timesteps = 2  # run quickly with few timesteps
-        cfg.interpolant.sampling.num_timesteps = 4  # ensure don't use training interpolant
+        cfg.inference.interpolant.sampling.num_timesteps = (
+            2  # run quickly with few timesteps
+        )
+        cfg.interpolant.sampling.num_timesteps = (
+            4  # ensure don't use training interpolant
+        )
 
         interpolant = Interpolant(cfg.inference.interpolant)
         interpolant.set_device(torch.device("cpu"))

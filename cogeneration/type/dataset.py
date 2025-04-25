@@ -84,14 +84,23 @@ class DatasetTransformColumns(StrEnum):
     torsion_angles_sin_cos = "torsion_angles_sin_cos"
 
 
-"""NumpyFeat is a feature in primitive or numpy"""
-NumpyFeat = Union[npt.NDArray, str, int]
+"""NumpyPrimitiveFeat is a feature in primitive or numpy"""
+NumpyPrimitiveFeat = Union[npt.NDArray, str, int]
 
 """MetadataCSVRow type alias for a single row of the metadata CSV file"""
-MetadataCSVRow = Dict[DatasetColumns, NumpyFeat]
+MetadataCSVRow = Dict[DatasetColumns, NumpyPrimitiveFeat]
 
 """MetadataDataFrame type alias for the metadata CSV file, composed of MetadataCSVRow"""
 MetadataDataFrame = pd.DataFrame
 
-"""ProcessedFile for pre-processed pkl, produced by `parse_pdb_files.py`"""
-ProcessedFile = Dict[DatasetProteinColumns, NumpyFeat]
+"""
+ChainFeatures represents an intermediate state converting `Protein` dict to `ProcessedFile`
+Use when only a subset of fields of `DatasetProteinColumns` are present in `ChainFeatures`.
+"""
+ChainFeatures = Dict[DatasetProteinColumns, npt.NDArray]
+
+"""
+ProcessedFile for pre-processed pkl, produced by `parse_pdb_files.py`
+It contains 1+ chains, concatenated into a flat `chain_features`.
+"""
+ProcessedFile = Dict[DatasetProteinColumns, npt.NDArray]

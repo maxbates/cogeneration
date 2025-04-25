@@ -53,7 +53,9 @@ class TestFlowModule:
         module = FlowModule(mock_cfg)
         module.training_step(pdb_noisy_batch)
 
-    def test_training_step_inpainting_but_actually_unconditional(self, mock_cfg_uninterpolated):
+    def test_training_step_inpainting_but_actually_unconditional(
+        self, mock_cfg_uninterpolated
+    ):
         mock_cfg_uninterpolated.data.task = DataTaskEnum.inpainting
         mock_cfg_uninterpolated.interpolant.inpainting_unconditional_prop = 1.0
         mock_cfg = mock_cfg_uninterpolated.interpolate()

@@ -21,7 +21,7 @@ from cogeneration.data.metrics import calc_ca_ca_metrics, calc_mdtraj_metrics
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restype_order_with_x, restypes_with_x
 from cogeneration.data.superimposition import superimpose
-from cogeneration.dataset.data_utils import parse_pdb_feats
+from cogeneration.dataset.process_pdb import process_pdb_file
 from cogeneration.type.dataset import DatasetProteinColumns as dpc
 from cogeneration.type.metrics import MetricName, OutputFileName
 from cogeneration.type.task import InferenceTaskEnum
@@ -227,6 +227,7 @@ class FoldingValidator:
         )
         codesign_df = FoldingValidator.assess_folded_structures(
             sample_pdb_path=pred_pdb_path,
+            pdb_name=sample_name,
             folded_df=codesign_df,
             true_bb_positions=true_bb_positions,
             diffuse_mask=diffuse_mask,
@@ -242,6 +243,7 @@ class FoldingValidator:
             )
             designability_df = FoldingValidator.assess_folded_structures(
                 sample_pdb_path=pred_pdb_path,
+                pdb_name=sample_name,
                 folded_df=designability_df,
                 true_bb_positions=true_bb_positions,
                 diffuse_mask=diffuse_mask,
@@ -720,6 +722,7 @@ class FoldingValidator:
     @staticmethod
     def assess_folded_structures(
         sample_pdb_path: str,
+        pdb_name: str,
         folded_df: pd.DataFrame,
         true_bb_positions: Optional[npt.NDArray] = None,  # (N, 37, 3)
         diffuse_mask: Optional[npt.NDArray] = None,  # (N) inpainting
@@ -737,7 +740,11 @@ class FoldingValidator:
 
         edited from `process_folded_outputs()` in public multiflow
         """
-        sample_feats = parse_pdb_feats("sample", pdb_path=sample_pdb_path)
+        sample_feats = process_pdb_file(
+            pdb_file_path=sample_pdb_path,
+            pdb_name=pdb_name,
+        )
+        sample_bb_pos = sample_feats[dpc.atom_positions][:, :3]
         sample_bb_pos = sample_feats[dpc.atom_positions][:, :3]  # (N, 3, 3)
 
         num_res = sample_bb_pos.shape[0]
@@ -759,8 +766,9 @@ class FoldingValidator:
         # Calculate RMSD etc. for each folded structured in folded_df
         all_metrics = []
         for _, row in folded_df.iterrows():
-            folded_feats = parse_pdb_feats(
-                row[MetricName.header], row[MetricName.folded_pdb_path]
+            folded_feats = process_pdb_file(
+                pdb_file_path=row[MetricName.folded_pdb_path],
+                pdb_name=row[MetricName.header],
             )
             sample_metrics = {
                 # Include the original row. Includes `header`, `folded_pdb_path`, `plddt_mean` from AF2.

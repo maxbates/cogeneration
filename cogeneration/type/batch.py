@@ -13,7 +13,7 @@ class BatchProps(StrEnum):
     Properties at time `1` (i.e. `"_1"`) are the ground truth, i.e. the original data.
     """
 
-    res_mask = "res_mask"  # (B, N) residues under consideration (e.g. not UNK, non-residues, etc.)
+    res_mask = "res_mask"  # (B, N) residues under consideration (use `dpc.bb_mask`)
     # ground truth properties
     aatypes_1 = "aatypes_1"  # (B, N) amino acid sequence, as ints (0-20)
     trans_1 = "trans_1"  # (B, N, 3) frame translations

@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional, Tuple, TypeVar, Union
 import numpy as np
 import pandas as pd
 import torch
-import tree
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
 from torch.utils.data import Dataset
@@ -16,9 +15,8 @@ from torch.utils.data import Dataset
 from cogeneration.config.base import Config, DatasetConfig, InferenceSamplesConfig
 from cogeneration.data import data_transforms, rigid_utils
 from cogeneration.data.const import seq_to_aatype
-from cogeneration.data.io import read_pkl
-from cogeneration.dataset.data_utils import parse_chain_feats
 from cogeneration.dataset.motif_factory import Motif, MotifFactory, Segment
+from cogeneration.dataset.process_pdb import read_processed_file
 from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProps as bp
 from cogeneration.type.batch import InferenceFeatures, empty_feats
@@ -320,27 +318,6 @@ class BaseDataset(Dataset):
         # reset index
         self.csv[dc.index] = list(range(len(self.csv)))
 
-    @staticmethod
-    def load_processed_path(processed_file_path: str) -> ProcessedFile:
-        """
-        Loads a single structure + metadata pickled at `processed_file_path`.
-        This file is written by e.g. `parse_pdb_files.py`.
-        """
-        processed_feats = read_pkl(processed_file_path)
-        processed_feats = parse_chain_feats(processed_feats, center=True)
-
-        # Only take modeled residues.
-        # This filters away residues outside range of consideration, yield length N := len(modeled_idx)
-        modeled_idx = processed_feats[dpc.modeled_idx]
-        min_idx = np.min(modeled_idx)
-        max_idx = np.max(modeled_idx)
-        del processed_feats[dpc.modeled_idx]
-        processed_feats = tree.map_structure(
-            lambda x: x[min_idx : (max_idx + 1)], processed_feats
-        )
-
-        return processed_feats
-
     def load_processed_path_with_caching(
         self, csv_row: MetadataCSVRow
     ) -> ProcessedFile:
@@ -356,7 +333,7 @@ class BaseDataset(Dataset):
         if use_cache and processed_file_path in self._cache:
             return self._cache[processed_file_path]
 
-        processed_feats = self.load_processed_path(processed_file_path)
+        processed_feats = read_processed_file(processed_file_path)
 
         if use_cache:
             self._cache[processed_file_path] = processed_feats
@@ -384,6 +361,7 @@ class BaseDataset(Dataset):
         )
         for i, chain_id in enumerate(all_chain_idx):
             chain_mask = (chain_idx == chain_id).long()
+            # TODO(multimer) make chain gap configurable
             chain_min_idx = torch.min(res_idx + (1 - chain_mask) * 1e3).long()
             new_res_idx += (res_idx - chain_min_idx + 1) * chain_mask
 
@@ -527,8 +505,9 @@ class BaseDataset(Dataset):
         if torch.isnan(trans_1).any() or torch.isnan(rotmats_1).any():
             raise ValueError(f"Found NaNs in {csv_row[dc.processed_path]}")
 
-        # res_mask for residues under consideration
+        # res_mask for residues under consideration uses `dpc.bb_mask`
         res_mask = torch.tensor(processed_file[dpc.bb_mask]).int()
+
         # pull out res_idx and chain_idx
         res_idx = torch.tensor(processed_file[dpc.residue_index])
         chain_idx = torch.tensor(processed_file[dpc.chain_index])
