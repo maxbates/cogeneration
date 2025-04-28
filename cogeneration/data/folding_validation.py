@@ -72,6 +72,7 @@ class FoldingValidator:
         pred_bb_positions: npt.NDArray,  # (N, n_bb_atoms, 3) where n_bb_atoms in [3, 5, ?]
         pred_aa: npt.NDArray,  # (N)
         diffuse_mask: npt.NDArray,  # (N)
+        res_index: npt.NDArray,  # (N)
         true_bb_positions: Optional[npt.NDArray],  # (N, 37, 3)
         true_aa: Optional[npt.NDArray],  # (N)
         also_fold_pmpnn_seq: bool = True,  # also fold inverse-folded sequences
@@ -367,10 +368,10 @@ class FoldingValidator:
         )
         top_sample.update(
             calc_ca_ca_metrics(
-                ca_pos=pred_bb_positions[:, residue_constants.atom_order["CA"]]
+                ca_pos=pred_bb_positions[:, residue_constants.atom_order["CA"]],
+                residue_index=res_index,
             )
         )
-
         # TODO(inpainting) - calculate scaffold-specific metrics for secondary structure, clashes
 
         # write top sample JSON

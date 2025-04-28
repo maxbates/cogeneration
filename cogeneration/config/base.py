@@ -154,6 +154,7 @@ class ModelHyperParamsConfig(BaseClassConfig):
     pos_embed_size: int = 128
     pos_embed_method: PositionalEmbeddingMethod = PositionalEmbeddingMethod.rotary
     pos_embed_max_len: int = 2048  # 2056 in public multiflow
+
     timestep_embed_size: int = 128
 
     @classmethod

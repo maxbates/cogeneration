@@ -2,6 +2,7 @@ from typing import Dict, Optional
 
 import mdtraj as md
 import numpy as np
+import numpy.typing as npt
 import torch
 
 from cogeneration.data import residue_constants
@@ -36,11 +37,22 @@ def t_stratified_loss(
     return stratified_losses
 
 
-def calc_ca_ca_metrics(ca_pos, bond_tol=0.1, clash_tol=1.0) -> Dict[MetricName, float]:
+def calc_ca_ca_metrics(
+    ca_pos: npt.NDArray,  # (N, 3)
+    residue_index: Optional[npt.NDArray] = None,  # (N,)
+    bond_tol=0.1,
+    clash_tol=1.0,  # angstrom, 1.5 in AF2 multimer
+) -> Dict[MetricName, float]:
     """
     Calculate metrics for the backbone CA-CA distances of a protein structure.
     """
     ca_bond_dists = np.linalg.norm(ca_pos - np.roll(ca_pos, 1, axis=0), axis=-1)[1:]
+
+    # mask out non-neighboring residues, handle chain gaps
+    if residue_index is not None:
+        has_no_gap_mask = (residue_index[1:] - residue_index[:-1]) == 1
+        ca_bond_dists = ca_bond_dists[has_no_gap_mask]
+
     ca_ca_dev = np.mean(np.abs(ca_bond_dists - residue_constants.ca_ca))
     ca_ca_valid = np.mean(ca_bond_dists < (residue_constants.ca_ca + bond_tol))
 

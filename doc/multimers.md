@@ -93,25 +93,26 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
     - NodeFeatureNet
          - [x] require `embed_chain=True` in `cfg.node_features` to inject per-residue sinusoidal chain embeddings via `chain_idx`
          - [x] ensure `chain_idx` is integer (cast to `long`) before calling `get_index_embedding`
-         - [ ] (?) optionally replace or augment sinusoidal chain encoding with a learned `nn.Embedding(num_chains, dim)` for small chain counts
+         - (?) optionally replace or augment sinusoidal chain encoding with a learned `nn.Embedding(num_chains, dim)` for small chain counts
     - EdgeFeatureNet
          - [x] enable `embed_chain=True` in `cfg.edge_features` to add the same-chain binary feature
     - Embedders
          - existing `get_index_embedding` (sinusoidal) covers both `res_idx` and `chain_idx`; no core change required
-         - [ ] (?) add a learned chain embedding helper
+         - (?) add a learned chain embedding helper
     - SequenceIPANet
-         - [ ] (?) Pass `chain_idx` to `sequence_ipa_net`, or positional embeddings better somehow?
+         - (?) Pass `chain_idx` to `sequence_ipa_net`, or positional embeddings better somehow?
             - Do already provide option to use `init_node_embed`...
     - [ ] Update `ipa_pytorch.py` to support multimers if necessary
     
 - Training
     - [ ] Update losses
         - [x] no neighbor loss across chains
+        - [x] C-alpha distance loss accounts for chains
         - [ ] contact-presrvation loss.. maybe `hotspot` loss is the best way to capture this...  
             - e.g. for residues more than N residues apart, is contact preserved
-        - [ ] consider explicit cross-chain distances? 
-        - Want to support training on non-interacting pairs too - see how RosettaFold did this in the paper where they predict binding
-    - [ ] Enable larger residue window, e.g. 256 -> 384 for multimers 
+        - (?)  consider explicit cross-chain distances?
+            - not sure what beyond hot spot and interaction distance is necessary...
+            - Want to support training on non-interacting pairs too - see how RosettaFold did this in the paper where they predict binding
 
 - Inpainting
     - [ ] Update motif selections to account for multiple chains

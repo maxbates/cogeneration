@@ -634,6 +634,7 @@ class FlowModule(LightningModule):
                     model_aa_traj=model_aa_trajs[i],
                     model_logits_traj=model_logits_trajs[i],
                     diffuse_mask=to_numpy(diffuse_mask)[0],
+                    res_index=to_numpy(batch[bp.res_idx])[i],
                     true_bb_pos=None,  # codesign  # TODO(inpainting) define
                     true_aa=None,  # codesign  # TODO(inpainting) define
                     also_fold_pmpnn_seq=True,  # always fold during validation
@@ -852,6 +853,7 @@ class FlowModule(LightningModule):
                 model_aa_traj=model_aa_trajs[i],
                 model_logits_traj=model_logits_trajs[i],
                 diffuse_mask=to_numpy(diffuse_mask[i]),
+                res_index=to_numpy(batch[bp.res_idx][i]),
                 true_bb_pos=to_numpy(true_bb_pos),
                 true_aa=to_numpy(true_aatypes),
                 also_fold_pmpnn_seq=self.cfg.inference.also_fold_pmpnn_seq,
@@ -873,6 +875,7 @@ class FlowModule(LightningModule):
         model_aa_traj: npt.NDArray,
         model_logits_traj: npt.NDArray,
         diffuse_mask: npt.NDArray,
+        res_index: npt.NDArray,
         true_bb_pos: Optional[npt.NDArray],  # if relevant
         true_aa: Optional[npt.NDArray],  # if relevant
         also_fold_pmpnn_seq: bool = True,
@@ -947,6 +950,7 @@ class FlowModule(LightningModule):
                 pred_bb_positions=bb_traj[-1],
                 pred_aa=aa_traj[-1],
                 diffuse_mask=diffuse_mask,
+                res_index=res_index,
                 also_fold_pmpnn_seq=also_fold_pmpnn_seq,
                 true_bb_positions=true_bb_pos,
                 true_aa=true_aa,
