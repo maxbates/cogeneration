@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+import warnings
 from collections import deque
 from dataclasses import dataclass, fields
 from random import random
@@ -13,6 +14,7 @@ import numpy.typing as npt
 import pandas as pd
 import torch
 import torch.distributed as dist
+from lightning_fabric.utilities.warnings import PossibleUserWarning
 from lightning_utilities.core.apply_func import apply_to_collection
 from pytorch_lightning import LightningModule
 from pytorch_lightning.loggers.wandb import WandbLogger
@@ -1011,13 +1013,15 @@ class FlowModule(LightningModule):
     ):
         if sync_dist and rank_zero_only:
             raise ValueError("Unable to sync dist when rank_zero_only=True")
-        self.log(
-            key,
-            value,
-            on_step=on_step,
-            on_epoch=on_epoch,
-            prog_bar=prog_bar,
-            batch_size=batch_size,
-            sync_dist=sync_dist,
-            rank_zero_only=rank_zero_only,
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=PossibleUserWarning)
+            self.log(
+                key,
+                value,
+                on_step=on_step,
+                on_epoch=on_epoch,
+                prog_bar=prog_bar,
+                batch_size=batch_size,
+                sync_dist=sync_dist,
+                rank_zero_only=rank_zero_only,
+            )

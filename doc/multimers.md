@@ -54,9 +54,7 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
             - more important happens in dataset 
         - [x] `cfg.dataset.chain_gap`: integer offset between chains
             - We already support a space between chains when randomize chains
-        - [ ] inspect public multiflow multimer files, see how they are written, how non-residues handled
-        - [ ] ? expose per-chain metadata (chain IDs, lengths) when generating metadata file
-            - however wont be available in public multiflow metadata file
+        - [x] inspect public multiflow multimer files, see how they are written, how non-residues handled
     - Dataset
         - Filtering
             - [ ] Establish options for multiple chains in dataset filter (`min_chains`, `max_chains`)
@@ -90,33 +88,30 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
         - [x] Require passing in `chain_idx` and `res_idx` so don't default to `torch.ones()`
 
 - Model
-    - [ ] update positional embeddings
+    - [x] update positional embeddings
          - [ ] consider clipping positional embeddings so across-chain out of range (like AF2 multimer) 
     - NodeFeatureNet
-         - [ ] require `embed_chain=True` in `cfg.node_features` to inject per-residue sinusoidal chain embeddings via `chain_idx`
-         - [ ] ensure `chain_idx` is integer (cast to `long`) before calling `get_index_embedding`
-         - [ ] optionally replace or augment sinusoidal chain encoding with a learned `nn.Embedding(num_chains, dim)` for small chain counts
+         - [x] require `embed_chain=True` in `cfg.node_features` to inject per-residue sinusoidal chain embeddings via `chain_idx`
+         - [x] ensure `chain_idx` is integer (cast to `long`) before calling `get_index_embedding`
+         - [ ] (?) optionally replace or augment sinusoidal chain encoding with a learned `nn.Embedding(num_chains, dim)` for small chain counts
     - EdgeFeatureNet
          - [x] enable `embed_chain=True` in `cfg.edge_features` to add the same-chain binary feature
     - Embedders
          - existing `get_index_embedding` (sinusoidal) covers both `res_idx` and `chain_idx`; no core change required
          - [ ] (?) add a learned chain embedding helper
     - SequenceIPANet
-         - [ ] Pass `chain_idx` to `sequence_ipa_net`, or positional embeddings better somehow?
+         - [ ] (?) Pass `chain_idx` to `sequence_ipa_net`, or positional embeddings better somehow?
             - Do already provide option to use `init_node_embed`...
     - [ ] Update `ipa_pytorch.py` to support multimers if necessary
     
 - Training
     - [ ] Update losses
-        - [ ] no neighbor loss across chains
-        - [ ] contact-presrvation loss  
+        - [x] no neighbor loss across chains
+        - [ ] contact-presrvation loss.. maybe `hotspot` loss is the best way to capture this...  
             - e.g. for residues more than N residues apart, is contact preserved
         - [ ] consider explicit cross-chain distances? 
         - Want to support training on non-interacting pairs too - see how RosettaFold did this in the paper where they predict binding
     - [ ] Enable larger residue window, e.g. 256 -> 384 for multimers 
-
-- Sampling
-    - 
 
 - Inpainting
     - [ ] Update motif selections to account for multiple chains
@@ -127,6 +122,9 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
          - [ ] masking binding interfaces of both chains, preserve rest
          - [ ] mask entire interacting chain
 
+- Sampling
+    - new eval dataset for multimers? or update PDB dataset with new motif strategies
+
 - Folding Validation
     - New Metrics
         - [ ] Split some metrics per chain, e.g. RMSD, LDDT
@@ -134,15 +132,15 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
             - [ ] binding precision / recall
 
 - IO
-    - [ ] update PDB/JSON exporters for multiple chains
+    - [x] update PDB/JSON exporters for multiple chains
 
 - Visualization
     - [ ] Ensure visualization works with multiple chains
 
 - Tests
-    - [ ] multi-chain `parse_pdb_feats()`
-    - [ ] `process_pdb_file()` -> `read_processed_file()`
-    - [ ] Parse `all_chain_feats` -> batch in BaseDataset
+    - [x] multi-chain `parse_pdb_feats()`
+    - [x] `process_pdb_file()` -> `read_processed_file()`
+    - [x] Parse `all_chain_feats` -> batch in BaseDataset
     - [ ] fixture for dummy/real multimer batch 
     - [ ] dataset loader multimers
     - [ ] `model.forward()` multimer
@@ -151,7 +149,7 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
     - [ ] `module.predict_step()` multimer
   
 - Misc
-    - [ ] Remove default values for `chain_idx` and `res_idx`, require passing them.
+    - [x] Remove default values for `chain_idx` and `res_idx`, require passing them.
     - [ ] address `TODO(multimer)`
   
 ## Future Work
@@ -161,11 +159,14 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
     - [ ] consider processing PDB multimers manually?
         - [ ] better small molecule handling, especially if in binding interface
     - [ ] Acquire more binders for training
+    - [ ] ? expose per-chain metadata (chain IDs, lengths) when generating metadata file
+        - however wont be available in public multiflow metadata file, use for new dataset?
     - [ ] Review RFDiffusion training curriculum
 
 - Support "hotspots"
     - RFDiffusion style specification of interacting residues
     - Method to determine hotspots from a complete structure
+    - update losses to ensure important binding residues are interacting across chains
     
 - Consider residue-specific time schedules
     - e.g. for inpainting a binder, freeze the target chain at t=1

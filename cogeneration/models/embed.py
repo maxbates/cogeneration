@@ -3,20 +3,37 @@ import math
 import torch
 from torch.nn import functional as F
 
+from cogeneration.type.embed import PositionalEmbeddingMethod
 
-def get_index_embedding(indices, embed_size, max_len: int = 2056):
-    """Creates sine / cosine positional embeddings from a prespecified indices.
+
+def get_rotary_embedding(indices, embed_size, max_len: int):
+    """
+    Creates rotary positional embeddings from prespecified indices.
 
     Args:
-        indices: offsets of size [..., N_edges] of type integer
-        max_len: maximum length.
-        embed_size: dimension of the embeddings to create
+        indices: offsets of size [..., N] of type integer
+        embed_size: dimension of the embeddings to create (must be even)
+        max_len: maximum length, used as theta base
 
     Returns:
-        positional embedding of shape [N, embed_size]
+        rotary positional embedding of shape [..., N, embed_size]
+    """
+    if embed_size % 2 != 0:
+        raise ValueError("embed_size must be even for rotary embeddings.")
+    theta = max_len ** (
+        -torch.arange(0, embed_size, 2, device=indices.device).float() / embed_size
+    )
+    indices = indices.float()[..., None]
+    angles = indices * theta
+    emb = torch.cat([torch.cos(angles), torch.sin(angles)], dim=-1)
+    return emb
+
+
+def get_sine_cosine_embedding(indices, embed_size, max_len: int):
+    """
+    Creates sine / cosine positional embeddings from prespecified indices.
     """
     K = torch.arange(embed_size // 2, device=indices.device)
-    # use torch.pow instead of ** to avoid implicit `size()` call
     power = torch.pow(max_len, 2 * K[None] / embed_size)
     pos_embedding_sin = torch.sin(indices[..., None] * math.pi / power).to(
         indices.device
@@ -26,6 +43,32 @@ def get_index_embedding(indices, embed_size, max_len: int = 2056):
     )
     pos_embedding = torch.cat([pos_embedding_sin, pos_embedding_cos], axis=-1)
     return pos_embedding
+
+
+def get_index_embedding(
+    indices,
+    embed_size,
+    max_len: int,
+    pos_embed_method: PositionalEmbeddingMethod,
+):
+    """
+    Creates positional embeddings from prespecified indices using the specified method.
+
+    Args:
+        indices: offsets of size [..., N_edges] of type integer
+        max_len: maximum length.
+        embed_size: dimension of the embeddings to create
+        pos_embed_method: method to use for positional embedding
+
+    Returns:
+        positional embedding of shape [N, embed_size]
+    """
+    if pos_embed_method == PositionalEmbeddingMethod.rotary:
+        return get_rotary_embedding(indices, embed_size, max_len)
+    elif pos_embed_method == PositionalEmbeddingMethod.sine_cosine:
+        return get_sine_cosine_embedding(indices, embed_size, max_len)
+    else:
+        raise ValueError(f"Unknown positional embedding method: {pos_embed_method}")
 
 
 def get_time_embedding(timesteps, embedding_dim, max_positions=2000):

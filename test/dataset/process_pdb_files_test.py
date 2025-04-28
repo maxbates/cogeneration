@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 
 from cogeneration.config.base import DatasetConfig, DatasetFilterConfig
+from cogeneration.data.protein import create_full_prot, to_pdb
 from cogeneration.dataset.datasets import BaseDataset
 from cogeneration.dataset.process_pdb import read_processed_file
 from cogeneration.scripts.process_pdb_files import process_pdb_with_metadata
@@ -14,30 +15,53 @@ from cogeneration.type.dataset import DatasetProteinColumns as dpc
 from cogeneration.type.task import DataTaskEnum
 
 # https://www2.rcsb.org/structure/2QLW
+# This protein has a fair amount of weird stuff going on to make it a good test case:
+# - it is a dimer
+# - has small molcules after chains that should be trimmed
+# - has small molecules between chains (MG and FMT)
+# - has non-residue atom types (MG atoms)
+# - has some unknown residues (like seleniummethionine)
+# - has preceding sequence without atoms
+# - glycine starts at position -1 in each chain
 example_pdb_path = Path(__file__).parent / "2qlw.pdb"
 
 
 class TestProcessPDBFiles:
     def test_process_file(self, tmp_path):
-        metadata, _ = process_pdb_with_metadata(
+        metadata, processed_pdb = process_pdb_with_metadata(
             pdb_file_path=str(example_pdb_path.absolute()),
             write_dir=str(tmp_path),
         )
-
-        # check metadata
         assert metadata is not None
-        assert metadata[dc.seq_len] == 454
-        assert metadata[dc.modeled_seq_len] == 335
-        assert metadata[dc.moduled_num_res] == 200
-        assert metadata[dc.num_chains] == 2
-        assert metadata[dc.oligomeric_detail] == "dimeric"
-        assert metadata[dc.quaternary_category] == "homomer"
-        assert metadata[dc.helix_percent] > 0.1
 
-        # check written file
+        # check written file exists
         written_file = metadata[dc.processed_path]
         with open(written_file, "rb") as f:
             pkl = pickle.load(f)
+
+        # DEBUG convert to PDB to inspect
+        # pdb_path = tmp_path / "2qlw_rewrite.pdb"
+        # protein = create_full_prot(
+        #     atom37=pkl[dpc.atom_positions],
+        #     atom37_mask=pkl[dpc.atom_mask],
+        #     aatype=pkl[dpc.aatype],
+        #     b_factors=pkl[dpc.b_factors],
+        # )
+        # with open(pdb_path, "w") as f:
+        #     f.write(to_pdb(protein))
+        # print(pdb_path)
+
+        # check metadata
+        assert metadata[dc.num_chains] == 2
+        # 2x 100 residues with known aa types
+        assert metadata[dc.moduled_num_res] == 200
+        # 2x 227 molecules/residues
+        assert metadata[dc.seq_len] == 454
+        # 100 modeled + intervening molecules + 100 modeled
+        assert metadata[dc.modeled_seq_len] == 335
+        assert metadata[dc.oligomeric_detail] == "dimeric"
+        assert metadata[dc.quaternary_category] == "homomer"
+        assert metadata[dc.helix_percent] > 0.1
 
         # modeled sequence includes non-AA residues (i.e. 20 = unknown)
         assert len(pkl[dpc.aatype]) == metadata[dc.seq_len]

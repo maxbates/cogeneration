@@ -14,6 +14,7 @@ from cogeneration.config.dict_utils import (
     flatten_dict,
     prune_unknown_dataclass_fields,
 )
+from cogeneration.type.embed import PositionalEmbeddingMethod
 from cogeneration.type.str_enum import StrEnum
 from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
 
@@ -147,10 +148,13 @@ class ModelHyperParamsConfig(BaseClassConfig):
 
     node_embed_size: int = 256
     edge_embed_size: int = 128
-    pos_embed_size: int = 128
-    timestep_embed_size: int = 128
 
     aa_num_tokens: int = 21  # number of amino acid types (if masking), 21 = mask
+
+    pos_embed_size: int = 128
+    pos_embed_method: PositionalEmbeddingMethod = PositionalEmbeddingMethod.rotary
+    pos_embed_max_len: int = 2048  # 2056 in public multiflow
+    timestep_embed_size: int = 128
 
     @classmethod
     def tiny(cls):
@@ -197,8 +201,11 @@ class ModelNodeFeaturesConfig(BaseClassConfig):
     c_timestep_emb: int = "${model.hyper_params.timestep_embed_size}"
     # aatype_pred_num_tokens: number of amino acid types (21 = mask if masking)
     aatype_pred_num_tokens: int = "${model.hyper_params.aa_num_tokens}"
-    # max_num_res: maximum number of residues
-    max_num_res: int = 2000
+    # positional embedding parameters
+    pos_embed_method: PositionalEmbeddingMethod = (
+        "${model.hyper_params.pos_embed_method}"
+    )
+    pos_embed_max_len: int = "${model.hyper_params.pos_embed_max_len}"
     # embed_chain: whether to embed chain index.
     embed_chain: bool = True
     # embed_aatype: whether to embed amino acid type
@@ -222,6 +229,11 @@ class ModelEdgeFeaturesConfig(BaseClassConfig):
     feat_dim: int = 64
     # num_bins: number of bins for edge distrogram
     num_bins: int = 22
+    # positional embedding parameters
+    pos_embed_method: PositionalEmbeddingMethod = (
+        "${model.hyper_params.pos_embed_method}"
+    )
+    pos_embed_max_len: int = "${model.hyper_params.pos_embed_max_len}"
     # self_condition: used by interpolant config.
     self_condition: bool = True
     # embed_chain: whether to embed chain index.
@@ -1088,6 +1100,10 @@ class Config(BaseClassConfig):
         raw_cfg.model.edge_features.embed_chain = False
         raw_cfg.interpolant.provide_kappa = False
         raw_cfg.inference.interpolant.provide_kappa = False
+        raw_cfg.model.hyper_params.pos_embed_method = (
+            PositionalEmbeddingMethod.sine_cosine
+        )
+        raw_cfg.model.hyper_params.pos_embed_max_len = 2056
 
         # Weights
         # assume we have public weights available, use as default checkpoint

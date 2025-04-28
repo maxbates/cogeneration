@@ -1,11 +1,30 @@
 import os
 
+import pytest
+
 from cogeneration.config.base import Config
 from cogeneration.scripts.curriculum import Curriculum, TrainingStep
 from cogeneration.scripts.train import Experiment
 
 
 class TestCurriculum:
+    def test_check_model_equivalence(self, tmp_path):
+        cfg1 = Config.test_uninterpolated(tmp_path=tmp_path / "step1")
+        cfg1.shared.id = "step1"
+        cfg2 = Config.test_uninterpolated(tmp_path=tmp_path / "step2")
+        cfg2.model.sequence_ipa_net.use_init_embed = False
+        cfg2.shared.id = "step2"
+
+        # Ensure init raises an error if models are not equivalent
+        assert cfg1.model != cfg2.model
+        with pytest.raises(ValueError, match="must share the same model schema"):
+            Curriculum(
+                steps=[
+                    TrainingStep(name="step1", cfg=cfg1.interpolate()),
+                    TrainingStep(name="step2", cfg=cfg2.interpolate()),
+                ]
+            )
+
     def test_run(self, tmp_path, monkeypatch):
         # Patch Experiment to avoid heavy initialization and training
         monkeypatch.setattr(Experiment, "__init__", lambda self, cfg: None)

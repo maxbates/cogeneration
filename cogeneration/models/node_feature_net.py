@@ -59,7 +59,12 @@ class NodeFeatureNet(nn.Module):
         aatypes_sc: torch.Tensor,  # (B, N, aatype_pred_num_tokens)
     ):
         # [B, N, c_pos_emb]
-        pos_emb = get_index_embedding(res_index, self.cfg.c_pos_emb, max_len=2056)
+        pos_emb = get_index_embedding(
+            res_index,
+            embed_size=self.cfg.c_pos_emb,
+            max_len=self.cfg.pos_embed_max_len,
+            pos_embed_method=self.cfg.pos_embed_method,
+        )
         pos_emb = pos_emb * res_mask.unsqueeze(-1)
 
         # [B, N, c_timestep_emb]
@@ -75,6 +80,11 @@ class NodeFeatureNet(nn.Module):
             input_feats.append(aatypes_sc)
         if self.cfg.embed_chain:
             input_feats.append(
-                get_index_embedding(chain_index, self.cfg.c_pos_emb, max_len=100)
+                get_index_embedding(
+                    chain_index,
+                    embed_size=self.cfg.c_pos_emb,
+                    max_len=100,  # very unlikely >= 100 chains
+                    pos_embed_method=self.cfg.pos_embed_method,
+                )
             )
         return self.linear(torch.cat(input_feats, dim=-1))

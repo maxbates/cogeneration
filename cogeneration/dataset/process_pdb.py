@@ -172,8 +172,8 @@ def _trim_chain_feats_to_modeled_residues(
 
 def _process_chain_feats(
     chain_feats: ChainFeatures,
-    center: bool = True,
-    trim_to_modeled_residues: bool = True,
+    center: bool,
+    trim_to_modeled_residues: bool,
     scale_factor: float = 1.0,
 ) -> ProcessedFile:
     """
@@ -289,6 +289,9 @@ def _process_pdb(
     # TODO(multimer) - determine modeled residues for each chain independently.
     # Note in public MultiFlow / FrameFlow code, this occurs after processing all the chains.
     #   It would make sense to do per-chain, in case several non-residues were present between chains.
+    #   Remember we want to preserve positions for proteins with gaps i.e. uncaptured neighbors/gaps,
+    #   so we don't impose a penalty on "neighbors" that aren't actually neighbors.
+    #   So don't mask exclusively to known and modeled residues.
     complex_feats[dpc.modeled_idx] = determine_modeled_residues(complex_feats)
 
     # Center the complex

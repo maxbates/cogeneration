@@ -42,7 +42,12 @@ class EdgeFeatureNet(nn.Module):
         # Input: (B, N)
         # Output: (B, N, N)
         d = r[:, :, None] - r[:, None, :]
-        pos_emb = get_index_embedding(d, self.cfg.feat_dim, max_len=2056)
+        pos_emb = get_index_embedding(
+            d,
+            embed_size=self.cfg.feat_dim,
+            max_len=self.cfg.pos_embed_max_len,
+            pos_embed_method=self.cfg.pos_embed_method,
+        )
         return self.linear_relpos(pos_emb)
 
     def _cross_concat(self, feats_1d, num_batch, num_res):

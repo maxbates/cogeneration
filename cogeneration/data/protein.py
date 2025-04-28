@@ -134,11 +134,12 @@ def process_chain(chain: Chain, chain_id: int) -> Protein:
             mask[residue_constants.atom_order[atom.name]] = 1.0
             res_b_factors[residue_constants.atom_order[atom.name]] = atom.bfactor
 
-        # copy AF2 behavior
-        # (note: missing in public FrameFlow, but it does [sometimes?] skip empty res...)
-        if np.sum(mask) < 0.5:
-            # If no known atom positions are reported for the residue then skip it.
-            continue
+        # TODO consider copying AF2 behavior for unknown atoms.
+        #   Leads to e.g. metalic atoms being dropped.
+        # # (note: missing in public FrameFlow, but it does [sometimes?] skip empty res...)
+        # if np.sum(mask) < 0.5:
+        #     # If no known atom positions are reported for the residue then skip it.
+        #     continue
 
         aatype.append(restype_idx)
         atom_positions.append(pos)
