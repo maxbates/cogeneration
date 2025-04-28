@@ -42,43 +42,52 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
     - read RFDiffusion2
     - read AlphaFold-Multimer chain-break handling and relative positional embeddings
         - What is a `Protein`, what is a `Complex`, what should we use
-    - read ESM-Flow / EigenFold "harmonic prior"      
-
-- Config
-    - [ ] `chain_gap`: integer offset between chains
-    - [ ] `dataset.filter.min_chains` / `dataset.filter.max_chains`
-    - [ ] dataset sampling weights for homo vs hetero
-    - [ ] `noise.type`: “gaussian” vs “harmonic”
-  
-- AlphaFold / OpenFold code
-    - [ ] update `protein.py`, need multi-chain version of `process_chain() -> Protein`
+    - read ESM-Flow / EigenFold "harmonic prior"
 
 - Data
     - Parsing
         - [x] refactor `parse_chain_feats` to take `Protein` and handle multiple chains
         - [x] update `parse_pdb_feats()`
             - [x] remove default `chain="A"` argument, require passing it
+        - [x] update `protein.py`, need multi-chain version of `process_chain() -> Protein`
         - [x] center all chains, not single chain
-        - [ ] Parse `all_chain_feats` -> batch
-        - [ ] update indexing, choose some strategy for chain gaps
-             - [ ] include a gap (like ~200 AlphaFold Multimer) between chains
+            - more important happens in dataset 
+        - [x] `cfg.dataset.chain_gap`: integer offset between chains
+            - We already support a space between chains when randomize chains
         - [ ] inspect public multiflow multimer files, see how they are written, how non-residues handled
-        - [ ] expose per-chain metadata (chain IDs, lengths)   
+        - [ ] ? expose per-chain metadata (chain IDs, lengths) when generating metadata file
+            - however wont be available in public multiflow metadata file
     - Dataset
-        - [ ] Establish options for multiple chains in dataset filter (`min_chains`, `max_chains`)
-        - [ ] Differentiate oligomers vs heteromers; sampling weights per class
+        - Filtering
+            - [ ] Establish options for multiple chains in dataset filter (`min_chains`, `max_chains`)
+            - [ ] `dataset.filter.min_chains` / `dataset.filter.max_chains`
+            - [ ] filter when small molecule is interacting or between chains
+                - How do we account for this, if the small molecules have been removed in the processed file?
+                - see e.g. https://www.rcsb.org/3d-view/6DY1
+                    - it's just called `dimeric` in `pdb_metadata.csv`, ignores TON / MYR fatty acid chains completely
+                - May need to process multimers again ourselves...
+                - Can look for molecules with interactions.
+                    - Check for any presence of interacting molecules (ignore water etc.)  
+                    - Check for overlapping ranges with protein interactions.
+        - Dynamic chain selection
+            - [ ] Ability to filter to chains of particular lengths, 
+                - e.g. drop a little peptide if 2 primary interacting chains
+                - or only keep 2 random interacting pairs
+            - [ ] ?? ability to filter chains with internal gaps
+        - [ ] Differentiate oligomers vs heteromers; target sampling weights per class per epoch
         - [ ] support dynamic padding/cropping for variable total residues
     
 - Interpolant
     - Noise
         - [ ] Introduce harmonic prior for translations
             - [ ] option for single gaussian, or harmonic prior
+            - [ ] `cfg.interpolant.trans.noise_type`: “gaussian” vs “harmonic” (once implement alternative like harmonic prior)
     - Batch OT
         - [ ] Do we need to make updates to OT implementation to support multiple chains
-        - Currently, cost depends on positions, everything is a monomer
-        - If use harmonic prior, `chain_idx` will vary between samples, not really meaningful to swap within batch
+            - Currently, cost depends on positions, everything is a monomer
+            - If use harmonic prior, `chain_idx` will vary between samples, not really meaningful to swap within batch
     - Sample
-        - Require passing in `chain_idx` and `res_idx` so don't default to `torch.ones()`
+        - [x] Require passing in `chain_idx` and `res_idx` so don't default to `torch.ones()`
 
 - Model
     - [ ] update positional embeddings
@@ -88,21 +97,22 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
          - [ ] ensure `chain_idx` is integer (cast to `long`) before calling `get_index_embedding`
          - [ ] optionally replace or augment sinusoidal chain encoding with a learned `nn.Embedding(num_chains, dim)` for small chain counts
     - EdgeFeatureNet
-         - [ ] enable `embed_chain=True` in `cfg.edge_features` to add the same-chain binary feature
+         - [x] enable `embed_chain=True` in `cfg.edge_features` to add the same-chain binary feature
     - Embedders
          - existing `get_index_embedding` (sinusoidal) covers both `res_idx` and `chain_idx`; no core change required
          - [ ] (?) add a learned chain embedding helper
     - SequenceIPANet
          - [ ] Pass `chain_idx` to `sequence_ipa_net`, or positional embeddings better somehow?
+            - Do already provide option to use `init_node_embed`...
     - [ ] Update `ipa_pytorch.py` to support multimers if necessary
     
 - Training
     - [ ] Update losses
-          - [ ] no neighbor loss across chains
-          - [ ] contact-presrvation loss
-              - e.g. for residues more than N residues apart, is contact preserved
-          - [ ] consider explicit cross-chain distances? 
-          - Want to support training on non-interacting pairs too - see how RosettaFold did this in the paper where they predict binding
+        - [ ] no neighbor loss across chains
+        - [ ] contact-presrvation loss  
+            - e.g. for residues more than N residues apart, is contact preserved
+        - [ ] consider explicit cross-chain distances? 
+        - Want to support training on non-interacting pairs too - see how RosettaFold did this in the paper where they predict binding
     - [ ] Enable larger residue window, e.g. 256 -> 384 for multimers 
 
 - Sampling
@@ -132,6 +142,7 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
 - Tests
     - [ ] multi-chain `parse_pdb_feats()`
     - [ ] `process_pdb_file()` -> `read_processed_file()`
+    - [ ] Parse `all_chain_feats` -> batch in BaseDataset
     - [ ] fixture for dummy/real multimer batch 
     - [ ] dataset loader multimers
     - [ ] `model.forward()` multimer
@@ -147,11 +158,14 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
 
 - Data
     - [ ] Check how many multimers are included in MultiFlow data dump
+    - [ ] consider processing PDB multimers manually?
+        - [ ] better small molecule handling, especially if in binding interface
     - [ ] Acquire more binders for training
     - [ ] Review RFDiffusion training curriculum
 
 - Support "hotspots"
     - RFDiffusion style specification of interacting residues
+    - Method to determine hotspots from a complete structure
     
 - Consider residue-specific time schedules
     - e.g. for inpainting a binder, freeze the target chain at t=1

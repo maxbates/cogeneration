@@ -64,6 +64,7 @@ class SequenceIPANet(BaseSequencePredictionNet):
         init_edge_embed: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Add initial embeddings, may improve passing though of time / positional embeddings
+        # TODO - should we include an MLP after merging?
         if self.cfg.use_init_embed:
             node_embed = 0.5 * (node_embed + init_node_embed)
             edge_embed = 0.5 * (edge_embed + init_edge_embed)

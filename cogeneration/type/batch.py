@@ -38,6 +38,14 @@ class BatchProps(StrEnum):
     sample_id = "sample_id"  # (B) inference sample id
 
 
+# datum level metadata, i.e. `(B)` rather than `(B, N)`
+METADATA_BATCH_PROPS = [
+    BatchProps.pdb_name,
+    BatchProps.csv_idx,
+    BatchProps.sample_id,
+]
+
+
 class NoisyBatchProps(StrEnum):
     """
     Properties of a noised batch

@@ -533,7 +533,7 @@ class Interpolant:
 
         return noisy_batch
 
-    def rot_sample_kappa(self, t):
+    def rot_sample_kappa(self, t: torch.Tensor):
         if self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.exp:
             return 1 - torch.exp(-t * self.cfg.rots.exp_rate)
         elif self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.linear:
@@ -541,7 +541,9 @@ class Interpolant:
         else:
             raise ValueError(f"Invalid schedule: {self.cfg.rots.sample_schedule}")
 
-    def _trans_vector_field(self, t, trans_1, trans_t):
+    def _trans_vector_field(
+        self, t: torch.Tensor, trans_1: torch.Tensor, trans_t: torch.Tensor
+    ):
         if self.cfg.trans.sample_schedule == InterpolantTranslationsScheduleEnum.linear:
             trans_vf = (trans_1 - trans_t) / (1 - t)
         elif (
@@ -562,7 +564,9 @@ class Interpolant:
             )
         return trans_vf
 
-    def _trans_euler_step(self, d_t, t, trans_1, trans_t):
+    def _trans_euler_step(
+        self, d_t: float, t: torch.Tensor, trans_1: torch.Tensor, trans_t: torch.Tensor
+    ) -> torch.Tensor:
         assert d_t >= 0
         trans_vf = self._trans_vector_field(t, trans_1, trans_t)
 
@@ -578,7 +582,13 @@ class Interpolant:
 
         return trans_next
 
-    def _rots_euler_step(self, d_t, t, rotmats_1, rotmats_t):
+    def _rots_euler_step(
+        self,
+        d_t: float,
+        t: torch.Tensor,
+        rotmats_1: torch.Tensor,
+        rotmats_t: torch.Tensor,
+    ) -> torch.Tensor:
         if self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.linear:
             scaling = 1 / (1 - t)
         elif self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.exp:
@@ -593,7 +603,7 @@ class Interpolant:
             # Add IGSO(3) noise to stay on SO(3).
             # Also scale by `scaling` so the ratio of drift and diffusion is consistent.
             num_batch, num_res, _, _ = rotmats_t.shape
-            # TODO - determine approprite value for sigma
+            # TODO(stochastic) - determine approprite value for sigma
             sigma = torch.tensor([1]) * (
                 scaling * self.cfg.rots.stochastic_noise_intensity * np.sqrt(d_t)
             )
@@ -607,7 +617,9 @@ class Interpolant:
 
         return rotmats_next
 
-    def _psi_euler_step(self, d_t, t, psi_1, psi_t):
+    def _psi_euler_step(
+        self, d_t: float, t: torch.Tensor, psi_1: torch.Tensor, psi_t: torch.Tensor
+    ) -> torch.Tensor:
         """
         Perform an Euler step to update psi angles.
         Note that only the model predicts psi angles, but they are not an input to the model.
@@ -856,6 +868,9 @@ class Interpolant:
         num_res: int,
         model,
         task: InferenceTaskEnum,
+        diffuse_mask: torch.Tensor,
+        chain_idx: torch.Tensor,
+        res_idx: torch.Tensor,
         trans_0: Optional[torch.Tensor] = None,
         rotmats_0: Optional[torch.Tensor] = None,
         psis_0: Optional[torch.Tensor] = None,
@@ -864,9 +879,6 @@ class Interpolant:
         rotmats_1: Optional[torch.Tensor] = None,
         psis_1: Optional[torch.Tensor] = None,
         aatypes_1: Optional[torch.Tensor] = None,
-        diffuse_mask: Optional[torch.Tensor] = None,
-        chain_idx: Optional[torch.Tensor] = None,
-        res_idx: Optional[torch.Tensor] = None,
         # t_nn is model/function that generates explicit time steps (r3, so3, cat) given t
         t_nn: Union[Callable[[torch.Tensor], torch.Tensor], Any] = None,
     ) -> Tuple[SamplingTrajectory, SamplingTrajectory]:
@@ -936,22 +948,6 @@ class Interpolant:
 
         # for inference, all residues under consideration
         res_mask = torch.ones(num_batch, num_res, device=self._device)
-
-        if chain_idx is None:
-            # Default: assumes fully-considered monomer (i.e. ~ `torch.ones`)
-            # TODO(multimer) drop monomer assumption
-            chain_idx = res_mask
-        if res_idx is None:
-            # Generate residue indices (shape: [num_batch, num_res])
-            # Each generated sample will be the same length
-            # TODO(multimer) drop monomer assumption - util to get `res_idx` given `chain_idx`
-            res_idx = torch.arange(num_res, device=self._device, dtype=torch.float32)[
-                None
-            ].repeat(num_batch, 1)
-        if diffuse_mask is None:
-            # Default: diffuse all residues under consideration
-            # TODO require argument
-            diffuse_mask = res_mask
 
         # Initialize t=1 values for translations, rotations, psi, and aatypes, if not defined
 
@@ -1204,7 +1200,7 @@ class Interpolant:
             trans_t_2 = self._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
             rotmats_t_2 = self._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
             aatypes_t_2 = self._aatypes_euler_step(d_t, t_1, pred_logits_1, aatypes_t_1)
-            psi_t_2 = (
+            psis_t_2 = (
                 self._psi_euler_step(d_t, t_1, pred_psis_1, psis_t_1)
                 if pred_psis_1 is not None
                 else None
@@ -1228,9 +1224,9 @@ class Interpolant:
                 )
 
                 # For psi angles, take an Euler step toward known values
-                if psi_t_2 is not None:
+                if psis_t_2 is not None:
                     psi_t_2_motif = self._psi_euler_step(d_t, t_1, psis_1, pred_psis_1)
-                    psi_t_2 = mask_blend_2d(psi_t_2, psi_t_2_motif, diffuse_mask)
+                    psis_t_2 = mask_blend_2d(psis_t_2, psi_t_2_motif, diffuse_mask)
 
             # Center diffused residues to maintain translation invariance
             # Definitely should center if inpainting or stochastic, but might as well if unconditional too
@@ -1240,7 +1236,7 @@ class Interpolant:
             # Add to trajectory
             protein_trajectory.append(
                 SamplingStep(
-                    structure=frames_to_atom37(trans_t_2, rotmats_t_2, psi_t_2),
+                    structure=frames_to_atom37(trans_t_2, rotmats_t_2, psis_t_2),
                     amino_acids=to_cpu(aatypes_t_2),
                 )
             )
@@ -1249,7 +1245,7 @@ class Interpolant:
             trans_t_1 = trans_t_2
             rotmats_t_1 = rotmats_t_2
             aatypes_t_1 = aatypes_t_2
-            psis_t_1 = psi_t_2
+            psis_t_1 = psis_t_2
             t_1 = t_2
 
         # We only integrated to 1-min_t, so need to make a final step

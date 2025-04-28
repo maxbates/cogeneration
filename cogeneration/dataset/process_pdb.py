@@ -9,9 +9,9 @@ import tree
 from Bio import PDB
 from numpy import typing as npt
 
-from cogeneration.data.const import ALPHANUMERIC, CA_IDX, CHAIN_TO_INT
+from cogeneration.data.const import CA_IDX
 from cogeneration.data.io import read_pkl, write_pkl
-from cogeneration.data.protein import process_chain
+from cogeneration.data.protein import chain_str_to_int, process_chain
 from cogeneration.data.residue_constants import unk_restype_index
 from cogeneration.type.dataset import ChainFeatures
 from cogeneration.type.dataset import DatasetColumns as dc
@@ -23,15 +23,6 @@ class DataError(Exception):
     """Error raised when an invalid PDB file is encountered."""
 
     pass
-
-
-def _chain_str_to_int(chain_str: str):
-    chain_int = 0
-    if len(chain_str) == 1:
-        return CHAIN_TO_INT[chain_str]
-    for i, chain_char in enumerate(chain_str):
-        chain_int += CHAIN_TO_INT[chain_char] + (i * len(ALPHANUMERIC))
-    return chain_int
 
 
 def _concat_np_features(
@@ -182,7 +173,7 @@ def _trim_chain_feats_to_modeled_residues(
 def _process_chain_feats(
     chain_feats: ChainFeatures,
     center: bool = True,
-    trim_modeled_residues: bool = True,
+    trim_to_modeled_residues: bool = True,
     scale_factor: float = 1.0,
 ) -> ProcessedFile:
     """
@@ -203,7 +194,8 @@ def _process_chain_feats(
 
     Note that positions are expected in angstroms (PDB style).
     """
-    # TODO(multimer) - make masking optional. Check FrameFlow original implementation and see if present
+    # TODO(multimer) - make masking optional so easier to reuse function or break out functionality.
+    #  Check FrameFlow original implementation and see if present
 
     chain_feats[dpc.bb_mask] = chain_feats[dpc.atom_mask][:, CA_IDX]
 
@@ -215,9 +207,10 @@ def _process_chain_feats(
 
     chain_feats[dpc.bb_positions] = chain_feats[dpc.atom_positions][:, CA_IDX]
 
-    # Only take modeled residues.
+    # Trim to modeled residues.
     # This filters away residues outside range of consideration, yield length N := len(modeled_idx)
-    if trim_modeled_residues:
+    # However, it does not filter away intermediates, i.e. if there is a gap in `modeled_idx`.
+    if trim_to_modeled_residues:
         chain_feats = _trim_chain_feats_to_modeled_residues(chain_feats)
 
     return chain_feats
@@ -264,7 +257,7 @@ def _process_pdb(
     struct_feats = []
     all_seqs = set()
     for chain_id, chain in struct_chains.items():
-        chain_id = _chain_str_to_int(chain_id)
+        chain_id = chain_str_to_int(chain_id)
         chain_protein = process_chain(chain, chain_id=chain_id)
         chain_dict: ChainFeatures = dataclasses.asdict(chain_protein)  # noqa
 
@@ -279,7 +272,7 @@ def _process_pdb(
             chain_dict,
             scale_factor=scale_factor,
             center=False,
-            trim_modeled_residues=False,
+            trim_to_modeled_residues=False,
         )
         all_seqs.add(tuple(chain_dict[dpc.aatype]))
         struct_feats.append(chain_dict)
@@ -381,17 +374,15 @@ def process_pdb_file(
 def read_processed_file(
     processed_file_path: str,
     center: bool = True,
-    trim_modeled_residues: bool = True,
+    trim_to_modeled_residues: bool = True,
 ) -> ProcessedFile:
     """
     Loads a processed PDB pkl from `process_pdb_file` and yields a ProcessedFile.
     """
-    # TODO(multimer) - ensure multimer files from public MultiFlow are written as expected
-    #   i.e. how multiple chains are handled, small molecules inside, etc.
     processed_feats = read_pkl(processed_file_path)
     processed_file = _process_chain_feats(
         processed_feats,
         center=center,
-        trim_modeled_residues=trim_modeled_residues,
+        trim_to_modeled_residues=trim_to_modeled_residues,
     )
     return processed_file

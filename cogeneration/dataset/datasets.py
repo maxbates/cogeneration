@@ -17,7 +17,7 @@ from cogeneration.data import data_transforms, rigid_utils
 from cogeneration.data.const import seq_to_aatype
 from cogeneration.dataset.motif_factory import Motif, MotifFactory, Segment
 from cogeneration.dataset.process_pdb import read_processed_file
-from cogeneration.type.batch import BatchFeatures
+from cogeneration.type.batch import METADATA_BATCH_PROPS, BatchFeatures
 from cogeneration.type.batch import BatchProps as bp
 from cogeneration.type.batch import InferenceFeatures, empty_feats
 from cogeneration.type.dataset import DatasetColumns as dc
@@ -341,7 +341,7 @@ class BaseDataset(Dataset):
         return processed_feats
 
     @staticmethod
-    def reset_residues_and_randomize_chains(feats: BatchFeatures):
+    def reset_residues_and_randomize_chains(cfg: DatasetConfig, feats: BatchFeatures):
         """
         Randomize chain indices, and re-number residue indices for each chain to start from 1.
         Modifies the input features in place.
@@ -361,8 +361,9 @@ class BaseDataset(Dataset):
         )
         for i, chain_id in enumerate(all_chain_idx):
             chain_mask = (chain_idx == chain_id).long()
-            # TODO(multimer) make chain gap configurable
-            chain_min_idx = torch.min(res_idx + (1 - chain_mask) * 1e3).long()
+            chain_min_idx = torch.min(
+                res_idx + (1 - chain_mask) * cfg.chain_gap_dist
+            ).long()
             new_res_idx += (res_idx - chain_min_idx + 1) * chain_mask
 
             # Shuffle chain_index
@@ -410,10 +411,8 @@ class BaseDataset(Dataset):
         new_total_length = sum([seg.length for seg in segments])
         new_feats = empty_feats(N=new_total_length)
 
-        metadata_props = [bp.pdb_name, bp.csv_idx, bp.sample_id]
-
         # copy over some features from original
-        for prop in metadata_props:
+        for prop in METADATA_BATCH_PROPS:
             if prop in feats:
                 new_feats[prop] = feats[prop]
 
@@ -424,7 +423,7 @@ class BaseDataset(Dataset):
 
                 # copy over relevant motif features
                 for prop, value in new_feats.items():
-                    if prop in metadata_props:
+                    if prop in METADATA_BATCH_PROPS:
                         continue
                     new_feats[prop][s:e] = feats[prop][s:e]
 
@@ -575,7 +574,7 @@ class BaseDataset(Dataset):
         #    BaseDataset.recenter_structure(feats=feats)
 
         # Randomize chains and reset residue positions - after motif-selection!
-        BaseDataset.reset_residues_and_randomize_chains(feats=feats)
+        BaseDataset.reset_residues_and_randomize_chains(cfg=cfg, feats=feats)
 
         return feats
 

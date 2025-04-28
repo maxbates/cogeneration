@@ -587,13 +587,14 @@ class FlowModule(LightningModule):
             num_res,
             self.model,
             task=inference_task,
+            diffuse_mask=diffuse_mask,
+            chain_idx=batch[bp.chain_idx],
+            res_idx=batch[bp.res_idx],
             # t=0 values will be noise
             trans_1=batch[bp.trans_1],
             rotmats_1=batch[bp.rotmats_1],
             aatypes_1=batch[bp.aatypes_1],
-            diffuse_mask=diffuse_mask,
-            chain_idx=batch[bp.chain_idx],
-            res_idx=batch[bp.res_idx],
+            psis_1=batch[bp.torsion_angles_sin_cos_1][..., 2, :],
         )
 
         bb_trajs = to_numpy(protein_traj.structure)
@@ -817,8 +818,8 @@ class FlowModule(LightningModule):
             psis_1=psi_torsions_1,
             aatypes_1=aatypes_1,
             diffuse_mask=diffuse_mask,
-            chain_idx=batch[bp.chain_idx] if bp.chain_idx in batch else None,
-            res_idx=batch[bp.res_idx] if bp.res_idx in batch else None,
+            chain_idx=batch[bp.chain_idx],
+            res_idx=batch[bp.res_idx],
         )
 
         model_bb_trajs = to_numpy(model_traj.structure)

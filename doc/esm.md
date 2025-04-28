@@ -47,8 +47,7 @@ Can probably take ESM module from FoldFlow2
     - [ ] By default, don't `embed_aatype` in `node_network` if using ESM?
         - [ ] how embed `aatype_sc` ?
         - [ ] important to embed `cat_t`?
-
-
+    
 - [ ] Pass these merged representations to sequence prediction net
 
 - [ ] Update checkpointing

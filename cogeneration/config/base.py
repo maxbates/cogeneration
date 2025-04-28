@@ -629,6 +629,8 @@ class DatasetConfig(BaseClassConfig):
     # TODO cfg to only add noise if t below some threshold (requires moving out of dataset)
     # TODO ensure noise added each time accessed and not cached
     noise_atom_positions_angstroms: float = 0.1
+    # multimer
+    chain_gap_dist: int = 200  # 200 in AF2M, 1e3 in public MultiFlow
 
     # Redesigned, i.e. use ProteinMPNN to generate sequences for a structure
     use_redesigned: bool = True

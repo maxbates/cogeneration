@@ -20,14 +20,19 @@ import dataclasses
 import io
 import os
 import re
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Union
 
 import numpy as np
 from Bio.PDB import PDBParser
 from Bio.PDB.Chain import Chain
 
 from cogeneration.data import residue_constants
-from cogeneration.data.const import PDB_CHAIN_IDS, PDB_MAX_CHAINS
+from cogeneration.data.const import (
+    ALPHANUMERIC,
+    CHAIN_TO_INT,
+    PDB_CHAIN_IDS,
+    PDB_MAX_CHAINS,
+)
 
 FeatureDict = Mapping[str, np.ndarray]
 ModelOutput = Mapping[str, Any]
@@ -69,88 +74,19 @@ class Protein:
             )
 
 
-def from_pdb_string(pdb_str: str, chain_id: Optional[str] = None) -> Protein:
-    """Takes a PDB string and constructs a Protein object.
-
-    WARNING: All non-standard residue types will be converted into UNK. All
-      non-standard atoms will be ignored.
-
-    Args:
-      pdb_str: The contents of the pdb file
-      chain_id: If chain_id is specified (e.g. A), then only that chain
-        is parsed. Otherwise all chains are parsed.
-
-    Returns:
-      A new `Protein` parsed from the pdb contents.
-    """
-    pdb_fh = io.StringIO(pdb_str)
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure("none", pdb_fh)
-    models = list(structure.get_models())
-    if len(models) != 1:
-        raise ValueError(
-            f"Only single model PDBs are supported. Found {len(models)} models."
-        )
-    model = models[0]
-
-    atom_positions = []
-    aatype = []
-    atom_mask = []
-    residue_index = []
-    chain_ids = []
-    b_factors = []
-
-    for chain in model:
-        if chain_id is not None and chain.id != chain_id:
-            continue
-        for res in chain:
-            if res.id[2] != " ":
-                raise ValueError(
-                    f"PDB contains an insertion code at chain {chain.id} and residue "
-                    f"index {res.id[1]}. These are not supported."
-                )
-            res_shortname = residue_constants.restype_3to1.get(res.resname, "X")
-            restype_idx = residue_constants.restype_order.get(
-                res_shortname, residue_constants.restype_num
-            )
-            pos = np.zeros((residue_constants.atom_type_num, 3))
-            mask = np.zeros((residue_constants.atom_type_num,))
-            res_b_factors = np.zeros((residue_constants.atom_type_num,))
-            for atom in res:
-                if atom.name not in residue_constants.atom_types:
-                    continue
-                pos[residue_constants.atom_order[atom.name]] = atom.coord
-                mask[residue_constants.atom_order[atom.name]] = 1.0
-                res_b_factors[residue_constants.atom_order[atom.name]] = atom.bfactor
-            if np.sum(mask) < 0.5:
-                # If no known atom positions are reported for the residue then skip it.
-                continue
-            aatype.append(restype_idx)
-            atom_positions.append(pos)
-            atom_mask.append(mask)
-            residue_index.append(res.id[1])
-            chain_ids.append(chain.id)
-            b_factors.append(res_b_factors)
-
-    # Chain IDs are usually characters so map these to ints.
-    unique_chain_ids = np.unique(chain_ids)
-    chain_id_mapping = {cid: n for n, cid in enumerate(unique_chain_ids)}
-    chain_index = np.array([chain_id_mapping[cid] for cid in chain_ids])
-
-    return Protein(
-        atom_positions=np.array(atom_positions),
-        atom_mask=np.array(atom_mask),
-        aatype=np.array(aatype),
-        residue_index=np.array(residue_index),
-        chain_index=chain_index,
-        b_factors=np.array(b_factors),
-    )
+def chain_str_to_int(chain_str: str) -> int:
+    chain_int = 0
+    if len(chain_str) == 1:
+        return CHAIN_TO_INT[chain_str]
+    for i, chain_char in enumerate(chain_str):
+        chain_int += CHAIN_TO_INT[chain_char] + (i * len(ALPHANUMERIC))
+    return chain_int
 
 
-def process_chain(chain: Chain, chain_id: str) -> Protein:
+def process_chain(chain: Chain, chain_id: int) -> Protein:
     """Convert a PDB chain object into a AlphaFold Protein instance.
 
-    Forked from alphafold.common.protein.from_pdb_string
+    Forked from alphafold.common.protein.py `_from_bio_structure()`
 
     WARNING: All non-standard residue types will be converted into UNK. All
         non-standard atoms will be ignored.
@@ -166,6 +102,10 @@ def process_chain(chain: Chain, chain_id: str) -> Protein:
     Returns:
         Protein object with protein features.
     """
+    assert isinstance(
+        chain_id, int
+    ), "chain_id must be an int, use `chain_str_to_int()`"
+
     atom_positions = []
     aatype = []
     atom_mask = []
@@ -173,6 +113,13 @@ def process_chain(chain: Chain, chain_id: str) -> Protein:
     b_factors = []
     chain_ids = []
     for res in chain:
+        # copy AF2 behavior (note: missing in public MultiFlow)
+        if res.id[2] != " ":
+            raise ValueError(
+                f"PDB/mmCIF contains an insertion code at chain {chain.id} and"
+                f" residue index {res.id[1]}. These are not supported."
+            )
+
         res_shortname = residue_constants.restype_3to1.get(res.resname, "X")
         restype_idx = residue_constants.restype_order.get(
             res_shortname, residue_constants.restype_num
@@ -186,12 +133,22 @@ def process_chain(chain: Chain, chain_id: str) -> Protein:
             pos[residue_constants.atom_order[atom.name]] = atom.coord
             mask[residue_constants.atom_order[atom.name]] = 1.0
             res_b_factors[residue_constants.atom_order[atom.name]] = atom.bfactor
+
+        # copy AF2 behavior
+        # (note: missing in public FrameFlow, but it does [sometimes?] skip empty res...)
+        if np.sum(mask) < 0.5:
+            # If no known atom positions are reported for the residue then skip it.
+            continue
+
         aatype.append(restype_idx)
         atom_positions.append(pos)
         atom_mask.append(mask)
         residue_index.append(res.id[1])
         b_factors.append(res_b_factors)
         chain_ids.append(chain_id)
+
+    # Unlike AF2, we expect to receive a valid int chain_id, and just pass it through.
+    # We concat chains explicitly in caller after processing chains.
 
     return Protein(
         atom_positions=np.array(atom_positions),
@@ -321,47 +278,6 @@ def ideal_atom_mask(prot: Protein) -> np.ndarray:
       An ideal atom mask.
     """
     return residue_constants.STANDARD_ATOM_MASK[prot.aatype]
-
-
-def from_prediction(
-    features: FeatureDict,
-    result: ModelOutput,
-    b_factors: Optional[np.ndarray] = None,
-    remove_leading_feature_dimension: bool = True,
-) -> Protein:
-    """Assembles a protein from a prediction.
-
-    Args:
-      features: Dictionary holding model inputs.
-      result: Dictionary holding model outputs.
-      b_factors: (Optional) B-factors to use for the protein.
-      remove_leading_feature_dimension: Whether to remove the leading dimension
-        of the `features` values.
-
-    Returns:
-      A protein instance.
-    """
-    fold_output = result["structure_module"]
-
-    def _maybe_remove_leading_dim(arr: np.ndarray) -> np.ndarray:
-        return arr[0] if remove_leading_feature_dimension else arr
-
-    if "asym_id" in features:
-        chain_index = _maybe_remove_leading_dim(features["asym_id"])
-    else:
-        chain_index = np.zeros_like(_maybe_remove_leading_dim(features["aatype"]))
-
-    if b_factors is None:
-        b_factors = np.zeros_like(fold_output["final_atom_mask"])
-
-    return Protein(
-        aatype=_maybe_remove_leading_dim(features["aatype"]),
-        atom_positions=fold_output["final_atom_positions"],
-        atom_mask=fold_output["final_atom_mask"],
-        residue_index=_maybe_remove_leading_dim(features["residue_index"]) + 1,
-        chain_index=chain_index,
-        b_factors=b_factors,
-    )
 
 
 def create_full_prot(

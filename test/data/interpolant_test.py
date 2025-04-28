@@ -238,7 +238,11 @@ class TestInterpolantSample:
             )
 
         prot_traj, model_traj = interpolant.sample(
-            num_batch=B, num_res=N, model=model, task=task, **kwargs
+            num_batch=B,
+            num_res=N,
+            model=model,
+            task=task,
+            **kwargs
         )
 
         assert prot_traj.structure.shape == (B, T + 1, N, 37, 3)
