@@ -108,8 +108,6 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
     - [ ] Update losses
         - [x] no neighbor loss across chains
         - [x] C-alpha distance loss accounts for chains
-        - [ ] contact-presrvation loss.. maybe `hotspot` loss is the best way to capture this...  
-            - e.g. for residues more than N residues apart, is contact preserved
         - (?)  consider explicit cross-chain distances?
             - not sure what beyond hot spot and interaction distance is necessary...
             - Want to support training on non-interacting pairs too - see how RosettaFold did this in the paper where they predict binding
@@ -165,9 +163,12 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
     - [ ] Review RFDiffusion training curriculum
 
 - Support "hotspots"
-    - RFDiffusion style specification of interacting residues
-    - Method to determine hotspots from a complete structure
-    - update losses to ensure important binding residues are interacting across chains
+    - [ ] RFDiffusion style specification of interacting residues
+        - pass as additional channel
+    - [ ] Method to determine hotspots from a complete structure
+        - pick a few residues, match something like RFDiffusion
+    - [ ] update losses to ensure important binding residues are interacting across chains
+        - optimize for picking a few, non-exhaustive, i.e. loss should focus on precision, recall within a region rather than all residues
     
 - Consider residue-specific time schedules
     - e.g. for inpainting a binder, freeze the target chain at t=1

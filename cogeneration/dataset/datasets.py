@@ -96,6 +96,15 @@ class DatasetFilterer:
             data_csv[dc.coil_percent] <= self.dataset_cfg.filter.max_coil_percent
         ]
 
+    def _max_percent_unknown_filter(
+        self, data_csv: MetadataDataFrame
+    ) -> MetadataDataFrame:
+        """Filter proteins which exceed `max_percent_residues_unknown`."""
+        return data_csv[
+            (data_csv[dc.seq_len] / data_csv[dc.modeled_seq_len])
+            >= self.dataset_cfg.filter.max_percent_residues_unknown
+        ]
+
     def filter_metadata(self, raw_csv: MetadataDataFrame) -> MetadataDataFrame:
         """
         Initial filtering of dataset.
@@ -126,6 +135,14 @@ class DatasetFilterer:
         if len(data_csv) < running_length:
             self._log.debug(
                 f"{running_length} ->{len(data_csv)} examples after length filter"
+            )
+            running_length = len(data_csv)
+
+        # modelable residues
+        data_csv = self._max_percent_unknown_filter(data_csv=data_csv)
+        if len(data_csv) < running_length:
+            self._log.debug(
+                f"{running_length} ->{len(data_csv)} examples after % unknown filter"
             )
             running_length = len(data_csv)
 

@@ -555,6 +555,8 @@ class DatasetFilterConfig(BaseClassConfig):
     # TODO - support filter on low pLDDT percentage
     # TODO - min/max motif percent threshold (avoid loopy things)
     rog_quantile: float = 0.96
+    # minimum percent of known and modelable residues in the structure of total sequence.
+    max_percent_residues_unknown: float = 0.5
     oligomeric: List[str] = field(
         default_factory=lambda: [
             "monomer",
@@ -1096,15 +1098,18 @@ class Config(BaseClassConfig):
         raw_cfg.shared.stochastic = False
         # Don't predict torsion angles
         raw_cfg.model.predict_psi_torsions = False
-        # Other parameters as defined by public codebase
+        # positional embeddings
         raw_cfg.model.node_features.embed_chain = False
         raw_cfg.model.edge_features.embed_chain = False
-        raw_cfg.interpolant.provide_kappa = False
-        raw_cfg.inference.interpolant.provide_kappa = False
+        raw_cfg.model.hyper_params.pos_embed_max_len = 2056
         raw_cfg.model.hyper_params.pos_embed_method = (
             PositionalEmbeddingMethod.sine_cosine
         )
-        raw_cfg.model.hyper_params.pos_embed_max_len = 2056
+        # no filter on unknown residues
+        raw_cfg.dataset.filter.max_percent_residues_unknown = 0.0
+        # rotations non-expoential schedule
+        raw_cfg.interpolant.provide_kappa = False
+        raw_cfg.inference.interpolant.provide_kappa = False
 
         # Weights
         # assume we have public weights available, use as default checkpoint
