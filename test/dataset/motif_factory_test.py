@@ -1,12 +1,58 @@
+from pathlib import Path
+
 import numpy as np
+import pytest
 import torch
 from numpy.random import default_rng
 
-from cogeneration.config.base import DatasetInpaintingConfig
+from cogeneration.config.base import DatasetInpaintingConfig, DatasetInpaintingMotifStrategy, DatasetConfig
+from cogeneration.type.batch import BatchProps as bp
+from cogeneration.dataset.datasets import batch_features_from_processed_file
 from cogeneration.dataset.motif_factory import Motif, MotifFactory, Scaffold
+from cogeneration.dataset.process_pdb import process_pdb_file
+
+# Use protein with weird stuff happening, is multimeric, has cross-chain interactions
+example_pdb_path = Path(__file__).parent / "2qlw.pdb"
 
 
 class TestMotifFactory:
+    @pytest.mark.parametrize(
+        "strategy", list(DatasetInpaintingMotifStrategy)
+    )
+    def test_generate_diffuse_mask(self, strategy: DatasetInpaintingMotifStrategy):
+        if strategy == DatasetInpaintingMotifStrategy.ALL:
+            return
+
+        cfg = DatasetInpaintingConfig(strategy=strategy)
+        rng = default_rng(0)
+        factory = MotifFactory(cfg=cfg, rng=rng)
+
+        processed_pdb = process_pdb_file(
+            pdb_file_path=str(example_pdb_path),
+            pdb_name="2qlw",
+        )
+        pdb_batch_features = batch_features_from_processed_file(
+            processed_file=processed_pdb,
+            cfg=DatasetConfig(),
+            processed_file_path=str(example_pdb_path),
+        )
+
+        diffuse_mask = factory.generate_diffuse_mask(
+            res_mask=pdb_batch_features[bp.res_mask],
+            plddt_mask=pdb_batch_features[bp.plddt_mask],
+            chain_idx=pdb_batch_features[bp.chain_idx],
+            res_idx=pdb_batch_features[bp.res_idx],
+            trans_1=pdb_batch_features[bp.trans_1],
+            rotmats_1=pdb_batch_features[bp.rotmats_1],
+            aatypes_1=pdb_batch_features[bp.aatypes_1],
+        )
+
+        assert isinstance(diffuse_mask, torch.Tensor)
+        assert diffuse_mask.shape == pdb_batch_features[bp.res_mask].shape
+        assert not (diffuse_mask == 0).all(), "At least one residue should be scaffolded"
+        assert not (diffuse_mask == 1).all(), "At least one residue should be part of the motif"
+
+
     def test_generate_single_motif_diffuse_mask(self):
         # There should be exactly one contiguous motif of length 5
         cfg = DatasetInpaintingConfig(
@@ -23,8 +69,11 @@ class TestMotifFactory:
         N = 20
         res_mask = torch.ones(N, dtype=torch.float32)
         plddt_mask = torch.ones(N, dtype=torch.float32)
+        chain_idx = torch.ones(N, dtype=torch.float32)
         mask = factory.generate_single_motif_diffuse_mask(
-            res_mask=res_mask, plddt_mask=plddt_mask
+            res_mask=res_mask,
+            plddt_mask=plddt_mask,
+            chain_idx=chain_idx,
         )
         assert isinstance(mask, torch.Tensor)
         assert mask.shape == (N,)

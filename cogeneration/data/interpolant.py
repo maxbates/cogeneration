@@ -483,8 +483,8 @@ class Interpolant:
         corruption_mask_sequence = diffuse_mask
         if task == DataTaskEnum.inpainting:
             # any rows with a fixed motif have a `diffuse_mask.mean() < 1.0`
-            is_inpainting_mask = diffuse_mask.float().mean(dim=1) < 1.0
-            corruption_mask_structure[is_inpainting_mask] = 1.0
+            row_inpainting_mask = diffuse_mask.float().mean(dim=1) < 1.0
+            corruption_mask_structure[row_inpainting_mask] = 1.0
 
         # Apply corruptions
 

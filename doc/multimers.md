@@ -113,13 +113,13 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
             - Want to support training on non-interacting pairs too - see how RosettaFold did this in the paper where they predict binding
 
 - Inpainting
-    - [ ] Update motif selections to account for multiple chains
+    - [x] Update motif selections to account for multiple chains
          - e.g. break motif on chain breaks for window-based methods
-    - [ ] Update motif segmenting to account for multiple chains
-    - [ ] Add new motif selection strategies
-         - [ ] masking binding interfaces of one chain, preserve rest
-         - [ ] masking binding interfaces of both chains, preserve rest
-         - [ ] mask entire interacting chain
+    - [x] Update motif segmenting to account for multiple chains
+    - [x] Add new motif selection strategies
+         - [x] masking binding interfaces of one chain, preserve rest
+         - [x] masking binding interfaces of both chains, preserve rest
+         - [x] mask entire interacting chain
 
 - Sampling
     - new eval dataset for multimers? or update PDB dataset with new motif strategies

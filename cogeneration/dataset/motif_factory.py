@@ -47,7 +47,8 @@ class MotifFactory:
     cfg: DatasetInpaintingConfig
     rng: np.random.Generator
 
-    def segments_from_contigmap(self, contigmap) -> List[Segment]:
+    @staticmethod
+    def segments_from_contigmap(contigmap: str) -> List[Segment]:
         # Parse a contigmap like "A1-20/20/A39-50" into a list of segment objects.
         segments = []
         length_so_far = 0
@@ -73,65 +74,22 @@ class MotifFactory:
 
         return segments
 
-    def generate_segments_from_diffuse_mask(
-        self,
-        diffuse_mask: torch.Tensor,
+    @staticmethod
+    def _is_multimeric(
         chain_idx: torch.Tensor,
-        random_scale_range=(0.5, 2),
-    ):
-        """
-        Generate segments from a diffuse mask.
-        Motifs are defined by diffuse_mask == 0, scaffolds are defined by diffuse_mask == 1
-        Scaffold regions are randomly scaled by a factor in random_scale_range.
-        """
-        # TODO(multimer) handle multiple chains i.e. diffuse mask over multiple chains
+    ) -> bool:
+        """Check if the input is a multimeric structure"""
+        return len(chain_idx.unique()) > 1
 
-        segments = []
-        seg_start = 0
-        current_val = diffuse_mask[0]
-        for i in range(1, len(diffuse_mask)):
-            if diffuse_mask[i] != current_val:
-                seg_end = i - 1
-                # 1 = scaffold region
-                if current_val:
-                    length = seg_end - seg_start + 1
-                    factor = self.rng.uniform(*random_scale_range)  # random scale
-                    target_length = int(round(length * factor))
-                    segments.append(
-                        Scaffold(start=seg_start, end=seg_end, new_length=target_length)
-                    )
-                # 0 = motif region
-                else:
-                    segments.append(
-                        Motif(
-                            start=seg_start,
-                            end=seg_end,
-                            chain_idx=chain_idx[seg_start].item(),
-                        )
-                    )
-                current_val = diffuse_mask[i]
-                seg_start = i
+    @staticmethod
+    def get_chain_breaks(chain_idx: torch.Tensor) -> List[int]:
+        # return indices where chains change
+        breaks = (chain_idx[1:] != chain_idx[:-1]).nonzero(as_tuple=False).flatten() + 1
+        return breaks.tolist()
 
-        # Process final segment.
-        seg_end = len(diffuse_mask) - 1
-        length = seg_end - seg_start + 1
-        if current_val:
-            factor = self.rng.uniform(*random_scale_range)
-            target_length = int(round(length * factor))
-            segments.append(
-                Scaffold(start=seg_start, end=seg_end, new_length=target_length)
-            )
-        else:
-            segments.append(
-                Motif(
-                    start=seg_start, end=seg_end, chain_idx=chain_idx[seg_start].item()
-                )
-            )
-
-        return segments
-
+    @staticmethod
     def _plddt_start_stop(
-        self, res_mask: torch.Tensor, plddt_mask: torch.Tensor
+        res_mask: torch.Tensor, plddt_mask: torch.Tensor
     ) -> Tuple[int, int, int]:
         """
         Trim low pLDDT residues to get start / stop bounds and length
@@ -149,6 +107,76 @@ class MotifFactory:
         stop = int(idx.max().item()) + 1
         length = stop - start
         return start, stop, length
+
+    def generate_segments_from_diffuse_mask(
+        self,
+        diffuse_mask: torch.Tensor,
+        chain_idx: torch.Tensor,
+        random_scale_range=(0.5, 2),
+    ):
+        """
+        Generate segments from a diffuse mask.
+        Motifs are defined by diffuse_mask == 0, scaffolds are defined by diffuse_mask == 1
+        Scaffold regions are randomly scaled by a factor in random_scale_range.
+        """
+        N = diffuse_mask.shape[0]
+        segments: List[Segment] = []
+        seg_start = 0
+        current_diff = diffuse_mask[0]
+        current_chain = bool(chain_idx[0].item())
+
+        for i in range(1, N):
+            diff = bool(diffuse_mask[i].item())
+            chain = int(chain_idx[i].item())
+
+            # boundary if mask flips or chain changes
+            if diff != current_diff or chain != current_chain:
+                seg_end = i - 1
+                length = seg_end - seg_start + 1
+
+                if current_diff:
+                    segments.append(
+                        Scaffold(
+                            start=seg_start,
+                            end=seg_end,
+                            # scaffold: randomly scale length
+                            new_length=int(
+                                round(length * self.rng.uniform(*random_scale_range))
+                            ),
+                        )
+                    )
+                else:
+                    # motif: record chain_idx
+                    segments.append(
+                        Motif(start=seg_start, end=seg_end, chain_idx=current_chain)
+                    )
+
+                # reset for next segment
+                seg_start = i
+                current_diff = diff
+                current_chain = chain
+
+        # final tail segment
+        seg_end = N - 1
+        length = seg_end - seg_start + 1
+        if current_diff:
+            segments.append(
+                Scaffold(
+                    start=seg_start,
+                    end=seg_end,
+                    # scaffold: randomly scale length
+                    new_length=int(
+                        round(length * self.rng.uniform(*random_scale_range))
+                    ),
+                )
+            )
+
+        else:
+            segments.append(
+                Motif(start=seg_start, end=seg_end, chain_idx=current_chain)
+            )
+
+        return segments
 
     def _determine_bounds(
         self, res_mask: torch.Tensor, plddt_mask: torch.Tensor
@@ -171,17 +199,63 @@ class MotifFactory:
         # If not trimming, use the full range of the res_mask
         return 0, N, N, N
 
+    def _pick_chain_bounds(
+        self,
+        res_mask: torch.Tensor,
+        plddt_mask: torch.Tensor,
+        chain_idx: torch.Tensor,
+    ) -> Tuple[int, int, int, int]:
+        """
+        Pick a chain at random that exceeds minumum motif length, return its bounds.
+        If no chain meets minimum length, ignore chains and treat like monomer.
+        """
+        chain_to_length = {
+            chain: (chain_idx == chain).sum().item() for chain in chain_idx.unique()
+        }
+
+        # limit to minimum length
+        num_res = res_mask.shape[0]
+        min_length = max(
+            self.cfg.min_motif_len, floor(num_res * self.cfg.min_percent_motifs)
+        )
+        chain_to_length = {
+            chain: length
+            for chain, length in chain_to_length.items()
+            if length >= min_length
+        }
+        if len(chain_to_length) == 0:
+            return self._determine_bounds(res_mask=res_mask, plddt_mask=plddt_mask)
+
+        # pick a random chain to use as the bounds
+        chain_idx = int(self.rng.choice(list(chain_to_length.keys())))
+        bound_start = (
+            res_mask[chain_idx == chain_idx].nonzero(as_tuple=False).min().item()
+        )
+        bound_stop = (
+            res_mask[chain_idx == chain_idx].nonzero(as_tuple=False).max().item() + 1
+        )
+        bound_length = bound_stop - bound_start
+        return bound_start, bound_stop, bound_length, num_res
+
     def generate_single_motif_diffuse_mask(
         self,
         res_mask: torch.Tensor,
         plddt_mask: torch.Tensor,
+        chain_idx: torch.Tensor,
+        break_across_chains: bool = True,
     ) -> torch.Tensor:
         """
         Generate a `diffuse_mask` for a single motif in a sequence.
         """
-        bound_start, bound_stop, bound_length, num_res = self._determine_bounds(
-            res_mask=res_mask, plddt_mask=plddt_mask
-        )
+        # To break across chains, just pick one chain and set bounds.
+        if break_across_chains and self._is_multimeric(chain_idx=res_mask):
+            bound_start, bound_stop, bound_length, num_res = self._pick_chain_bounds(
+                res_mask=res_mask, plddt_mask=plddt_mask, chain_idx=chain_idx
+            )
+        else:
+            bound_start, bound_stop, bound_length, num_res = self._determine_bounds(
+                res_mask=res_mask, plddt_mask=plddt_mask
+            )
 
         motif_length = self.rng.integers(
             # lower bound exceeding `min_motif_length`, `min_percent_motifs`
@@ -200,6 +274,7 @@ class MotifFactory:
                 bound_stop, bound_length - motif_length - self.cfg.min_padding + 1
             ),
         )
+
         motif_end = motif_start + motif_length
 
         # diffuse everything but the motif
@@ -403,6 +478,148 @@ class MotifFactory:
         diffuse_mask = (dist2d[seed_idx] <= mask_distance_threshold).float()
         return diffuse_mask
 
+    def generate_binding_interface_diffuse_mask(
+        self,
+        chain_idx: torch.Tensor,
+        trans_1: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Mask residues in binding interface(s) as scaffold.
+
+        Residues within `binding_threshold` across chains are marked as interacting.
+        Then, residues between those residues and within `proximity_threshold` are added to the scaffold.
+        Does not consider which chains are interacting, just all interactions across all chains.
+        """
+        N = chain_idx.shape[0]
+        binding_threshold = self.cfg.interaction_dist_threshold_ang
+        proximity_threshold = self.cfg.proximity_dist_threshold_ang
+
+        # compute min distance to other residues
+        dist_2d = torch.linalg.norm(trans_1[:, None, :] - trans_1[None, :, :], dim=-1)
+        # mask out intra-chain distances
+        dist_2d[chain_idx[:, None] == chain_idx[None, :]] = float("inf")
+
+        # flag which residues have any partner within each threshold
+        prox_flag = (dist_2d <= proximity_threshold).any(dim=1)
+        bind_flag = (dist_2d <= binding_threshold).any(dim=1)
+
+        # iterate through, inspect each proximity window, set ranges where some residues
+        # are under `binding_threshold` to scaffold (1), rest is motifs (0)
+        diffuse_mask = torch.zeros(N, dtype=torch.float32)
+        i = 0
+        while i < N:
+            if not prox_flag[i]:
+                i += 1
+                continue
+            start = i
+            # consume proximity window
+            while i < N and prox_flag[i]:
+                i += 1
+            end = i
+            # if any residue here is in binding range, scaffold the whole window
+            if bind_flag[start:end].any():
+                diffuse_mask[start:end] = 1.0
+
+        return diffuse_mask
+
+    def generate_binding_interface_single_chain_diffuse_mask(
+        self,
+        chain_idx: torch.Tensor,
+        trans_1: torch.Tensor,
+        chain_to_mask: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Mask residues in binding interface, and in one chain (`chain_to_mask`) as scaffold.
+        """
+        # ablate only one chain at the interface
+        N = chain_idx.shape[0]
+        proximity_threshold = self.cfg.proximity_dist_threshold_ang
+        if chain_to_mask is None:
+            chain_to_mask = int(self.rng.choice(chain_idx.unique().tolist()))
+
+        # compute pairwise distances
+        dist_2d = torch.linalg.norm(trans_1[:, None, :] - trans_1[None, :, :], dim=-1)
+        # mask out intra-chain distances
+        dist_2d[chain_idx[:, None] == chain_idx[None, :]] = float("inf")
+
+        # flag residues in proximity
+        prox_flag = (dist_2d <= proximity_threshold).any(dim=1)
+
+        # set residues in proximity to scaffolds (1) and rest to motifs (0)
+        diffuse_mask = torch.zeros(N, dtype=torch.float32)
+        diffuse_mask[(chain_idx == chain_to_mask) & prox_flag] = 1.0
+        return diffuse_mask
+
+    def generate_binder_diffuse_mask(
+        self,
+        chain_idx: torch.Tensor,
+        chain_to_mask: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Mask out one chain entirely
+        TODO - filter out chains not interacting? Or assume interacting?
+        """
+        if chain_to_mask is None:
+            chain_to_mask = int(self.rng.choice(chain_idx.unique().tolist()))
+
+        diffuse_mask = torch.ones(chain_idx.shape[0], dtype=torch.float32)
+        diffuse_mask[chain_idx == chain_to_mask] = 0.0
+        return diffuse_mask
+
+    def strategy_diffuse_mask(
+        self,
+        strategy: DatasetInpaintingMotifStrategy,
+        res_mask: torch.Tensor,
+        plddt_mask: torch.Tensor,
+        chain_idx: torch.Tensor,
+        res_idx: torch.Tensor,
+        trans_1: torch.Tensor,
+        rotmats_1: torch.Tensor,
+        aatypes_1: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Get a `diffuse_mask` for a specified `strategy`.
+        """
+        if strategy == DatasetInpaintingMotifStrategy.single_motif:
+            return self.generate_single_motif_diffuse_mask(
+                res_mask=res_mask,
+                plddt_mask=plddt_mask,
+                chain_idx=chain_idx,
+            )
+        elif strategy == DatasetInpaintingMotifStrategy.variable_motifs:
+            return self.generate_multiple_motif_diffuse_mask(
+                res_mask=res_mask,
+                plddt_mask=plddt_mask,
+            )
+        elif strategy == DatasetInpaintingMotifStrategy.random_neighbors:
+            return self.generate_masked_neighbors_diffuse_mask(
+                res_mask=res_mask, plddt_mask=plddt_mask, trans_1=trans_1
+            )
+        elif strategy == DatasetInpaintingMotifStrategy.densest_neighbors:
+            return self.generate_densest_neighbors_diffuse_mask(
+                res_mask=res_mask, plddt_mask=plddt_mask, trans_1=trans_1
+            )
+        elif strategy == DatasetInpaintingMotifStrategy.binding_interface_single_chain:
+            assert self._is_multimeric(chain_idx=chain_idx)
+            return self.generate_binding_interface_single_chain_diffuse_mask(
+                chain_idx=chain_idx,
+                trans_1=trans_1,
+            )
+        elif strategy == DatasetInpaintingMotifStrategy.binding_interface:
+            assert self._is_multimeric(chain_idx=chain_idx)
+            return self.generate_binding_interface_diffuse_mask(
+                chain_idx=chain_idx,
+                trans_1=trans_1,
+            )
+        elif strategy == DatasetInpaintingMotifStrategy.binder:
+            assert self._is_multimeric(chain_idx=chain_idx)
+            return self.generate_binder_diffuse_mask(
+                chain_idx=chain_idx,
+                chain_to_mask=None,
+            )
+        else:
+            raise ValueError(f"Unknown motif selection strategy: {self.cfg.strategy}")
+
     def generate_diffuse_mask(
         self,
         res_mask: torch.Tensor,
@@ -414,25 +631,28 @@ class MotifFactory:
         aatypes_1: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Main entrypoint to get a diffuse_mask for a given set of residues.
+        Entrypoint to get a `diffuse_mask` specified by `DatasetInpaintingConfig`
         """
-        if self.cfg.strategy == DatasetInpaintingMotifStrategy.single_motif:
-            return self.generate_single_motif_diffuse_mask(
-                res_mask=res_mask,
-                plddt_mask=plddt_mask,
-            )
-        elif self.cfg.strategy == DatasetInpaintingMotifStrategy.variable_motifs:
-            return self.generate_multiple_motif_diffuse_mask(
-                res_mask=res_mask,
-                plddt_mask=plddt_mask,
-            )
-        elif self.cfg.strategy == DatasetInpaintingMotifStrategy.random_neighbors:
-            return self.generate_masked_neighbors_diffuse_mask(
-                res_mask=res_mask, plddt_mask=plddt_mask, trans_1=trans_1
-            )
-        elif self.cfg.strategy == DatasetInpaintingMotifStrategy.densest_neighbors:
-            return self.generate_densest_neighbors_diffuse_mask(
-                res_mask=res_mask, plddt_mask=plddt_mask, trans_1=trans_1
-            )
-        else:
-            raise ValueError(f"Unknown motif selection strategy: {self.cfg.strategy}")
+        strategy = self.cfg.strategy
+
+        # if `strategy == ALL`, pick a random one, handling multimer/monomer strategies
+        if strategy == DatasetInpaintingMotifStrategy.ALL:
+            is_multimer = self._is_multimeric(chain_idx=chain_idx)
+            while strategy == DatasetInpaintingMotifStrategy.ALL:
+                new_strategy = self.rng.choice(list(DatasetInpaintingMotifStrategy))
+                if not is_multimer and DatasetInpaintingMotifStrategy.is_multimeric(
+                    new_strategy
+                ):
+                    continue
+                strategy = new_strategy
+
+        return self.strategy_diffuse_mask(
+            strategy=strategy,
+            res_mask=res_mask,
+            plddt_mask=plddt_mask,
+            chain_idx=chain_idx,
+            res_idx=res_idx,
+            trans_1=trans_1,
+            rotmats_1=rotmats_1,
+            aatypes_1=aatypes_1,
+        )

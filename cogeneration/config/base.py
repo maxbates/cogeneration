@@ -569,6 +569,9 @@ class DatasetFilterConfig(BaseClassConfig):
 
 
 class DatasetInpaintingMotifStrategy(StrEnum):
+    # Enable picking from all strategies
+    ALL = "ALL"
+
     # single motif
     single_motif = "single_motif"
     # [min_num_motifs, max_num_motifs], skewed toward fewer
@@ -577,6 +580,21 @@ class DatasetInpaintingMotifStrategy(StrEnum):
     random_neighbors = "random_neighbors"
     # sample highly interacting res, mask neighbors < distance threshold
     densest_neighbors = "densest_neighbors"
+    # (multimer) binding interface, mask only one chain
+    binding_interface_single_chain = "binding_interface_single_chain"
+    # (multimer) pick all residues within interaction threshold
+    binding_interface = "binding_interface"
+    # (multimer) pick any chain and consider it a "binder"
+    binder = "binder"
+
+    @staticmethod
+    def is_multimeric(strategy: "DatasetInpaintingMotifStrategy") -> bool:
+        """Check if `strategy` is multimeric"""
+        return strategy in [
+            DatasetInpaintingMotifStrategy.binding_interface_single_chain,
+            DatasetInpaintingMotifStrategy.binding_interface,
+            DatasetInpaintingMotifStrategy.binder,
+        ]
 
 
 @dataclass
@@ -585,17 +603,16 @@ class DatasetInpaintingConfig(BaseClassConfig):
     Configuration for generating motifs / scaffolding
     """
 
+    # try to trim low plddt ends from structures, see `dataset.min_plddt_threshold`
+    trim_low_plddt_ends: bool = True
+    # Specify motif selection strategy, or `ALL` to enable all.
+    # TODO - allow specifying a collection of strategies
+    strategy: DatasetInpaintingMotifStrategy = DatasetInpaintingMotifStrategy.ALL
+
+    # Strategy-dependent parameters
     # target fraction of residues to be in motif (remainder to be diffused)
     min_percent_motifs: float = 0.10
     max_percent_motifs: float = 0.70
-    # try to trim low plddt ends from structures, see `dataset.min_plddt_threshold`
-    trim_low_plddt_ends: bool = True
-    # there are several methods supported for picking motifs
-    # TODO allow specifying multiple, with a weighting for each
-    strategy: DatasetInpaintingMotifStrategy = (
-        DatasetInpaintingMotifStrategy.variable_motifs
-    )
-    # Strategy-dependent parameters
     # motif length bounds
     min_motif_len: int = 8
     max_motif_len: int = 768
@@ -604,6 +621,9 @@ class DatasetInpaintingConfig(BaseClassConfig):
     # for variable number of motifs
     min_num_motifs: int = 1
     max_num_motifs: int = 5
+    # for multimers, determining interacting residues
+    interaction_dist_threshold_ang: float = 6.0
+    proximity_dist_threshold_ang: float = 10.0
 
 
 # dataset_metadata_dir_path is the root directory for dataset / metadata files
@@ -1072,7 +1092,10 @@ class Config(BaseClassConfig):
         # shortest validation samples in public data are 60 residues
         raw_cfg.dataset.max_eval_length = 63
 
-        # inpainting, always generate motifs
+        # inpainting, always generate motifs by default
+        raw_cfg.dataset.inpainting.strategy = (
+            DatasetInpaintingMotifStrategy.single_motif
+        )
         raw_cfg.interpolant.inpainting_unconditional_prop = 0.0
 
         return raw_cfg

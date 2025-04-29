@@ -173,6 +173,89 @@ class DatasetFilterer:
         return data_csv
 
 
+def batch_features_from_processed_file(
+    processed_file: ProcessedFile,
+    cfg: DatasetConfig,
+    processed_file_path: str,
+) -> BatchFeatures:
+    """
+    Converts a ProcessedFile (numpy) into BatchFeatures (tensors, frames).
+    Defaults to `diffuse_mask` of all ones. Can be modified by caller.
+    """
+
+    # Check the sequence
+    aatypes_1 = processed_file[dpc.aatype]
+    num_unique_aatypes = len(set(aatypes_1))
+    if num_unique_aatypes <= 1:
+        raise ValueError(
+            f"Example @ {processed_file_path} has only {num_unique_aatypes} unique amino acids."
+        )
+    aatypes_1 = torch.tensor(aatypes_1).long()
+
+    # Construct an intermediate `chain_feats` for OpenFold pipeline
+    chain_feats = {
+        "aatype": aatypes_1,
+        "all_atom_positions": torch.tensor(processed_file[dpc.atom_positions]).double(),
+        "all_atom_mask": torch.tensor(processed_file[dpc.atom_mask]).double(),
+    }
+
+    # Add noise to atom position tensor.
+    # Features are in angstrom-scale.
+    add_noise = cfg.noise_atom_positions_angstroms > 0
+    if add_noise:
+        atom_position_noise = (
+            torch.randn_like(chain_feats["all_atom_positions"])
+            * cfg.noise_atom_positions_angstroms
+        )
+        chain_feats["all_atom_positions"] += atom_position_noise
+
+    # Run through OpenFold data transforms.
+    # Convert atomic representation to frames
+    chain_feats = data_transforms.atom37_to_frames(chain_feats)
+    # calculate torsion angles, in case predicting psi angles
+    chain_feats = data_transforms.atom37_to_torsion_angles()(chain_feats)
+
+    # Extract rigids (translations + rotations), check for poorly processed
+    rigids_1 = rigid_utils.Rigid.from_tensor_4x4(
+        chain_feats[dtc.rigidgroups_gt_frames]
+    )[:, 0]
+    rotmats_1 = rigids_1.get_rots().get_rot_mats()
+    trans_1 = rigids_1.get_trans()
+    if torch.isnan(trans_1).any() or torch.isnan(rotmats_1).any():
+        raise ValueError(f"Found NaNs in {processed_file_path}")
+
+    # res_mask for residues under consideration uses `dpc.bb_mask`
+    res_mask = torch.tensor(processed_file[dpc.bb_mask]).int()
+
+    # pull out res_idx and chain_idx
+    res_idx = torch.tensor(processed_file[dpc.residue_index])
+    chain_idx = torch.tensor(processed_file[dpc.chain_index])
+
+    # Mask low pLDDT residues
+    res_plddt = torch.tensor(processed_file[dpc.b_factors][:, 1])
+    plddt_mask = torch.ones_like(res_mask)
+    if cfg.add_plddt_mask:
+        plddt_mask = (res_plddt > cfg.min_plddt_threshold).int()
+
+    # Default diffuse mask is all ones
+    diffuse_mask = torch.ones_like(res_mask)
+
+    feats: BatchFeatures = {
+        bp.res_mask: res_mask,
+        bp.aatypes_1: aatypes_1,
+        bp.trans_1: trans_1,
+        bp.rotmats_1: rotmats_1,
+        bp.torsion_angles_sin_cos_1: chain_feats[dtc.torsion_angles_sin_cos],
+        bp.chain_idx: chain_idx,
+        bp.res_idx: res_idx,
+        bp.res_plddt: res_plddt,
+        bp.diffuse_mask: diffuse_mask,
+        bp.plddt_mask: plddt_mask,
+    }
+
+    return feats
+
+
 class BaseDataset(Dataset):
     def __init__(
         self,
@@ -478,97 +561,37 @@ class BaseDataset(Dataset):
                 processed_file[dpc.aatype].shape == best_aatype.shape
             ), f"best_seq different length: {processed_file[dpc.aatype].shape} vs {best_aatype.shape}"
 
-        # Check the sequence
-        aatypes_1 = processed_file[dpc.aatype]
-        num_unique_aatypes = len(set(aatypes_1))
-        if num_unique_aatypes <= 1:
-            raise ValueError(
-                f"Example {csv_row[dc.pdb_name]} @ {csv_row[dc.processed_path]} has only {num_unique_aatypes} unique amino acids."
-            )
-        aatypes_1 = torch.tensor(aatypes_1).long()
+        feats = batch_features_from_processed_file(
+            processed_file=processed_file,
+            cfg=cfg,
+            processed_file_path=csv_row[dc.processed_path],
+        )
 
-        # Construct an intermediate `chain_feats` for OpenFold pipeline
-        chain_feats = {
-            "aatype": aatypes_1,
-            "all_atom_positions": torch.tensor(
-                processed_file[dpc.atom_positions]
-            ).double(),
-            "all_atom_mask": torch.tensor(processed_file[dpc.atom_mask]).double(),
-        }
+        # Pass through relevant data from CSV
+        feats[bp.pdb_name] = csv_row[dc.pdb_name]
 
-        # Add noise to atom position tensor.
-        # Features are in angstrom-scale.
-        add_noise = cfg.noise_atom_positions_angstroms > 0
-        if add_noise:
-            atom_position_noise = (
-                torch.randn_like(chain_feats["all_atom_positions"])
-                * cfg.noise_atom_positions_angstroms
-            )
-            chain_feats["all_atom_positions"] += atom_position_noise
-
-        # Run through OpenFold data transforms.
-        # Convert atomic representation to frames
-        chain_feats = data_transforms.atom37_to_frames(chain_feats)
-        # calculate torsion angles, in case predicting psi angles
-        chain_feats = data_transforms.atom37_to_torsion_angles()(chain_feats)
-
-        # Extract rigids (translations + rotations), check for poorly processed
-        rigids_1 = rigid_utils.Rigid.from_tensor_4x4(
-            chain_feats[dtc.rigidgroups_gt_frames]
-        )[:, 0]
-        rotmats_1 = rigids_1.get_rots().get_rot_mats()
-        trans_1 = rigids_1.get_trans()
-        if torch.isnan(trans_1).any() or torch.isnan(rotmats_1).any():
-            raise ValueError(f"Found NaNs in {csv_row[dc.processed_path]}")
-
-        # res_mask for residues under consideration uses `dpc.bb_mask`
-        res_mask = torch.tensor(processed_file[dpc.bb_mask]).int()
-
-        # pull out res_idx and chain_idx
-        res_idx = torch.tensor(processed_file[dpc.residue_index])
-        chain_idx = torch.tensor(processed_file[dpc.chain_index])
-
-        # Mask low pLDDT residues
-        res_plddt = torch.tensor(processed_file[dpc.b_factors][:, 1])
-        plddt_mask = torch.ones_like(res_mask)
-        if cfg.add_plddt_mask:
-            plddt_mask = (res_plddt > cfg.min_plddt_threshold).int()
-
-        # Determine diffuse_mask depending on task
+        # Update `diffuse_mask` depending on task
         if task == DataTaskEnum.hallucination:
-            diffuse_mask = torch.ones_like(res_mask)
+            # diffuse_mask = torch.ones()
+            pass
         elif task == DataTaskEnum.inpainting:
             diffuse_mask = motif_factory.generate_diffuse_mask(
-                res_mask=res_mask,
-                plddt_mask=plddt_mask,
-                chain_idx=chain_idx,
-                res_idx=res_idx,
-                trans_1=trans_1,
-                rotmats_1=rotmats_1,
-                aatypes_1=aatypes_1,
+                res_mask=feats[bp.res_mask],
+                plddt_mask=feats[bp.plddt_mask],
+                chain_idx=feats[bp.chain_idx],
+                res_idx=feats[bp.res_idx],
+                trans_1=feats[bp.trans_1],
+                rotmats_1=feats[bp.rotmats_1],
+                aatypes_1=feats[bp.aatypes_1],
             )
+            feats[bp.diffuse_mask] = diffuse_mask
         else:
             raise ValueError(f"Unknown task {task}")
 
         # Ensure have a valid `diffuse_mask` for modeling
-        if torch.sum(diffuse_mask) == 0:
-            diffuse_mask = torch.ones_like(diffuse_mask)
-        diffuse_mask = diffuse_mask.int()
-
-        feats: BatchFeatures = {
-            bp.res_mask: res_mask,
-            bp.aatypes_1: aatypes_1,
-            bp.trans_1: trans_1,
-            bp.rotmats_1: rotmats_1,
-            bp.torsion_angles_sin_cos_1: chain_feats[dtc.torsion_angles_sin_cos],
-            bp.chain_idx: chain_idx,
-            bp.res_idx: res_idx,
-            bp.res_plddt: res_plddt,
-            bp.diffuse_mask: diffuse_mask,
-            bp.plddt_mask: plddt_mask,
-            # Pass through relevant data from CSV
-            bp.pdb_name: csv_row[dc.pdb_name],
-        }
+        if torch.sum(feats[bp.diffuse_mask]) == 0:
+            feats[bp.diffuse_mask] = torch.ones_like(feats[bp.res_mask])
+        feats[bp.diffuse_mask] = feats[bp.diffuse_mask].float()
 
         # For inpainting evaluation (i.e. not training), vary scaffold lengths
         # Using the `diffuse_mask`, modify the scaffold region lengths, and mask out the scaffolds
@@ -576,10 +599,10 @@ class BaseDataset(Dataset):
         if (
             task == DataTaskEnum.inpainting
             and not is_training
-            and (diffuse_mask == 0).any()
+            and (feats[bp.diffuse_mask] == 0).any()
         ):
             segments = motif_factory.generate_segments_from_diffuse_mask(
-                diffuse_mask=diffuse_mask,
+                diffuse_mask=feats[bp.diffuse_mask],
                 chain_idx=feats[bp.chain_idx],
             )
             BaseDataset.segment_features(feats=feats, segments=segments)
