@@ -862,6 +862,10 @@ class InferenceSamplesConfig(BaseClassConfig):
     max_length: int = 256
     # gap between lengths to sample, `range(min_length, max_length, length_step)`
     length_step: int = 1
+    # Multimers - set `chain_idx` for 2+ chains, where each chain must be `min_length`
+    multimer_fraction: float = 0.25
+    multimer_min_length: int = 100
+    chain_gap_dist: int = "${dataset.chain_gap_dist}"
 
 
 @dataclass

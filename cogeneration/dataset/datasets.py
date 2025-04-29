@@ -2,19 +2,19 @@ import logging
 import os
 import random
 from dataclasses import dataclass
+from math import floor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TypeVar, Union
 
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import PolynomialFeatures
 from torch.utils.data import Dataset
 
 from cogeneration.config.base import Config, DatasetConfig, InferenceSamplesConfig
 from cogeneration.data import data_transforms, rigid_utils
 from cogeneration.data.const import seq_to_aatype
+from cogeneration.dataset.filterer import DatasetFilterer
 from cogeneration.dataset.motif_factory import Motif, MotifFactory, Segment
 from cogeneration.dataset.process_pdb import read_processed_file
 from cogeneration.type.batch import METADATA_BATCH_PROPS, BatchFeatures
@@ -25,152 +25,6 @@ from cogeneration.type.dataset import DatasetProteinColumns as dpc
 from cogeneration.type.dataset import DatasetTransformColumns as dtc
 from cogeneration.type.dataset import MetadataCSVRow, MetadataDataFrame, ProcessedFile
 from cogeneration.type.task import DataTaskEnum
-
-
-def _read_clusters(cluster_path: Union[Path, str], synthetic=False) -> Dict[str, Any]:
-    pdb_to_cluster = {}
-    with open(cluster_path, "r") as f:
-        for i, line in enumerate(f):
-            for chain in line.split(" "):
-                if not synthetic:
-                    pdb = chain.split("_")[0].strip()
-                else:
-                    pdb = chain.strip()
-                pdb_to_cluster[pdb.upper()] = i
-    return pdb_to_cluster
-
-
-class DatasetFilterer:
-    def __init__(self, dataset_cfg: DatasetConfig):
-        self.dataset_cfg = dataset_cfg
-        self._log = logging.getLogger("DatasetFilterer")
-
-    def _rog_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:
-        """
-        Filter by radius of gyration.
-        """
-        y_quant = pd.pivot_table(
-            data_csv,
-            values=dc.radius_gyration,
-            index=dc.modeled_seq_len,
-            aggfunc=lambda x: np.quantile(x, self.dataset_cfg.filter.rog_quantile),
-        )
-        x_quant = y_quant.index.to_numpy()
-        y_quant = y_quant.radius_gyration.to_numpy()
-
-        # Fit polynomial regressor
-        poly = PolynomialFeatures(degree=4, include_bias=True)
-        poly_features = poly.fit_transform(x_quant[:, None])
-        poly_reg_model = LinearRegression()
-        poly_reg_model.fit(poly_features, y_quant)
-
-        # Calculate cutoff for all sequence lengths
-        max_len = data_csv[dc.modeled_seq_len].max()
-        pred_poly_features = poly.fit_transform(np.arange(max_len)[:, None])
-        # Add a little more.
-        pred_y = poly_reg_model.predict(pred_poly_features) + 0.1
-
-        row_rog_cutoffs = data_csv[dc.modeled_seq_len].map(lambda x: pred_y[x - 1])
-        return data_csv[data_csv[dc.radius_gyration] < row_rog_cutoffs]
-
-    def _length_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:
-        """Filter by sequence length."""
-        return data_csv[
-            (data_csv[dc.modeled_seq_len] >= self.dataset_cfg.filter.min_num_res)
-            & (data_csv[dc.modeled_seq_len] <= self.dataset_cfg.filter.max_num_res)
-        ]
-
-    def _plddt_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:
-        """Filter proteins which do not have the required minimum pLDDT."""
-        # not used in the public multiflow codebase
-        # TODO - pull out pLDDTs from structure, not available in current CSV
-        # return data_csv[
-        #     dc.num_confident_plddt
-        #     > self.dataset_cfg.filter.min_num_confident_plddt
-        # ]
-        return data_csv
-
-    def _max_coil_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:
-        """Filter proteins which exceed max_coil_percent."""
-        return data_csv[
-            data_csv[dc.coil_percent] <= self.dataset_cfg.filter.max_coil_percent
-        ]
-
-    def _max_percent_unknown_filter(
-        self, data_csv: MetadataDataFrame
-    ) -> MetadataDataFrame:
-        """Filter proteins which exceed `max_percent_residues_unknown`."""
-        return data_csv[
-            (data_csv[dc.seq_len] / data_csv[dc.modeled_seq_len])
-            >= self.dataset_cfg.filter.max_percent_residues_unknown
-        ]
-
-    def filter_metadata(self, raw_csv: MetadataDataFrame) -> MetadataDataFrame:
-        """
-        Initial filtering of dataset.
-        Does not filter redesigned / synthetic datasets.
-        """
-        filter_cfg = self.dataset_cfg.filter
-        running_length = len(raw_csv)
-        data_csv = raw_csv.copy()
-
-        # monomer / oligomer
-        data_csv = data_csv[data_csv[dc.oligomeric_detail].isin(filter_cfg.oligomeric)]
-        if len(data_csv) < running_length:
-            self._log.debug(
-                f"{running_length} -> {len(data_csv)} examples after oligomeric filter"
-            )
-            running_length = len(data_csv)
-
-        # number of chains
-        data_csv = data_csv[data_csv[dc.num_chains].isin(filter_cfg.num_chains)]
-        if len(data_csv) < running_length:
-            self._log.debug(
-                f"{running_length} ->{len(data_csv)} examples after num_chains filter"
-            )
-            running_length = len(data_csv)
-
-        # length
-        data_csv = self._length_filter(data_csv=data_csv)
-        if len(data_csv) < running_length:
-            self._log.debug(
-                f"{running_length} ->{len(data_csv)} examples after length filter"
-            )
-            running_length = len(data_csv)
-
-        # modelable residues
-        data_csv = self._max_percent_unknown_filter(data_csv=data_csv)
-        if len(data_csv) < running_length:
-            self._log.debug(
-                f"{running_length} ->{len(data_csv)} examples after % unknown filter"
-            )
-            running_length = len(data_csv)
-
-        # max coil percent
-        data_csv = self._max_coil_filter(data_csv=data_csv)
-        if len(data_csv) < running_length:
-            self._log.debug(
-                f"{running_length} ->{len(data_csv)} examples after max coil filter"
-            )
-            running_length = len(data_csv)
-
-        # radius of gyration
-        data_csv = self._rog_filter(data_csv=data_csv)
-        if len(data_csv) < running_length:
-            self._log.debug(
-                f"{running_length} -> {len(data_csv)} examples after rog filter"
-            )
-            running_length = len(data_csv)
-
-        # pLDDT
-        data_csv = self._plddt_filter(data_csv=data_csv)
-        if len(data_csv) < running_length:
-            self._log.debug(
-                f"{running_length} -> {len(data_csv)} examples after pLDDT filter"
-            )
-            running_length = len(data_csv)
-
-        return data_csv
 
 
 def batch_features_from_processed_file(
@@ -254,6 +108,19 @@ def batch_features_from_processed_file(
     }
 
     return feats
+
+
+def _read_clusters(cluster_path: Union[Path, str], synthetic=False) -> Dict[str, Any]:
+    pdb_to_cluster = {}
+    with open(cluster_path, "r") as f:
+        for i, line in enumerate(f):
+            for chain in line.split(" "):
+                if not synthetic:
+                    pdb = chain.split("_")[0].strip()
+                else:
+                    pdb = chain.strip()
+                pdb_to_cluster[pdb.upper()] = i
+    return pdb_to_cluster
 
 
 class BaseDataset(Dataset):
@@ -685,14 +552,16 @@ class LengthSamplingDataset(Dataset):
     """
     During predictions/inference, dataset to generate (e.g. unconditional) samples across lengths
     Each item comprises `num_res` (int) and `sample_id` (torch.Tensor, int or ints or strings)
+
+    # TODO enable multiple chain hallucination? Or just use PDB with scaffolding?
     """
 
-    def __init__(self, inference_samples_cfg: InferenceSamplesConfig):
-        self.cfg = inference_samples_cfg
+    def __init__(self, cfg: InferenceSamplesConfig):
+        self.cfg = cfg
 
         # determine lengths to sample
-        if inference_samples_cfg.length_subset is not None:
-            all_sample_lengths = [int(x) for x in inference_samples_cfg.length_subset]
+        if cfg.length_subset is not None:
+            all_sample_lengths = [int(x) for x in cfg.length_subset]
         else:
             all_sample_lengths = range(
                 self.cfg.min_length, self.cfg.max_length + 1, self.cfg.length_step
@@ -714,16 +583,71 @@ class LengthSamplingDataset(Dataset):
     def __len__(self):
         return len(self._all_sample_ids)
 
+    def generate_idx(self, num_res: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generates chain_idx and res_idx, potentially multimeric"""
+        # Generate monomer if...
+        if (
+            # fraction is 0 or random() < fraction
+            random.random() >= self.cfg.multimer_fraction
+            or
+            # too short for multimers
+            num_res < self.cfg.multimer_min_length * 2
+        ):
+            return torch.ones(num_res, dtype=torch.long), torch.arange(num_res)
+
+        # Otherwise, sample number of chains and chain lengths for a multimer
+
+        # sample number of chains, skewed toward fewer
+        max_chains = int(floor(num_res / self.cfg.multimer_min_length))
+        chain_possibilities = np.arange(2, max_chains + 1)
+        num_chains = np.random.choice(
+            a=chain_possibilities,
+            p=1 / chain_possibilities / np.sum(1 / chain_possibilities),
+        )
+
+        # build chain_idx and res_idx by choosing chain lengths and filling in
+        chain_idx = torch.zeros(num_res, dtype=torch.long)
+        res_idx = torch.zeros(num_res, dtype=torch.long)
+
+        # determine an "extension" length to add to `multimer_min_length` by breaking up remaining_length
+        remaining_length = num_res - num_chains * self.cfg.multimer_min_length
+        if remaining_length == 0:
+            # nothing leftover, all chains the same length
+            chain_extensions = np.zeros(num_chains, dtype=int)
+        else:
+            chain_extensions = list(
+                sorted(np.random.choice(remaining_length, num_chains, replace=False))
+            )
+
+        # update idx
+        last_extension_size = 0
+        last_end_idx = 0
+        for chain_id, extension_size in enumerate(chain_extensions):
+            chain_length = (
+                self.cfg.multimer_min_length + extension_size - last_extension_size
+            )
+            last_extension_size = extension_size
+
+            chain_end = last_end_idx + chain_length
+            chain_idx[last_end_idx:chain_end] = chain_id + 1
+            res_idx[last_end_idx:chain_end] = (
+                chain_id * self.cfg.chain_gap_dist
+            ) + torch.arange(last_end_idx, chain_end, dtype=torch.long)
+            last_end_idx = chain_end
+
+        return chain_idx, res_idx
+
     def __getitem__(self, idx) -> InferenceFeatures:
         num_res, sample_id = self._all_sample_ids[idx]
-        item = {
+        chain_idx, res_idx = self.generate_idx(num_res)
+
+        return {
             bp.sample_id: sample_id,
             bp.res_mask: torch.ones(num_res),
             bp.diffuse_mask: torch.ones(num_res),
-            bp.res_idx: torch.arange(num_res),
-            bp.chain_idx: torch.ones(num_res),
+            bp.res_idx: res_idx,
+            bp.chain_idx: chain_idx,
         }
-        return item
 
 
 DatasetClassT = TypeVar("DatasetClassT")

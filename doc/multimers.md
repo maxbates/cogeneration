@@ -57,23 +57,9 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
         - [x] inspect public multiflow multimer files, see how they are written, how non-residues handled
     - Dataset
         - Filtering
-            - [ ] Establish options for multiple chains in dataset filter (`min_chains`, `max_chains`)
-            - [ ] `dataset.filter.min_chains` / `dataset.filter.max_chains`
-            - [ ] filter when small molecule is interacting or between chains
-                - How do we account for this, if the small molecules have been removed in the processed file?
-                - see e.g. https://www.rcsb.org/3d-view/6DY1
-                    - it's just called `dimeric` in `pdb_metadata.csv`, ignores TON / MYR fatty acid chains completely
-                - May need to process multimers again ourselves...
-                - Can look for molecules with interactions.
-                    - Check for any presence of interacting molecules (ignore water etc.)  
-                    - Check for overlapping ranges with protein interactions.
+            - [ ] convert `num_chains` filter to `dataset.filter.min_chains` / `dataset.filter.max_chains`
         - Dynamic chain selection
-            - [ ] Ability to filter to chains of particular lengths, 
-                - e.g. drop a little peptide if 2 primary interacting chains
-                - or only keep 2 random interacting pairs
-            - [ ] ?? ability to filter chains with internal gaps
-        - [ ] Differentiate oligomers vs heteromers; target sampling weights per class per epoch
-        - [ ] support dynamic padding/cropping for variable total residues
+        - (?) Differentiate oligomers vs heteromers; target sampling weights per class per epoch
     
 - Interpolant
     - Noise
@@ -102,13 +88,13 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
     - SequenceIPANet
          - (?) Pass `chain_idx` to `sequence_ipa_net`, or positional embeddings better somehow?
             - Do already provide option to use `init_node_embed`...
-    - [ ] Update `ipa_pytorch.py` to support multimers if necessary
+    - [x] Update `ipa_pytorch.py` to support multimers if necessary
     
 - Training
-    - [ ] Update losses
+    - [x] Update losses
         - [x] no neighbor loss across chains
         - [x] C-alpha distance loss accounts for chains
-        - (?)  consider explicit cross-chain distances?
+        - (?) consider explicit cross-chain distances?
             - not sure what beyond hot spot and interaction distance is necessary...
             - Want to support training on non-interacting pairs too - see how RosettaFold did this in the paper where they predict binding
 
@@ -122,7 +108,9 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
          - [x] mask entire interacting chain
 
 - Sampling
-    - new eval dataset for multimers? or update PDB dataset with new motif strategies
+    - [x] new eval dataset for multimers? or update PDB dataset with new motif strategies
+    - [x] enable multimers in length sampling dataset for inference
+        - [x] include in sampling cfg
 
 - Folding Validation
     - New Metrics
@@ -153,14 +141,29 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
   
 ## Future Work
 
-- Data
-    - [ ] Check how many multimers are included in MultiFlow data dump
+- New Multimer dataset + metadata
+    - [ ] Check how many multimers are included in MultiFlow data dump    
     - [ ] consider processing PDB multimers manually?
         - [ ] better small molecule handling, especially if in binding interface
     - [ ] Acquire more binders for training
     - [ ] ? expose per-chain metadata (chain IDs, lengths) when generating metadata file
         - however wont be available in public multiflow metadata file, use for new dataset?
+    - [ ] Ability to filter to chains of particular lengths,
+        - **to support length batching, need to know chain lengths ahead of time**
+        - may make sense to filter and data augment in processing pipeline - i.e. each combination can be its own item
+            - avoid things with too much symmetry, too many chains
+        - e.g. drop a little peptide if 2 primary interacting chains
+        - or only keep 2 random interacting pairs
+    - (?) ability to filter chains with internal gaps
     - [ ] Review RFDiffusion training curriculum
+    - [ ] filter when small molecule is interacting or between chains
+        - How do we account for this, if the small molecules have been removed in the processed file?
+        - see e.g. https://www.rcsb.org/3d-view/6DY1
+            - it's just called `dimeric` in `pdb_metadata.csv`, ignores TON / MYR fatty acid chains completely
+        - May need to process multimers again ourselves...
+        - Can look for molecules with interactions.
+            - Check for any presence of interacting molecules (ignore water etc.)  
+            - Check for overlapping ranges with protein interactions.
 
 - Support "hotspots"
     - [ ] RFDiffusion style specification of interacting residues

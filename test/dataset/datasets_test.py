@@ -1,6 +1,7 @@
 import torch
 
-from cogeneration.dataset.datasets import BaseDataset
+from cogeneration.config.base import InferenceSamplesConfig
+from cogeneration.dataset.datasets import BaseDataset, LengthSamplingDataset
 from cogeneration.dataset.motif_factory import Motif, Scaffold
 from cogeneration.type.batch import BatchProps as bp
 from cogeneration.type.batch import empty_feats
@@ -38,3 +39,34 @@ class TestBaseDataset:
 
         # Check metadata fields are carried over
         assert new_feats[bp.pdb_name] == feats[bp.pdb_name]
+
+class TestLengthSamplingDataset:
+    def test_multimer(self):
+        cfg = InferenceSamplesConfig(
+            samples_per_length=1,
+            length_subset=[50, 99, 100, 500, 20000],
+            multimer_fraction=1.0,
+            multimer_min_length=50,
+            chain_gap_dist=200,
+        )
+        dataset = LengthSamplingDataset(cfg=cfg)
+
+        # short samples should be monomers
+        len50 = dataset[0]
+        assert (len50[bp.chain_idx] == 1.0).all()
+        len99 = dataset[1]
+        assert (len99[bp.chain_idx] == 1.0).all()
+        # 100 should have 2 chains both 50 long
+        len100 = dataset[2]
+        assert (len100[bp.chain_idx]).float().mean() == 1.5  # half 1, half 2
+        assert len100[bp.res_idx][50] == 250
+        len500 = dataset[3]
+        # 500 should have several chains
+        assert len(len500[bp.chain_idx].unique()) > 1
+        assert len(len500[bp.chain_idx].unique()) <= 10
+        len20000 = dataset[4]
+        # should basically never pick min length for all
+        assert len(len500[bp.chain_idx].unique()) < (20000 / 50)
+
+
+
