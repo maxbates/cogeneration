@@ -40,6 +40,7 @@ class TestBaseDataset:
         # Check metadata fields are carried over
         assert new_feats[bp.pdb_name] == feats[bp.pdb_name]
 
+
 class TestLengthSamplingDataset:
     def test_multimer(self):
         cfg = InferenceSamplesConfig(
@@ -67,6 +68,3 @@ class TestLengthSamplingDataset:
         len20000 = dataset[4]
         # should basically never pick min length for all
         assert len(len500[bp.chain_idx].unique()) < (20000 / 50)
-
-
-

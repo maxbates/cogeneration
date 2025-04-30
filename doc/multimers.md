@@ -63,13 +63,19 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
     
 - Interpolant
     - Noise
-        - [ ] Introduce harmonic prior for translations
-            - [ ] option for single gaussian, or harmonic prior
-            - [ ] `cfg.interpolant.trans.noise_type`: “gaussian” vs “harmonic” (once implement alternative like harmonic prior)
+        - [x] Introduce harmonic prior for translations
+            - [x] option for single gaussian, or harmonic prior
+            - [x] `cfg.interpolant.trans.noise_type`: “gaussian” vs “harmonic” (once implement alternative like harmonic prior)
+       - [x] update interpolant if stochastic for sampling and training to use correct prior
+       - [x] confirm stochastic paths still reasonable
     - Batch OT
-        - [ ] Do we need to make updates to OT implementation to support multiple chains
+        - [x] Do we need to make updates to OT implementation to support multiple chains
             - Currently, cost depends on positions, everything is a monomer
             - If use harmonic prior, `chain_idx` will vary between samples, not really meaningful to swap within batch
+               - However, we are just aligning residue positions 1-to-1, chain_idx not explicitly important 
+            - Maybe a multimer will just fall through with different point clouds esp if harmonic
+            - But may want to be explicit, and only center + align 
+        - [x] enable center + align without batch OT
     - Sample
         - [x] Require passing in `chain_idx` and `res_idx` so don't default to `torch.ones()`
 
@@ -91,7 +97,7 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
     - [x] Update `ipa_pytorch.py` to support multimers if necessary
     
 - Training
-    - [x] Update losses
+    -  ~~Update losses~~ losses fine, handle hotspots separately
         - [x] no neighbor loss across chains
         - [x] C-alpha distance loss accounts for chains
         - (?) consider explicit cross-chain distances?
@@ -114,15 +120,15 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
 
 - Folding Validation
     - New Metrics
-        - [ ] Split some metrics per chain, e.g. RMSD, LDDT
         - [ ] Binding interface metrics
             - [ ] binding precision / recall
+        - (?) Split some metrics per chain, e.g. RMSD, LDDT
 
 - IO
     - [x] update PDB/JSON exporters for multiple chains
 
 - Visualization
-    - [ ] Ensure visualization works with multiple chains
+    - [x] Ensure visualization works with multiple chains
 
 - Tests
     - [x] multi-chain `parse_pdb_feats()`

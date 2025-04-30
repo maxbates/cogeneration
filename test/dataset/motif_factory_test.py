@@ -5,20 +5,22 @@ import pytest
 import torch
 from numpy.random import default_rng
 
-from cogeneration.config.base import DatasetInpaintingConfig, DatasetInpaintingMotifStrategy, DatasetConfig
-from cogeneration.type.batch import BatchProps as bp
+from cogeneration.config.base import (
+    DatasetConfig,
+    DatasetInpaintingConfig,
+    DatasetInpaintingMotifStrategy,
+)
 from cogeneration.dataset.datasets import batch_features_from_processed_file
 from cogeneration.dataset.motif_factory import Motif, MotifFactory, Scaffold
 from cogeneration.dataset.process_pdb import process_pdb_file
+from cogeneration.type.batch import BatchProps as bp
 
 # Use protein with weird stuff happening, is multimeric, has cross-chain interactions
 example_pdb_path = Path(__file__).parent / "2qlw.pdb"
 
 
 class TestMotifFactory:
-    @pytest.mark.parametrize(
-        "strategy", list(DatasetInpaintingMotifStrategy)
-    )
+    @pytest.mark.parametrize("strategy", list(DatasetInpaintingMotifStrategy))
     def test_generate_diffuse_mask(self, strategy: DatasetInpaintingMotifStrategy):
         if strategy == DatasetInpaintingMotifStrategy.ALL:
             return
@@ -49,9 +51,12 @@ class TestMotifFactory:
 
         assert isinstance(diffuse_mask, torch.Tensor)
         assert diffuse_mask.shape == pdb_batch_features[bp.res_mask].shape
-        assert not (diffuse_mask == 0).all(), "At least one residue should be scaffolded"
-        assert not (diffuse_mask == 1).all(), "At least one residue should be part of the motif"
-
+        assert not (
+            diffuse_mask == 0
+        ).all(), "At least one residue should be scaffolded"
+        assert not (
+            diffuse_mask == 1
+        ).all(), "At least one residue should be part of the motif"
 
     def test_generate_single_motif_diffuse_mask(self):
         # There should be exactly one contiguous motif of length 5

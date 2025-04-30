@@ -1,7 +1,7 @@
 import copy
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from random import random
 from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
@@ -13,12 +13,14 @@ from cogeneration.config.base import (
     InterpolantAATypesInterpolantTypeEnum,
     InterpolantConfig,
     InterpolantRotationsScheduleEnum,
+    InterpolantTranslationsNoiseTypeEnum,
     InterpolantTranslationsScheduleEnum,
 )
 from cogeneration.data import all_atom, so3_utils
-from cogeneration.data.const import MASK_TOKEN_INDEX, NM_TO_ANG_SCALE, NUM_TOKENS
+from cogeneration.data.const import MASK_TOKEN_INDEX, NM_TO_ANG_SCALE
 from cogeneration.data.noise_mask import (
     centered_gaussian,
+    centered_harmonic,
     mask_blend_1d,
     mask_blend_2d,
     mask_blend_3d,
@@ -192,11 +194,65 @@ class Interpolant:
 
     def _compute_sigma_t(self, t: torch.Tensor, scale: float, min_sigma: float = 0.01):
         """
-        Compute the standard deviation of the IGSO(3) noise at time t.
+        Compute the standard deviation of the noise at time `t`.
         The standard deviation is a parabolic function of t, with a minimum at t=0 and t=1.
         """
         sigma_t = scale * torch.sqrt(t * (1 - t) + 1e-4)
         return torch.clamp(sigma_t, min=min_sigma)
+
+    def _trans_noise(self, chain_idx: torch.Tensor) -> torch.Tensor:
+        """
+        sample t=0 noise for translations, scaled to angstroms
+        """
+        if (
+            self.cfg.trans.noise_type
+            == InterpolantTranslationsNoiseTypeEnum.centered_gaussian
+        ):
+            return (
+                centered_gaussian(
+                    *chain_idx.shape,
+                    device=self._device,
+                )
+                * NM_TO_ANG_SCALE
+            )
+        elif (
+            self.cfg.trans.noise_type
+            == InterpolantTranslationsNoiseTypeEnum.centered_harmonic
+        ):
+            return (
+                centered_harmonic(
+                    chain_idx=chain_idx,
+                    device=self._device,
+                )
+                * NM_TO_ANG_SCALE
+            )
+        else:
+            raise ValueError(
+                f"Unknown translation noise type {self.cfg.trans.noise_type}"
+            )
+
+    def _aatypes_noise(self, res_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Generate initial amino acid types based on the interpolant type
+        """
+        num_batch, num_res = res_mask.shape
+
+        if (
+            self.cfg.aatypes.interpolant_type
+            == InterpolantAATypesInterpolantTypeEnum.masking
+        ):
+            return masked_categorical(num_batch, num_res, device=self._device)
+        elif (
+            self.cfg.aatypes.interpolant_type
+            == InterpolantAATypesInterpolantTypeEnum.uniform
+        ):
+            return uniform_categorical(
+                num_batch, num_res, num_tokens=self.num_tokens, device=self._device
+            )
+        else:
+            raise ValueError(
+                f"Unknown aatypes interpolant type {self.cfg.aatypes.interpolant_type}"
+            )
 
     def _batch_ot(self, trans_0, trans_1, res_mask, center: bool = False):
         """
@@ -204,6 +260,10 @@ class Interpolant:
         returns OT mapping of trans_0 structures to trans_1 structures.
         Will force translations are centered if `center==True`.
         Does not re-order the translations within a structure.
+
+        For multimers, ignore chain_idx for now.
+        If we use a harmonic prior, with a gaussian per chain, probably the samples will match back up.
+        If we use a gaussian prior... just assume it will work out for now at least.
         """
         num_batch, num_res = trans_0.shape[:2]
 
@@ -230,19 +290,28 @@ class Interpolant:
         noise_perm, gt_perm = linear_sum_assignment(to_cpu(cost_matrix).numpy())
         return batch_0[(tuple(gt_perm), tuple(noise_perm))]
 
-    def _corrupt_trans(self, trans_1, t, res_mask, diffuse_mask):
+    def _corrupt_trans(self, trans_1, t, res_mask, diffuse_mask, chain_idx):
         """
         Corrupt translations from t=1 to t using Gaussian noise.
         """
-        trans_nm_0 = centered_gaussian(*res_mask.shape, device=self._device)
-        trans_0 = trans_nm_0 * NM_TO_ANG_SCALE
+        trans_0 = self._trans_noise(chain_idx=chain_idx)  # (B, N, 3)
 
-        # compute batch OT. Expect no need to center, noise and t=1 should already be.
+        # compute batch OT, or aligning, to enable learning straighter paths.
+        # Expect no need to re-center as noise and t=1 should already be.
+        # Also, we center below after adding noise / motif-masking.
         if self.cfg.trans.batch_ot:
             trans_0 = self._batch_ot(
                 trans_0,
                 trans_1,
                 res_mask=res_mask,
+                center=False,
+            )
+        elif self.cfg.trans.batch_align:
+            trans_0, _, _ = batch_align_structures(
+                pos_1=trans_0,
+                pos_2=trans_1,
+                mask=res_mask,
+                center=False,
             )
 
         # compute trans_t
@@ -255,18 +324,16 @@ class Interpolant:
         if self.cfg.trans.stochastic:
             # guassian noise added is markovian; just sample from gaussian, scaled by sigma_t, and add.
             # sigma_t is ~parabolic (and ~0 at t=0 and t=1) so corrupted sample reflects marginal distribution at t.
+            # TODO - confirm scaling harmonic noise this way makes sense
             sigma_t = self._compute_sigma_t(
                 t.squeeze(1),  # t is (B, 1), we need (B,)
                 scale=self.cfg.trans.stochastic_noise_intensity,
             )
-            intermediate_noise = centered_gaussian(
-                *res_mask.shape,
-                device=self._device,
-            )  # (B, N, 3)
+            intermediate_noise = self._trans_noise(chain_idx=chain_idx)  # (B, N, 3)
             intermediate_noise = intermediate_noise * sigma_t[..., None, None]
-            intermediate_noise = intermediate_noise * NM_TO_ANG_SCALE
             trans_t = trans_t + intermediate_noise
 
+        # Fix non-diffused residues to t=1
         trans_t = mask_blend_2d(trans_t, trans_1, diffuse_mask)
 
         # Center residues at origin
@@ -332,36 +399,18 @@ class Interpolant:
         assert res_mask.shape == (num_batch, num_res)
         assert diffuse_mask.shape == (num_batch, num_res)
 
-        # mask fraction of residues based on t
+        # aatypes_t = aatypes_1 with masked fraction of residues based on t
         u = torch.rand(num_batch, num_res, device=self._device)
-        aatypes_t = aatypes_1.clone()
-        corruption_mask = u < (1 - t)  # (B, N)
-
-        if (
-            self.cfg.aatypes.interpolant_type
-            == InterpolantAATypesInterpolantTypeEnum.masking
-        ):
-            # For masking interpolant, corrupted residues are set to mask
-            aatypes_t[corruption_mask] = MASK_TOKEN_INDEX
-
-        elif (
-            self.cfg.aatypes.interpolant_type
-            == InterpolantAATypesInterpolantTypeEnum.uniform
-        ):
-            # For uniform interpolant, corrupted residues are set to random logits
-            uniform_sample = torch.randint_like(aatypes_t, low=0, high=NUM_TOKENS)
-            aatypes_t[corruption_mask] = uniform_sample[corruption_mask]
-        else:
-            raise ValueError(
-                f"Unknown aatypes interpolant type {self.cfg.aatypes.interpolant_type}"
-            )
+        corruption_mask = (u < (1 - t)).int()
+        aatypes_noise = self._aatypes_noise(res_mask=res_mask)
+        aatypes_t = mask_blend_1d(aatypes_noise, aatypes_1.clone(), corruption_mask)
 
         # TODO - determine how to add additional noise
         #   We only have access to the discrete types here, not the logits / rate matrix
         #   But we want to be able to add additional noise to the rate matrix on trajectory
         #   Do we just add additional noise now?
 
-        # residues outside `res_mask` are set to mask.
+        # residues outside `res_mask` are set to mask regardless of aatype noise strategy.
         aatypes_t = aatypes_t * res_mask + MASK_TOKEN_INDEX * (1 - res_mask)
 
         # only corrupt residues in `diffuse_mask`
@@ -469,6 +518,7 @@ class Interpolant:
         aatypes_1 = batch[bp.aatypes_1]  # (B, N)
         res_mask = batch[bp.res_mask]  # (B, N)
         diffuse_mask = batch[bp.diffuse_mask]  # (B, N)
+        chain_idx = noisy_batch[bp.chain_idx]  # (B, N)
         r3_t = noisy_batch[nbp.r3_t]  # (B, 1)
         so3_t = noisy_batch[nbp.so3_t]  # (B, 1)
         cat_t = noisy_batch[nbp.cat_t]  # (B, 1)
@@ -494,6 +544,7 @@ class Interpolant:
                 t=r3_t,
                 res_mask=res_mask,
                 diffuse_mask=corruption_mask_structure,
+                chain_idx=chain_idx,
             )
         else:
             trans_t = trans_1
@@ -565,7 +616,12 @@ class Interpolant:
         return trans_vf
 
     def _trans_euler_step(
-        self, d_t: float, t: torch.Tensor, trans_1: torch.Tensor, trans_t: torch.Tensor
+        self,
+        d_t: float,
+        t: torch.Tensor,
+        trans_1: torch.Tensor,
+        trans_t: torch.Tensor,
+        chain_idx: torch.Tensor,
     ) -> torch.Tensor:
         assert d_t >= 0
         trans_vf = self._trans_vector_field(t, trans_1, trans_t)
@@ -573,11 +629,13 @@ class Interpolant:
         trans_next = trans_t + trans_vf * d_t
 
         if self.cfg.trans.stochastic:
-            # add gaussian noise scaled by sqrt(dt)
+            # Sample from either Gaussian or Harmonic prior (zero‐mean, correct covariance)
+            # For harmonic noise, each Brownian increment has covariance J^{-1} (the harmonic prior) instead of identity.
+            base_noise = self._trans_noise(
+                chain_idx=chain_idx
+            )  # (B, N, 3) in Angstroms
             trans_next += (
-                torch.randn_like(trans_next)
-                * np.sqrt(d_t)
-                * self.cfg.trans.stochastic_noise_intensity
+                base_noise * math.sqrt(d_t) * self.cfg.trans.stochastic_noise_intensity
             )
 
         return trans_next
@@ -968,32 +1026,14 @@ class Interpolant:
         # Initialize t=0 prior samples i.e. noise (technically `t=cfg.min_t`)
 
         if trans_0 is None:
-            # Generate centered Gaussian noise for translations (shape: [num_batch, num_res, 3])
-            trans_0 = (
-                centered_gaussian(num_batch, num_res, device=self._device)
-                * NM_TO_ANG_SCALE
-            )
+            # Generate centered Gaussian noise for translations (B, N, 3)
+            trans_0 = self._trans_noise(chain_idx=chain_idx)
         if rotmats_0 is None:
-            # Generate uniform SO(3) rotation matrices (shape: [num_batch, num_res, 3, 3])
+            # Generate uniform SO(3) rotation matrices (B, N, 3, 3)
             rotmats_0 = uniform_so3(num_batch, num_res, device=self._device)
         if aatypes_0 is None:
-            # Generate initial amino acid types based on the interpolant type
-            if (
-                self.cfg.aatypes.interpolant_type
-                == InterpolantAATypesInterpolantTypeEnum.masking
-            ):
-                aatypes_0 = masked_categorical(num_batch, num_res, device=self._device)
-            elif (
-                self.cfg.aatypes.interpolant_type
-                == InterpolantAATypesInterpolantTypeEnum.uniform
-            ):
-                aatypes_0 = uniform_categorical(
-                    num_batch, num_res, num_tokens=self.num_tokens, device=self._device
-                )
-            else:
-                raise ValueError(
-                    f"Unknown aatypes interpolant type {self.cfg.aatypes.interpolant_type}"
-                )
+            # Generate mask / random aa_types (B, N)
+            aatypes_0 = self._aatypes_noise(res_mask=res_mask)
         if psis_0 is None:
             # Generate initial psi angles
             # TODO a better prior, reflecting these are angles
@@ -1197,7 +1237,9 @@ class Interpolant:
             # Take next step, size `d_t` from `t_1` (current value) to `t_2` (toward predicted value)
             # We are at `t_1` with state `{domain}_t_1`. The model predicted `pred_{domain}_1`.
             d_t = t_2 - t_1
-            trans_t_2 = self._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
+            trans_t_2 = self._trans_euler_step(
+                d_t, t_1, pred_trans_1, trans_t_1, chain_idx=chain_idx
+            )
             rotmats_t_2 = self._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
             aatypes_t_2 = self._aatypes_euler_step(d_t, t_1, pred_logits_1, aatypes_t_1)
             psis_t_2 = (
@@ -1213,7 +1255,9 @@ class Interpolant:
                 aatypes_t_2 = mask_blend_1d(aatypes_t_2, aatypes_1, diffuse_mask)
 
                 # Get interpolated values for motif translations and rotations
-                trans_t_2_motif = self._trans_euler_step(d_t, t_1, trans_1, trans_t_1)
+                trans_t_2_motif = self._trans_euler_step(
+                    d_t, t_1, trans_1, trans_t_1, chain_idx=chain_idx
+                )
                 rotmats_t_2_motif = self._rots_euler_step(
                     d_t, t_1, rotmats_1, rotmats_t_1
                 )

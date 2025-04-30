@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from cogeneration.data.const import MASK_TOKEN_INDEX
@@ -5,13 +7,72 @@ from cogeneration.data.const import MASK_TOKEN_INDEX
 # TODO - move masks to a different file?
 
 
-def centered_gaussian(num_batch, num_res, device: torch.device, n_bb_atoms: int = 3):
+def centered_gaussian(
+    num_batch, num_res, device: torch.device, n_bb_atoms: int = 3
+) -> torch.Tensor:
     """
-    Generates a tensor of shape (num_batch, num_res, 3) with values sampled from a centered Gaussian distribution.
+    Generates a tensor of shape (num_batch, num_res, n_bb_atoms=3)
+    with values sampled from a centered Gaussian distribution.
     e.g. t=0 translations, in nanometer scale.
     """
     noise = torch.randn(num_batch, num_res, n_bb_atoms, device=device)
     return noise - torch.mean(noise, dim=-2, keepdims=True)
+
+
+def centered_harmonic(
+    chain_idx: torch.Tensor,
+    device: torch.device,
+    n_bb_atoms: int = 3,
+    sigma: float = 2.08,
+) -> torch.Tensor:
+    """
+    Creates a simple harmonic prior for protein chains, where internal residues have 2 neighbors and the ends have 1.
+    `chain_idx` (B, N) is used for determining multimer chain breaks.
+
+    Returns (B, N, n_bb_atoms=3) zero‐mean harmonic noise, in nanometers
+
+    Based on HarmonicFlow implementation, for which small molecule application probably more important.
+    However, has the advantage for protein noodles that neighboring residues are placed closer together in space,
+    compared to a simple guassian cloud.
+
+    Choose sigma ~2.08 so that the marginal variance per coordinate of the harmonic prior
+    matches the unit variance of torch.randn().
+    For J = L + (1/σ²)·I with L the nearest-neighbor Laplacian, the average variance
+        (1/N)·tr(J⁻¹) = (1/N)∑_i 1/(λ_i(L) + 1/σ²) should equal 1.
+    Solving for σ gives ~2.08
+    """
+    batch_size, N = chain_idx.shape
+    lam = 1.0 / sigma**2  # diagonal loading (precision)
+    a = 1.0  # nearest‐neighbor spring constant
+
+    out = torch.zeros(batch_size, N, n_bb_atoms, device=device)
+    for b in range(batch_size):
+        # find where residue i and i+1 share the same chain
+        same = chain_idx[b][:-1] == chain_idx[b][1:]
+        pos = torch.nonzero(same, as_tuple=True)[0]
+
+        # build precision matrix J = L + λI
+        J = torch.zeros(N, N, device=device)
+        if pos.numel():
+            i = pos
+            j = pos + 1
+            J[i, i] += a
+            J[j, j] += a  # degree contributions
+            J[i, j] = -a
+            J[j, i] = -a  # off‐diagonals
+        J += lam * torch.eye(N, device=device)
+
+        # eigendecompose J
+        D, P = torch.linalg.eigh(J)
+
+        # sample standard normal noise z ∈ ℝ^(N×n_bb_atoms)
+        z = torch.randn(N, n_bb_atoms, device=device)
+        # harmonic prior: x = P @ (z / sqrt(D))
+        x = P @ (z / torch.sqrt(D)[:, None])
+        # center to zero mean
+        out[b] = x - x.mean(dim=0, keepdim=True)
+
+    return out
 
 
 def random_rotation_matrix(device):

@@ -379,6 +379,11 @@ class InterpolantRotationsConfig(BaseClassConfig):
     stochastic_noise_intensity: float = 0.1  # `g` in FoldFlow SO3SFM
 
 
+class InterpolantTranslationsNoiseTypeEnum(StrEnum):
+    centered_gaussian = "centered_gaussian"
+    centered_harmonic = "centered_harmonic"
+
+
 class InterpolantTranslationsScheduleEnum(StrEnum):
     linear = "linear"
     # variance-preserving SDE. sampling only.
@@ -393,8 +398,13 @@ class InterpolantTranslationsConfig(BaseClassConfig):
     corrupt: bool = (
         "${ternary:${equals: ${inference.task}, 'inverse_folding'}, False, True}"
     )
-    # batch_ot: enable minibatch optimal transport AND importantly, centering
+    # noise source distribution
+    noise_type: InterpolantTranslationsNoiseTypeEnum = (
+        InterpolantTranslationsNoiseTypeEnum.centered_harmonic
+    )
+    # batch_ot: enable minibatch optimal transport, otherwise enable aligning noise to sampled data
     batch_ot: bool = True
+    batch_align: bool = True
     # train_schedule: training schedule for interpolant
     train_schedule: InterpolantTranslationsScheduleEnum = (
         InterpolantTranslationsScheduleEnum.linear
@@ -1123,6 +1133,13 @@ class Config(BaseClassConfig):
         raw_cfg.model.sequence_pred_type = ModelSequencePredictionEnum.aa_pred
         # stochastic paths not part of public MultiFlow
         raw_cfg.shared.stochastic = False
+        # use simple gaussian prior for translations
+        raw_cfg.interpolant.trans.noise_type = (
+            InterpolantTranslationsNoiseTypeEnum.centered_gaussian
+        )
+        raw_cfg.inference.interpolant.trans.noise_type = (
+            InterpolantTranslationsNoiseTypeEnum.centered_gaussian
+        )
         # Don't predict torsion angles
         raw_cfg.model.predict_psi_torsions = False
         # positional embeddings

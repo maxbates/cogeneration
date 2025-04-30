@@ -45,6 +45,7 @@ def batch_align_structures(
     """
     Center and align structures to reference structures
     If no mask is provided, structures are centered at origin, otherwise pass `center=True` to center
+    TODO set `center=True` by default so get similar behavior as when no mask is provided
     """
     if pos_1.shape != pos_2.shape:
         raise ValueError("pos_1 and pos_2 must have the same shape.")
@@ -59,6 +60,8 @@ def batch_align_structures(
     flat_pos_1 = pos_1.reshape(-1, 3)
     flat_pos_2 = pos_2.reshape(-1, 3)
     flat_batch_indices = batch_indices.reshape(-1)
+
+    # If no mask, center and align, return aligned structures
     if mask is None:
         aligned_pos_1, aligned_pos_2, align_rots = align_structures(
             flat_pos_1, flat_batch_indices, flat_pos_2
