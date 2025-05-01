@@ -31,13 +31,13 @@ class TestCurriculum:
         monkeypatch.setattr(Experiment, "train", lambda self: None)
 
         # Create two dummy configs with unique IDs and checkpoint directories
-        # we need to override the `checkpointer.dirpath` because `test_interpolated` disrupts the template.
-        cfg1 = Config.test_uninterpolated(tmp_path=tmp_path)
+        cfg1 = Config.test_uninterpolated(tmp_path=tmp_path / "step1")
         cfg1.shared.id = "step1"
-        cfg1.experiment.checkpointer.dirpath = str((tmp_path / "step1").absolute())
-        cfg2 = Config.test_uninterpolated(tmp_path=tmp_path)
+        cfg1 = cfg1.interpolate()
+
+        cfg2 = Config.test_uninterpolated(tmp_path=tmp_path / "step2")
         cfg2.shared.id = "step2"
-        cfg2.experiment.checkpointer.dirpath = str((tmp_path / "step2").absolute())
+        cfg2 = cfg2.interpolate()
 
         # Instantiate Curriculum, which should coordinate checkpoints
         curriculum = Curriculum(
@@ -56,31 +56,25 @@ class TestCurriculum:
         curriculum.run()
 
     def test_resume(self, tmp_path, monkeypatch, mock_checkpoint):
-        cfg1 = Config.test_uninterpolated(tmp_path=tmp_path)
+        cfg1 = Config.test_uninterpolated(tmp_path=tmp_path / "step1")
         cfg1.shared.id = "step1"
-        cfg1.experiment.checkpointer.dirpath = str(tmp_path / "step1")
         cfg1 = cfg1.interpolate()
 
-        cfg2 = Config.test_uninterpolated(tmp_path=tmp_path)
+        cfg2 = Config.test_uninterpolated(tmp_path=tmp_path / "step2")
         cfg2.shared.id = "step2"
-        cfg2.experiment.checkpointer.dirpath = str(tmp_path / "step2")
         cfg2 = cfg2.interpolate()
 
         # Create a dummy checkpoint for step1
         cfg1, ckpt1 = mock_checkpoint(cfg=cfg1)
 
-        # Monkeypatch Experiment
+        # Monkeypatch Experiment to avoid actually training
         called = []
 
         def fake_init(self, cfg):
             called.append(cfg)
 
         monkeypatch.setattr(Experiment, "__init__", fake_init)
-
-        def fake_train(self):
-            pass
-
-        monkeypatch.setattr(Experiment, "train", fake_train)
+        monkeypatch.setattr(Experiment, "train", lambda self: None)
 
         curriculum = Curriculum(
             steps=[

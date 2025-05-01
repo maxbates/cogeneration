@@ -13,6 +13,7 @@ from cogeneration.config.base import (
     InterpolantAATypesInterpolantTypeEnum,
     InterpolantConfig,
     InterpolantRotationsScheduleEnum,
+    InterpolantTrainTimeSamplingEnum,
     InterpolantTranslationsNoiseTypeEnum,
     InterpolantTranslationsScheduleEnum,
 )
@@ -188,9 +189,53 @@ class Interpolant:
         self._device = device
 
     def sample_t(self, num_batch):
-        """Take a random t in the range [min_t, 1-min_t], for corrupting / training a batch."""
-        t = torch.rand(num_batch, device=self._device)
-        return t * (1 - 2 * self.cfg.min_t) + self.cfg.min_t
+        """
+        Take a random t in the range [min_t, 1-min_t], for corrupting / training a batch.
+        """
+        if (
+            self.cfg.train_time_sampling_method
+            == InterpolantTrainTimeSamplingEnum.uniform
+        ):
+            # sample from uniform [0, 1]
+            t = torch.rand(num_batch, device=self._device)
+        elif (
+            self.cfg.train_time_sampling_method
+            == InterpolantTrainTimeSamplingEnum.late_biased
+        ):
+            # late-biased is composed of three different distributions; we sample one to sample from.
+            #    |
+            #    |                ________
+            #    |           ___/│       │
+            #    |       ___/    │       │
+            #    |   ___/ ramp   │ late  │
+            #    |__/____________│_______│
+            #    |          uniform      │
+            #    +---------------+-------+-> t
+            #    0             t_late    1
+            t_late = 0.80
+
+            # pre-sample all three schedules
+            # 0 = uniform
+            t0 = torch.rand(num_batch, device=self._device)
+            # 1 = ramp
+            t1 = torch.sqrt(torch.rand(num_batch, device=self._device)) * t_late
+            # 2 = late uniform
+            t2 = t_late + torch.rand(num_batch, device=self._device) * (1 - t_late)
+
+            # pick one of {0=uniform,1=ramp,2=late} per sample
+            choice = torch.tensor(
+                np.random.choice([0, 1, 2], size=num_batch, p=[0.3, 0.45, 0.25]),
+                device=self._device
+            )
+            t = torch.where(choice == 0, t0, torch.where(choice == 1, t1, t2)).to(self._device)
+        else:
+            raise ValueError(
+                f"Unknown train time sampling method: {self.cfg.train_time_sampling_method}"
+            )
+
+        # scale to [min_t, 1-min_t]
+        min_t = self.cfg.min_t
+        return t * (1 - 2 * min_t) + min_t
 
     def _compute_sigma_t(self, t: torch.Tensor, scale: float, min_sigma: float = 0.01):
         """

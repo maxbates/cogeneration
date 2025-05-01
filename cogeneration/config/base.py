@@ -479,6 +479,11 @@ class InterpolantAATypesConfig(BaseClassConfig):
     # TODO - extra stochastic option, in addition to purity
 
 
+class InterpolantTrainTimeSamplingEnum(StrEnum):
+    uniform = "uniform"
+    late_biased = "late_biased"
+
+
 @dataclass
 class InterpolantSamplingConfig(BaseClassConfig):
     # training takes a random t. Sampling runs over t timestemps.
@@ -503,6 +508,9 @@ class InterpolantConfig(BaseClassConfig):
         those domains are fixed at ~t=1. Value should match how the model was trained for these tasks.
     """
 
+    train_time_sampling_method: InterpolantTrainTimeSamplingEnum = (
+        InterpolantTrainTimeSamplingEnum.late_biased
+    )
     min_t: float = 1e-2
     # `codesign_separate_t` allows separate `t` times for rots / trans / aatypes so fixed domains are at ~t=1.
     codesign_separate_t: bool = True
@@ -1154,6 +1162,10 @@ class Config(BaseClassConfig):
         # rotations non-expoential schedule
         raw_cfg.interpolant.provide_kappa = False
         raw_cfg.inference.interpolant.provide_kappa = False
+        # linear time sampling for training
+        raw_cfg.interpolant.train_time_sampling_method = (
+            InterpolantTrainTimeSamplingEnum.uniform
+        )
 
         # Weights
         # assume we have public weights available, use as default checkpoint
