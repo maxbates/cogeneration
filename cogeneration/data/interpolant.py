@@ -225,9 +225,11 @@ class Interpolant:
             # pick one of {0=uniform,1=ramp,2=late} per sample
             choice = torch.tensor(
                 np.random.choice([0, 1, 2], size=num_batch, p=[0.3, 0.45, 0.25]),
-                device=self._device
+                device=self._device,
             )
-            t = torch.where(choice == 0, t0, torch.where(choice == 1, t1, t2)).to(self._device)
+            t = torch.where(choice == 0, t0, torch.where(choice == 1, t1, t2)).to(
+                self._device
+            )
         else:
             raise ValueError(
                 f"Unknown train time sampling method: {self.cfg.train_time_sampling_method}"

@@ -15,7 +15,7 @@ from cogeneration.config.base import Config, DatasetConfig, InferenceSamplesConf
 from cogeneration.data import data_transforms, rigid_utils
 from cogeneration.data.const import seq_to_aatype
 from cogeneration.dataset.filterer import DatasetFilterer
-from cogeneration.dataset.motif_factory import Motif, MotifFactory, Segment
+from cogeneration.dataset.motif_factory import Motif, MotifFactory, Scaffold, Segment
 from cogeneration.dataset.process_pdb import read_processed_file
 from cogeneration.type.batch import METADATA_BATCH_PROPS, BatchFeatures
 from cogeneration.type.batch import BatchProps as bp
@@ -374,28 +374,44 @@ class BaseDataset(Dataset):
         """
         Apply `Motif` and `Scaffold` `Segments` to `feats`.
         Preserves the feats in motifs, and masks them in scaffolds, and extends scaffolds to target length.
+        i.e. has the effect of masking `trans_1`, `rotmats_1`, `aatypes_1` etc. in scaffolds.
+
+        Does not manage `res_idx` and `chain_idx` - assumes will be shuffled after calling
+        TODO - support specifying chain breaks some how... don't break when shuffle
         """
         new_total_length = sum([seg.length for seg in segments])
         new_feats = empty_feats(N=new_total_length)
 
-        # copy over some features from original
+        # copy over metadata features from original
         for prop in METADATA_BATCH_PROPS:
             if prop in feats:
                 new_feats[prop] = feats[prop]
 
+        # copy features in motif ranges.
+        # scaffold lengths may have changed, so use updated indices in new_feats
+        running_segment_start = 0
         for segment in segments:
-            if isinstance(segment, Motif):
-                s, e = segment.start, segment.end
-                e = e + 1  # make end position inclusive for range selection
+            # get positions. note `end` positions are exclusive here
+            # original positions (i.e. in `feats`)
+            os, oe, l = segment.start, segment.start + segment.length, segment.length
+            # new positions (i.e. in `new_feats`)
+            ns, ne = running_segment_start, running_segment_start + l
 
+            if isinstance(segment, Motif):
                 # copy over relevant motif features
                 for prop, value in new_feats.items():
                     if prop in METADATA_BATCH_PROPS:
                         continue
-                    new_feats[prop][s:e] = feats[prop][s:e]
+                    new_feats[prop][ns:ne] = feats[prop][os:oe]
 
-                # enforce certain values in motif
-                new_feats[bp.diffuse_mask][s:e] = 1.0
+                # set diffuse_mask to 0.0 in motif positions
+                new_feats[bp.diffuse_mask][ns:ne] = 0.0
+            elif isinstance(segment, Scaffold):
+                # set diffuse_mask to 1.0 in scaffold positions
+                new_feats[bp.diffuse_mask][ns:ne] = 1.0
+
+            # for any segment update running length
+            running_segment_start += segment.length
 
         return new_feats
 
@@ -481,6 +497,7 @@ class BaseDataset(Dataset):
         #    BaseDataset.recenter_structure(feats=feats)
 
         # Randomize chains and reset residue positions - after motif-selection!
+        # The motifs refer to chains, so don't want to disrupt that mapping.
         BaseDataset.reset_residues_and_randomize_chains(cfg=cfg, feats=feats)
 
         return feats
@@ -552,8 +569,6 @@ class LengthSamplingDataset(Dataset):
     """
     During predictions/inference, dataset to generate (e.g. unconditional) samples across lengths
     Each item comprises `num_res` (int) and `sample_id` (torch.Tensor, int or ints or strings)
-
-    # TODO enable multiple chain hallucination? Or just use PDB with scaffolding?
     """
 
     def __init__(self, cfg: InferenceSamplesConfig):

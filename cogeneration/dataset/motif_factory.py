@@ -15,7 +15,7 @@ from cogeneration.config.base import (
 @dataclass
 class Segment:
     start: int  # 0-indexed start in input residues
-    end: int  # 0-indexed end in input residues, not inclusive
+    end: int  # 0-indexed end in input residues, *inclusive*
 
     @property
     def length(self):
@@ -102,11 +102,11 @@ class MotifFactory:
         if idx.numel() == 0:
             return 0, N, N
 
-        # start = first index, stop = last index + 1 for slicing
+        # start = first index, stop_exclusive = last index + 1 for slicing
         start = int(idx.min().item())
-        stop = int(idx.max().item()) + 1
-        length = stop - start
-        return start, stop, length
+        stop_exclusive = int(idx.max().item()) + 1
+        length = stop_exclusive - start
+        return start, stop_exclusive, length
 
     def generate_segments_from_diffuse_mask(
         self,
@@ -131,24 +131,27 @@ class MotifFactory:
 
             # boundary if mask flips or chain changes
             if diff != current_diff or chain != current_chain:
-                seg_end = i - 1
-                length = seg_end - seg_start + 1
+                seg_end_inclusive = i - 1
+                # scaffold: randomly scale length
+                length = seg_end_inclusive - seg_start + 1
+                new_length = int(round(length * self.rng.uniform(*random_scale_range)))
 
                 if current_diff:
                     segments.append(
                         Scaffold(
                             start=seg_start,
-                            end=seg_end,
-                            # scaffold: randomly scale length
-                            new_length=int(
-                                round(length * self.rng.uniform(*random_scale_range))
-                            ),
+                            end=seg_end_inclusive,
+                            new_length=new_length,
                         )
                     )
                 else:
                     # motif: record chain_idx
                     segments.append(
-                        Motif(start=seg_start, end=seg_end, chain_idx=current_chain)
+                        Motif(
+                            start=seg_start,
+                            end=seg_end_inclusive,
+                            chain_idx=current_chain,
+                        )
                     )
 
                 # reset for next segment
@@ -157,23 +160,17 @@ class MotifFactory:
                 current_chain = chain
 
         # final tail segment
-        seg_end = N - 1
-        length = seg_end - seg_start + 1
+        seg_end_inclusive = N - 1
+        # scaffold: randomly scale length
+        length = seg_end_inclusive - seg_start + 1
+        new_length = int(round(length * self.rng.uniform(*random_scale_range)))
         if current_diff:
             segments.append(
-                Scaffold(
-                    start=seg_start,
-                    end=seg_end,
-                    # scaffold: randomly scale length
-                    new_length=int(
-                        round(length * self.rng.uniform(*random_scale_range))
-                    ),
-                )
+                Scaffold(start=seg_start, end=seg_end_inclusive, new_length=new_length)
             )
-
         else:
             segments.append(
-                Motif(start=seg_start, end=seg_end, chain_idx=current_chain)
+                Motif(start=seg_start, end=seg_end_inclusive, chain_idx=current_chain)
             )
 
         return segments
@@ -183,18 +180,18 @@ class MotifFactory:
     ) -> Tuple[int, int, int, int]:
         """
         Determine the acceptable bounds of the motif.
+        Returns: (bound_start, bound_stop_exclusive, bound_length, num_res)
+
         If `cfg.trim_low_plddt_ends` is set, it will trim the ends of the motif based on pLDDT scores.
         Otherwise, it will use the full range of the res_mask.
-
-        Returns: (bound_start, bound_stop, bound_length, num_res)
         """
         N = len(res_mask)
 
         if self.cfg.trim_low_plddt_ends:
-            plddt_start, plddt_stop, plddt_length = self._plddt_start_stop(
+            plddt_start, plddt_stop_exclusive, plddt_length = self._plddt_start_stop(
                 res_mask=res_mask, plddt_mask=plddt_mask
             )
-            return plddt_start, plddt_stop, plddt_length, N
+            return plddt_start, plddt_stop_exclusive, plddt_length, N
 
         # If not trimming, use the full range of the res_mask
         return 0, N, N, N
@@ -207,7 +204,7 @@ class MotifFactory:
     ) -> Tuple[int, int, int, int]:
         """
         Pick a chain at random that exceeds minumum motif length, return its bounds.
-        If no chain meets minimum length, ignore chains and treat like monomer.
+        If no chain meets minimum length, ignore `chain_idx` and treat like monomer.
         """
         chain_to_length = {
             chain: (chain_idx == chain).sum().item() for chain in chain_idx.unique()
@@ -231,11 +228,11 @@ class MotifFactory:
         bound_start = (
             res_mask[chain_idx == chain_idx].nonzero(as_tuple=False).min().item()
         )
-        bound_stop = (
+        bound_stop_exclusive = (
             res_mask[chain_idx == chain_idx].nonzero(as_tuple=False).max().item() + 1
         )
-        bound_length = bound_stop - bound_start
-        return bound_start, bound_stop, bound_length, num_res
+        bound_length = bound_stop_exclusive - bound_start
+        return bound_start, bound_stop_exclusive, bound_length, num_res
 
     def generate_single_motif_diffuse_mask(
         self,
@@ -249,12 +246,14 @@ class MotifFactory:
         """
         # To break across chains, just pick one chain and set bounds.
         if break_across_chains and self._is_multimeric(chain_idx=res_mask):
-            bound_start, bound_stop, bound_length, num_res = self._pick_chain_bounds(
-                res_mask=res_mask, plddt_mask=plddt_mask, chain_idx=chain_idx
+            bound_start, bound_stop_exclusive, bound_length, num_res = (
+                self._pick_chain_bounds(
+                    res_mask=res_mask, plddt_mask=plddt_mask, chain_idx=chain_idx
+                )
             )
         else:
-            bound_start, bound_stop, bound_length, num_res = self._determine_bounds(
-                res_mask=res_mask, plddt_mask=plddt_mask
+            bound_start, bound_stop_exclusive, bound_length, num_res = (
+                self._determine_bounds(res_mask=res_mask, plddt_mask=plddt_mask)
             )
 
         motif_length = self.rng.integers(
@@ -271,7 +270,8 @@ class MotifFactory:
         motif_start = self.rng.integers(
             low=max(bound_start, self.cfg.min_padding),
             high=min(
-                bound_stop, bound_length - motif_length - self.cfg.min_padding + 1
+                bound_stop_exclusive,
+                bound_length - motif_length - self.cfg.min_padding + 1,
             ),
         )
 
@@ -299,8 +299,8 @@ class MotifFactory:
         However, note that `diffuse_mask` may select residues not in `res_mask`,
         which would subsequently be masked out.
         """
-        bound_start, bound_stop, bound_length, num_res = self._determine_bounds(
-            res_mask=res_mask, plddt_mask=plddt_mask
+        bound_start, bound_stop_exclusive, bound_length, num_res = (
+            self._determine_bounds(res_mask=res_mask, plddt_mask=plddt_mask)
         )
 
         # Choose how many motifs to create (skewed toward small numbers)
@@ -401,14 +401,14 @@ class MotifFactory:
         Pick a residue, mask N closest residues as scaffold, remaining structure as motif
         This method is similar to the published FoldFold2 method
         """
-        bound_start, bound_stop, bound_length, num_res = self._determine_bounds(
-            res_mask=res_mask, plddt_mask=plddt_mask
+        bound_start, bound_stop_exclusive, bound_length, num_res = (
+            self._determine_bounds(res_mask=res_mask, plddt_mask=plddt_mask)
         )
 
         dist2d = torch.linalg.norm(trans_1[:, None, :] - trans_1[None, :, :], dim=-1)
 
         # pick a random residue within bounds
-        seed_idx = self.rng.integers(low=bound_start, high=bound_stop)
+        seed_idx = self.rng.integers(low=bound_start, high=bound_stop_exclusive)
         # sample a number of residues that will be scaffolded. ignore `motif_length` criteria, go off percentage.
         min_scaffold_length = min(
             bound_length, num_res - ceil(num_res * self.cfg.max_percent_motifs)
@@ -437,8 +437,8 @@ class MotifFactory:
         """
         Sample a residue with many neighbors, mask all neighbors within a distance threshold
         """
-        bound_start, bound_stop, bound_length, num_res = self._determine_bounds(
-            res_mask=res_mask, plddt_mask=plddt_mask
+        bound_start, bound_stop_exclusive, bound_length, num_res = (
+            self._determine_bounds(res_mask=res_mask, plddt_mask=plddt_mask)
         )
 
         # use 8.0 instead of 6.0 to allow picking up residues just outside "interaction" range
@@ -460,7 +460,7 @@ class MotifFactory:
             weights[~valid] = 0.0
             # only pick residues within bounds
             weights[:bound_start] = 0.0
-            weights[bound_stop:] = 0.0
+            weights[bound_stop_exclusive:] = 0.0
             probs = weights / weights.sum()
 
         # sample a seed residue index

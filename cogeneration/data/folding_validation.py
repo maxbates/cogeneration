@@ -69,11 +69,11 @@ class FoldingValidator:
         sample_name: Union[int, str],
         sample_dir: str,  # directory to write intermediates / outputs to
         pred_pdb_path: str,  # PDB file for predicted / generated structure, atom37.
-        pred_bb_positions: npt.NDArray,  # (N, n_bb_atoms, 3) where n_bb_atoms in [3, 5, ?]
+        pred_bb_positions: npt.NDArray,  # (N, n_bb_atoms, 3) where n_bb_atoms in {3, 5}
         pred_aa: npt.NDArray,  # (N)
         diffuse_mask: npt.NDArray,  # (N)
         res_index: npt.NDArray,  # (N)
-        true_bb_positions: Optional[npt.NDArray],  # (N, 37, 3)
+        true_bb_positions: Optional[npt.NDArray],  # (N, 37, 3), motifs for inpainting
         true_aa: Optional[npt.NDArray],  # (N)
         also_fold_pmpnn_seq: bool = True,  # also fold inverse-folded sequences
         n_inverse_folds: Optional[int] = None,

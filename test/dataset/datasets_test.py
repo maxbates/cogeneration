@@ -1,6 +1,7 @@
 import torch
 
 from cogeneration.config.base import InferenceSamplesConfig
+from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.dataset.datasets import BaseDataset, LengthSamplingDataset
 from cogeneration.dataset.motif_factory import Motif, Scaffold
 from cogeneration.type.batch import BatchProps as bp
@@ -17,21 +18,35 @@ class TestBaseDataset:
         N = 7
         feats = empty_feats(N)
 
+        # segment start/end are *inclusive*
         segments = [
-            Scaffold(start=0, end=2, new_length=5),
-            Motif(start=2, end=5, chain="A"),
-            Scaffold(start=5, end=7, new_length=1),
+            Scaffold(start=0, end=2, new_length=5),  # 0,1,2 -> 0,1,2,3,4
+            Motif(start=2, end=5, chain="A"),  # 2,3,4,5 -> 5,6,7,8
+            Scaffold(start=5, end=7, new_length=1),  # 6,7 -> 9
         ]
 
         new_feats = BaseDataset.segment_features(feats=feats, segments=segments)
 
-        # Confirm trans + rots are preserved in motif in new positions
-        assert torch.equal(new_feats[bp.trans_1][5:8], feats[bp.trans_1][2:5])
-        assert torch.equal(new_feats[bp.rotmats_1][5:8], feats[bp.rotmats_1][2:5])
+        # check diffuse_mask
+        assert (feats[bp.diffuse_mask] == 1.0).all()
+        assert (new_feats[bp.diffuse_mask][0:5] == 1.0).all()
+        assert (new_feats[bp.diffuse_mask][5:9] == 0.0).all()
+        assert (new_feats[bp.diffuse_mask][9:10] == 1.0).all()
+
+        # Confirm trans + rots + aatypes are preserved in motif in new positions
+        assert torch.equal(new_feats[bp.trans_1][5:9], feats[bp.trans_1][2:6])
+        assert torch.equal(new_feats[bp.rotmats_1][5:9], feats[bp.rotmats_1][2:6])
+        assert torch.equal(new_feats[bp.aatypes_1][5:9], feats[bp.aatypes_1][2:6])
         assert torch.equal(
-            new_feats[bp.torsion_angles_sin_cos_1][5:8],
-            feats[bp.torsion_angles_sin_cos_1][2:5],
+            new_feats[bp.torsion_angles_sin_cos_1][5:9],
+            feats[bp.torsion_angles_sin_cos_1][2:6],
         )
+
+        # trans + rots + aatypes masked in scaffold regions
+        assert torch.equal(new_feats[bp.trans_1][0:5], torch.zeros(5, 3))
+        assert torch.equal(new_feats[bp.rotmats_1][0:5], torch.eye(3)[None].repeat(5, 1, 1))
+        assert torch.equal(new_feats[bp.aatypes_1][0:5], torch.ones(5) * MASK_TOKEN_INDEX)
+        assert torch.equal(new_feats[bp.torsion_angles_sin_cos_1][0:5], torch.zeros(5, 7, 2))
 
         # Check output length matches sum of segment lengths
         expected_length = sum(seg.length for seg in segments)

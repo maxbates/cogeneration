@@ -31,6 +31,7 @@ from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import mask_blend_2d
 from cogeneration.data.trajectory import SavedTrajectory, save_trajectory
 from cogeneration.models.model import FlowModel
+from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProps as bp
 from cogeneration.type.batch import InferenceFeatures
 from cogeneration.type.batch import NoisyBatchProps as nbp
@@ -444,7 +445,7 @@ class FlowModule(LightningModule):
 
         return losses
 
-    def training_step(self, batch: NoisyFeatures):
+    def training_step(self, batch: BatchFeatures):
         step_start_time = time.time()
 
         self.interpolant.set_device(batch[bp.res_mask].device)

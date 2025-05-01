@@ -112,6 +112,21 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
          - [x] masking binding interfaces of one chain, preserve rest
          - [x] masking binding interfaces of both chains, preserve rest
          - [x] mask entire interacting chain
+    - [ ] support chain breaks
+        - Update MotifFactory
+            - [ ] new Segment subclass ChainBreak
+            - [ ] ensure chain breaks respected in motif generation
+            - [ ] pass `chain_idx` to `segments_from_diffuse_mask`, add ChainBreak segments
+        - [ ] update chain shuffling + residue indexing to respect
+            - should manage chain_idx and res_idx while building up segments
+                - chain break size should use config `chain_gap_dist`
+                - do need to reset chain_idx to be 0 indexed
+                - break up `reset_res_idx` and `reset_chain_idx` into separate functions
+            - remove chain shuffling and randomization - just use for unconditional
+        - [ ] allow specifying chain break in contigmap
+            - [ ] use RFDiffusion style `/0` break
+        - [ ] update tests
+        
 
 - Sampling
     - [x] new eval dataset for multimers? or update PDB dataset with new motif strategies
@@ -122,6 +137,8 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
     - New Metrics
         - [ ] Binding interface metrics
             - [ ] binding precision / recall
+            - requires refactor to pass through the full original structure, or similar
+            - `true_bb_positions` e.g. for inpainting (most relevant task) is limited to the motifs
         - (?) Split some metrics per chain, e.g. RMSD, LDDT
 
 - IO
