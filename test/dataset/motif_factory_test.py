@@ -11,7 +11,7 @@ from cogeneration.config.base import (
     DatasetInpaintingMotifStrategy,
 )
 from cogeneration.dataset.datasets import batch_features_from_processed_file
-from cogeneration.dataset.motif_factory import Motif, MotifFactory, Scaffold
+from cogeneration.dataset.motif_factory import ChainBreak, Motif, MotifFactory, Scaffold
 from cogeneration.dataset.process_pdb import process_pdb_file
 from cogeneration.type.batch import BatchProps as bp
 
@@ -193,9 +193,9 @@ class TestMotifFactory:
         rng = default_rng(0)
         factory = MotifFactory(cfg=cfg, rng=rng)
 
-        contigmap = "2/B4-6/C7-8"
+        contigmap = "2/B4-6/0 C7-8"
         segments = factory.segments_from_contigmap(contigmap)
-        assert len(segments) == 3
+        assert len(segments) == 4
 
         seg0 = segments[0]
         assert isinstance(seg0, Scaffold)
@@ -209,10 +209,13 @@ class TestMotifFactory:
         assert seg1.length == 3
 
         seg2 = segments[2]
-        assert isinstance(seg2, Motif)
-        assert seg2.chain == "C"
-        assert seg2.start == 7 and seg2.end == 8
-        assert seg2.length == 2
+        assert isinstance(seg2, ChainBreak)
+
+        seg3 = segments[3]
+        assert isinstance(seg3, Motif)
+        assert seg3.chain == "C"
+        assert seg3.start == 7 and seg3.end == 8
+        assert seg3.length == 2
 
     def test_segments_from_contigmap_invalid_token_raises(self):
         cfg = DatasetInpaintingConfig()

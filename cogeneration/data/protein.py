@@ -33,6 +33,7 @@ from cogeneration.data.const import (
     PDB_CHAIN_IDS,
     PDB_MAX_CHAINS,
 )
+from cogeneration.data.residue_constants import restypes_with_x
 
 FeatureDict = Mapping[str, np.ndarray]
 ModelOutput = Mapping[str, Any]
@@ -178,8 +179,9 @@ def to_pdb(prot: Protein, model=1, add_end=True) -> str:
     Returns:
       PDB string.
     """
-    restypes = residue_constants.restypes + ["X"]
-    res_1to3 = lambda r: residue_constants.restype_1to3.get(restypes[r], "UNK")
+    res_1to3 = lambda r: residue_constants.restype_1to3.get(
+        restypes_with_x[int(r)], "UNK"
+    )
     atom_types = residue_constants.atom_types
 
     pdb_lines = []

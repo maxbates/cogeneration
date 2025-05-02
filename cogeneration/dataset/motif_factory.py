@@ -1,3 +1,4 @@
+import random
 import re
 from dataclasses import dataclass
 from math import ceil, floor
@@ -43,21 +44,49 @@ class Scaffold(Segment):
 
 
 @dataclass
+class ChainBreak(Segment):
+
+    @property
+    def length(self):
+        return 0
+
+
+@dataclass
 class MotifFactory:
     cfg: DatasetInpaintingConfig
     rng: np.random.Generator
 
-    @staticmethod
-    def segments_from_contigmap(contigmap: str) -> List[Segment]:
-        # Parse a contigmap like "A1-20/20/A39-50" into a list of segment objects.
+    def segments_from_contigmap(self, contigmap: str) -> List[Segment]:
+        # Parse a contigmap like "5-15/A1-20/20/0 A39-50" into a list of segment objects.
+
+        # TODO - require input `feats` and ground positions in feats
+        #   motif should not require a chain. It's start / end should refer to feat indices.
+        #   Just use flattened chains in `feats` as positions. Map the contigmap to those positions.
+        #   Note, requires `chain_idx` and chains specified in `contigmap` to be aligned...
         segments = []
         length_so_far = 0
 
         # split contigmap on either "/" or ","
         tokens = re.split(r"[/,]", contigmap)
         for token in tokens:
+            # special case for chain-break token: "0 ", since won't split on " "
+            if token.startswith("0 "):
+                cb = ChainBreak(start=length_so_far, end=length_so_far)
+                segments.append(cb)
+                # remove "0 " prefix and continue
+                token = token[2:]
+
             if re.match(r"^\d+$", token):  # scaffold token e.g. "20"
                 scaffold_length = int(token)
+                scaffold = Scaffold(
+                    start=length_so_far, end=length_so_far, new_length=scaffold_length
+                )
+                segments.append(scaffold)
+                length_so_far += scaffold.new_length
+            elif re.match(r"^\d+-\d+$", token):  # variable length scaffold e.g. "5-15"
+                scaffold_length = random.randint(
+                    int(token.split("-")[0]), int(token.split("-")[1])
+                )
                 scaffold = Scaffold(
                     start=length_so_far, end=length_so_far, new_length=scaffold_length
                 )
@@ -118,6 +147,7 @@ class MotifFactory:
         Generate segments from a diffuse mask.
         Motifs are defined by diffuse_mask == 0, scaffolds are defined by diffuse_mask == 1
         Scaffold regions are randomly scaled by a factor in random_scale_range.
+        Chain breaks are inserted when `chain_idx` changes.
         """
         N = diffuse_mask.shape[0]
         segments: List[Segment] = []
@@ -131,28 +161,33 @@ class MotifFactory:
 
             # boundary if mask flips or chain changes
             if diff != current_diff or chain != current_chain:
-                seg_end_inclusive = i - 1
-                # scaffold: randomly scale length
-                length = seg_end_inclusive - seg_start + 1
-                new_length = int(round(length * self.rng.uniform(*random_scale_range)))
+                seg_end = i - 1
+                # scaffold: randomly scale length of original segment span
+                orig_len = seg_end - seg_start + 1
+                new_len = int(round(orig_len * self.rng.uniform(*random_scale_range)))
 
+                # append motif or scaffold segment
                 if current_diff:
                     segments.append(
                         Scaffold(
                             start=seg_start,
-                            end=seg_end_inclusive,
-                            new_length=new_length,
+                            end=seg_end,
+                            new_length=new_len,
                         )
                     )
                 else:
-                    # motif: record chain_idx
                     segments.append(
                         Motif(
                             start=seg_start,
-                            end=seg_end_inclusive,
+                            end=seg_end,
                             chain_idx=current_chain,
                         )
                     )
+
+                # if chain has changed, insert a chain break
+                if chain != current_chain:
+                    cb = ChainBreak(start=seg_end, end=seg_end)
+                    segments.append(cb)
 
                 # reset for next segment
                 seg_start = i

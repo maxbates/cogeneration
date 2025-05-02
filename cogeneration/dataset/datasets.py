@@ -15,7 +15,13 @@ from cogeneration.config.base import Config, DatasetConfig, InferenceSamplesConf
 from cogeneration.data import data_transforms, rigid_utils
 from cogeneration.data.const import seq_to_aatype
 from cogeneration.dataset.filterer import DatasetFilterer
-from cogeneration.dataset.motif_factory import Motif, MotifFactory, Scaffold, Segment
+from cogeneration.dataset.motif_factory import (
+    ChainBreak,
+    Motif,
+    MotifFactory,
+    Scaffold,
+    Segment,
+)
 from cogeneration.dataset.process_pdb import read_processed_file
 from cogeneration.type.batch import METADATA_BATCH_PROPS, BatchFeatures
 from cogeneration.type.batch import BatchProps as bp
@@ -308,36 +314,41 @@ class BaseDataset(Dataset):
         return processed_feats
 
     @staticmethod
-    def reset_residues_and_randomize_chains(cfg: DatasetConfig, feats: BatchFeatures):
+    def randomize_chains(cfg: DatasetConfig, feats: BatchFeatures):
         """
-        Randomize chain indices, and re-number residue indices for each chain to start from 1.
-        Modifies the input features in place.
+        Randomly permute chain indices; new chain IDs start at 1.
+        """
+        chain_idx = feats[bp.chain_idx]
+
+        # identify unique original chain IDs (sorted)
+        all_chain_ids = torch.unique(chain_idx).tolist()
+        # sample a random permutation
+        permuted = random.sample(all_chain_ids, len(all_chain_ids))
+        # remap to new IDs starting at 1
+        # Note that public MultiFlow simply started at 1 but retained gaps in IDs. We just re-index.
+        new_chain_idx = torch.zeros_like(chain_idx)
+        for new_id, orig_id in enumerate(permuted, start=1):
+            new_chain_idx[chain_idx == orig_id] = new_id
+
+        feats[bp.chain_idx] = new_chain_idx.long()
+
+    @staticmethod
+    def reset_residue_index(cfg: DatasetConfig, feats: BatchFeatures):
+        """
+        Re-number `res_index` starting from 1 within each chain.
+
+        Each chain is re-numbered by subtracting the largest idx observed in the chain,
+        so that intra-chain distances are preserved.
         """
         chain_idx = feats[bp.chain_idx]
         res_idx = feats[bp.res_idx]
 
         new_res_idx = torch.zeros_like(res_idx)
-        new_chain_idx = torch.zeros_like(res_idx)
-        all_chain_idx = torch.unique(chain_idx).tolist()
-        shuffled_chain_idx = (
-            torch.tensor(
-                random.sample(all_chain_idx, len(all_chain_idx)), dtype=torch.long
-            )
-            - torch.min(chain_idx)
-            + 1
-        )
-        for i, chain_id in enumerate(all_chain_idx):
-            chain_mask = (chain_idx == chain_id).long()
-            chain_min_idx = torch.min(
-                res_idx + (1 - chain_mask) * cfg.chain_gap_dist
-            ).long()
+        for cid in torch.unique(chain_idx).tolist():
+            chain_mask = (chain_idx == cid).int()
+            chain_min_idx = torch.min(res_idx + (1 - chain_mask) * 1e4).long()
             new_res_idx += (res_idx - chain_min_idx + 1) * chain_mask
 
-            # Shuffle chain_index
-            replacement_chain_id = shuffled_chain_idx[i]
-            new_chain_idx += replacement_chain_id * chain_mask
-
-        feats[bp.chain_idx] = new_chain_idx
         feats[bp.res_idx] = new_res_idx
 
     @staticmethod
@@ -370,14 +381,14 @@ class BaseDataset(Dataset):
     def segment_features(
         feats: BatchFeatures,
         segments: List[Segment],
-    ):
+    ) -> BatchFeatures:
         """
-        Apply `Motif` and `Scaffold` `Segments` to `feats`.
+        Apply `Motif` and `Scaffold` and `ChainBreak` (`Segment` instances) to `feats`.
+
         Preserves the feats in motifs, and masks them in scaffolds, and extends scaffolds to target length.
         i.e. has the effect of masking `trans_1`, `rotmats_1`, `aatypes_1` etc. in scaffolds.
 
-        Does not manage `res_idx` and `chain_idx` - assumes will be shuffled after calling
-        TODO - support specifying chain breaks some how... don't break when shuffle
+        Resets `chain_idx` to match Segments provided. Expected to reset indices after calling this function.
         """
         new_total_length = sum([seg.length for seg in segments])
         new_feats = empty_feats(N=new_total_length)
@@ -387,31 +398,77 @@ class BaseDataset(Dataset):
             if prop in feats:
                 new_feats[prop] = feats[prop]
 
-        # copy features in motif ranges.
-        # scaffold lengths may have changed, so use updated indices in new_feats
-        running_segment_start = 0
+        # There are several indices we need to track:
+        # 1) indices in original `feats`
+        # 2) indices in `new_feats`, because scaffolds may have different lengths
+        # 3) updating `chain_idx` and `res_idx`.
+        #    `Motif` specify a `chain` or `chain_id`, but only as the source of their information.
+        #       In the context of mapping features, all chains are flat features, so just use start/end positions.
+        #    `Scaffold` just continue the current chain
+        #    `ChainBreak` specify the beginning of a new chain, i.e. `chain_idx+1`
+        #   `res_idx` != (1) or (2) if there is a chain break.
+        #
+        # We'll manually track `chain_idx` and increment when we encounter `ChainBreak`.
+        # After building up the features, can re-index which will use the new `chain_idx`.
+        # TODO - build up `res_idx` as well here. Shouldn't need to re-index after this function.
+
+        # track current chain (1-indexed)
+        current_chain_idx = 1
+        # track res_idx (1-indexed per chain)
+        current_res_idx = 1
+        # track position in `new_feats`
+        new_feats_start = 0
+
         for segment in segments:
-            # get positions. note `end` positions are exclusive here
-            # original positions (i.e. in `feats`)
+            # chain break only bumps `current_chain_idx`.
+            # it should not modify new_feats or `feats` / `new_feats` indices
+            if isinstance(segment, ChainBreak):
+                current_chain_idx += 1  # increment
+                current_res_idx = 1  # reset
+                continue
+
+            # for motifs / scaffolds, compute original and new indices
             os, oe, l = segment.start, segment.start + segment.length, segment.length
-            # new positions (i.e. in `new_feats`)
-            ns, ne = running_segment_start, running_segment_start + l
+            ns, ne = new_feats_start, new_feats_start + l
 
             if isinstance(segment, Motif):
-                # copy over relevant motif features
-                for prop, value in new_feats.items():
+                # Motifs mostly preserve data
+                for prop in list(new_feats.keys()):
                     if prop in METADATA_BATCH_PROPS:
                         continue
                     new_feats[prop][ns:ne] = feats[prop][os:oe]
 
-                # set diffuse_mask to 0.0 in motif positions
+                # mark motif fixed
                 new_feats[bp.diffuse_mask][ns:ne] = 0.0
-            elif isinstance(segment, Scaffold):
-                # set diffuse_mask to 1.0 in scaffold positions
-                new_feats[bp.diffuse_mask][ns:ne] = 1.0
+                # enforce idx
+                new_feats[bp.chain_idx][ns:ne] = current_chain_idx
+                new_feats[bp.res_idx][ns:ne] = torch.arange(
+                    current_res_idx, current_res_idx + l
+                )
 
-            # for any segment update running length
-            running_segment_start += segment.length
+            elif isinstance(segment, Scaffold):
+                # Scaffolds mostly retain default `empty_feats` values.
+
+                # ensure marked to be diffused
+                new_feats[bp.diffuse_mask][ns:ne] = 1.0
+                # enforce idx
+                new_feats[bp.chain_idx][ns:ne] = current_chain_idx
+                new_feats[bp.res_idx][ns:ne] = torch.arange(
+                    current_res_idx, current_res_idx + l
+                )
+
+            else:
+                raise ValueError(f"Unknown segment type: {type(segment)}")
+
+            # advance cursors by segment length
+            new_feats_start += segment.length
+            current_res_idx += segment.length
+
+        # TODO(inpainting-fixed) If motif positions are fixed, those motifs need to be re-centered
+        # to avoid hinting / memorizing where to place scaffolds.
+        # Need to update `recenter_structure` method to use `diffuse_mask` appropriately.
+        # if add_noise or (diffuse_mask == 0).any()
+        #    BaseDataset.recenter_structure(feats=feats)
 
         return new_feats
 
@@ -488,17 +545,12 @@ class BaseDataset(Dataset):
                 diffuse_mask=feats[bp.diffuse_mask],
                 chain_idx=feats[bp.chain_idx],
             )
-            BaseDataset.segment_features(feats=feats, segments=segments)
+            # apply segmenting (note, generates new chain_idx)
+            feats = BaseDataset.segment_features(feats=feats, segments=segments)
 
-        # TODO(inpainting-fixed) If motif positions are fixed, those motifs need to be re-centered
-        # to avoid hinting / memorizing where to place scaffolds.
-        # Need to update `recenter_structure` method to use `diffuse_mask` appropriately.
-        # if add_noise or (diffuse_mask == 0).any()
-        #    BaseDataset.recenter_structure(feats=feats)
-
-        # Randomize chains and reset residue positions - after motif-selection!
-        # The motifs refer to chains, so don't want to disrupt that mapping.
-        BaseDataset.reset_residues_and_randomize_chains(cfg=cfg, feats=feats)
+        # Randomize chains and reset residue positions
+        BaseDataset.randomize_chains(cfg, feats)
+        BaseDataset.reset_residue_index(cfg, feats)
 
         return feats
 
@@ -630,24 +682,28 @@ class LengthSamplingDataset(Dataset):
             # nothing leftover, all chains the same length
             chain_extensions = np.zeros(num_chains, dtype=int)
         else:
-            chain_extensions = list(
-                sorted(np.random.choice(remaining_length, num_chains, replace=False))
+            # pick break points along remaining_length
+            chain_extensions = np.random.choice(
+                remaining_length, num_chains, replace=False
             )
 
         # update idx
         last_extension_size = 0
         last_end_idx = 0
-        for chain_id, extension_size in enumerate(chain_extensions):
+        for chain_id, extension_size in enumerate(list(sorted(chain_extensions))):
             chain_length = (
                 self.cfg.multimer_min_length + extension_size - last_extension_size
             )
-            last_extension_size = extension_size
-
             chain_end = last_end_idx + chain_length
+
+            # chain_idx is 1-indexed
             chain_idx[last_end_idx:chain_end] = chain_id + 1
-            res_idx[last_end_idx:chain_end] = (
-                chain_id * self.cfg.chain_gap_dist
-            ) + torch.arange(last_end_idx, chain_end, dtype=torch.long)
+            # res_idx is 1-indexed and per-chain
+            res_idx[last_end_idx:chain_end] = torch.arange(
+                1, chain_length + 1, dtype=torch.long
+            )
+
+            last_extension_size = extension_size
             last_end_idx = chain_end
 
         return chain_idx, res_idx

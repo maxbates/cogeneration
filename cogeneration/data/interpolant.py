@@ -450,7 +450,7 @@ class Interpolant:
         u = torch.rand(num_batch, num_res, device=self._device)
         corruption_mask = (u < (1 - t)).int()
         aatypes_noise = self._aatypes_noise(res_mask=res_mask)
-        aatypes_t = mask_blend_1d(aatypes_noise, aatypes_1.clone(), corruption_mask)
+        aatypes_t = mask_blend_1d(aatypes_noise, aatypes_1, corruption_mask)
 
         # TODO - determine how to add additional noise
         #   We only have access to the discrete types here, not the logits / rate matrix
@@ -576,8 +576,8 @@ class Interpolant:
         #   The motif sequence is fixed. However, the rest is not, and t should be in sync across domains.
         # For other tasks, everything is corrupted i.e. `(diffuse_mask == 1.0).all()`
         #   Though values at t=1 effectively won't be corrupted.
-        corruption_mask_structure = diffuse_mask.clone()
         corruption_mask_sequence = diffuse_mask
+        corruption_mask_structure = diffuse_mask.clone()
         if task == DataTaskEnum.inpainting:
             # any rows with a fixed motif have a `diffuse_mask.mean() < 1.0`
             row_inpainting_mask = diffuse_mask.float().mean(dim=1) < 1.0

@@ -81,6 +81,7 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
 
 - Model
     - [x] update positional embeddings
+         - [ ] note that each chain is indexed from 1. Update positional embedding strategy accordingly
          - [ ] consider clipping positional embeddings so across-chain out of range (like AF2 multimer) 
     - NodeFeatureNet
          - [x] require `embed_chain=True` in `cfg.node_features` to inject per-residue sinusoidal chain embeddings via `chain_idx`
@@ -112,20 +113,21 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
          - [x] masking binding interfaces of one chain, preserve rest
          - [x] masking binding interfaces of both chains, preserve rest
          - [x] mask entire interacting chain
-    - [ ] support chain breaks
+    - [x] support chain breaks
         - Update MotifFactory
-            - [ ] new Segment subclass ChainBreak
-            - [ ] ensure chain breaks respected in motif generation
-            - [ ] pass `chain_idx` to `segments_from_diffuse_mask`, add ChainBreak segments
-        - [ ] update chain shuffling + residue indexing to respect
-            - should manage chain_idx and res_idx while building up segments
+            - [x] new Segment subclass ChainBreak
+            - [x] ensure chain breaks respected in motif generation
+            - [x] pass `chain_idx` to `segments_from_diffuse_mask`, add ChainBreak segments
+        - [x] update chain shuffling + residue indexing to respect breaks
+            - [x] should manage chain_idx and res_idx while building up segments
                 - chain break size should use config `chain_gap_dist`
                 - do need to reset chain_idx to be 0 indexed
                 - break up `reset_res_idx` and `reset_chain_idx` into separate functions
-            - remove chain shuffling and randomization - just use for unconditional
-        - [ ] allow specifying chain break in contigmap
-            - [ ] use RFDiffusion style `/0` break
-        - [ ] update tests
+            - ~~remove chain shuffling and randomization - just use for unconditional~~
+        - [x] allow specifying chain break in contigmap
+            - [x] use RFDiffusion style `/0` break
+        - [x] update tests
+        - [x] drop `chain_gap_dist`... not needed
         
 
 - Sampling
@@ -187,6 +189,12 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
         - Can look for molecules with interactions.
             - Check for any presence of interacting molecules (ignore water etc.)  
             - Check for overlapping ranges with protein interactions.
+
+- contigmap parsing
+    - [ ] better differentiate `Segments` from feats vs `Segments` from contigmap
+    - Segments from feats and diffuse mask have start / end in feats, i.e. flattened chains
+    - Segments from contigmap specify `chain` or `chain_id` and start/end are chain specific
+    - Need to be able to convert contigmap segments -> feats segments
 
 - Support "hotspots"
     - [ ] RFDiffusion style specification of interacting residues

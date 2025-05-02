@@ -6,7 +6,11 @@ from cogeneration.config.base import Config
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import centered_gaussian
 from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
-from cogeneration.dataset.test_utils import create_pdb_batch
+from cogeneration.dataset.test_utils import (
+    MockDataloader,
+    create_pdb_batch,
+    mock_noisy_feats,
+)
 from cogeneration.type.batch import BatchProps as bp
 from cogeneration.type.batch import NoisyBatchProps as nbp
 from cogeneration.type.batch import PredBatchProps as pbp
@@ -151,27 +155,53 @@ class TestInterpolant:
         mock_cfg_uninterpolated.data.task = DataTaskEnum.inpainting
         cfg = mock_cfg_uninterpolated.interpolate()
 
-        torch.manual_seed(0)
+        # Create a mock batch, instead of PDB, because PDBs contain UNK and less predictable
+        B = 5
+        N = 20
+        batch = next(
+            iter(
+                MockDataloader(
+                    corrupt=False,
+                    sample_lengths=[N] * B,
+                    batch_size=B,
+                )
+            )
+        )
 
         interpolant = Interpolant(cfg.interpolant)
-        batch = create_pdb_batch(cfg)
         # Create a custom diffuse mask: first half scaffold (1), second half motif (0)
-        B, N = batch[bp.res_mask].shape
         diffuse_mask = torch.zeros((B, N), dtype=torch.int)
         diffuse_mask[:, : N // 2] = 1
         batch[bp.diffuse_mask] = diffuse_mask
 
-        noisy_batch = interpolant.corrupt_batch(batch, DataTaskEnum.inpainting)
+        noisy_batch = interpolant.corrupt_batch(batch, task=DataTaskEnum.inpainting)
 
         motif_mask = diffuse_mask == 0
         scaffold_mask = diffuse_mask == 1
+
+        # aatypes fixed in motifs, some percent corrupted in scaffolds dep on `t`
+        # We might expect ~0.24 to be corrupted on average:
+        #    diffuse_mask.mean() == 0.5
+        #    t.mean() == 0.5
+        #    (aatypes_1 == UNK).mean() == 0.04
+        # But we'll pick a conservative lower bound.
         assert torch.equal(
             noisy_batch[nbp.aatypes_t][motif_mask], batch[bp.aatypes_1][motif_mask]
         ), "Motif amino acids should be preserved in inpainting"
-        assert torch.any(
+        assert (
             noisy_batch[nbp.aatypes_t][scaffold_mask]
             != batch[bp.aatypes_1][scaffold_mask]
-        ), "Scaffold amino acids should be corrupted in inpainting"
+        ).float().mean() > 0.05, (
+            "Scaffold amino acids should be corrupted in inpainting"
+        )
+
+        # structure interpolates in scaffolds and motifs
+        assert torch.all(
+            noisy_batch[nbp.trans_t][scaffold_mask] != batch[bp.trans_1][scaffold_mask]
+        ), "scaffold structure should change"
+        assert torch.all(
+            noisy_batch[nbp.trans_t][scaffold_mask] != batch[bp.trans_1][scaffold_mask]
+        ), "motif structure should change"
 
 
 class TestInterpolantSample:

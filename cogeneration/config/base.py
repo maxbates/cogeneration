@@ -682,8 +682,6 @@ class DatasetConfig(BaseClassConfig):
     # TODO cfg to only add noise if t below some threshold (requires moving out of dataset)
     # TODO ensure noise added each time accessed and not cached
     noise_atom_positions_angstroms: float = 0.1
-    # multimer
-    chain_gap_dist: int = 200  # 200 in AF2M, 1e3 in public MultiFlow
 
     # Redesigned, i.e. use ProteinMPNN to generate sequences for a structure
     use_redesigned: bool = True
@@ -883,7 +881,6 @@ class InferenceSamplesConfig(BaseClassConfig):
     # Multimers - set `chain_idx` for 2+ chains, where each chain must be `min_length`
     multimer_fraction: float = 0.25
     multimer_min_length: int = 100
-    chain_gap_dist: int = "${dataset.chain_gap_dist}"
 
 
 @dataclass
@@ -1119,6 +1116,8 @@ class Config(BaseClassConfig):
             DatasetInpaintingMotifStrategy.single_motif
         )
         raw_cfg.interpolant.inpainting_unconditional_prop = 0.0
+        raw_cfg.interpolant.codesign_forward_fold_prop = 0.0
+        raw_cfg.interpolant.codesign_inverse_fold_prop = 0.0
 
         return raw_cfg
 

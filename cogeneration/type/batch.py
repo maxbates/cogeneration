@@ -101,11 +101,12 @@ def empty_feats(N: int) -> BatchFeatures:
     """
     return {
         BatchProps.res_mask: torch.ones(N),
-        BatchProps.aatypes_1: torch.ones(N) * MASK_TOKEN_INDEX,
+        # assume masking interpolant
+        BatchProps.aatypes_1: (torch.ones(N) * MASK_TOKEN_INDEX).long(),
         BatchProps.trans_1: torch.zeros(N, 3),
         BatchProps.rotmats_1: torch.eye(3).repeat(N, 1, 1),
         BatchProps.torsion_angles_sin_cos_1: torch.zeros(N, 7, 2),
-        BatchProps.chain_idx: torch.ones(N),
+        BatchProps.chain_idx: torch.zeros(N),
         BatchProps.res_idx: torch.arange(N),
         BatchProps.res_plddt: torch.zeros(N),
         BatchProps.diffuse_mask: torch.ones(N),

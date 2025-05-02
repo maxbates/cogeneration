@@ -83,11 +83,27 @@ def pdb_noisy_batch(mock_cfg):
 
 @pytest.fixture
 def mock_dataloader(request):
+    """Yields mock batches of un-corrupted samples"""
     # TODO - increase default batch size > 1
     batch_size = getattr(request, "param", {}).get("batch_size", 1)
-    sample_lengths = getattr(request, "param", {}).get("sample_lengths", None)
+    sample_lengths = getattr(request, "param", {}).get("sample_lengths", [20])
 
     return MockDataloader(
+        corrupt=False,
+        batch_size=batch_size,
+        sample_lengths=sample_lengths,
+    )
+
+
+@pytest.fixture
+def mock_corrupted_dataloader(request):
+    """Yields mock batches of corrupted samples"""
+    # TODO - increase default batch size > 1
+    batch_size = getattr(request, "param", {}).get("batch_size", 1)
+    sample_lengths = getattr(request, "param", {}).get("sample_lengths", [20])
+
+    return MockDataloader(
+        corrupt=True,
         batch_size=batch_size,
         sample_lengths=sample_lengths,
     )

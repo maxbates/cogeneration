@@ -17,7 +17,7 @@ class TestFlowModel:
         assert output is not None
 
     @pytest.mark.parametrize(
-        "mock_dataloader",
+        "mock_corrupted_dataloader",
         [
             {"batch_size": 1, "sample_lengths": [10]},
             {"batch_size": 1, "sample_lengths": [10, 12]},
@@ -32,10 +32,10 @@ class TestFlowModel:
         ],
         indirect=True,
     )
-    def test_forward_mock_dataloader(self, mock_cfg, mock_dataloader):
+    def test_forward_mock_dataloader(self, mock_cfg, mock_corrupted_dataloader):
         model = FlowModel(mock_cfg.model)
 
-        for batch in mock_dataloader:
+        for batch in mock_corrupted_dataloader:
             assert batch is not None
             output = model(batch)
             assert output is not None

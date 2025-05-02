@@ -3,7 +3,7 @@ import torch
 from cogeneration.config.base import InferenceSamplesConfig
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.dataset.datasets import BaseDataset, LengthSamplingDataset
-from cogeneration.dataset.motif_factory import Motif, Scaffold
+from cogeneration.dataset.motif_factory import ChainBreak, Motif, Scaffold
 from cogeneration.type.batch import BatchProps as bp
 from cogeneration.type.batch import empty_feats
 
@@ -22,6 +22,7 @@ class TestBaseDataset:
         segments = [
             Scaffold(start=0, end=2, new_length=5),  # 0,1,2 -> 0,1,2,3,4
             Motif(start=2, end=5, chain="A"),  # 2,3,4,5 -> 5,6,7,8
+            ChainBreak(start=5, end=5),
             Scaffold(start=5, end=7, new_length=1),  # 6,7 -> 9
         ]
 
@@ -44,9 +45,19 @@ class TestBaseDataset:
 
         # trans + rots + aatypes masked in scaffold regions
         assert torch.equal(new_feats[bp.trans_1][0:5], torch.zeros(5, 3))
-        assert torch.equal(new_feats[bp.rotmats_1][0:5], torch.eye(3)[None].repeat(5, 1, 1))
-        assert torch.equal(new_feats[bp.aatypes_1][0:5], torch.ones(5) * MASK_TOKEN_INDEX)
-        assert torch.equal(new_feats[bp.torsion_angles_sin_cos_1][0:5], torch.zeros(5, 7, 2))
+        assert torch.equal(
+            new_feats[bp.rotmats_1][0:5], torch.eye(3)[None].repeat(5, 1, 1)
+        )
+        assert torch.equal(
+            new_feats[bp.aatypes_1][0:5], torch.ones(5) * MASK_TOKEN_INDEX
+        )
+        assert torch.equal(
+            new_feats[bp.torsion_angles_sin_cos_1][0:5], torch.zeros(5, 7, 2)
+        )
+
+        # chain break observed for final scaffold
+        assert (new_feats[bp.chain_idx][0:9] == 1.0).all()
+        assert (new_feats[bp.chain_idx][9:10] == 2.0).all()
 
         # Check output length matches sum of segment lengths
         expected_length = sum(seg.length for seg in segments)
@@ -63,7 +74,6 @@ class TestLengthSamplingDataset:
             length_subset=[50, 99, 100, 500, 20000],
             multimer_fraction=1.0,
             multimer_min_length=50,
-            chain_gap_dist=200,
         )
         dataset = LengthSamplingDataset(cfg=cfg)
 
@@ -75,7 +85,7 @@ class TestLengthSamplingDataset:
         # 100 should have 2 chains both 50 long
         len100 = dataset[2]
         assert (len100[bp.chain_idx]).float().mean() == 1.5  # half 1, half 2
-        assert len100[bp.res_idx][50] == 250
+        assert len100[bp.res_idx][50] == 1  # res_idx resets
         len500 = dataset[3]
         # 500 should have several chains
         assert len(len500[bp.chain_idx].unique()) > 1
