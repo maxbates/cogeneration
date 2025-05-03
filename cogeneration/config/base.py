@@ -1,4 +1,5 @@
 import datetime
+import itertools
 import os
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
@@ -14,6 +15,7 @@ from cogeneration.config.dict_utils import (
     flatten_dict,
     prune_unknown_dataclass_fields,
 )
+from cogeneration.type.dataset import OLIGOMERIC_PREFIXES
 from cogeneration.type.embed import PositionalEmbeddingMethod
 from cogeneration.type.str_enum import StrEnum
 from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
@@ -585,6 +587,25 @@ class DatasetFilterConfig(BaseClassConfig):
     )
     num_chains: List[int] = field(default_factory=lambda: [1])
 
+    @classmethod
+    def multimeric(cls) -> "DatasetFilterConfig":
+        """Factory for multimeric configuration"""
+
+        # generate reasonable combos: {name}, {name,name}, {name,name,name}
+        oligomeric_names = [
+            f"{prefix}meric" for i, prefix in OLIGOMERIC_PREFIXES.items()
+        ]
+        oligomeric_combos = [
+            ",".join(combo)
+            for i in range(1, 4)
+            for combo in itertools.combinations(oligomeric_names, i)
+        ]
+
+        return cls(
+            oligomeric=oligomeric_combos,
+            num_chains=list(range(2, 20)),
+        )
+
 
 class DatasetInpaintingMotifStrategy(StrEnum):
     # Enable picking from all strategies
@@ -648,6 +669,17 @@ class DatasetInpaintingConfig(BaseClassConfig):
 dataset_metadata_dir_path = PATH_PROJECT_ROOT / "cogeneration" / "datasets" / "metadata"
 
 
+class DatasetTrimMethod(StrEnum):
+    """
+    Methods for trimming ChainFeatures to modeled residues.
+    Relevant to multimers.
+    """
+    # concat chains and trim ends; `modeled_seq_len` in metadata
+    whole_complex = "whole_complex"
+    # trim chains independently; `modeled_seq_len_independent` in metadata
+    chains_independently = "chains_independently"
+
+
 @dataclass
 class DatasetConfig(BaseClassConfig):
     """
@@ -678,6 +710,9 @@ class DatasetConfig(BaseClassConfig):
     # plddt [0, 100]. Minimum threshold, per residue, masked if below and add_plddt_mask=True
     add_plddt_mask: bool = True
     min_plddt_threshold: float = 0.0
+    # trim chains independently to modeled positions
+    # removes non-residues between chains, more important for multimers
+    modeled_trim_method: DatasetTrimMethod = DatasetTrimMethod.chains_independently
     # add gaussian noise to atom positions
     # TODO cfg to only add noise if t below some threshold (requires moving out of dataset)
     # TODO ensure noise added each time accessed and not cached

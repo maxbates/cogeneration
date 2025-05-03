@@ -86,7 +86,7 @@ def mock_dataloader(request):
     """Yields mock batches of un-corrupted samples"""
     # TODO - increase default batch size > 1
     batch_size = getattr(request, "param", {}).get("batch_size", 1)
-    sample_lengths = getattr(request, "param", {}).get("sample_lengths", [20])
+    sample_lengths = getattr(request, "param", {}).get("sample_lengths", None)
 
     return MockDataloader(
         corrupt=False,
@@ -100,7 +100,7 @@ def mock_corrupted_dataloader(request):
     """Yields mock batches of corrupted samples"""
     # TODO - increase default batch size > 1
     batch_size = getattr(request, "param", {}).get("batch_size", 1)
-    sample_lengths = getattr(request, "param", {}).get("sample_lengths", [20])
+    sample_lengths = getattr(request, "param", {}).get("sample_lengths", None)
 
     return MockDataloader(
         corrupt=True,

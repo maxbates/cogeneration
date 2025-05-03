@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from cogeneration.config.base import Config
+from cogeneration.config.base import Config, DatasetFilterConfig
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import centered_gaussian
 from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
@@ -90,8 +90,6 @@ class TestInterpolant:
         mock_cfg_uninterpolated.data.task = task
         cfg = mock_cfg_uninterpolated.interpolate()
 
-        torch.manual_seed(0)
-
         # Build interpolant
         interpolant = Interpolant(cfg.interpolant)
         batch = create_pdb_batch(cfg)
@@ -145,6 +143,41 @@ class TestInterpolant:
         assert torch.any(trans_diff.abs() > 1e-6), "trans_t should be corrupted"
         rot_diff = noisy_batch[nbp.rotmats_t] - batch[bp.rotmats_1]
         assert torch.any(rot_diff.abs() > 1e-6), "rotmats_t should be corrupted"
+
+    @pytest.mark.parametrize(
+        "task", [DataTaskEnum.hallucination, DataTaskEnum.inpainting]
+    )
+    def test_corrupt_batch_multimer(self, task, mock_cfg_uninterpolated):
+        """
+        Test that corrupt_batch adds expected keys with correct shapes
+        """
+        mock_cfg_uninterpolated.data.task = task
+        mock_cfg_uninterpolated.dataset.filter = DatasetFilterConfig.multimeric()
+        cfg = mock_cfg_uninterpolated.interpolate()
+
+        interpolant = Interpolant(cfg.interpolant)
+        batch = create_pdb_batch(cfg)
+        noisy_batch = interpolant.corrupt_batch(batch, task)
+
+        # confirm multimers, 1-indexed
+        assert noisy_batch[bp.chain_idx].min() == 1
+        assert noisy_batch[bp.chain_idx].float().mean() > 1.1
+        assert noisy_batch[bp.res_idx].min() == 1
+
+        # chain breaks -> res_idx resets to 1
+        chain_break_start_mask = torch.zeros_like(
+            noisy_batch[bp.chain_idx], dtype=torch.bool
+        )
+        chain_break_start_mask[:, 1:] = (
+            noisy_batch[bp.chain_idx][:, :-1] != noisy_batch[bp.chain_idx][:, 1:]
+        )
+        assert (noisy_batch[bp.res_idx][chain_break_start_mask] == 1).all()
+
+        # diffuse masks as expected
+        if task == DataTaskEnum.inpainting:
+            assert noisy_batch[bp.diffuse_mask].float().mean() < 1.0
+        elif task == DataTaskEnum.hallucination:
+            assert noisy_batch[bp.diffuse_mask].float().mean() == 1.0
 
     def test_corrupt_batch_preserves_motif_sequences_in_inpainting(
         self, mock_cfg_uninterpolated

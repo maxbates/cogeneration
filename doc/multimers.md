@@ -55,6 +55,16 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
         - [x] `cfg.dataset.chain_gap`: integer offset between chains
             - We already support a space between chains when randomize chains
         - [x] inspect public multiflow multimer files, see how they are written, how non-residues handled
+        - Per chain trimming
+            - [x] Enable per-chain trimming in `process_pdb`, e.g. to clear out solvent atoms between chains
+            - [x] test
+            - [x] create enum for trimming methods
+            - [ ] add column to metadata enum
+                - [ ] reprocess PDB metadata (and other datasets) to add to CSV
+                - [ ] write a little script to add it
+            - [ ] LengthBatcher uses correct `modeled_seq_len` column depending on method
+            - [ ] check other references to `modeled_seq_len`
+            - [ ] update metadata creation to include new column -- should generate both columns
     - Dataset
         - Filtering
             - [ ] convert `num_chains` filter to `dataset.filter.min_chains` / `dataset.filter.max_chains`
@@ -153,8 +163,8 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
     - [x] multi-chain `parse_pdb_feats()`
     - [x] `process_pdb_file()` -> `read_processed_file()`
     - [x] Parse `all_chain_feats` -> batch in BaseDataset
-    - [ ] fixture for dummy/real multimer batch 
-    - [ ] dataset loader multimers
+    - [x] fixture for dummy/real multimer batch 
+    - [x] dataset loader multimers
     - [ ] `model.forward()` multimer
     - [ ] `module.training_step()` multimer
     - [ ] `module.validation_step()` multimer

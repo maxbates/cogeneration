@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from cogeneration.config.base import Config, DatasetConfig, InferenceSamplesConfig
+from cogeneration.config.base import Config, DatasetConfig, InferenceSamplesConfig, DatasetTrimMethod
 from cogeneration.data import data_transforms, rigid_utils
 from cogeneration.data.const import seq_to_aatype
 from cogeneration.dataset.filterer import DatasetFilterer
@@ -306,7 +306,14 @@ class BaseDataset(Dataset):
         if use_cache and processed_file_path in self._cache:
             return self._cache[processed_file_path]
 
-        processed_feats = read_processed_file(processed_file_path)
+        trim_chains_independently = (
+            self.dataset_cfg.modeled_trim_method ==
+            DatasetTrimMethod.chains_independently
+        )
+        processed_feats = read_processed_file(
+            processed_file_path,
+            trim_chains_independently=trim_chains_independently,
+        )
 
         if use_cache:
             self._cache[processed_file_path] = processed_feats

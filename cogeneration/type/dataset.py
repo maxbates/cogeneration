@@ -59,9 +59,9 @@ class DatasetProteinColumns(StrEnum):
     """
 
     aatype = "aatype"  # (P, ) AA sequence residue indices
-    atom_positions = "atom_positions"  # (P, 37, 3) all atom positions
     atom_mask = "atom_mask"  # (P, 37) all atoms to consider
     bb_mask = "bb_mask"  # (P, ) alpha carbons considered
+    atom_positions = "atom_positions"  # (P, 37, 3) all atom positions
     bb_positions = "bb_positions"  # (P, 3) alpha carbon
     residue_index = "residue_index"  # (P, ) residue index
     chain_index = "chain_index"  # (P, ) chain index
@@ -94,7 +94,7 @@ MetadataCSVRow = Dict[DatasetColumns, NumpyPrimitiveFeat]
 MetadataDataFrame = pd.DataFrame
 
 """
-ChainFeatures represents an intermediate state converting `Protein` dict to `ProcessedFile`
+ChainFeatures represents an intermediate state converting `asdict(Protein)` to `ProcessedFile`.
 Use when only a subset of fields of `DatasetProteinColumns` are present in `ChainFeatures`.
 """
 ChainFeatures = Dict[DatasetProteinColumns, npt.NDArray]
@@ -104,3 +104,31 @@ ProcessedFile for pre-processed pkl, produced by `parse_pdb_files.py`
 It contains 1+ chains, concatenated into a flat `chain_features`.
 """
 ProcessedFile = Dict[DatasetProteinColumns, npt.NDArray]
+
+
+"""
+Note the descriptions vary more widely in the metadata provided by MultiFlow,
+perhaps taken from PDB directly, but this is fairly close.
+"""
+OLIGOMERIC_PREFIXES = {
+    1: "mono",
+    2: "di",
+    3: "tri",
+    4: "tetra",
+    5: "penta",
+    6: "hexa",
+    7: "hepta",
+    8: "octa",
+    9: "nona",
+    10: "deca",
+    11: "undeca",
+    12: "dodeca",  # pref to `duodeca`
+    13: "trideca",
+    14: "tetradeca",
+    15: "pentadeca",
+    16: "hexadeca",
+    17: "heptadeca",
+    18: "octadeca",
+    19: "nonadeca",
+    20: "eicosa",  # pref to `icosa`
+}

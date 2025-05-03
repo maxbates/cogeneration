@@ -13,7 +13,7 @@ from cogeneration.data.const import CA_IDX
 from cogeneration.data.io import read_pkl, write_pkl
 from cogeneration.data.protein import chain_str_to_int, process_chain
 from cogeneration.data.residue_constants import unk_restype_index
-from cogeneration.type.dataset import ChainFeatures
+from cogeneration.type.dataset import OLIGOMERIC_PREFIXES, ChainFeatures
 from cogeneration.type.dataset import DatasetColumns as dc
 from cogeneration.type.dataset import DatasetProteinColumns as dpc
 from cogeneration.type.dataset import MetadataCSVRow, ProcessedFile
@@ -72,59 +72,38 @@ def _oligomeric_detail(
     """
     Describe oligomeric detail of each unique sequence in the structure.
     Per-sequence details are comma-separated e.g. "monomeric,24-meric,trimeric"
-
-    Note the descriptions vary more widely in the metadata provided by MultiFlow,
-    perhaps taken from PDB directly, but this is fairly close.
     """
-    count_to_prefix = {
-        1: "mono",
-        2: "di",
-        3: "tri",
-        4: "tetra",
-        5: "penta",
-        6: "hexa",
-        7: "hepta",
-        8: "octa",
-        9: "nona",
-        10: "deca",
-        11: "undeca",
-        12: "dodeca",  # pref to `duodeca`
-        13: "trideca",
-        14: "tetradeca",
-        15: "pentadeca",
-        16: "hexadeca",
-        17: "heptadeca",
-        18: "octadeca",
-        19: "nonadeca",
-        20: "eicosa",  # pref to `icosa`
-    }
+
     counts = [int(x) for x in _oligomeric_count(struct_feats).split(",")]
     return ",".join(
         [
-            f"{count_to_prefix[x]}meric" if x in count_to_prefix else f"{x}-meric"
+            (
+                f"{OLIGOMERIC_PREFIXES[x]}meric"
+                if x in OLIGOMERIC_PREFIXES
+                else f"{x}-meric"
+            )
             for x in counts
         ]
     )
 
 
 def center_and_scale_chain_feats(
-    chain_feats: ChainFeatures, center: bool = True, scale_factor: float = 1.0
+    chain_feats: ChainFeatures, scale_factor: float = 1.0
 ) -> ChainFeatures:
     """
     Updates `dpc.atom_positions` after centering (if `center` is True) and scaling by `scale_factor`.
     """
-    if center:
-        # don't assume `dpc.bb_mask` exists yet
-        bb_mask = chain_feats[dpc.atom_mask][:, CA_IDX]
-        bb_pos = chain_feats[dpc.atom_positions][:, CA_IDX]
-        bb_center = np.sum(bb_pos, axis=0) / (np.sum(bb_mask) + 1e-5)
-        centered_pos = chain_feats[dpc.atom_positions] - bb_center[None, None, :]
-        scaled_pos = centered_pos / scale_factor
-    else:
-        scaled_pos = chain_feats[dpc.atom_positions] / scale_factor
+    # don't assume `dpc.bb_mask` exists yet
+    bb_mask = chain_feats[dpc.atom_mask][:, CA_IDX]
+    bb_pos = chain_feats[dpc.atom_positions][:, CA_IDX]
+    bb_center = np.sum(bb_pos, axis=0) / (np.sum(bb_mask) + 1e-5)
+    centered_pos = chain_feats[dpc.atom_positions] - bb_center[None, None, :]
+    scaled_pos = centered_pos / scale_factor
 
     # update in place
     chain_feats[dpc.atom_positions] = scaled_pos * chain_feats[dpc.atom_mask][..., None]
+    chain_feats[dpc.bb_positions] = chain_feats[dpc.atom_positions][:, CA_IDX]
+
     return chain_feats
 
 
@@ -134,39 +113,78 @@ def determine_modeled_residues(
     """
     Determines the modeled residues in `chain_feats`.
     Most appropriate for a chain, rather than complex, but can be used for either.
+    However, it is 0-indexed given input, so don't use for multimer chains and then concat.
+
     raises DataError if no modeled residues are found.
 
     Returns an array like `[0, 1, 4, 5, ...]` (e.g. if 2, 3 are invalid) of valid residues.
     """
-    complex_aatype = chain_feats[dpc.aatype]
-    modeled_residues = np.where(complex_aatype != unk_restype_index)[0]
+    modeled_residues = np.where(chain_feats[dpc.aatype] != unk_restype_index)[0]
     return modeled_residues
 
 
-def _trim_chain_feats_to_modeled_residues(
+def trim_chain_feats_to_modeled_residues(
     chain_feats: ChainFeatures,
+    trim_chains_independently: bool = True,
 ) -> ChainFeatures:
     """
     Trims `chain_feats` to `dpc.modeled_idx` residues.
     Deletes the field, returns a new instance where each field is trimmed.
-    Therefore, can only trim once!
+    Therefore, can only trim once! Should be called on reading a ProcessedFile, but not writing.
 
     The FrameFlow/MultiFlow implementation just trims the ends using min/max modeled positions.
     Invalid residues are left in place, but `BatchProps.res_mask` should use `dpc.bb_mask` to ignore them.
-    There are reasons to leave them in, consider during modeling, but not consider in loss...
-    In the monomer setting, not a big deal, but leaves more junky in multimers.
+
+    In public MultiFlow / FrameFlow code, this occurs after processing all the chains, and only considers
+    the ends of the concatenated chains.
+    In the monomer setting, like the public versions of these two models, this is not a big deal,
+    but leaves more junk in multimers, e.g. { chain ... junk ... chain }
+
+    Remember we want to preserve positions for proteins with gaps i.e. uncaptured neighbors/gaps,
+      so we don't impose a penalty on "neighbors" that aren't actually neighbors.
+      So don't mask exclusively to known and modeled residues.
+
     Also need a better way to handle this when loading public MultiFlow data to achieve same effect.
     Minimally, we want to trim each chain from the public data.
-    # TODO - consider removing them. Make it configurable. Compare performance.
-    # TODO(multimer) - allow making this a default in `parse_pdb_feats` once have working implementation.
-    #    Will need to determine how to track `modeled_idx` for metadata to maintain compatibility.
-    #    Also need to "add" across chains anyways, can't number each chain individually...
     """
-    modeled_idx = chain_feats[dpc.modeled_idx]
-    min_idx = np.min(modeled_idx)
-    max_idx = np.max(modeled_idx)
+    is_monomer = len(np.unique(chain_feats[dpc.chain_index])) == 1
+
+    # Match public MultiFlow / FrameFlow behavior
+    if is_monomer or not trim_chains_independently:
+        modeled_idx = chain_feats[dpc.modeled_idx]
+        min_idx = np.min(modeled_idx)
+        max_idx = np.max(modeled_idx)
+
+        # del `modeled_idx`. All other features are (P, *), and are trimmed to (N, *)
+        del chain_feats[dpc.modeled_idx]
+        chain_feats = tree.map_structure(
+            lambda x: x[min_idx : (max_idx + 1)], chain_feats
+        )
+        return chain_feats
+
+    # Trim each chain independently.
+    # We want to preserve internal positions within chains, but if there is junk between chains (e.g. solvent)
+    # then we drop it.
+    # We'll determine the start / end positions of each chain that are modeled, and trim to those.
+
+    chain_idx = chain_feats[dpc.chain_index]
+    modeled_mask = np.zeros_like(chain_idx, dtype=bool)
+    modeled_mask[chain_feats[dpc.modeled_idx]] = True
+
+    keep_mask = np.zeros_like(chain_idx, dtype=bool)
+    idx = np.arange(chain_idx.size)
+
+    # for each chain, find first / last positions modeled, add to keep_mask
+    for cid in np.unique(chain_idx):
+        in_chain = chain_idx == cid
+        modeled_in_chain = in_chain & modeled_mask
+        if modeled_in_chain.any():
+            first, last = np.flatnonzero(modeled_in_chain)[[0, -1]]
+            keep_mask |= in_chain & (idx >= first) & (idx <= last)
+
+    # del `modeled_idx`. All other features are (P, *), and are trimmed to (N, *)
     del chain_feats[dpc.modeled_idx]
-    chain_feats = tree.map_structure(lambda x: x[min_idx : (max_idx + 1)], chain_feats)
+    chain_feats = tree.map_structure(lambda x: x[keep_mask], chain_feats)
     return chain_feats
 
 
@@ -174,44 +192,33 @@ def _process_chain_feats(
     chain_feats: ChainFeatures,
     center: bool,
     trim_to_modeled_residues: bool,
+    trim_chains_independently: bool,
     scale_factor: float = 1.0,
 ) -> ProcessedFile:
     """
     Parse chain features. Add position information and mask for backbone atoms.
     Returns a complete ProcessedFile.
 
-    This function is used both:
-    1) To process each PDB Chain -> `Protein` -> `ChainFeatures` in `process_pdb_file()`
-    2) Load a processed file, which may have come from public MultiFlow data dump.
-       Field additions should be idempotent.
-
-    Important to maintain backwards compatibility with public Multiflow, which:
-    - added `dpc.bb_mask`
-    - centered
-    - masked `dpc.atom_positions` using `dpc.atom_mask`
-    - added `dpc.bb_positions`
-    - trimmed to modeled residues
+    Used to load a processed file, which may have come from public MultiFlow data dump.
+    Field additions should be idempotent.
 
     Note that positions are expected in angstroms (PDB style).
     """
-    # TODO(multimer) - make masking optional so easier to reuse function or break out functionality.
-    #  Check FrameFlow original implementation and see if present
-
-    chain_feats[dpc.bb_mask] = chain_feats[dpc.atom_mask][:, CA_IDX]
-
-    chain_feats = center_and_scale_chain_feats(
-        chain_feats,
-        center=center,
-        scale_factor=scale_factor,
-    )
-
-    chain_feats[dpc.bb_positions] = chain_feats[dpc.atom_positions][:, CA_IDX]
+    # Center and update positions.
+    if center:
+        chain_feats = center_and_scale_chain_feats(
+            chain_feats,
+            scale_factor=scale_factor,
+        )
 
     # Trim to modeled residues.
-    # This filters away residues outside range of consideration, yield length N := len(modeled_idx)
-    # However, it does not filter away intermediates, i.e. if there is a gap in `modeled_idx`.
+    # This filters away residues outside range of consideration, yield length N := len(modeled_idx).
+    # However, it does not filter away intermediates positions, i.e. if there is a gap in `modeled_idx`.
     if trim_to_modeled_residues:
-        chain_feats = _trim_chain_feats_to_modeled_residues(chain_feats)
+        chain_feats = trim_chain_feats_to_modeled_residues(
+            chain_feats,
+            trim_chains_independently=trim_chains_independently,
+        )
 
     return chain_feats
 
@@ -236,7 +243,6 @@ def _process_pdb(
 
     During processing, we track and write `dpc.modeled_idx`.
     It can be used on read to trim complex.
-    TODO(multimer) see note in `trim_chain_feats_to_modeled_residues` about trimming per-chain during processing.
 
     Raises DataError if a known filtering rule is hit. All other errors propogated.
     """
@@ -259,23 +265,21 @@ def _process_pdb(
     for chain_id, chain in struct_chains.items():
         chain_id = chain_str_to_int(chain_id)
         chain_protein = process_chain(chain, chain_id=chain_id)
-        chain_dict: ChainFeatures = dataclasses.asdict(chain_protein)  # noqa
+        chain_feats: ChainFeatures = dataclasses.asdict(chain_protein)  # noqa
 
         # check for non-protein chains and skip them
-        if np.sum(chain_dict[dpc.aatype] != unk_restype_index) == 0:
+        if np.sum(chain_feats[dpc.aatype] != unk_restype_index) == 0:
             continue
 
-        # TODO(multimer) - do we need to run this here if no trimming etc. per chain, or is running after `concat` sufficient?
+        # Add missing fields
+        # `chain_feats` then has almost all the fields of a processed file, save for `concat`
         # During processing of individual chains, don't center them. We'll center the complex later.
         # Don't trim modeled residues. Write them. Can trim on load.
-        chain_dict = _process_chain_feats(
-            chain_dict,
-            scale_factor=scale_factor,
-            center=False,
-            trim_to_modeled_residues=False,
-        )
-        all_seqs.add(tuple(chain_dict[dpc.aatype]))
-        struct_feats.append(chain_dict)
+        chain_feats[dpc.bb_mask] = chain_feats[dpc.atom_mask][:, CA_IDX]
+        chain_feats[dpc.bb_positions] = chain_feats[dpc.atom_positions][:, CA_IDX]
+
+        all_seqs.add(tuple(chain_feats[dpc.aatype]))
+        struct_feats.append(chain_feats)
 
     # Concat features for each chain in complex.
     # Note in AlphaFold2, the merging process is more complex, because it has MSAs, templates, etc.
@@ -283,22 +287,13 @@ def _process_pdb(
     #   using enums CHAIN_FEATURES, SEQ_FEATURES, MSA_FEATURES etc.
     #   However, we are really just working with `SEQ_FEATURES` and can concat them all.
     #   We track in the metadata `dc.seq_len` (the only CHAIN_FEATURE we consider) below.
-    complex_feats = _concat_np_features(struct_feats, False)
+    complex_feats: ChainFeatures = _concat_np_features(struct_feats, False)  # noqa
 
     # Determine modeled residues.
-    # TODO(multimer) - determine modeled residues for each chain independently.
-    # Note in public MultiFlow / FrameFlow code, this occurs after processing all the chains.
-    #   It would make sense to do per-chain, in case several non-residues were present between chains.
-    #   Remember we want to preserve positions for proteins with gaps i.e. uncaptured neighbors/gaps,
-    #   so we don't impose a penalty on "neighbors" that aren't actually neighbors.
-    #   So don't mask exclusively to known and modeled residues.
     complex_feats[dpc.modeled_idx] = determine_modeled_residues(complex_feats)
 
     # Center the complex
-    complex_feats = center_and_scale_chain_feats(complex_feats, center=True)
-
-    # At this point `complex_feats` has all the features of a `ProcessedFile`.
-    complex_feats: ProcessedFile = complex_feats
+    complex_feats = center_and_scale_chain_feats(complex_feats)
 
     # Generate metadata file
     metadata: MetadataCSVRow = {}
@@ -378,6 +373,7 @@ def read_processed_file(
     processed_file_path: str,
     center: bool = True,
     trim_to_modeled_residues: bool = True,
+    trim_chains_independently: bool = True,
 ) -> ProcessedFile:
     """
     Loads a processed PDB pkl from `process_pdb_file` and yields a ProcessedFile.
@@ -387,5 +383,6 @@ def read_processed_file(
         processed_feats,
         center=center,
         trim_to_modeled_residues=trim_to_modeled_residues,
+        trim_chains_independently=trim_chains_independently,
     )
     return processed_file
