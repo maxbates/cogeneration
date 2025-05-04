@@ -6,13 +6,15 @@ Uses DDP, which requires appropriate setup.
 import logging
 import math
 
+import pandas as pd
 import torch
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler, dist
 
-from cogeneration.config.base import DatasetConfig
+from cogeneration.config.base import DataSamplerConfig, DatasetConfig
 from cogeneration.dataset.datasets import BaseDataset
+from cogeneration.type.dataset import DatasetColumns
 
 
 class ProteinData(LightningDataModule):
@@ -41,6 +43,7 @@ class ProteinData(LightningDataModule):
         batch_sampler = LengthBatcher(
             sampler_cfg=self.sampler_cfg,
             metadata_csv=self._train_dataset.csv,
+            modeled_length_col=self.dataset_cfg.modeled_trim_method.to_dataset_column(),
             rank=rank,
             num_replicas=num_replicas,
         )
@@ -90,8 +93,9 @@ class LengthBatcher:
     def __init__(
         self,
         *,
-        sampler_cfg,
-        metadata_csv,
+        sampler_cfg: DataSamplerConfig,
+        metadata_csv: pd.DataFrame,
+        modeled_length_col: DatasetColumns,
         seed=123,
         shuffle=True,
         num_replicas=None,
@@ -110,6 +114,7 @@ class LengthBatcher:
 
         self._sampler_cfg = sampler_cfg
         self._data_csv = metadata_csv
+        self.modeled_length_col = modeled_length_col
 
         # Each replica needs the same number of batches. We set the number
         # of batches to arbitrarily be the number of examples per replica.
@@ -156,7 +161,7 @@ class LengthBatcher:
 
         # Each batch contains multiple proteins of the same length.
         sample_order = []
-        for seq_len, len_df in replica_csv.groupby("modeled_seq_len"):
+        for seq_len, len_df in replica_csv.groupby(self.modeled_length_col):
             max_batch_size = min(
                 self.max_batch_size,
                 self._sampler_cfg.max_num_res_squared // seq_len**2 + 1,

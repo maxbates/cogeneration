@@ -59,12 +59,16 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
             - [x] Enable per-chain trimming in `process_pdb`, e.g. to clear out solvent atoms between chains
             - [x] test
             - [x] create enum for trimming methods
-            - [ ] add column to metadata enum
-                - [ ] reprocess PDB metadata (and other datasets) to add to CSV
-                - [ ] write a little script to add it
-            - [ ] LengthBatcher uses correct `modeled_seq_len` column depending on method
-            - [ ] check other references to `modeled_seq_len`
-            - [ ] update metadata creation to include new column -- should generate both columns
+            - [x] add column to metadata enum
+            - [x] reprocess PDB metadata (and other datasets) to add to CSV
+                - [x] write a little script to add it
+            - [x] update metadata creation to include new column - should generate both columns
+            - [x] LengthBatcher uses correct `modeled_seq_len` column depending on method
+            - [x] update eval dataset to use correct column
+            - [x] check other references to `modeled_seq_len`
+            - [ ] update `cluster` file to support other trimming strategy?
+                - not sure what this cluster file is doing. maybe based on 2d structure?
+                - should generate in data pipeline
     - Dataset
         - Filtering
             - [ ] convert `num_chains` filter to `dataset.filter.min_chains` / `dataset.filter.max_chains`
@@ -91,7 +95,7 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
 
 - Model
     - [x] update positional embeddings
-         - [ ] note that each chain is indexed from 1. Update positional embedding strategy accordingly
+         - [ ] note that each chain is indexed from 1. Update positional embedding strategy accordingly?
          - [ ] consider clipping positional embeddings so across-chain out of range (like AF2 multimer) 
     - NodeFeatureNet
          - [x] require `embed_chain=True` in `cfg.node_features` to inject per-residue sinusoidal chain embeddings via `chain_idx`
@@ -199,6 +203,7 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
         - Can look for molecules with interactions.
             - Check for any presence of interacting molecules (ignore water etc.)  
             - Check for overlapping ranges with protein interactions.
+    - [ ] generate cluster as part of pipeline
 
 - contigmap parsing
     - [ ] better differentiate `Segments` from feats vs `Segments` from contigmap

@@ -11,7 +11,12 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from cogeneration.config.base import Config, DatasetConfig, InferenceSamplesConfig, DatasetTrimMethod
+from cogeneration.config.base import (
+    Config,
+    DatasetConfig,
+    DatasetTrimMethod,
+    InferenceSamplesConfig,
+)
 from cogeneration.data import data_transforms, rigid_utils
 from cogeneration.data.const import seq_to_aatype
 from cogeneration.dataset.filterer import DatasetFilterer
@@ -129,6 +134,18 @@ def _read_clusters(cluster_path: Union[Path, str], synthetic=False) -> Dict[str,
     return pdb_to_cluster
 
 
+def read_metadata_file(
+    metadata_path: Union[Path, str],
+) -> MetadataDataFrame:
+    """
+    Reads a metadata CSV file and returns a DataFrame.
+    """
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(f"Metadata file {metadata_path} does not exist")
+    metadata_df = pd.read_csv(metadata_path)
+    return metadata_df
+
+
 class BaseDataset(Dataset):
     def __init__(
         self,
@@ -152,10 +169,7 @@ class BaseDataset(Dataset):
         )
 
         # Process structures and clusters
-        assert os.path.exists(
-            self.dataset_cfg.csv_path
-        ), f"CSV path {self.dataset_cfg.csv_path} does not exist"
-        self.raw_csv = pd.read_csv(self.dataset_cfg.csv_path)
+        self.raw_csv = read_metadata_file(self.dataset_cfg.csv_path)
         self._log.debug(
             f"Loaded {len(self.raw_csv)} examples from {self.dataset_cfg.csv_path}"
         )
@@ -163,7 +177,6 @@ class BaseDataset(Dataset):
         # Initial filtering
         dataset_filterer = DatasetFilterer(dataset_cfg)
         metadata_csv = dataset_filterer.filter_metadata(self.raw_csv)
-        metadata_csv = metadata_csv.sort_values(dc.modeled_seq_len, ascending=False)
 
         # Concat redesigned data, if provided
         if self.dataset_cfg.use_redesigned:
@@ -257,6 +270,10 @@ class BaseDataset(Dataset):
     def __len__(self):
         return len(self.csv)
 
+    @property
+    def modeled_length_col(self) -> dc:
+        return self.dataset_cfg.modeled_trim_method.to_dataset_column()
+
     def _create_split(self, data_csv: MetadataDataFrame):
         # Training or validation specific logic.
         # TODO actually split - this isn't really splitting... it's ~ all the samples in both cases
@@ -265,7 +282,7 @@ class BaseDataset(Dataset):
             self._log.info(f"Training: {len(self.csv)} examples")
         else:
             # pick all samples in data_csv with valid eval length
-            eval_lengths = data_csv[dc.modeled_seq_len]
+            eval_lengths = data_csv[self.modeled_length_col]
             if self.dataset_cfg.max_eval_length is not None:
                 eval_lengths = eval_lengths[
                     eval_lengths <= self.dataset_cfg.max_eval_length
@@ -276,13 +293,13 @@ class BaseDataset(Dataset):
             )
             length_indices = length_indices.astype(int)
             eval_lengths = all_lengths[length_indices]
-            eval_csv = data_csv[data_csv[dc.modeled_seq_len].isin(eval_lengths)]
+            eval_csv = data_csv[data_csv[self.modeled_length_col].isin(eval_lengths)]
 
             # Fix a random seed to get the same split each time.
-            eval_csv = eval_csv.groupby(dc.modeled_seq_len).sample(
+            eval_csv = eval_csv.groupby(self.modeled_length_col).sample(
                 self.dataset_cfg.samples_per_eval_length, replace=True, random_state=123
             )
-            eval_csv = eval_csv.sort_values(dc.modeled_seq_len, ascending=False)
+            eval_csv = eval_csv.sort_values(self.modeled_length_col, ascending=False)
             self.csv = eval_csv
             self._log.info(
                 f"Validation: {len(self.csv)} examples with lengths {eval_lengths}"
@@ -300,15 +317,15 @@ class BaseDataset(Dataset):
         processed_file_path = os.path.join(
             self.dataset_cfg.processed_data_path, csv_row[dc.processed_path]
         )
-        seq_len = csv_row[dc.modeled_seq_len]
+        seq_len = csv_row[self.modeled_length_col]
         use_cache = seq_len > self.dataset_cfg.cache_num_res
 
         if use_cache and processed_file_path in self._cache:
             return self._cache[processed_file_path]
 
         trim_chains_independently = (
-            self.dataset_cfg.modeled_trim_method ==
-            DatasetTrimMethod.chains_independently
+            self.dataset_cfg.modeled_trim_method
+            == DatasetTrimMethod.chains_independently
         )
         processed_feats = read_processed_file(
             processed_file_path,

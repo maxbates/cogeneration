@@ -15,7 +15,7 @@ from cogeneration.config.dict_utils import (
     flatten_dict,
     prune_unknown_dataclass_fields,
 )
-from cogeneration.type.dataset import OLIGOMERIC_PREFIXES
+from cogeneration.type.dataset import OLIGOMERIC_PREFIXES, DatasetColumns
 from cogeneration.type.embed import PositionalEmbeddingMethod
 from cogeneration.type.str_enum import StrEnum
 from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
@@ -674,10 +674,22 @@ class DatasetTrimMethod(StrEnum):
     Methods for trimming ChainFeatures to modeled residues.
     Relevant to multimers.
     """
-    # concat chains and trim ends; `modeled_seq_len` in metadata
+
+    # concat chains and trim ends
     whole_complex = "whole_complex"
-    # trim chains independently; `modeled_seq_len_independent` in metadata
+    # trim chains independently
     chains_independently = "chains_independently"
+
+    def to_dataset_column(self) -> DatasetColumns:
+        """
+        Convert to DatasetColumns column name
+        """
+        if self == DatasetTrimMethod.whole_complex:
+            return DatasetColumns.modeled_seq_len
+        elif self == DatasetTrimMethod.chains_independently:
+            return DatasetColumns.modeled_indep_seq_len
+        else:
+            raise ValueError(f"Unknown trim method: {self}")
 
 
 @dataclass

@@ -6,6 +6,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
 
 from cogeneration.config.base import DatasetConfig
+from cogeneration.type.dataset import DatasetColumns
 from cogeneration.type.dataset import DatasetColumns as dc
 from cogeneration.type.dataset import MetadataDataFrame
 
@@ -15,6 +16,10 @@ class DatasetFilterer:
         self.dataset_cfg = dataset_cfg
         self._log = logging.getLogger("DatasetFilterer")
 
+    @property
+    def modeled_length_col(self) -> DatasetColumns:
+        return self.dataset_cfg.modeled_trim_method.to_dataset_column()
+
     def _rog_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:
         """
         Filter by radius of gyration.
@@ -22,7 +27,7 @@ class DatasetFilterer:
         y_quant = pd.pivot_table(
             data_csv,
             values=dc.radius_gyration,
-            index=dc.modeled_seq_len,
+            index=self.modeled_length_col,
             aggfunc=lambda x: np.quantile(x, self.dataset_cfg.filter.rog_quantile),
         )
         x_quant = y_quant.index.to_numpy()
@@ -35,19 +40,19 @@ class DatasetFilterer:
         poly_reg_model.fit(poly_features, y_quant)
 
         # Calculate cutoff for all sequence lengths
-        max_len = data_csv[dc.modeled_seq_len].max()
+        max_len = data_csv[self.modeled_length_col].max()
         pred_poly_features = poly.fit_transform(np.arange(max_len)[:, None])
         # Add a little more.
         pred_y = poly_reg_model.predict(pred_poly_features) + 0.1
 
-        row_rog_cutoffs = data_csv[dc.modeled_seq_len].map(lambda x: pred_y[x - 1])
+        row_rog_cutoffs = data_csv[self.modeled_length_col].map(lambda x: pred_y[x - 1])
         return data_csv[data_csv[dc.radius_gyration] < row_rog_cutoffs]
 
     def _length_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:
         """Filter by sequence length."""
         return data_csv[
-            (data_csv[dc.modeled_seq_len] >= self.dataset_cfg.filter.min_num_res)
-            & (data_csv[dc.modeled_seq_len] <= self.dataset_cfg.filter.max_num_res)
+            (data_csv[self.modeled_length_col] >= self.dataset_cfg.filter.min_num_res)
+            & (data_csv[self.modeled_length_col] <= self.dataset_cfg.filter.max_num_res)
         ]
 
     def _plddt_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:
@@ -71,7 +76,7 @@ class DatasetFilterer:
     ) -> MetadataDataFrame:
         """Filter proteins which exceed `max_percent_residues_unknown`."""
         return data_csv[
-            (data_csv[dc.seq_len] / data_csv[dc.modeled_seq_len])
+            (data_csv[dc.seq_len] / data_csv[self.modeled_length_col])
             >= self.dataset_cfg.filter.max_percent_residues_unknown
         ]
 
@@ -139,5 +144,8 @@ class DatasetFilterer:
                 f"{running_length} -> {len(data_csv)} examples after pLDDT filter"
             )
             running_length = len(data_csv)
+
+        # sort by modeled length
+        data_csv = data_csv.sort_values(by=self.modeled_length_col, ascending=False)
 
         return data_csv

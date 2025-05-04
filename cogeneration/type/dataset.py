@@ -16,9 +16,14 @@ class DatasetColumns(StrEnum):
     oligomeric_count = "oligomeric_count"  # num non-unique sequences
     oligomeric_detail = "oligomeric_detail"  # per-unique seq details
     num_chains = "num_chains"
-    seq_len = "seq_len"  # total number of atoms
-    modeled_seq_len = "modeled_seq_len"  # max - min res number
-    moduled_num_res = "moduled_num_res"  # (new) num residues in modeled structure
+    seq_len = "seq_len"  # total number of residues
+    modeled_seq_len = "modeled_seq_len"  # max - min res number, whole complex trimming
+    modeled_indep_seq_len = (
+        "modeled_indep_seq_len"  # (new) chains independently trimmed
+    )
+    moduled_num_res = (
+        "moduled_num_res"  # (new) count of num residues in modeled structure
+    )
     coil_percent = "coil_percent"
     helix_percent = "helix_percent"
     strand_percent = "strand_percent"

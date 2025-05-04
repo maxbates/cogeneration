@@ -123,55 +123,30 @@ def determine_modeled_residues(
     return modeled_residues
 
 
-def trim_chain_feats_to_modeled_residues(
+def determine_modeled_residues_mask(
     chain_feats: ChainFeatures,
     trim_chains_independently: bool = True,
-) -> ChainFeatures:
-    """
-    Trims `chain_feats` to `dpc.modeled_idx` residues.
-    Deletes the field, returns a new instance where each field is trimmed.
-    Therefore, can only trim once! Should be called on reading a ProcessedFile, but not writing.
-
-    The FrameFlow/MultiFlow implementation just trims the ends using min/max modeled positions.
-    Invalid residues are left in place, but `BatchProps.res_mask` should use `dpc.bb_mask` to ignore them.
-
-    In public MultiFlow / FrameFlow code, this occurs after processing all the chains, and only considers
-    the ends of the concatenated chains.
-    In the monomer setting, like the public versions of these two models, this is not a big deal,
-    but leaves more junk in multimers, e.g. { chain ... junk ... chain }
-
-    Remember we want to preserve positions for proteins with gaps i.e. uncaptured neighbors/gaps,
-      so we don't impose a penalty on "neighbors" that aren't actually neighbors.
-      So don't mask exclusively to known and modeled residues.
-
-    Also need a better way to handle this when loading public MultiFlow data to achieve same effect.
-    Minimally, we want to trim each chain from the public data.
-    """
+) -> npt.NDArray:
+    chain_idx = chain_feats[dpc.chain_index]
+    modeled_idx = chain_feats[dpc.modeled_idx]
     is_monomer = len(np.unique(chain_feats[dpc.chain_index])) == 1
+
+    # will set regions to keep to True and return
+    keep_mask = np.zeros_like(chain_idx, dtype=bool)
 
     # Match public MultiFlow / FrameFlow behavior
     if is_monomer or not trim_chains_independently:
-        modeled_idx = chain_feats[dpc.modeled_idx]
         min_idx = np.min(modeled_idx)
         max_idx = np.max(modeled_idx)
-
-        # del `modeled_idx`. All other features are (P, *), and are trimmed to (N, *)
-        del chain_feats[dpc.modeled_idx]
-        chain_feats = tree.map_structure(
-            lambda x: x[min_idx : (max_idx + 1)], chain_feats
-        )
-        return chain_feats
+        keep_mask[min_idx : (max_idx + 1)] = True
+        return keep_mask
 
     # Trim each chain independently.
     # We want to preserve internal positions within chains, but if there is junk between chains (e.g. solvent)
     # then we drop it.
-    # We'll determine the start / end positions of each chain that are modeled, and trim to those.
-
-    chain_idx = chain_feats[dpc.chain_index]
+    # We'll determine the start / end positions of each chain that are modeled, and add to keep_mask
     modeled_mask = np.zeros_like(chain_idx, dtype=bool)
     modeled_mask[chain_feats[dpc.modeled_idx]] = True
-
-    keep_mask = np.zeros_like(chain_idx, dtype=bool)
     idx = np.arange(chain_idx.size)
 
     # for each chain, find first / last positions modeled, add to keep_mask
@@ -182,8 +157,45 @@ def trim_chain_feats_to_modeled_residues(
             first, last = np.flatnonzero(modeled_in_chain)[[0, -1]]
             keep_mask |= in_chain & (idx >= first) & (idx <= last)
 
+    return keep_mask
+
+
+def trim_chain_feats_to_modeled_residues(
+    chain_feats: ChainFeatures,
+    trim_chains_independently: bool = True,
+) -> ChainFeatures:
+    """
+    Trims `chain_feats` to `dpc.modeled_idx` residues.
+    Deletes the field, returns a new instance where each field is trimmed.
+    Therefore, can only trim once! Should be called on reading a ProcessedFile, but not writing.
+
+    There are two trimming strategies:
+
+    1) Trim the complex.
+    The FrameFlow/MultiFlow implementation just trims the ends using min/max modeled positions.
+    In public MultiFlow / FrameFlow code, this occurs after processing all the chains, and only considers
+    the ends of the concatenated chains.
+    In the monomer setting, like the public versions of these two models, this is not a big deal,
+    but leaves more junk in multimers, e.g. { chain ... junk ... chain }
+
+    2) Trim chains independently.
+    `trim_chains_independently` determines the min/max bounds for each chain independently,
+    and keeps all residues in each chain between all non-UNK residues.
+
+    In both cases, invalid residues are left in place, but `BatchProps.res_mask` should use `dpc.bb_mask` to ignore them.
+    Remember we want to preserve positions for proteins with gaps i.e. uncaptured neighbors/gaps,
+      so we don't impose a penalty on "neighbors" that aren't actually neighbors.
+      So don't mask exclusively to known and modeled residues.
+    """
+
+    keep_mask = determine_modeled_residues_mask(
+        chain_feats=chain_feats,
+        trim_chains_independently=trim_chains_independently,
+    )
+
     # del `modeled_idx`. All other features are (P, *), and are trimmed to (N, *)
     del chain_feats[dpc.modeled_idx]
+
     chain_feats = tree.map_structure(lambda x: x[keep_mask], chain_feats)
     return chain_feats
 
@@ -306,10 +318,19 @@ def _process_pdb(
 
         # Track modeled sequence lengths
         modeled_idx = complex_feats[dpc.modeled_idx]
-        min_modeled_idx = np.min(modeled_idx)
-        max_modeled_idx = np.max(modeled_idx)
-        metadata[dc.modeled_seq_len] = max_modeled_idx - min_modeled_idx + 1
         metadata[dc.moduled_num_res] = len(modeled_idx)
+        # complex trimming, just determine start and ends
+        complex_keep_mask = determine_modeled_residues_mask(
+            chain_feats=complex_feats,
+            trim_chains_independently=False,
+        )
+        metadata[dc.modeled_seq_len] = np.sum(complex_keep_mask)
+        # chain independent trimming, trim each chain independently
+        independent_keep_mask = determine_modeled_residues_mask(
+            chain_feats=complex_feats,
+            trim_chains_independently=True,
+        )
+        metadata[dc.modeled_indep_seq_len] = np.sum(independent_keep_mask)
 
         # Track quaternary / oligomeric information
         # TODO - consider differentiating number chains vs number valid chains
@@ -332,6 +353,9 @@ def _process_pdb(
             pdb_rg = md.compute_rg(traj)
         except Exception as e:
             raise DataError(f"Mdtraj failed with error {e}")
+
+        # use denom `metadata[dc.modeled_seq_len]` to match public MultiFlow
+        # though if use chain-independent filtering, values almost certainly higher.
         metadata[dc.coil_percent] = np.sum(pdb_ss == "C") / metadata[dc.modeled_seq_len]
         metadata[dc.helix_percent] = (
             np.sum(pdb_ss == "H") / metadata[dc.modeled_seq_len]

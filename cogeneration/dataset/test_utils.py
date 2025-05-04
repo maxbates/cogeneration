@@ -163,6 +163,7 @@ def create_pdb_dataloader(
         batch_sampler = LengthBatcher(
             sampler_cfg=cfg.data.sampler,
             metadata_csv=train_dataset.csv,
+            modeled_length_col=cfg.dataset.modeled_trim_method.to_dataset_column(),
             rank=0,
             num_replicas=1,
         )
