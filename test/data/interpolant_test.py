@@ -11,10 +11,10 @@ from cogeneration.dataset.test_utils import (
     create_pdb_batch,
     mock_noisy_feats,
 )
-from cogeneration.type.batch import BatchProps as bp
-from cogeneration.type.batch import NoisyBatchProps as nbp
-from cogeneration.type.batch import PredBatchProps as pbp
-from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
+from cogeneration.type.batch import BatchProp as bp
+from cogeneration.type.batch import NoisyBatchProp as nbp
+from cogeneration.type.batch import PredBatchProp as pbp
+from cogeneration.type.task import DataTask, InferenceTask
 
 
 class TestInterpolant:
@@ -28,7 +28,7 @@ class TestInterpolant:
         2. Re-center both batches
         3. Return the OT mapping of trans_0 to trans_1
         """
-        mock_cfg_uninterpolated.data.task = DataTaskEnum.inpainting
+        mock_cfg_uninterpolated.data.task = DataTask.inpainting
         mock_cfg = mock_cfg_uninterpolated.interpolate()
 
         device = torch.device("cpu")
@@ -80,9 +80,7 @@ class TestInterpolant:
         result_distances = torch.linalg.norm(result - trans_1, dim=-1)
         assert torch.sum(result_distances) <= torch.sum(original_distances)
 
-    @pytest.mark.parametrize(
-        "task", [DataTaskEnum.hallucination, DataTaskEnum.inpainting]
-    )
+    @pytest.mark.parametrize("task", [DataTask.hallucination, DataTask.inpainting])
     def test_corrupt_batch_basic_behavior(self, task, mock_cfg_uninterpolated):
         """
         Test that corrupt_batch adds expected keys with correct shapes
@@ -144,9 +142,7 @@ class TestInterpolant:
         rot_diff = noisy_batch[nbp.rotmats_t] - batch[bp.rotmats_1]
         assert torch.any(rot_diff.abs() > 1e-6), "rotmats_t should be corrupted"
 
-    @pytest.mark.parametrize(
-        "task", [DataTaskEnum.hallucination, DataTaskEnum.inpainting]
-    )
+    @pytest.mark.parametrize("task", [DataTask.hallucination, DataTask.inpainting])
     def test_corrupt_batch_multimer(self, task, mock_cfg_uninterpolated):
         """
         Test that corrupt_batch adds expected keys with correct shapes
@@ -174,9 +170,9 @@ class TestInterpolant:
         assert (noisy_batch[bp.res_idx][chain_break_start_mask] == 1).all()
 
         # diffuse masks as expected
-        if task == DataTaskEnum.inpainting:
+        if task == DataTask.inpainting:
             assert noisy_batch[bp.diffuse_mask].float().mean() < 1.0
-        elif task == DataTaskEnum.hallucination:
+        elif task == DataTask.hallucination:
             assert noisy_batch[bp.diffuse_mask].float().mean() == 1.0
 
     def test_corrupt_batch_preserves_motif_sequences_in_inpainting(
@@ -185,7 +181,7 @@ class TestInterpolant:
         """
         For inpainting, motif positions (diffuse_mask == 0) should preserve original amino acids.
         """
-        mock_cfg_uninterpolated.data.task = DataTaskEnum.inpainting
+        mock_cfg_uninterpolated.data.task = DataTask.inpainting
         cfg = mock_cfg_uninterpolated.interpolate()
 
         # Create a mock batch, instead of PDB, because PDBs contain UNK and less predictable
@@ -207,7 +203,7 @@ class TestInterpolant:
         diffuse_mask[:, : N // 2] = 1
         batch[bp.diffuse_mask] = diffuse_mask
 
-        noisy_batch = interpolant.corrupt_batch(batch, task=DataTaskEnum.inpainting)
+        noisy_batch = interpolant.corrupt_batch(batch, task=DataTask.inpainting)
 
         motif_mask = diffuse_mask == 0
         scaffold_mask = diffuse_mask == 1
@@ -240,7 +236,7 @@ class TestInterpolant:
 class TestInterpolantSample:
     """Test suite for Interpolant.sample()."""
 
-    def _run_sample(self, cfg: Config, batch, task: InferenceTaskEnum):
+    def _run_sample(self, cfg: Config, batch, task: InferenceTask):
         cfg.inference.interpolant.sampling.num_timesteps = (
             2  # run quickly with few timesteps
         )
@@ -280,20 +276,20 @@ class TestInterpolantSample:
             chain_idx=batch[bp.chain_idx],
             res_idx=batch[bp.res_idx],
         )
-        if task == InferenceTaskEnum.unconditional:
+        if task == InferenceTask.unconditional:
             pass
-        elif task == InferenceTaskEnum.inpainting:
+        elif task == InferenceTask.inpainting:
             kwargs.update(
                 trans_1=batch[bp.trans_1],
                 rotmats_1=batch[bp.rotmats_1],
                 psis_1=batch[bp.torsion_angles_sin_cos_1][..., 2, :],
                 aatypes_1=batch[bp.aatypes_1],
             )
-        elif task == InferenceTaskEnum.forward_folding:
+        elif task == InferenceTask.forward_folding:
             kwargs.update(
                 aatypes_1=batch[bp.aatypes_1],
             )
-        elif task == InferenceTaskEnum.inverse_folding:
+        elif task == InferenceTask.inverse_folding:
             kwargs.update(
                 trans_1=batch[bp.trans_1],
                 rotmats_1=batch[bp.rotmats_1],
@@ -319,18 +315,18 @@ class TestInterpolantSample:
     def test_sample_unconditional(
         self, mock_cfg_uninterpolated, mock_pred_unconditional_dataloader
     ):
-        mock_cfg_uninterpolated.inference.task = InferenceTaskEnum.unconditional
+        mock_cfg_uninterpolated.inference.task = InferenceTask.unconditional
         cfg = mock_cfg_uninterpolated.interpolate()
 
         batch = next(iter(mock_pred_unconditional_dataloader))
-        self._run_sample(cfg=cfg, batch=batch, task=InferenceTaskEnum.unconditional)
+        self._run_sample(cfg=cfg, batch=batch, task=InferenceTask.unconditional)
 
     @pytest.mark.parametrize(
         "task",
         [
-            InferenceTaskEnum.inpainting,
-            InferenceTaskEnum.forward_folding,
-            InferenceTaskEnum.inverse_folding,
+            InferenceTask.inpainting,
+            InferenceTask.forward_folding,
+            InferenceTask.inverse_folding,
         ],
     )
     def test_sample_conditional(
@@ -348,13 +344,13 @@ class TestInterpolantSample:
         """
         Inpainting sampling should preserve amino acid sequence at motif positions
         """
-        mock_cfg_uninterpolated.inference.task = InferenceTaskEnum.inpainting
+        mock_cfg_uninterpolated.inference.task = InferenceTask.inpainting
         mock_cfg_uninterpolated.interpolant.sampling.num_timesteps = 3
         cfg = mock_cfg_uninterpolated.interpolate()
 
         batch = next(iter(mock_pred_conditional_dataloader))
         _, model_traj = self._run_sample(
-            cfg=cfg, batch=batch, task=InferenceTaskEnum.inpainting
+            cfg=cfg, batch=batch, task=InferenceTask.inpainting
         )
 
         final_aa = model_traj.amino_acids[:, -1]

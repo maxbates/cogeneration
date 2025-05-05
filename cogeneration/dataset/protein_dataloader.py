@@ -14,7 +14,7 @@ from torch.utils.data.distributed import DistributedSampler, dist
 
 from cogeneration.config.base import DataSamplerConfig, DatasetConfig
 from cogeneration.dataset.datasets import BaseDataset
-from cogeneration.type.dataset import DatasetColumns
+from cogeneration.type.dataset import MetadataColumn
 
 
 class ProteinData(LightningDataModule):
@@ -95,7 +95,7 @@ class LengthBatcher:
         *,
         sampler_cfg: DataSamplerConfig,
         metadata_csv: pd.DataFrame,
-        modeled_length_col: DatasetColumns,
+        modeled_length_col: MetadataColumn,
         seed=123,
         shuffle=True,
         num_replicas=None,
@@ -164,7 +164,7 @@ class LengthBatcher:
         for seq_len, len_df in replica_csv.groupby(self.modeled_length_col):
             max_batch_size = min(
                 self.max_batch_size,
-                self._sampler_cfg.max_num_res_squared // seq_len**2 + 1,
+                self._sampler_cfg.max_num_res_squared // int(seq_len) ** 2 + 1,
             )
             num_batches = math.ceil(len(len_df) / max_batch_size)
             for i in range(num_batches):

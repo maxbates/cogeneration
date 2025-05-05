@@ -29,13 +29,13 @@ from cogeneration.dataset.motif_factory import (
 )
 from cogeneration.dataset.process_pdb import read_processed_file
 from cogeneration.type.batch import METADATA_BATCH_PROPS, BatchFeatures
-from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import InferenceFeatures, empty_feats
-from cogeneration.type.dataset import DatasetColumns as dc
-from cogeneration.type.dataset import DatasetProteinColumns as dpc
-from cogeneration.type.dataset import DatasetTransformColumns as dtc
+from cogeneration.type.dataset import DatasetProteinColumn as dpc
+from cogeneration.type.dataset import DatasetTransformColumn as dtc
+from cogeneration.type.dataset import MetadataColumn as dc
 from cogeneration.type.dataset import MetadataCSVRow, MetadataDataFrame, ProcessedFile
-from cogeneration.type.task import DataTaskEnum
+from cogeneration.type.task import DataTask
 
 
 def batch_features_from_processed_file(
@@ -152,7 +152,7 @@ class BaseDataset(Dataset):
         *,
         dataset_cfg: DatasetConfig,
         is_training: bool,
-        task: DataTaskEnum,
+        task: DataTask,
     ):
         self._log = logging.getLogger(__name__)
         self._is_training = is_training
@@ -499,7 +499,7 @@ class BaseDataset(Dataset):
     @staticmethod
     def _featurize_processed_file(
         cfg: DatasetConfig,
-        task: DataTaskEnum,
+        task: DataTask,
         is_training: bool,
         processed_file: ProcessedFile,
         csv_row: MetadataCSVRow,
@@ -535,10 +535,10 @@ class BaseDataset(Dataset):
         feats[bp.pdb_name] = csv_row[dc.pdb_name]
 
         # Update `diffuse_mask` depending on task
-        if task == DataTaskEnum.hallucination:
+        if task == DataTask.hallucination:
             # diffuse_mask = torch.ones()
             pass
-        elif task == DataTaskEnum.inpainting:
+        elif task == DataTask.inpainting:
             diffuse_mask = motif_factory.generate_diffuse_mask(
                 res_mask=feats[bp.res_mask],
                 plddt_mask=feats[bp.plddt_mask],
@@ -561,7 +561,7 @@ class BaseDataset(Dataset):
         # Using the `diffuse_mask`, modify the scaffold region lengths, and mask out the scaffolds
         # i.e. {trans,rots,aatypes}_1 only defined for motif positions
         if (
-            task == DataTaskEnum.inpainting
+            task == DataTask.inpainting
             and not is_training
             and (feats[bp.diffuse_mask] == 0).any()
         ):
@@ -626,7 +626,7 @@ class PdbDataset(BaseDataset):
     """
 
     def __init__(
-        self, *, dataset_cfg: DatasetConfig, is_training: bool, task: DataTaskEnum
+        self, *, dataset_cfg: DatasetConfig, is_training: bool, task: DataTask
     ):
         assert (
             dataset_cfg.cluster_path is not None
@@ -752,7 +752,7 @@ DatasetClassT = TypeVar("DatasetClassT")
 class DatasetConstructor:
     dataset_class: DatasetClassT
     cfg: DatasetConfig
-    task: DataTaskEnum
+    task: DataTask
 
     def create_datasets(self) -> Tuple[DatasetClassT, Optional[DatasetClassT]]:
         """generate dataset, and possibly validation dataset"""
@@ -772,7 +772,7 @@ class DatasetConstructor:
 
     @classmethod
     def pdb_dataset(
-        cls, dataset_cfg: DatasetConfig, task: DataTaskEnum = DataTaskEnum.hallucination
+        cls, dataset_cfg: DatasetConfig, task: DataTask = DataTask.hallucination
     ):
         """Generates default training and evaluation datasets"""
         return cls(

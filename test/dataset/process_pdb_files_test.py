@@ -12,10 +12,10 @@ from cogeneration.dataset.process_pdb import (
     trim_chain_feats_to_modeled_residues,
 )
 from cogeneration.scripts.process_pdb_files import process_pdb_with_metadata
-from cogeneration.type.dataset import DatasetColumns as dc
-from cogeneration.type.dataset import DatasetProteinColumns
-from cogeneration.type.dataset import DatasetProteinColumns as dpc
-from cogeneration.type.task import DataTaskEnum
+from cogeneration.type.dataset import DatasetProteinColumn
+from cogeneration.type.dataset import DatasetProteinColumn as dpc
+from cogeneration.type.dataset import MetadataColumn as dc
+from cogeneration.type.task import DataTask
 
 # https://www2.rcsb.org/structure/2QLW
 # This protein has a fair amount of weird stuff going on to make it a good test case:
@@ -84,7 +84,7 @@ class TestProcessPDBFiles:
         assert len(pkl[dpc.modeled_idx]) == metadata[dc.moduled_num_res]
 
         # check all expected keys are present
-        expected_keys = [key for key in DatasetProteinColumns]
+        expected_keys = [key for key in DatasetProteinColumn]
         observed_keys = list(pkl.keys())
         extra_keys = set(observed_keys) - set(expected_keys)
         missing_keys = set(expected_keys) - set(observed_keys)
@@ -127,7 +127,7 @@ class TestProcessPDBFiles:
                 ),
             ),
             is_training=True,
-            task=DataTaskEnum.hallucination,
+            task=DataTask.hallucination,
         )
 
         assert len(dataset) > 0

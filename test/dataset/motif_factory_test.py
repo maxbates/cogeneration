@@ -13,7 +13,7 @@ from cogeneration.config.base import (
 from cogeneration.dataset.datasets import batch_features_from_processed_file
 from cogeneration.dataset.motif_factory import ChainBreak, Motif, MotifFactory, Scaffold
 from cogeneration.dataset.process_pdb import process_pdb_file
-from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import BatchProp as bp
 
 # Use protein with weird stuff happening, is multimeric, has cross-chain interactions
 example_pdb_path = Path(__file__).parent / "2qlw.pdb"

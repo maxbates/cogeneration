@@ -5,9 +5,9 @@ from cogeneration.config.base import InterpolantTranslationsScheduleEnum
 from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.dataset.test_utils import create_pdb_noisy_batch
 from cogeneration.models.module import FlowModule, TrainingLosses
-from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.metrics import MetricName
-from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
+from cogeneration.type.task import DataTask, InferenceTask
 
 
 class TestFlowModule:
@@ -42,7 +42,7 @@ class TestFlowModule:
         module.training_step(pdb_noisy_batch)
 
     def test_training_step_inpainting(self, mock_cfg_uninterpolated):
-        mock_cfg_uninterpolated.data.task = DataTaskEnum.inpainting
+        mock_cfg_uninterpolated.data.task = DataTask.inpainting
         mock_cfg_uninterpolated.interpolant.inpainting_unconditional_prop = 0.0
         mock_cfg = mock_cfg_uninterpolated.interpolate()
 
@@ -56,7 +56,7 @@ class TestFlowModule:
     def test_training_step_inpainting_but_actually_unconditional(
         self, mock_cfg_uninterpolated
     ):
-        mock_cfg_uninterpolated.data.task = DataTaskEnum.inpainting
+        mock_cfg_uninterpolated.data.task = DataTask.inpainting
         mock_cfg_uninterpolated.interpolant.inpainting_unconditional_prop = 1.0
         mock_cfg = mock_cfg_uninterpolated.interpolate()
 
@@ -163,7 +163,7 @@ class TestFlowModule:
     def test_predict_step_unconditional_works(
         self, mock_cfg, mock_pred_unconditional_dataloader, mock_folding_validation
     ):
-        assert mock_cfg.inference.task == InferenceTaskEnum.unconditional
+        assert mock_cfg.inference.task == InferenceTask.unconditional
 
         module = FlowModule(mock_cfg)
         batch = next(iter(mock_pred_unconditional_dataloader))
@@ -183,7 +183,7 @@ class TestFlowModule:
         mock_pred_inpainting_dataloader,
         mock_folding_validation,
     ):
-        mock_cfg_uninterpolated.inference.task = InferenceTaskEnum.inpainting
+        mock_cfg_uninterpolated.inference.task = InferenceTask.inpainting
         mock_cfg = mock_cfg_uninterpolated.interpolate()
 
         module = FlowModule(mock_cfg)
@@ -204,7 +204,7 @@ class TestFlowModule:
         mock_pred_conditional_dataloader,
         mock_folding_validation,
     ):
-        mock_cfg_uninterpolated.inference.task = InferenceTaskEnum.forward_folding
+        mock_cfg_uninterpolated.inference.task = InferenceTask.forward_folding
         mock_cfg = mock_cfg_uninterpolated.interpolate()
 
         assert mock_cfg.inference.interpolant.aatypes.noise == 0.0
@@ -228,7 +228,7 @@ class TestFlowModule:
         mock_pred_conditional_dataloader,
         mock_folding_validation,
     ):
-        mock_cfg_uninterpolated.inference.task = InferenceTaskEnum.inverse_folding
+        mock_cfg_uninterpolated.inference.task = InferenceTask.inverse_folding
         mock_cfg = mock_cfg_uninterpolated.interpolate()
 
         module = FlowModule(mock_cfg)
@@ -249,7 +249,7 @@ class TestFlowModule:
         mock_pred_unconditional_dataloader,
         mock_folding_validation,
     ):
-        mock_cfg_uninterpolated.inference.task = InferenceTaskEnum.unconditional
+        mock_cfg_uninterpolated.inference.task = InferenceTask.unconditional
         mock_cfg_uninterpolated.shared.stochastic = True
         mock_cfg = mock_cfg_uninterpolated.interpolate()
 

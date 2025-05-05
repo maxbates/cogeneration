@@ -32,13 +32,13 @@ from cogeneration.data.noise_mask import mask_blend_2d
 from cogeneration.data.trajectory import SavedTrajectory, save_trajectory
 from cogeneration.models.model import FlowModel
 from cogeneration.type.batch import BatchFeatures
-from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import InferenceFeatures
-from cogeneration.type.batch import NoisyBatchProps as nbp
+from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
-from cogeneration.type.batch import PredBatchProps as pbp
+from cogeneration.type.batch import PredBatchProp as pbp
 from cogeneration.type.metrics import MetricName, OutputFileName
-from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
+from cogeneration.type.task import DataTask, InferenceTask
 
 
 def to_numpy(x: Optional[torch.Tensor]) -> Optional[np.ndarray]:
@@ -540,7 +540,7 @@ class FlowModule(LightningModule):
 
         # inpainting / scaffolding metrics
         # note that depending on `cfg.interpolant` some examples may be set to different subtasks.
-        if self.cfg.data.task == DataTaskEnum.inpainting:
+        if self.cfg.data.task == DataTask.inpainting:
             diffuse_mask = batch[bp.diffuse_mask].float()
             scaffold_percent = torch.mean(diffuse_mask).item()
             self._log_scalar(
@@ -572,16 +572,16 @@ class FlowModule(LightningModule):
         diffuse_mask = batch[bp.diffuse_mask]
 
         # Get inference task corresponding to training task
-        inference_task = InferenceTaskEnum.from_data_task(task=self.cfg.data.task)
+        inference_task = InferenceTask.from_data_task(task=self.cfg.data.task)
 
         # TODO(inpainting) consider running validation for inpainting and unconditional generation.
         #   However, don't jump between tasks - perhaps run both, if `prop` > 0.
         # Like training, some proportion of batches convert `inpainting` -> `unconditional`
         # if (
-        #     inference_task == InferenceTaskEnum.inpainting and
+        #     inference_task == InferenceTask.inpainting and
         #     random() < self.cfg.interpolant.inpainting_unconditional_prop
         # ):
-        #     inference_task = InferenceTaskEnum.unconditional
+        #     inference_task = InferenceTask.unconditional
 
         # Validation can run either unconditional generation, or inpainting
         self.interpolant.set_device(res_mask.device)
@@ -694,7 +694,7 @@ class FlowModule(LightningModule):
         assert num_batch == len(sample_ids)
 
         # Task-specific logic for creating output `sample_dirs`
-        if task == InferenceTaskEnum.unconditional:
+        if task == InferenceTask.unconditional:
             sample_dirs = [
                 os.path.join(
                     self.inference_dir,
@@ -703,7 +703,7 @@ class FlowModule(LightningModule):
                 )
                 for sample_id in sample_ids
             ]
-        elif task == InferenceTaskEnum.inpainting:
+        elif task == InferenceTask.inpainting:
             # For inpainting, we take a known PDB, but may alter its scaffold lengths
             sample_dirs = [
                 os.path.join(
@@ -713,7 +713,7 @@ class FlowModule(LightningModule):
                 )
                 for sample_id in sample_ids
             ]
-        elif task == InferenceTaskEnum.forward_folding:
+        elif task == InferenceTask.forward_folding:
             sample_dirs = [
                 os.path.join(
                     self.inference_dir,
@@ -721,7 +721,7 @@ class FlowModule(LightningModule):
                     sample_pdb_name,
                 )
             ]
-        elif task == InferenceTaskEnum.inverse_folding:
+        elif task == InferenceTask.inverse_folding:
             sample_dirs = [
                 os.path.join(
                     self.inference_dir, f"length_{sample_length}", sample_pdb_name
@@ -738,9 +738,9 @@ class FlowModule(LightningModule):
         # Note for inpainting, only the motifs are defined
         true_aatypes = None
         if (
-            task == InferenceTaskEnum.inpainting
-            or task == InferenceTaskEnum.forward_folding
-            or task == InferenceTaskEnum.inverse_folding
+            task == InferenceTask.inpainting
+            or task == InferenceTask.forward_folding
+            or task == InferenceTask.inverse_folding
         ):
             assert aatypes_1 is not None
 
@@ -757,17 +757,14 @@ class FlowModule(LightningModule):
         # For some tasks, we have a `true_bb_pos` ground truth structure for sample metrics
         # Note for inpainting, `true_bb_pos` is masked and only defined at the motifs
         true_bb_pos = None
-        if (
-            task == InferenceTaskEnum.inpainting
-            or task == InferenceTaskEnum.forward_folding
-        ):
+        if task == InferenceTask.inpainting or task == InferenceTask.forward_folding:
             assert trans_1 is not None
             assert rotmats_1 is not None
             assert psi_torsions_1 is not None
             assert true_aatypes is not None
 
             # For inpainting, limit true structure to motif positions
-            if task == InferenceTaskEnum.inpainting:
+            if task == InferenceTask.inpainting:
                 mask = 1 - diffuse_mask
             else:
                 mask = res_mask
@@ -796,16 +793,16 @@ class FlowModule(LightningModule):
             return
 
         # Prepare for sampling - zero out some values, depending on task
-        if task == InferenceTaskEnum.unconditional:
+        if task == InferenceTask.unconditional:
             # Zero-out structure and sequence
             trans_1 = rotmats_1 = psi_torsions_1 = aatypes_1 = None
-        elif task == InferenceTaskEnum.inpainting:
+        elif task == InferenceTask.inpainting:
             # Keep all t=1 values (though they may be masked to the motifs)
             pass
-        elif task == InferenceTaskEnum.forward_folding:
+        elif task == InferenceTask.forward_folding:
             # Zero-out structure
             trans_1 = rotmats_1 = psi_torsions_1 = None
-        elif task == InferenceTaskEnum.inverse_folding:
+        elif task == InferenceTask.inverse_folding:
             # Zero-out sequence
             aatypes_1 = None
         else:
@@ -869,7 +866,7 @@ class FlowModule(LightningModule):
         self,
         sample_id: Union[int, str],
         sample_dir: str,  # inference output directory for this sample
-        task: InferenceTaskEnum,
+        task: InferenceTask,
         bb_traj: npt.NDArray,
         aa_traj: npt.NDArray,
         model_bb_traj: npt.NDArray,

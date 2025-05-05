@@ -6,7 +6,7 @@ from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.type.str_enum import StrEnum
 
 
-class BatchProps(StrEnum):
+class BatchProp(StrEnum):
     """
     Dataloader batches cannot be structs, so we define an enum of batch properties.
 
@@ -40,13 +40,13 @@ class BatchProps(StrEnum):
 
 # datum level metadata, i.e. `(B)` rather than `(B, N)`
 METADATA_BATCH_PROPS = [
-    BatchProps.pdb_name,
-    BatchProps.csv_idx,
-    BatchProps.sample_id,
+    BatchProp.pdb_name,
+    BatchProp.csv_idx,
+    BatchProp.sample_id,
 ]
 
 
-class NoisyBatchProps(StrEnum):
+class NoisyBatchProp(StrEnum):
     """
     Properties of a noised batch
 
@@ -63,7 +63,7 @@ class NoisyBatchProps(StrEnum):
     aatypes_sc = "aatypes_sc"  # (B, N, 21) tensor, self-conditioned pred sequence @ t, including mask token
 
 
-class PredBatchProps(StrEnum):
+class PredBatchProp(StrEnum):
     """
     Properties of a predicted batch
     """
@@ -83,16 +83,16 @@ class PredBatchProps(StrEnum):
 TensorFeat = Union[torch.Tensor, str, int]
 
 """BatchFeatures is a batch, features after featurizing ProcessedFile"""
-BatchFeatures = Dict[BatchProps, TensorFeat]
+BatchFeatures = Dict[BatchProp, TensorFeat]
 
 """NoisyFeatures is an item of a batch corrupted by Interpolant"""
-NoisyFeatures = Dict[Union[BatchProps, NoisyBatchProps], TensorFeat]
+NoisyFeatures = Dict[Union[BatchProp, NoisyBatchProp], TensorFeat]
 
 """InferenceFeatures is an inference (validation / prediction) batch"""
-InferenceFeatures = Dict[BatchProps, TensorFeat]
+InferenceFeatures = Dict[BatchProp, TensorFeat]
 
 """ModelPrediction is the output of the model, i.e. the predicted features"""
-ModelPrediction = Dict[PredBatchProps, TensorFeat]
+ModelPrediction = Dict[PredBatchProp, TensorFeat]
 
 
 def empty_feats(N: int) -> BatchFeatures:
@@ -100,20 +100,20 @@ def empty_feats(N: int) -> BatchFeatures:
     Create empty features for a protein of length N.
     """
     return {
-        BatchProps.res_mask: torch.ones(N),
+        BatchProp.res_mask: torch.ones(N),
         # assume masking interpolant
-        BatchProps.aatypes_1: (torch.ones(N) * MASK_TOKEN_INDEX).long(),
-        BatchProps.trans_1: torch.zeros(N, 3),
-        BatchProps.rotmats_1: torch.eye(3).repeat(N, 1, 1),
-        BatchProps.torsion_angles_sin_cos_1: torch.zeros(N, 7, 2),
-        BatchProps.chain_idx: torch.zeros(N),
-        BatchProps.res_idx: torch.arange(N),
-        BatchProps.res_plddt: torch.zeros(N),
-        BatchProps.diffuse_mask: torch.ones(N),
-        BatchProps.plddt_mask: torch.ones(N),
-        BatchProps.pdb_name: "",
+        BatchProp.aatypes_1: (torch.ones(N) * MASK_TOKEN_INDEX).long(),
+        BatchProp.trans_1: torch.zeros(N, 3),
+        BatchProp.rotmats_1: torch.eye(3).repeat(N, 1, 1),
+        BatchProp.torsion_angles_sin_cos_1: torch.zeros(N, 7, 2),
+        BatchProp.chain_idx: torch.zeros(N),
+        BatchProp.res_idx: torch.arange(N),
+        BatchProp.res_plddt: torch.zeros(N),
+        BatchProp.diffuse_mask: torch.ones(N),
+        BatchProp.plddt_mask: torch.ones(N),
+        BatchProp.pdb_name: "",
         # metadata
-        BatchProps.csv_idx: torch.tensor([1], dtype=torch.long),
+        BatchProp.csv_idx: torch.tensor([1], dtype=torch.long),
         # inference only
-        BatchProps.sample_id: 0,
+        BatchProp.sample_id: 0,
     }

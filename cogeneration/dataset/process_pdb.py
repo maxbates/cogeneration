@@ -14,8 +14,8 @@ from cogeneration.data.io import read_pkl, write_pkl
 from cogeneration.data.protein import chain_str_to_int, process_chain
 from cogeneration.data.residue_constants import unk_restype_index
 from cogeneration.type.dataset import OLIGOMERIC_PREFIXES, ChainFeatures
-from cogeneration.type.dataset import DatasetColumns as dc
-from cogeneration.type.dataset import DatasetProteinColumns as dpc
+from cogeneration.type.dataset import DatasetProteinColumn as dpc
+from cogeneration.type.dataset import MetadataColumn as dc
 from cogeneration.type.dataset import MetadataCSVRow, ProcessedFile
 
 

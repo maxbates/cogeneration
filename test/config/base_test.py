@@ -122,9 +122,9 @@ data:
         loaded = Config().merge_dict(loaded, interpolate=True)
         # check overrides applied
         assert loaded.shared.local is False
-        from cogeneration.type.task import DataTaskEnum
+        from cogeneration.type.task import DataTask
 
-        assert loaded.data.task == DataTaskEnum.inpainting
+        assert loaded.data.task == DataTask.inpainting
 
     def test_merge_checkpoint_cfg(self, tmp_path):
         # set up an original config with a changed inference flag

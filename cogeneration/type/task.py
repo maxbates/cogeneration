@@ -1,14 +1,14 @@
 from cogeneration.type.str_enum import StrEnum
 
 
-class DataTaskEnum(StrEnum):
+class DataTask(StrEnum):
     """task for training"""
 
     hallucination = "hallucination"
     inpainting = "inpainting"  # aka `scaffolding`
 
 
-class InferenceTaskEnum(StrEnum):
+class InferenceTask(StrEnum):
     """task for inference"""
 
     unconditional = "unconditional"
@@ -17,23 +17,23 @@ class InferenceTaskEnum(StrEnum):
     inverse_folding = "inverse_folding"
 
     @staticmethod
-    def from_data_task(task: DataTaskEnum) -> "InferenceTaskEnum":
-        """Get InferenceTaskEnum corresponding to DataTaskEnum"""
-        if task == DataTaskEnum.hallucination:
-            return InferenceTaskEnum.unconditional
-        elif task == DataTaskEnum.inpainting:
-            return InferenceTaskEnum.inpainting
+    def from_data_task(task: DataTask) -> "InferenceTask":
+        """Get InferenceTask corresponding to DataTask"""
+        if task == DataTask.hallucination:
+            return InferenceTask.unconditional
+        elif task == DataTask.inpainting:
+            return InferenceTask.inpainting
         else:
             # default
-            return InferenceTaskEnum.unconditional
+            return InferenceTask.unconditional
 
     @staticmethod
-    def to_data_task(task: "InferenceTaskEnum") -> DataTaskEnum:
-        """Get DataTaskEnum corresponding to InferenceTaskEnum"""
-        if task == InferenceTaskEnum.unconditional:
-            return DataTaskEnum.hallucination
-        elif task == InferenceTaskEnum.inpainting:
-            return DataTaskEnum.inpainting
+    def to_data_task(task: "InferenceTask") -> DataTask:
+        """Get DataTask corresponding to InferenceTask"""
+        if task == InferenceTask.unconditional:
+            return DataTask.hallucination
+        elif task == InferenceTask.inpainting:
+            return DataTask.inpainting
         else:
             # default
-            return DataTaskEnum.hallucination
+            return DataTask.hallucination

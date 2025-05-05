@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 from cogeneration.data.io import read_pkl
 from cogeneration.dataset.datasets import read_metadata_file
 from cogeneration.dataset.process_pdb import _process_chain_feats, read_processed_file
-from cogeneration.type.dataset import DatasetColumns, DatasetProteinColumns
+from cogeneration.type.dataset import DatasetProteinColumn, MetadataColumn
 
 
 class MetadataUpdater:
@@ -72,41 +72,41 @@ class MetadataUpdater:
         """
         row_updates: dict = {}
 
-        processed_path = self.abs_processed_path(row[DatasetColumns.processed_path])
+        processed_path = self.abs_processed_path(row[MetadataColumn.processed_path])
         raw_processed_file = read_pkl(processed_path)
 
-        if DatasetColumns.moduled_num_res not in row:
-            row_updates[DatasetColumns.moduled_num_res] = len(
-                raw_processed_file[DatasetProteinColumns.modeled_idx]
+        if MetadataColumn.moduled_num_res not in row:
+            row_updates[MetadataColumn.moduled_num_res] = len(
+                raw_processed_file[DatasetProteinColumn.modeled_idx]
             )
 
-        if DatasetColumns.modeled_seq_len not in row:
+        if MetadataColumn.modeled_seq_len not in row:
             whole_complex_trimmed = _process_chain_feats(
                 raw_processed_file,
                 center=True,
                 trim_to_modeled_residues=True,
                 trim_chains_independently=False,
             )
-            row_updates[DatasetColumns.modeled_seq_len] = len(
-                whole_complex_trimmed[DatasetProteinColumns.aatype]
+            row_updates[MetadataColumn.modeled_seq_len] = len(
+                whole_complex_trimmed[DatasetProteinColumn.aatype]
             )
 
-        if DatasetColumns.modeled_indep_seq_len not in row:
+        if MetadataColumn.modeled_indep_seq_len not in row:
             chain_independent_trimmed = _process_chain_feats(
                 raw_processed_file,
                 center=True,
                 trim_to_modeled_residues=True,
                 trim_chains_independently=True,
             )
-            row_updates[DatasetColumns.modeled_indep_seq_len] = len(
-                chain_independent_trimmed[DatasetProteinColumns.aatype]
+            row_updates[MetadataColumn.modeled_indep_seq_len] = len(
+                chain_independent_trimmed[DatasetProteinColumn.aatype]
             )
 
         return row_updates
 
     def check_all_columns_present(self):
         """Verify all DatasetColumns are present in the DataFrame."""
-        expected = {col for col in DatasetColumns}
+        expected = {col for col in MetadataColumn}
         present = set(self.df.columns)
         missing = expected - present
         extra = present - expected

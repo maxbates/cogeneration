@@ -15,10 +15,10 @@ from cogeneration.config.dict_utils import (
     flatten_dict,
     prune_unknown_dataclass_fields,
 )
-from cogeneration.type.dataset import OLIGOMERIC_PREFIXES, DatasetColumns
+from cogeneration.type.dataset import OLIGOMERIC_PREFIXES, MetadataColumn
 from cogeneration.type.embed import PositionalEmbeddingMethod
 from cogeneration.type.str_enum import StrEnum
-from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
+from cogeneration.type.task import DataTask, InferenceTask
 
 """
 Structured configurations for cogeneration.
@@ -560,7 +560,7 @@ class DatasetEnum(StrEnum):
 
 @dataclass
 class DataConfig(BaseClassConfig):
-    task: DataTaskEnum = DataTaskEnum.hallucination
+    task: DataTask = DataTask.hallucination
     dataset: DatasetEnum = DatasetEnum.pdb
     loader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
     sampler: DataSamplerConfig = field(default_factory=DataSamplerConfig)
@@ -680,14 +680,14 @@ class DatasetTrimMethod(StrEnum):
     # trim chains independently
     chains_independently = "chains_independently"
 
-    def to_dataset_column(self) -> DatasetColumns:
+    def to_dataset_column(self) -> MetadataColumn:
         """
-        Convert to DatasetColumns column name
+        Convert to DatasetColumn column name
         """
         if self == DatasetTrimMethod.whole_complex:
-            return DatasetColumns.modeled_seq_len
+            return MetadataColumn.modeled_seq_len
         elif self == DatasetTrimMethod.chains_independently:
-            return DatasetColumns.modeled_indep_seq_len
+            return MetadataColumn.modeled_indep_seq_len
         else:
             raise ValueError(f"Unknown trim method: {self}")
 
@@ -932,7 +932,7 @@ class InferenceSamplesConfig(BaseClassConfig):
 
 @dataclass
 class InferenceConfig(BaseClassConfig):
-    task: InferenceTaskEnum = InferenceTaskEnum.unconditional
+    task: InferenceTask = InferenceTask.unconditional
 
     seed: int = "${shared.seed}"
     use_gpu: bool = True
@@ -1177,8 +1177,8 @@ class Config(BaseClassConfig):
         raw_cfg = cls()
 
         # Default to unconditional generation
-        raw_cfg.data.task = DataTaskEnum.hallucination
-        raw_cfg.inference.task = InferenceTaskEnum.unconditional
+        raw_cfg.data.task = DataTask.hallucination
+        raw_cfg.inference.task = InferenceTask.unconditional
 
         # Model
         # Use public MultiFlow model size hyperparameters

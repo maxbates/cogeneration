@@ -6,8 +6,8 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
 
 from cogeneration.config.base import DatasetConfig
-from cogeneration.type.dataset import DatasetColumns
-from cogeneration.type.dataset import DatasetColumns as dc
+from cogeneration.type.dataset import MetadataColumn
+from cogeneration.type.dataset import MetadataColumn as dc
 from cogeneration.type.dataset import MetadataDataFrame
 
 
@@ -17,7 +17,7 @@ class DatasetFilterer:
         self._log = logging.getLogger("DatasetFilterer")
 
     @property
-    def modeled_length_col(self) -> DatasetColumns:
+    def modeled_length_col(self) -> MetadataColumn:
         return self.dataset_cfg.modeled_trim_method.to_dataset_column()
 
     def _rog_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:

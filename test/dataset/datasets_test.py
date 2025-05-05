@@ -4,7 +4,7 @@ from cogeneration.config.base import InferenceSamplesConfig
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.dataset.datasets import BaseDataset, LengthSamplingDataset
 from cogeneration.dataset.motif_factory import ChainBreak, Motif, Scaffold
-from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import empty_feats
 
 

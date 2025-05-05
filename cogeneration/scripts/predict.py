@@ -14,7 +14,7 @@ from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingData
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.utils import get_available_device, print_timing
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
-from cogeneration.type.task import InferenceTaskEnum
+from cogeneration.type.task import InferenceTask
 from cogeneration.util.log import rank_zero_logger
 
 torch.set_float32_matmul_precision("high")
@@ -30,13 +30,13 @@ class EvalRunner:
         self._dataloader: Optional[torch.utils.data.DataLoader] = None
 
         # Read in checkpoint config
-        if cfg.inference.task == InferenceTaskEnum.unconditional:
+        if cfg.inference.task == InferenceTask.unconditional:
             ckpt_path = cfg.inference.unconditional_ckpt_path
-        elif cfg.inference.task == InferenceTaskEnum.inpainting:
+        elif cfg.inference.task == InferenceTask.inpainting:
             ckpt_path = cfg.inference.inpainting_ckpt_path
-        elif cfg.inference.task == InferenceTaskEnum.forward_folding:
+        elif cfg.inference.task == InferenceTask.forward_folding:
             ckpt_path = cfg.inference.forward_folding_ckpt_path
-        elif cfg.inference.task == InferenceTaskEnum.inverse_folding:
+        elif cfg.inference.task == InferenceTask.inverse_folding:
             ckpt_path = cfg.inference.inverse_folding_ckpt_path
         else:
             raise ValueError(f"Unknown task {cfg.inference.task}")
@@ -106,12 +106,12 @@ class EvalRunner:
         if self._dataloader is not None:
             return self._dataloader
 
-        if self.cfg.inference.task == InferenceTaskEnum.unconditional:
+        if self.cfg.inference.task == InferenceTask.unconditional:
             eval_dataset = LengthSamplingDataset(self.cfg.inference.samples)
         elif (
-            self.cfg.inference.task == InferenceTaskEnum.inpainting
-            or self.cfg.inference.task == InferenceTaskEnum.forward_folding
-            or self.cfg.inference.task == InferenceTaskEnum.inverse_folding
+            self.cfg.inference.task == InferenceTask.inpainting
+            or self.cfg.inference.task == InferenceTask.forward_folding
+            or self.cfg.inference.task == InferenceTask.inverse_folding
         ):
             # We want to use the input cfg inference settings for the pdb dataset,
             # not what was in the ckpt config
@@ -122,7 +122,7 @@ class EvalRunner:
             # i.e. for inpainting, we generate motifs.
             dataset_constructor = DatasetConstructor.pdb_dataset(
                 dataset_cfg=pdb_test_cfg,
-                task=InferenceTaskEnum.to_data_task(self.cfg.inference.task),
+                task=InferenceTask.to_data_task(self.cfg.inference.task),
             )
             _, eval_dataset = dataset_constructor.create_datasets()
         else:

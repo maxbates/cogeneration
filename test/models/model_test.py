@@ -3,7 +3,7 @@ import torch
 
 from cogeneration.config.base import Config, ModelConfig, ModelSequencePredictionEnum
 from cogeneration.models.model import FlowModel
-from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import BatchProp as bp
 
 
 class TestFlowModel:

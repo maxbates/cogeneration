@@ -9,10 +9,10 @@ from cogeneration.data.interpolant import Interpolant
 from cogeneration.dataset.datasets import DatasetConstructor
 from cogeneration.dataset.protein_dataloader import LengthBatcher
 from cogeneration.type.batch import BatchFeatures
-from cogeneration.type.batch import BatchProps as bp
-from cogeneration.type.batch import NoisyBatchProps as nbp
+from cogeneration.type.batch import BatchProp as bp
+from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
-from cogeneration.type.task import DataTaskEnum
+from cogeneration.type.task import DataTask
 
 
 def mock_feats(N: int, idx: int, multimer: bool = False) -> BatchFeatures:
@@ -138,7 +138,7 @@ class MockDataloader(DataLoader):
 
 def create_pdb_dataloader(
     cfg: Config,
-    task: Optional[DataTaskEnum] = None,
+    task: Optional[DataTask] = None,
     training: bool = True,
     eval_batch_size: int = 1,
 ) -> DataLoader:

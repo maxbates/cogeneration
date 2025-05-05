@@ -31,11 +31,11 @@ from cogeneration.data.noise_mask import (
 )
 from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
 from cogeneration.type.batch import BatchFeatures
-from cogeneration.type.batch import BatchProps as bp
-from cogeneration.type.batch import NoisyBatchProps as nbp
+from cogeneration.type.batch import BatchProp as bp
+from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
-from cogeneration.type.batch import PredBatchProps as pbp
-from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
+from cogeneration.type.batch import PredBatchProp as pbp
+from cogeneration.type.task import DataTask, InferenceTask
 
 
 def to_cpu(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -466,7 +466,7 @@ class Interpolant:
     def _set_corruption_times(
         self,
         noisy_batch: NoisyFeatures,
-        task: DataTaskEnum,
+        task: DataTask,
     ):
         res_mask = noisy_batch[bp.res_mask]  # (B, N)
         num_batch, num_res = res_mask.shape
@@ -480,8 +480,8 @@ class Interpolant:
             normal_cat_t = self.sample_t(num_batch)
             ones_t = torch.ones((num_batch,), device=self._device)
 
-            # determine multi-task allocations. Each DataTaskEnum supports different multi-tasks.
-            if task == DataTaskEnum.inpainting:
+            # determine multi-task allocations. Each DataTask supports different multi-tasks.
+            if task == DataTask.inpainting:
                 # proportions: unconditional, forward, inverse, rest = normal inpainting
                 unc = self.cfg.inpainting_unconditional_prop
                 fwd = self.cfg.codesign_forward_fold_prop
@@ -498,7 +498,7 @@ class Interpolant:
                     orig_diffuse,
                 ).float()
 
-            elif task == DataTaskEnum.hallucination:
+            elif task == DataTask.hallucination:
                 # proportions: forward, inverse, rest = normal unconditional
                 fwd = self.cfg.codesign_forward_fold_prop
                 inv = self.cfg.codesign_inverse_fold_prop
@@ -540,7 +540,7 @@ class Interpolant:
         noisy_batch[nbp.r3_t] = r3_t  # [B, 1]
         noisy_batch[nbp.cat_t] = cat_t  # [B, 1]
 
-    def corrupt_batch(self, batch: BatchFeatures, task: DataTaskEnum) -> NoisyFeatures:
+    def corrupt_batch(self, batch: BatchFeatures, task: DataTask) -> NoisyFeatures:
         """
         Corrupt `t=1` data into a noisy batch at sampled `t`.
 
@@ -578,7 +578,7 @@ class Interpolant:
         #   Though values at t=1 effectively won't be corrupted.
         corruption_mask_sequence = diffuse_mask
         corruption_mask_structure = diffuse_mask.clone()
-        if task == DataTaskEnum.inpainting:
+        if task == DataTask.inpainting:
             # any rows with a fixed motif have a `diffuse_mask.mean() < 1.0`
             row_inpainting_mask = diffuse_mask.float().mean(dim=1) < 1.0
             corruption_mask_structure[row_inpainting_mask] = 1.0
@@ -972,7 +972,7 @@ class Interpolant:
         num_batch: int,
         num_res: int,
         model,
-        task: InferenceTaskEnum,
+        task: InferenceTask,
         diffuse_mask: torch.Tensor,
         chain_idx: torch.Tensor,
         res_idx: torch.Tensor,
@@ -1016,12 +1016,12 @@ class Interpolant:
         - perform the final step after the loop
         """
         # task-specific input checks
-        if task == InferenceTaskEnum.unconditional:
+        if task == InferenceTask.unconditional:
             assert self.cfg.trans.corrupt
             assert self.cfg.rots.corrupt
             assert self.cfg.aatypes.corrupt
             # no inputs required
-        elif task == InferenceTaskEnum.inpainting:
+        elif task == InferenceTask.inpainting:
             assert self.cfg.trans.corrupt
             assert self.cfg.rots.corrupt
             assert self.cfg.aatypes.corrupt
@@ -1031,7 +1031,7 @@ class Interpolant:
             assert psis_1 is not None
             assert aatypes_1 is not None
             assert diffuse_mask is not None
-        elif task == InferenceTaskEnum.forward_folding:
+        elif task == InferenceTask.forward_folding:
             assert self.cfg.trans.corrupt
             assert self.cfg.rots.corrupt
             assert not self.cfg.aatypes.corrupt
@@ -1040,7 +1040,7 @@ class Interpolant:
             assert (
                 self.cfg.aatypes.noise == 0.0
             )  # cfg check unnecessary if not corrupting?
-        elif task == InferenceTaskEnum.inverse_folding:
+        elif task == InferenceTask.inverse_folding:
             assert not self.cfg.trans.corrupt
             assert not self.cfg.rots.corrupt
             assert self.cfg.aatypes.corrupt
@@ -1088,7 +1088,7 @@ class Interpolant:
 
         # For inpainting, fix motif sequence. Translations and rotations will be sampled.
         # TODO(inpainting-fixed) support fixed motifs
-        if task == InferenceTaskEnum.inpainting:
+        if task == InferenceTask.inpainting:
             # trans_0 = mask_blend_2d(trans_0, trans_1, diffuse_mask)
             # rotmats_0 = mask_blend_3d(rotmats_0, rotmats_1, diffuse_mask)
             aatypes_0 = mask_blend_1d(aatypes_0, aatypes_1, diffuse_mask)
@@ -1096,13 +1096,13 @@ class Interpolant:
         # Handle `codesign_separate_t`
         # t=0 values will be fixed to t=1 values throughout where appropriate
         if self.cfg.codesign_separate_t:
-            if task == InferenceTaskEnum.unconditional:
+            if task == InferenceTask.unconditional:
                 pass
-            elif task == InferenceTaskEnum.inpainting:
+            elif task == InferenceTask.inpainting:
                 pass
-            elif task == InferenceTaskEnum.forward_folding:
+            elif task == InferenceTask.forward_folding:
                 aatypes_0 = aatypes_1
-            elif task == InferenceTaskEnum.inverse_folding:
+            elif task == InferenceTask.inverse_folding:
                 trans_0 = trans_1
                 rotmats_0 = rotmats_1
                 psis_0 = psis_1
@@ -1196,13 +1196,13 @@ class Interpolant:
                 t_minus_1 = (1 - self.cfg.min_t) * torch.ones(
                     (num_batch, 1), device=self._device
                 )
-                if task == InferenceTaskEnum.unconditional:
+                if task == InferenceTask.unconditional:
                     pass
-                elif task == InferenceTaskEnum.inpainting:
+                elif task == InferenceTask.inpainting:
                     pass
-                elif task == InferenceTaskEnum.forward_folding:
+                elif task == InferenceTask.forward_folding:
                     batch[nbp.cat_t] = t_minus_1
-                elif task == InferenceTaskEnum.inverse_folding:
+                elif task == InferenceTask.inverse_folding:
                     batch[nbp.r3_t] = t_minus_1
                     batch[nbp.so3_t] = t_minus_1
                 else:
@@ -1228,20 +1228,20 @@ class Interpolant:
             )
 
             # Mask fixed values to prepare for integration and update the batch for next step.
-            if task == InferenceTaskEnum.unconditional:
+            if task == InferenceTask.unconditional:
                 pass
-            elif task == InferenceTaskEnum.inpainting:
+            elif task == InferenceTask.inpainting:
                 # TODO(inpainting-fixed) depending on guidance type, set _1 values to t=1 using mask
                 # pred_trans_1 = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
                 # pred_rotmats_1 = mask_blend_3d(pred_rotmats_1, rotmats_1, diffuse_mask)
                 # pred_psis_1 = mask_blend_2d(pred_psis_1, psis_1, diffuse_mask)
                 pred_logits_1 = mask_blend_2d(pred_logits_1, logits_1, diffuse_mask)
                 pred_aatypes_1 = mask_blend_1d(pred_aatypes_1, aatypes_1, diffuse_mask)
-            elif task == InferenceTaskEnum.forward_folding:
+            elif task == InferenceTask.forward_folding:
                 # scale logits during integration, assumes will `softmax`
                 pred_logits_1 = 100.0 * logits_1
                 pred_aatypes_1 = aatypes_1
-            elif task == InferenceTaskEnum.inverse_folding:
+            elif task == InferenceTask.inverse_folding:
                 pred_trans_1 = trans_1
                 pred_rotmats_1 = rotmats_1
                 pred_psis_1 = psis_1
@@ -1250,27 +1250,27 @@ class Interpolant:
 
             # Update self-conditioning values
             if self.cfg.self_condition:
-                if task == InferenceTaskEnum.unconditional:
+                if task == InferenceTask.unconditional:
                     batch[nbp.trans_sc] = mask_blend_2d(
                         pred_trans_1, trans_1, diffuse_mask
                     )
                     batch[nbp.aatypes_sc] = mask_blend_2d(
                         pred_logits_1, logits_1, diffuse_mask
                     )
-                elif task == InferenceTaskEnum.inpainting:
+                elif task == InferenceTask.inpainting:
                     # TODO(inpainting-fixed) set _1 values to t=1 using mask
                     # batch[nbp.trans_sc] = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
                     batch[nbp.trans_sc] = pred_trans_1  # interpolate all residues
                     batch[nbp.aatypes_sc] = mask_blend_2d(
                         pred_logits_1, logits_1, diffuse_mask
                     )
-                elif task == InferenceTaskEnum.forward_folding:
+                elif task == InferenceTask.forward_folding:
                     batch[nbp.trans_sc] = mask_blend_2d(
                         pred_trans_1, trans_1, diffuse_mask
                     )
                     # sequence fixed for self-conditioning
                     batch[nbp.aatypes_sc] = logits_1
-                elif task == InferenceTaskEnum.inverse_folding:
+                elif task == InferenceTask.inverse_folding:
                     # matching Multiflow, `trans_sc` not fixed
                     batch[nbp.trans_sc] = mask_blend_2d(
                         pred_trans_1, trans_1, diffuse_mask
@@ -1297,7 +1297,7 @@ class Interpolant:
 
             # For inpainting, fix motif sequence; set motif structure by interpolating motif toward known t=1.
             # TODO(inpainting-fixed) support fixed motifs
-            if task == InferenceTaskEnum.inpainting:
+            if task == InferenceTask.inpainting:
                 # Sequence is fixed for motifs at t=1
                 aatypes_t_2 = mask_blend_1d(aatypes_t_2, aatypes_1, diffuse_mask)
 
@@ -1368,9 +1368,9 @@ class Interpolant:
         )
 
         # Clean up the final outputs
-        if task == InferenceTaskEnum.unconditional:
+        if task == InferenceTask.unconditional:
             pass
-        elif task == InferenceTaskEnum.inpainting:
+        elif task == InferenceTask.inpainting:
             # Here, deviate from the convention in FrameFlow which leaves these alone.
             # Forcing them, like `forward_folding` or `inverse_folding` seems to make sense
             # if they are used for guidance.
@@ -1383,10 +1383,10 @@ class Interpolant:
                 if pred_psis_1 is not None
                 else None
             )
-        elif task == InferenceTaskEnum.forward_folding:
+        elif task == InferenceTask.forward_folding:
             pred_logits_1 = logits_1
             pred_aatypes_1 = aatypes_1
-        elif task == InferenceTaskEnum.inverse_folding:
+        elif task == InferenceTask.inverse_folding:
             pred_trans_1 = trans_1
             pred_rotmats_1 = rotmats_1
             pred_psis_1 = psis_1

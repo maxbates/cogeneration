@@ -27,9 +27,9 @@ from cogeneration.dataset.test_utils import (
 )
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
-from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.metrics import MetricName
-from cogeneration.type.task import DataTaskEnum, InferenceTaskEnum
+from cogeneration.type.task import DataTask, InferenceTask
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -133,7 +133,7 @@ def mock_pred_conditional_dataloader(request, mock_cfg):
 
     return create_pdb_dataloader(
         cfg=mock_cfg,
-        task=DataTaskEnum.hallucination,
+        task=DataTask.hallucination,
         training=False,
         eval_batch_size=batch_size,
     )
@@ -146,7 +146,7 @@ def mock_pred_inpainting_dataloader(request, mock_cfg):
 
     return create_pdb_dataloader(
         cfg=mock_cfg,
-        task=DataTaskEnum.inpainting,
+        task=DataTask.inpainting,
         training=False,
         eval_batch_size=batch_size,
     )
@@ -180,7 +180,7 @@ def mock_folding_validation(tmp_path):
             assert cfg is not None, "cfg is required for folding validation mock"
 
             # TODO(inpainting) improve mock for inpainting
-            if cfg.inference.task != InferenceTaskEnum.unconditional:
+            if cfg.inference.task != InferenceTask.unconditional:
                 print(
                     f"WARNING. mocks currently assume unconditional generation. May impact outputs. Got {cfg.inference.task}"
                 )
@@ -332,7 +332,7 @@ def mock_checkpoint(mock_folding_validation):
         final_ckpt_path = str(ckpt_dir / "final.ckpt")
 
         # update config with the checkpoint
-        assert cfg.inference.task == InferenceTaskEnum.unconditional
+        assert cfg.inference.task == InferenceTask.unconditional
         cfg.inference.unconditional_ckpt_path = str(ckpt_path)
         cfg.inference.inpainting_ckpt_path = str(ckpt_path)
         cfg.inference.forward_folding_ckpt_path = str(ckpt_path)

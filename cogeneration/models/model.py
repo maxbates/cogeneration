@@ -8,11 +8,11 @@ from cogeneration.models.edge_feature_net import EdgeFeatureNet
 from cogeneration.models.ipa_attention import AttentionIPATrunk
 from cogeneration.models.node_feature_net import NodeFeatureNet
 from cogeneration.models.sequence_ipa_net import SequenceIPANet
-from cogeneration.type.batch import BatchProps as bp
+from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import ModelPrediction
-from cogeneration.type.batch import NoisyBatchProps as nbp
+from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
-from cogeneration.type.batch import PredBatchProps as pbp
+from cogeneration.type.batch import PredBatchProp as pbp
 
 
 class FlowModel(nn.Module):

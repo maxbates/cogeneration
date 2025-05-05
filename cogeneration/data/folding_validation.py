@@ -22,9 +22,9 @@ from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restype_order_with_x, restypes_with_x
 from cogeneration.data.superimposition import superimpose
 from cogeneration.dataset.process_pdb import process_pdb_file
-from cogeneration.type.dataset import DatasetProteinColumns as dpc
+from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.metrics import MetricName, OutputFileName
-from cogeneration.type.task import InferenceTaskEnum
+from cogeneration.type.task import InferenceTask
 
 # NOTE - would be nice to better make 3rd party software injectable so easier to mock
 # However, it is not hard to patch the relevant functions for now.
@@ -65,7 +65,7 @@ class FoldingValidator:
 
     def assess_sample(
         self,
-        task: InferenceTaskEnum,  # task type to determine which metrics to compute
+        task: InferenceTask,  # task type to determine which metrics to compute
         sample_name: Union[int, str],
         sample_dir: str,  # directory to write intermediates / outputs to
         pred_pdb_path: str,  # PDB file for predicted / generated structure, atom37.
@@ -193,8 +193,7 @@ class FoldingValidator:
         # For codesign, we pick the best sample we generated.
         # For forward/inverse folding, we pick the most designable sample (i.e. inverse folded then folded).
         is_codesign = (
-            task == InferenceTaskEnum.unconditional
-            or task == InferenceTaskEnum.inpainting
+            task == InferenceTask.unconditional or task == InferenceTask.inpainting
         )
 
         # Sequence recovery helpers
@@ -261,7 +260,7 @@ class FoldingValidator:
 
         # Calculate sequence-recovery
         # Skip for forward_folding, since sequence is fixed
-        if true_aa is not None and task != InferenceTaskEnum.forward_folding:
+        if true_aa is not None and task != InferenceTask.forward_folding:
             codesign_df[MetricName.inverse_folding_sequence_recovery_gt] = (
                 _calc_seq_recovery(true_aa, pred_aa)
             )
@@ -276,7 +275,7 @@ class FoldingValidator:
                 )
 
             # For inpainting task, compute sequence recovery for fixed motifs
-            if task == InferenceTaskEnum.inpainting:
+            if task == InferenceTask.inpainting:
                 # Get mask for fixed motifs (where diffuse_mask = 0)
                 motif_mask = diffuse_mask == 0
                 if motif_mask.any():
@@ -328,7 +327,7 @@ class FoldingValidator:
             ].mean()
 
             # inpainting summary metrics
-            if task == InferenceTaskEnum.inpainting:
+            if task == InferenceTask.inpainting:
                 codesign_df[MetricName.inverse_folding_motif_sequence_recovery_mean] = (
                     designability_df[
                         MetricName.motif_inverse_folding_sequence_recovery
@@ -393,7 +392,7 @@ class FoldingValidator:
 
     def assess_all_top_samples(
         self,
-        task: InferenceTaskEnum,
+        task: InferenceTask,
         top_samples_df: pd.DataFrame,
         output_dir: str,
     ) -> Tuple[pd.DataFrame, str]:
@@ -406,10 +405,7 @@ class FoldingValidator:
 
         # TODO(inpainting) - add inpainting specific metrics, perhaps specific file name
 
-        if (
-            task == InferenceTaskEnum.unconditional
-            or task == InferenceTaskEnum.inpainting
-        ):
+        if task == InferenceTask.unconditional or task == InferenceTask.inpainting:
             metrics_csv_path = os.path.join(
                 output_dir, OutputFileName.designable_metrics_df
             )
@@ -438,7 +434,7 @@ class FoldingValidator:
             )
 
             # Add inpainting-specific metrics if task is inpainting
-            if task == InferenceTaskEnum.inpainting:
+            if task == InferenceTask.inpainting:
                 metrics.update(
                     {
                         "Average Motif Sequence Recovery": top_samples_df[
@@ -452,7 +448,7 @@ class FoldingValidator:
 
             # TODO - calculate diversity using FoldSeek, see MultiFlow.
 
-        elif task == InferenceTaskEnum.forward_folding:
+        elif task == InferenceTask.forward_folding:
             metrics_csv_path = os.path.join(
                 output_dir, OutputFileName.forward_fold_metrics_df
             )
@@ -469,7 +465,7 @@ class FoldingValidator:
                     ].mean(),
                 }
             )
-        elif task == InferenceTaskEnum.inverse_folding:
+        elif task == InferenceTask.inverse_folding:
             metrics_csv_path = os.path.join(
                 output_dir, OutputFileName.inverse_fold_metrics_df
             )
@@ -727,7 +723,7 @@ class FoldingValidator:
         folded_df: pd.DataFrame,
         true_bb_positions: Optional[npt.NDArray] = None,  # (N, 37, 3)
         diffuse_mask: Optional[npt.NDArray] = None,  # (N) inpainting
-        task: InferenceTaskEnum = InferenceTaskEnum.unconditional,  # influences which metrics to compute
+        task: InferenceTask = InferenceTask.unconditional,  # influences which metrics to compute
     ) -> pd.DataFrame:
         """
         Calculate RMSD, pLDDT, and other metrics, comparing folded structures in `folded_df`
@@ -786,7 +782,7 @@ class FoldingValidator:
             sample_metrics[MetricName.is_designable] = bb_rmsd <= 2.0
 
             # Calculate RMSD for fixed motifs in folded structures
-            if task == InferenceTaskEnum.inpainting:
+            if task == InferenceTask.inpainting:
                 sample_metrics[MetricName.motif_bb_rmsd_folded] = _calc_bb_rmsd(
                     motif_mask, sample_bb_pos, folded_bb_pos
                 )
@@ -816,7 +812,7 @@ class FoldingValidator:
                 )
 
                 # Calculate RMSD to GT for fixed motifs in folded structures
-                if task == InferenceTaskEnum.inpainting:
+                if task == InferenceTask.inpainting:
                     sample_metrics[MetricName.motif_bb_rmsd_gt] = _calc_bb_rmsd(
                         motif_mask, sample_bb_pos, true_bb_pos
                     )
