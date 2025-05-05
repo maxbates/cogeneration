@@ -300,6 +300,8 @@ class ModelSequenceIPANetConfig(BaseClassConfig):
 
     # aatype_pred_num_tokens: number of amino acid types => logits / rate-matrix shape
     aatype_pred_num_tokens: int = "${model.hyper_params.aa_num_tokens}"
+    # c_s: internal embedding size for ReLU
+    c_s: int = "${model.hyper_params.node_embed_size}"
     # add initial node + edge embeddings to post-IPA trunk embeddings
     # FoldFlow-2 claimed this was important to pass through time + positional embeddings to logit prediction
     use_init_embed: bool = True
@@ -560,6 +562,7 @@ class DataConfig(BaseClassConfig):
 @dataclass
 class DatasetFilterConfig(BaseClassConfig):
     """Config for filtering metadata CSV. requires data to be in metadata CSV."""
+
     max_num_res: int = 384
     min_num_res: int = 60
     max_coil_percent: float = 0.667  # was 0.5 in public MultiFlow

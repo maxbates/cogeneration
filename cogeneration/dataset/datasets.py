@@ -189,7 +189,9 @@ class BaseDataset(Dataset):
                 self.redesigned_csv, left_on=dc.pdb_name, right_on=dc.example
             )
             # Filter out examples with high RMSD
-            metadata_csv = metadata_csv[metadata_csv[dc.best_rmsd] < self.dataset_cfg.redesigned_rmsd_threshold]
+            metadata_csv = metadata_csv[
+                metadata_csv[dc.best_rmsd] < self.dataset_cfg.redesigned_rmsd_threshold
+            ]
 
         # Add cluster information
         if self.dataset_cfg.cluster_path is not None:

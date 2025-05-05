@@ -39,11 +39,12 @@ class SequenceIPANet(BaseSequencePredictionNet):
             predict_torsions=False,  # no torsion prediction, leave to structure module
         )
 
-        # Use final representation to predict amino acid tokens
-        # TODO(model) - consider also using edge features to predict logits.
-        self.aatype_pred_net = nn.Linear(
-            self.cfg.ipa.c_s,
-            self.cfg.aatype_pred_num_tokens,
+        # Use final representation to predict amino acid tokens.
+        # Note: ReLU serves to only allow flow to tokens that are more likely.
+        self.aatype_pred_net = nn.Sequential(
+            nn.Linear(self.cfg.ipa.c_s, self.cfg.c_s),
+            nn.ReLU(),
+            nn.Linear(self.cfg.c_s, self.cfg.aatype_pred_num_tokens),
         )
 
     @property
@@ -63,8 +64,8 @@ class SequenceIPANet(BaseSequencePredictionNet):
         init_node_embed: torch.Tensor,
         init_edge_embed: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Add initial embeddings, may improve passing though of time / positional embeddings
-        # TODO(model) - should we include an MLP after merging?
+        # Add initial embeddings, assume improve passing though of time / positional embeddings
+        # Skip project/layernorm and just pass to IPA.
         if self.cfg.use_init_embed:
             node_embed = 0.5 * (node_embed + init_node_embed)
             edge_embed = 0.5 * (edge_embed + init_edge_embed)
