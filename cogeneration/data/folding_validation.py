@@ -339,6 +339,8 @@ class FoldingValidator:
 
         # Assign some information to both dataframes
         for df in [codesign_df, designability_df]:
+            if df is None:
+                continue
             df[MetricName.sample_length] = sample_length
             df[MetricName.sample_id] = sample_name
 
@@ -566,9 +568,10 @@ class FoldingValidator:
         os.makedirs(output_dir, exist_ok=True)
 
         # NOTE - public MultiFlow only runs model 4, but may want to consider running others.
+        # TODO - pass device
 
         af2_args = [
-            self.cfg.colabfold_path,
+            str(self.cfg.colabfold_path),
             fasta_path,
             output_dir,
             "--msa-mode",
@@ -577,8 +580,6 @@ class FoldingValidator:
             "1",
             "--random-seed",
             "123",
-            "--device",
-            f"{self.device_id}",
             "--model-order",
             "4",
             "--num-recycle",
@@ -589,9 +590,13 @@ class FoldingValidator:
         process = subprocess.Popen(
             af2_args, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
         )
-        _ = process.wait()
+        code = process.wait()
+        if code != 0:
+            raise RuntimeError(
+                f"AlphaFold2 run.py failed with code {code}. Args: {' '.join(af2_args)}"
+            )
 
-        fasta_seqs = SeqIO.to_dict(SeqIO.read(fasta_path, "fasta"))
+        fasta_seqs = SeqIO.to_dict(SeqIO.parse(fasta_path, "fasta"))
         all_af2_files = glob.glob(os.path.join(output_dir, "*"))
         af2_model_4_pdbs = {}
         af2_model_4_jsons = {}
@@ -660,29 +665,36 @@ class FoldingValidator:
         shutil.copy(input_pdb_path, output_pdb_path)
 
         # Create a directory `seqs`, as required by the PMPNN code, into which we write each sequence as a file.
-        os.makedirs(os.path.join(output_dir, "seqs"), exist_ok=True)
+        seqs_dir = os.path.join(output_dir, "seqs")
+        os.makedirs(seqs_dir, exist_ok=True)
 
-        # Prepare inputs
-        process = subprocess.Popen(
-            [
-                "python",
-                os.path.join(
-                    self.cfg.pmpnn_path, "helper_scripts/parse_multiple_chains.py"
-                ),
-                f"--input_path={input_pdb_path}",
-                f"--output_path={output_dir}",
-            ]
-        )
-        _ = process.wait()
+        # `parse_multiple_chains` takes directory of PDBs, but assume we are working with one
+        # process = subprocess.Popen(
+        #     [
+        #         "python3",
+        #         os.path.join(
+        #             self.cfg.pmpnn_path, "helper_scripts/parse_multiple_chains.py"
+        #         ),
+        #         f"--input_path={input_pdb_path}",
+        #         f"--output_path={output_dir}",
+        #     ]
+        # )
+        # code = process.wait()
+        # if code != 0:
+        #     raise RuntimeError(
+        #         f"ProteinMPNN parse_multiple_chains.py failed with code {code}"
+        #     )
 
         # Run ProteinMPNN Inverse Folding
+        # TODO pass device
+
         pmpnn_args = [
-            "python",
+            "python3",
             os.path.join(self.cfg.pmpnn_path, "protein_mpnn_run.py"),
             "--out_folder",
             output_dir,
-            "--jsonl_path",
-            output_dir,
+            "--pdb_path",
+            output_pdb_path,
             "--num_seq_per_target",
             str(num_sequences),
             "--sampling_temp",
@@ -691,13 +703,13 @@ class FoldingValidator:
             str(seed),
             "--batch_size",
             "1",
-            "--device",
-            str(device_id),
         ]
         process = subprocess.Popen(
             pmpnn_args, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
         )
-        _ = process.wait()
+        code = process.wait()
+        if code != 0:
+            raise RuntimeError(f"ProteinMPNN run.py failed with code {code}. Args: {' '.join(pmpnn_args)}")
 
         # Rename the entries into a new file.
         mpnn_fasta_path = os.path.join(
@@ -706,13 +718,15 @@ class FoldingValidator:
             pdb_name + ".fa",
         )
         modified_fasta_path = mpnn_fasta_path.replace(".fa", "_modified.fasta")
-        fasta_seqs = SeqIO.to_dict(SeqIO.read(mpnn_fasta_path, "fasta"))
+        fasta_records = SeqIO.parse(mpnn_fasta_path, "fasta")
         with open(modified_fasta_path, "w") as f:
-            for i, (header, seq) in enumerate(fasta_seqs.items()):
+            for i, record in enumerate(fasta_records):
                 # Skip the first, which is the input.
                 if i == 0:
                     continue
-                f.write(f">{pdb_name}_pmpnn_seq_{i}\n{seq}\n")
+                # record names are like `T=0.1, sample=1, score=0.4789, global_score=0.4789, seq_recovery=0.2188`
+                # but drop and we'll compute ourselves.
+                f.write(f">{pdb_name}_pmpnn_seq_{i}\n{record.seq}\n")
 
         return modified_fasta_path
 

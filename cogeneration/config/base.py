@@ -947,7 +947,7 @@ class InferenceConfig(BaseClassConfig):
     # validation
     # whether to also fold the generated pmpnn seq for each structure
     also_fold_pmpnn_seq: bool = True
-    # whether to also save the trajectory of the generation process
+    # whether to also save generation trajectory artifacts when sampling
     write_sample_trajectories: bool = False
 
 
@@ -957,12 +957,15 @@ class FoldingConfig(BaseClassConfig):
     folding_model: str = "af2"  # "af2" only at the moment, maybe "esm" in the future
     # dedicated device for folding. decrement other devices by 1 if True
     own_device: bool = False
-    # TODO update ProteinMPNN path
-    pmpnn_path: Path = PATH_PROJECT_ROOT / "ProteinMPNN"
+    # Assume ProteinMPNN to be a sibling to project root, installed separately
+    pmpnn_path: Path = PATH_PROJECT_ROOT.parent / "ProteinMPNN"
     pmpnn_seed: int = "${shared.seed}"
     pt_hub_dir: Path = PATH_PROJECT_ROOT / "cache" / "torch"
-    # TODO update colabfold path
-    colabfold_path: Path = PATH_PROJECT_ROOT / "colabfold/bin/colabfold_batch"
+    # uses LocalColabFold for folding locally
+    # https://github.com/YoshitakaMo/localcolabfold
+    # which is a variant of ColabFold
+    # installation: https://bcrf.biochem.wisc.edu/2023/04/27/alphafold2-on-macintosh-m1/
+    colabfold_path: Path = PATH_PROJECT_ROOT.parent / "localcolabfold/colabfold-conda/bin/colabfold_batch"
 
 
 @dataclass

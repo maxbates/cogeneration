@@ -515,8 +515,8 @@ class BaseDataset(Dataset):
         This function should be called as examples are needed, i.e. in `__get_item__`,
         because it adds noise to atom positions, picks motif positions, etc. as defined by cfg.
         """
-        # Redesigned sequences can be used to substitute the original sequence.
-        if cfg.use_redesigned:
+        # Redesigned sequences can be used to substitute the original sequence during training.
+        if is_training and cfg.use_redesigned:
             best_seq = csv_row[dc.best_seq]
             if not isinstance(best_seq, str):
                 raise ValueError(f"Unexpected value best_seq: {best_seq}")

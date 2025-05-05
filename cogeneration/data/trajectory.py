@@ -202,7 +202,7 @@ def save_trajectory(
         with open(aa_traj_fasta_path, "w") as f:
             for i in range(num_steps):
                 f.write(f">step{i}\n")
-                f.write("".join([restypes_with_x[aa] for aa in aa_traj[i]]))
+                f.write("".join([restypes_with_x[aa] for aa in aa_traj[i]]) + "\n")
 
     # Animate logits trajectory, if provided.
     if model_logits_traj is not None:
