@@ -76,10 +76,6 @@ class TrainingLosses:
     aatypes_loss: torch.Tensor
     train_loss: torch.Tensor  # aggregated loss
 
-    def __getitem__(self, key: str) -> Any:
-        # TODO - deprecate and use properties directly
-        return getattr(self, key)
-
     def items(self):
         # avoid using asdict() because deepcopy on Tensors creates issues
         # instead, return iterater over fields
@@ -176,7 +172,7 @@ class FlowModule(LightningModule):
             return tensor
 
         # if we are on MPS, convert all tensors to float32
-        # TODO - check the device itself, not the config
+        # TODO - check the device itself, not the config (but should match)
         if self.cfg.experiment.trainer.accelerator == "mps":
             batch = apply_to_collection(batch, torch.Tensor, convert_to_float32)
 
@@ -321,7 +317,7 @@ class FlowModule(LightningModule):
         aatypes_loss = torch.sum(ce_loss * loss_mask, dim=-1) / loss_denom_num_res
         aatypes_loss *= training_cfg.aatypes_loss_weight
 
-        # TODO - translation vector field loss
+        # TODO(model) - translation vector field loss
         #   See FoldFlow2
         #   compute vf from t -> gt t=1 vs t -> pred t=1
 
@@ -343,7 +339,7 @@ class FlowModule(LightningModule):
             / (loss_denom_num_res * 3)
         )
 
-        # TODO consider explicit rotation loss (see FoldFlow2)
+        # TODO(model) consider explicit rotation loss (see FoldFlow2)
 
         # Backbone atom loss
         pred_bb_atoms = all_atom.to_atom37(pred_trans_1, pred_rotmats_1, pred_psi_1)[
@@ -390,7 +386,7 @@ class FlowModule(LightningModule):
             bb_atom_loss * training_cfg.aux_loss_use_bb_loss
             + dist_mat_loss * training_cfg.aux_loss_use_pair_loss
         )
-        # TODO consider separate t threshold for dist loss vs bb atom loss, add to config
+        # TODO(model) consider separate t threshold for dist loss vs bb atom loss, add to config
         auxiliary_loss *= (r3_t[:, 0] > training_cfg.aux_loss_t_pass) & (
             so3_t[:, 0] > training_cfg.aux_loss_t_pass
         )

@@ -1,8 +1,14 @@
 import numpy as np
 import pandas as pd
+from torch.utils.data import DataLoader
 
-from cogeneration.config.base import InterpolantTranslationsScheduleEnum
+from cogeneration.config.base import (
+    DatasetFilterConfig,
+    InferenceSamplesConfig,
+    InterpolantTranslationsScheduleEnum,
+)
 from cogeneration.data.residue_constants import restypes_with_x
+from cogeneration.dataset.datasets import LengthSamplingDataset
 from cogeneration.dataset.test_utils import create_pdb_noisy_batch
 from cogeneration.models.module import FlowModule, TrainingLosses
 from cogeneration.type.batch import BatchProp as bp
@@ -43,7 +49,6 @@ class TestFlowModule:
 
     def test_training_step_inpainting(self, mock_cfg_uninterpolated):
         mock_cfg_uninterpolated.data.task = DataTask.inpainting
-        mock_cfg_uninterpolated.interpolant.inpainting_unconditional_prop = 0.0
         mock_cfg = mock_cfg_uninterpolated.interpolate()
 
         pdb_noisy_batch = create_pdb_noisy_batch(mock_cfg)
@@ -62,6 +67,26 @@ class TestFlowModule:
 
         pdb_noisy_batch = create_pdb_noisy_batch(mock_cfg)
         assert (pdb_noisy_batch[bp.diffuse_mask] == 1.0).all()
+
+        module = FlowModule(mock_cfg)
+        module.training_step(pdb_noisy_batch)
+
+    def test_training_step_inpainting_multimers_stochastic(
+        self, mock_cfg_uninterpolated
+    ):
+        mock_cfg_uninterpolated.data.task = DataTask.inpainting
+        mock_cfg_uninterpolated.dataset.filter = DatasetFilterConfig.multimeric()
+        mock_cfg_uninterpolated.shared.stochastic = True
+        mock_cfg = mock_cfg_uninterpolated.interpolate()
+
+        assert mock_cfg.interpolant.trans.stochastic
+        assert mock_cfg.interpolant.rots.stochastic
+
+        # create multimer batch using stochastic paths
+        pdb_noisy_batch = create_pdb_noisy_batch(mock_cfg)
+        assert pdb_noisy_batch[bp.diffuse_mask].mean() > 0.1
+        assert pdb_noisy_batch[bp.diffuse_mask].mean() < 0.9
+        assert pdb_noisy_batch[bp.chain_idx].unique().shape[0] > 1
 
         module = FlowModule(mock_cfg)
         module.training_step(pdb_noisy_batch)
@@ -262,6 +287,47 @@ class TestFlowModule:
 
         module = FlowModule(mock_cfg)
         batch = next(iter(mock_pred_unconditional_dataloader))
+
+        mock_folding_validation(
+            batch=batch,
+            cfg=mock_cfg,
+            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+        )
+
+        # just test that it works
+        _ = module.predict_step(batch, 0)
+
+    def test_predict_step_unconditional_multimer_stochastic_works(
+        self,
+        mock_cfg_uninterpolated,
+        mock_folding_validation,
+    ):
+        mock_cfg_uninterpolated.inference.task = InferenceTask.unconditional
+        mock_cfg_uninterpolated.dataset.filter = DatasetFilterConfig.multimeric()
+        mock_cfg_uninterpolated.inference.samples = InferenceSamplesConfig(
+            multimer_fraction=1.0,
+            samples_per_length=1,
+            num_batch=1,
+            length_subset=[200],
+        )
+        mock_cfg_uninterpolated.shared.stochastic = True
+        mock_cfg = mock_cfg_uninterpolated.interpolate()
+
+        assert mock_cfg.inference.interpolant.rots.stochastic
+        assert mock_cfg.inference.interpolant.trans.stochastic
+        assert (
+            mock_cfg.inference.interpolant.trans.sample_schedule
+            == InterpolantTranslationsScheduleEnum.vpsde
+        )
+
+        module = FlowModule(mock_cfg)
+
+        dataloader = DataLoader(
+            dataset=LengthSamplingDataset(mock_cfg.inference.samples),
+            batch_size=1,
+        )
+        batch = next(iter(dataloader))
+        assert batch[bp.chain_idx].unique().shape[0] > 1
 
         mock_folding_validation(
             batch=batch,

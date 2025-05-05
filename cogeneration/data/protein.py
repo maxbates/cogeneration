@@ -320,8 +320,6 @@ def write_prot_to_pdb(
     """
     Writes a protein (3D tensor) or a trajectory (N steps, 3D tensor) to a PDB file.
     The positions should be the full atom37 representation
-
-    TODO stricter behavior writing files
     """
     if overwrite:
         max_existing_idx = 0

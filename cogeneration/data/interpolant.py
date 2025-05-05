@@ -179,7 +179,7 @@ class Interpolant:
 
     @property
     def igso3(self):
-        # On CPU. TODO consider moving to `self._device`.
+        # On CPU
         if self._igso3 is None:
             sigma_grid = torch.linspace(0.1, self.cfg.rots.igso3_sigma, 1000)
             self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=".cache")
@@ -371,7 +371,7 @@ class Interpolant:
         if self.cfg.trans.stochastic:
             # guassian noise added is markovian; just sample from gaussian, scaled by sigma_t, and add.
             # sigma_t is ~parabolic (and ~0 at t=0 and t=1) so corrupted sample reflects marginal distribution at t.
-            # TODO - confirm scaling harmonic noise this way makes sense
+            # TODO(stochastic) - confirm scaling harmonic noise this way makes sense
             sigma_t = self._compute_sigma_t(
                 t.squeeze(1),  # t is (B, 1), we need (B,)
                 scale=self.cfg.trans.stochastic_noise_intensity,
@@ -452,7 +452,7 @@ class Interpolant:
         aatypes_noise = self._aatypes_noise(res_mask=res_mask)
         aatypes_t = mask_blend_1d(aatypes_noise, aatypes_1, corruption_mask)
 
-        # TODO - determine how to add additional noise
+        # TODO(stochastic) - determine how to add additional noise
         #   We only have access to the discrete types here, not the logits / rate matrix
         #   But we want to be able to add additional noise to the rate matrix on trajectory
         #   Do we just add additional noise now?

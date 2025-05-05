@@ -9,7 +9,7 @@ from cogeneration.data.rigid_utils import Rigid
 from cogeneration.models.aa_pred import BaseSequencePredictionNet
 from cogeneration.models.ipa_attention import AttentionIPATrunk
 
-# TODO - consider a backwards predictor too, see Discrete Flow Matching
+# TODO(model) - consider a backwards predictor too, see Discrete Flow Matching
 # in practice, this will predict masks, but allow for "correction"
 
 # consider more interesting proability paths than just masking
@@ -40,7 +40,7 @@ class SequenceIPANet(BaseSequencePredictionNet):
         )
 
         # Use final representation to predict amino acid tokens
-        # TODO - consider also using edge features to predict logits.
+        # TODO(model) - consider also using edge features to predict logits.
         self.aatype_pred_net = nn.Linear(
             self.cfg.ipa.c_s,
             self.cfg.aatype_pred_num_tokens,
@@ -64,7 +64,7 @@ class SequenceIPANet(BaseSequencePredictionNet):
         init_edge_embed: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Add initial embeddings, may improve passing though of time / positional embeddings
-        # TODO - should we include an MLP after merging?
+        # TODO(model) - should we include an MLP after merging?
         if self.cfg.use_init_embed:
             node_embed = 0.5 * (node_embed + init_node_embed)
             edge_embed = 0.5 * (edge_embed + init_edge_embed)

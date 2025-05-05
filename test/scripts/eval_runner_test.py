@@ -51,7 +51,7 @@ class TestEvalRunner:
         cfg, ckpt_path = mock_checkpoint(cfg=mock_cfg)
 
         # only sample one sample
-        # TODO - support multiple samples
+        # TODO(test) - support multiple samples
         #   We need to mock folding validation for all samples in pred dataloader.
         n_samples_expected = 1
         cfg.inference.samples.samples_per_length = 1

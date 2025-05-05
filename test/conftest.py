@@ -84,7 +84,7 @@ def pdb_noisy_batch(mock_cfg):
 @pytest.fixture
 def mock_dataloader(request):
     """Yields mock batches of un-corrupted samples"""
-    # TODO - increase default batch size > 1
+    # TODO(test) - increase default batch size > 1
     batch_size = getattr(request, "param", {}).get("batch_size", 1)
     sample_lengths = getattr(request, "param", {}).get("sample_lengths", None)
 
@@ -98,7 +98,7 @@ def mock_dataloader(request):
 @pytest.fixture
 def mock_corrupted_dataloader(request):
     """Yields mock batches of corrupted samples"""
-    # TODO - increase default batch size > 1
+    # TODO(test) - increase default batch size > 1
     batch_size = getattr(request, "param", {}).get("batch_size", 1)
     sample_lengths = getattr(request, "param", {}).get("sample_lengths", None)
 
@@ -111,7 +111,7 @@ def mock_corrupted_dataloader(request):
 
 @pytest.fixture
 def mock_pred_unconditional_dataloader(request):
-    # TODO - increase default batch size > 1
+    # TODO(test) - increase default batch size > 1
     batch_size = getattr(request, "param", {}).get("batch_size", 1)
 
     length_sampling_dataset = LengthSamplingDataset(
@@ -128,7 +128,7 @@ def mock_pred_unconditional_dataloader(request):
 @pytest.fixture
 def mock_pred_conditional_dataloader(request, mock_cfg):
     """For `forward_folding` or `inverse_folding` tasks"""
-    # TODO - increase default batch size > 1
+    # TODO(test) - increase default batch size > 1
     batch_size = getattr(request, "param", {}).get("batch_size", 1)
 
     return create_pdb_dataloader(
@@ -141,7 +141,7 @@ def mock_pred_conditional_dataloader(request, mock_cfg):
 
 @pytest.fixture
 def mock_pred_inpainting_dataloader(request, mock_cfg):
-    # TODO - increase default batch size > 1
+    # TODO(test) - increase default batch size > 1
     batch_size = getattr(request, "param", {}).get("batch_size", 1)
 
     return create_pdb_dataloader(
@@ -316,7 +316,7 @@ def mock_checkpoint(mock_folding_validation):
     Note this is sort of slow, because we actually have to call `Trainer.fit()`
     to save the checkpoint, though we only train for one step, which takes ~30-60s on a Mac with MPS.
 
-    TODO - memoize, maybe if by hashing `cfg.model`?
+    TODO(test) - memoize, maybe if by hashing `cfg.model`?
     #   Need to confirm cfg is equivalent enough to use as checkpoint? or overwrite when changes made?
     #   Maybe we can hash the config (ignoring fields like `shared.id`)
     """

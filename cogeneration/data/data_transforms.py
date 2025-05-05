@@ -1,6 +1,4 @@
-# TODO - use openfold directly rather than copying source
-# Source slightly modified to use internal imports
-
+# Copyright 2025 Max - Source slightly modified to use internal imports
 # Copyright 2021 AlQuraishi Laboratory
 # Copyright 2021 DeepMind Technologies Limited
 #

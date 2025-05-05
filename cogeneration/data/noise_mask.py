@@ -4,8 +4,6 @@ import torch
 
 from cogeneration.data.const import MASK_TOKEN_INDEX
 
-# TODO - move masks to a different file?
-
 
 def centered_gaussian(
     num_batch, num_res, device: torch.device, n_bb_atoms: int = 3

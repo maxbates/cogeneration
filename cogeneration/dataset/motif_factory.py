@@ -591,8 +591,7 @@ class MotifFactory:
         chain_to_mask: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        Mask out one chain entirely
-        TODO - filter out chains not interacting? Or assume interacting?
+        Mask out one chain entirely. Assumes any chain is reasonable target, i.e. interacting.
         """
         if chain_to_mask is None:
             chain_to_mask = int(self.rng.choice(chain_idx.unique().tolist()))

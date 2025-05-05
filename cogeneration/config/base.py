@@ -64,7 +64,6 @@ class BaseClassConfig:
         """
         # use `to_object()` so intermediate fields are dataclasses, not DictConfig
         # `create()` interpolates the fields
-        # TODO consider using `hydra.instantiate` to interpolate the config?
         return OmegaConf.to_object(OmegaConf.create(self))
 
     def asdict(self, interpolate: bool = False) -> Dict[str, Any]:
@@ -130,9 +129,6 @@ class SharedConfig(BaseClassConfig):
     # random number generator shared seed
     seed: int = 123
 
-    # TODO - `size` argument to determine model hyperparameters
-    # TODO - gpu size argument to determine batch size, etc.
-
 
 @dataclass
 class ModelHyperParamsConfig(BaseClassConfig):
@@ -140,9 +136,6 @@ class ModelHyperParamsConfig(BaseClassConfig):
     Shared hyperparameters for the model.
     Use a structured config for hyperparameters so easy to reference in templates.
     Default values match those from Multiflow. Use factory methods for different configurations.
-
-    TODO centralize other hyperparameters here, like transformer depth, heads, etc.
-    (assuming we really want to share them, i.e. different transformers should be the same size)
 
     TODO register hydra config group to enable easy switching
     https://hydra.cc/docs/tutorials/structured_config/defaults/
@@ -285,8 +278,6 @@ class ModelAAPredConfig(BaseClassConfig):
 class ModelSequenceIPANetConfig(BaseClassConfig):
     """
     IPA style transformer, predicting logits instead of backbone update.
-
-    TODO - consider centralizing on AAPredConfig, and just use this for IPA, without duplicate fields
 
     Public MultiFlow code uses minimal AAPred linear network.
     The public MultiFlow config alludes to a `sequence_net` not in code, with fields:
@@ -568,12 +559,10 @@ class DataConfig(BaseClassConfig):
 
 @dataclass
 class DatasetFilterConfig(BaseClassConfig):
+    """Config for filtering metadata CSV. requires data to be in metadata CSV."""
     max_num_res: int = 384
     min_num_res: int = 60
     max_coil_percent: float = 0.667  # was 0.5 in public MultiFlow
-    min_num_confident_plddt: float = 40  # TODO implement
-    # TODO - support filter on low pLDDT percentage
-    # TODO - min/max motif percent threshold (avoid loopy things)
     rog_quantile: float = 0.96
     # minimum percent of known and modelable residues in the structure of total sequence.
     max_percent_residues_unknown: float = 0.5
@@ -645,7 +634,6 @@ class DatasetInpaintingConfig(BaseClassConfig):
     # try to trim low plddt ends from structures, see `dataset.min_plddt_threshold`
     trim_low_plddt_ends: bool = True
     # Specify motif selection strategy, or `ALL` to enable all.
-    # TODO - allow specifying a collection of strategies
     strategy: DatasetInpaintingMotifStrategy = DatasetInpaintingMotifStrategy.ALL
 
     # Strategy-dependent parameters
@@ -735,6 +723,7 @@ class DatasetConfig(BaseClassConfig):
     redesigned_csv_path: Optional[Path] = (
         dataset_metadata_dir_path / "pdb_redesigned.csv"
     )
+    redesigned_rmsd_threshold: float = 2.0
 
     # Synthetic, e.g. AlphaFold structures?
     use_synthetic: bool = True

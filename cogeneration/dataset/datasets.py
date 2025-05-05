@@ -189,8 +189,7 @@ class BaseDataset(Dataset):
                 self.redesigned_csv, left_on=dc.pdb_name, right_on=dc.example
             )
             # Filter out examples with high RMSD
-            # TODO - make configurable
-            metadata_csv = metadata_csv[metadata_csv[dc.best_rmsd] < 2.0]
+            metadata_csv = metadata_csv[metadata_csv[dc.best_rmsd] < self.dataset_cfg.redesigned_rmsd_threshold]
 
         # Add cluster information
         if self.dataset_cfg.cluster_path is not None:
@@ -252,7 +251,10 @@ class BaseDataset(Dataset):
             # concat synthetic data to metadata_csv
             metadata_csv = pd.concat([metadata_csv, self.synthetic_csv])
 
-        # TODO - consider filtering synthetic and redesigned data, not just initial data
+        # We just use the synthetic and re-designed data as is without additional filtering.
+        # Some filtering would be difficult, e.g. because designed structures/sequences may have
+        # values like pLDDT assigned by the tool that generated them.
+        # Also, presumably the synthetic data is generated from already-filtered structures/sequences.
 
         self._create_split(metadata_csv)
 
@@ -434,7 +436,6 @@ class BaseDataset(Dataset):
         #
         # We'll manually track `chain_idx` and increment when we encounter `ChainBreak`.
         # After building up the features, can re-index which will use the new `chain_idx`.
-        # TODO - build up `res_idx` as well here. Shouldn't need to re-index after this function.
 
         # track current chain (1-indexed)
         current_chain_idx = 1

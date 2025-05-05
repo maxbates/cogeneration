@@ -333,8 +333,6 @@ def _process_pdb(
         metadata[dc.modeled_indep_seq_len] = np.sum(independent_keep_mask)
 
         # Track quaternary / oligomeric information
-        # TODO - consider differentiating number chains vs number valid chains
-        #    Because some may be filtered out i.e. if they are not proteins
         metadata[dc.num_chains] = len(struct_chains)
         metadata[dc.oligomeric_count] = _oligomeric_count(struct_feats)
         metadata[dc.oligomeric_detail] = _oligomeric_detail(struct_feats)

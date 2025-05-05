@@ -169,14 +169,14 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
     - [x] Parse `all_chain_feats` -> batch in BaseDataset
     - [x] fixture for dummy/real multimer batch 
     - [x] dataset loader multimers
-    - [ ] `model.forward()` multimer
-    - [ ] `module.training_step()` multimer
-    - [ ] `module.validation_step()` multimer
-    - [ ] `module.predict_step()` multimer
+    - [x] `model.forward()` multimer
+    - [x] `module.training_step()` multimer
+    - [-] `module.validation_step()` multimer
+    - [x] `module.predict_step()` multimer
   
 - Misc
     - [x] Remove default values for `chain_idx` and `res_idx`, require passing them.
-    - [ ] address `TODO(multimer)`
+    - [x] address `TODO(multimer)`
   
 ## Future Work
 
@@ -195,6 +195,10 @@ Validation etc. assumes a single chain, and will be a reasonable lift to update 
         - or only keep 2 random interacting pairs
     - (?) ability to filter chains with internal gaps
     - [ ] Review RFDiffusion training curriculum
+    - [ ] track non-chain entities in structure, include in metadata alongside `num_chains`
+    - [ ] consider tracking pLDDT so can filter on it, rather than mask. 
+        - Requires knowing ahead of time what residues to count but prob dependent on trimming strategy
+        - Still, probably useful for fine-tuning rounds
     - [ ] filter when small molecule is interacting or between chains
         - How do we account for this, if the small molecules have been removed in the processed file?
         - see e.g. https://www.rcsb.org/3d-view/6DY1

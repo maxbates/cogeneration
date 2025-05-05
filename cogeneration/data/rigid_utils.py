@@ -1,5 +1,3 @@
-# TODO - use openfold directly, rather than copying source
-
 # Copyright 2021 AlQuraishi Laboratory
 # Copyright 2021 DeepMind Technologies Limited
 #

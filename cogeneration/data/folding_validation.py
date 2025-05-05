@@ -529,7 +529,7 @@ class FoldingValidator:
         Generates and returns a fasta of inverse folded sequences using ProteinMPNN.
         The number of sequences is determined by cfg.
         """
-        # TODO - support pass fixed residues to ProteinMPNN
+        # TODO(inpainting) - support pass fixed residues to ProteinMPNN
         #    However, for inpainting, likely want to pass an empty mask,
         #    since some of the metrics check for sequence conservation of motifs.
         # assert diffuse_mask is None or (diffuse_mask == 1.0).all()
