@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment  # noqa
+from torch.distributions import VonMises
 
 from cogeneration.config.base import (
     InterpolantAATypesInterpolantTypeEnum,
@@ -300,6 +301,16 @@ class Interpolant:
             raise ValueError(
                 f"Unknown aatypes interpolant type {self.cfg.aatypes.interpolant_type}"
             )
+
+    def _psi_noise(self, num_batch: int, num_res: int, kappa=1.0):
+        """
+        Generate initial psi angles as Von Mises noise
+        keeps angle periodic and roughly centred so the network has less work than with randn
+        """
+        vm = VonMises(torch.zeros(()), torch.tensor(kappa))
+        psis = vm.sample((num_batch, num_res)).to(self._device)  # (B, N)
+        # represent each angle by its sine & cosine
+        return torch.stack((psis.sin(), psis.cos()), dim=-1)  # (B, N, 2)
 
     def _batch_ot(self, trans_0, trans_1, res_mask, center: bool = False):
         """
@@ -665,12 +676,11 @@ class Interpolant:
     def _trans_euler_step(
         self,
         d_t: float,
-        t: torch.Tensor,
-        trans_1: torch.Tensor,
-        trans_t: torch.Tensor,
-        chain_idx: torch.Tensor,
+        t: torch.Tensor,  # (B, 1)
+        trans_1: torch.Tensor,  # (B, N, 3)
+        trans_t: torch.Tensor,  # (B, N, 3)
+        chain_idx: torch.Tensor,  # (B, N)
     ) -> torch.Tensor:
-        assert d_t >= 0
         trans_vf = self._trans_vector_field(t, trans_1, trans_t)
 
         trans_next = trans_t + trans_vf * d_t
@@ -681,18 +691,20 @@ class Interpolant:
             base_noise = self._trans_noise(
                 chain_idx=chain_idx
             )  # (B, N, 3) in Angstroms
-            trans_next += (
-                base_noise * math.sqrt(d_t) * self.cfg.trans.stochastic_noise_intensity
+            sigma_t = self._compute_sigma_t(
+                t.squeeze(1),  # (B,)
+                scale=self.cfg.trans.stochastic_noise_intensity,
             )
+            trans_next += base_noise * math.sqrt(d_t) * sigma_t[..., None, None]
 
         return trans_next
 
     def _rots_euler_step(
         self,
         d_t: float,
-        t: torch.Tensor,
-        rotmats_1: torch.Tensor,
-        rotmats_t: torch.Tensor,
+        t: torch.Tensor,  # (B, 1)
+        rotmats_1: torch.Tensor,  # (B, N, 3, 3)
+        rotmats_t: torch.Tensor,  # (B, N, 3, 3)
     ) -> torch.Tensor:
         if self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.linear:
             scaling = 1 / (1 - t)
@@ -704,17 +716,20 @@ class Interpolant:
         rotmats_next = so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)
 
         if self.cfg.rots.stochastic:
+            # Brownian increment: σ(t) · √dt with σ(t)=intensity·√(t(1–t))
             # Sample IGSO(3) noise with a time-independent sigma_t, scaled by sqrt(dt)
             # Add IGSO(3) noise to stay on SO(3).
-            # Also scale by `scaling` so the ratio of drift and diffusion is consistent.
             num_batch, num_res, _, _ = rotmats_t.shape
-            # TODO(stochastic) - determine approprite value for sigma
-            sigma = torch.tensor([1]) * (
-                scaling * self.cfg.rots.stochastic_noise_intensity * np.sqrt(d_t)
-            )
-            intermediate_noise = self.igso3.sample(sigma, num_batch * num_res).to(
-                rotmats_t.device
-            )
+
+            sigma_t = self._compute_sigma_t(
+                t.squeeze(1),  # t is (B, 1), we need (B,)
+                scale=self.cfg.rots.stochastic_noise_intensity,
+            ) * math.sqrt(
+                d_t
+            )  # (B,)
+            sigma_t = sigma_t.cpu()  # ensure on cpu for igso3 calculation
+            intermediate_noise = self.igso3.sample(sigma_t, num_res)
+            intermediate_noise = intermediate_noise.to(rotmats_t.device)
             intermediate_noise = intermediate_noise.reshape(num_batch, num_res, 3, 3)
             rotmats_next = torch.einsum(
                 "...ij,...jk->...ik", rotmats_next, intermediate_noise
@@ -723,7 +738,11 @@ class Interpolant:
         return rotmats_next
 
     def _psi_euler_step(
-        self, d_t: float, t: torch.Tensor, psi_1: torch.Tensor, psi_t: torch.Tensor
+        self,
+        d_t: float,
+        t: torch.Tensor,  # (B, 1)
+        psi_1: torch.Tensor,  # (B, N, 2)
+        psi_t: torch.Tensor,  # (B, N, 2)
     ) -> torch.Tensor:
         """
         Perform an Euler step to update psi angles.
@@ -735,12 +754,21 @@ class Interpolant:
 
         # HACK piggyback on `trans.stochastic`
         if self.cfg.trans.stochastic:
-            # add gaussian noise scaled by sqrt(dt)
-            psi_next += (
-                torch.randn_like(psi_next)
-                * np.sqrt(d_t)
-                * self.cfg.trans.stochastic_noise_intensity
-            )
+            # σ_t = σ(t) · √dt with σ(t)=intensity·√(t(1-t))
+            sigma_t = (
+                self._compute_sigma_t(
+                    t.squeeze(1),  # (B,)
+                    scale=self.cfg.trans.stochastic_noise_intensity,
+                )
+                * math.sqrt(d_t)  # shape (B,)
+            ).unsqueeze(
+                1
+            )  # (B, 1)
+
+            psi_next = psi_next + torch.randn_like(psi_next) * sigma_t
+
+        # wrap back into (-π, π]
+        psi_next = (psi_next + np.pi) % (2 * np.pi) - np.pi
 
         return psi_next
 
@@ -772,7 +800,9 @@ class Interpolant:
 
         return step_probs
 
-    def _aatypes_euler_step(self, d_t, t, logits_1, aatypes_t):
+    def _aatypes_euler_step(
+        self, d_t: float, t: float, logits_1: torch.Tensor, aatypes_t: torch.Tensor
+    ):
         """
         Perform an Euler step to update amino acid types based on the provided logits and interpolation settings.
 
@@ -783,7 +813,7 @@ class Interpolant:
            Assumes S = 20.
         """
         # d_t:       float timestep delta
-        # t:         current interpolation time in [0,1]
+        # t:         current interpolation time in [0,1]   TODO - move to tensor to match other domains
         # logits_1:  (B, N, S) unscaled probabilities for each aa
         # aatypes_t: (B, N) current aa types
 
@@ -1083,8 +1113,7 @@ class Interpolant:
             aatypes_0 = self._aatypes_noise(res_mask=res_mask)
         if psis_0 is None:
             # Generate initial psi angles
-            # TODO a better prior, reflecting these are angles
-            psis_0 = torch.randn((num_batch, num_res, 2), device=self._device)
+            psis_0 = self._psi_noise(num_batch, num_res)
 
         # For inpainting, fix motif sequence. Translations and rotations will be sampled.
         # TODO(inpainting-fixed) support fixed motifs
@@ -1190,7 +1219,7 @@ class Interpolant:
                 batch[nbp.r3_t] = t
                 batch[nbp.cat_t] = t
 
-            # If `codesign_separate_t`, fixed domains set to ~t=1 (penultimate step, take final step later)
+            # If `codesign_separate_t`, fixed domains set to t=1-min_t (penultimate step, take final step later)
             if self.cfg.codesign_separate_t:
                 # TODO consider setting to t=1 to match how `codesign_separate_t` sets values in `corrupt_batch()`
                 t_minus_1 = (1 - self.cfg.min_t) * torch.ones(
@@ -1284,13 +1313,24 @@ class Interpolant:
             # Take next step, size `d_t` from `t_1` (current value) to `t_2` (toward predicted value)
             # We are at `t_1` with state `{domain}_t_1`. The model predicted `pred_{domain}_1`.
             d_t = t_2 - t_1
+            t_tensor = torch.ones((num_batch, 1), device=self._device) * t_1
             trans_t_2 = self._trans_euler_step(
-                d_t, t_1, pred_trans_1, trans_t_1, chain_idx=chain_idx
+                d_t=d_t,
+                t=t_tensor,
+                trans_1=pred_trans_1,
+                trans_t=trans_t_1,
+                chain_idx=chain_idx,
             )
-            rotmats_t_2 = self._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
-            aatypes_t_2 = self._aatypes_euler_step(d_t, t_1, pred_logits_1, aatypes_t_1)
+            rotmats_t_2 = self._rots_euler_step(
+                d_t=d_t, t=t_tensor, rotmats_1=pred_rotmats_1, rotmats_t=rotmats_t_1
+            )
+            aatypes_t_2 = self._aatypes_euler_step(
+                d_t=d_t, t=t_1, logits_1=pred_logits_1, aatypes_t=aatypes_t_1
+            )
             psis_t_2 = (
-                self._psi_euler_step(d_t, t_1, pred_psis_1, psis_t_1)
+                self._psi_euler_step(
+                    d_t=d_t, t=t_tensor, psi_1=pred_psis_1, psi_t=psis_t_1
+                )
                 if pred_psis_1 is not None
                 else None
             )

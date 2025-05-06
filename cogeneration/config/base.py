@@ -370,8 +370,8 @@ class InterpolantRotationsConfig(BaseClassConfig):
     exp_rate: float = 10
     # stochastic paths
     stochastic: bool = "${shared.stochastic}"
-    # sigma scaled by g * sqrt(t * (1-t))
-    stochastic_noise_intensity: float = 0.1  # `g` in FoldFlow SO3SFM
+    # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
+    stochastic_noise_intensity: float = 0.5  # `g` in FoldFlow SO3SFM
 
 
 class InterpolantTranslationsNoiseTypeEnum(StrEnum):
@@ -422,8 +422,8 @@ class InterpolantTranslationsConfig(BaseClassConfig):
     #   cutoff: 5.0
     # stochastic paths
     stochastic: bool = "${shared.stochastic}"
-    # sigma scaled by g * sqrt(t * (1-t))
-    stochastic_noise_intensity: float = 0.1  # `g` in FoldFlow SO3SFM
+    # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
+    stochastic_noise_intensity: float = 0.5  # `g` in FoldFlow SO3SFM
 
 
 class InterpolantAATypesScheduleEnum(StrEnum):
@@ -965,7 +965,9 @@ class FoldingConfig(BaseClassConfig):
     # https://github.com/YoshitakaMo/localcolabfold
     # which is a variant of ColabFold
     # installation: https://bcrf.biochem.wisc.edu/2023/04/27/alphafold2-on-macintosh-m1/
-    colabfold_path: Path = PATH_PROJECT_ROOT.parent / "localcolabfold/colabfold-conda/bin/colabfold_batch"
+    colabfold_path: Path = (
+        PATH_PROJECT_ROOT.parent / "localcolabfold/colabfold-conda/bin/colabfold_batch"
+    )
 
 
 @dataclass

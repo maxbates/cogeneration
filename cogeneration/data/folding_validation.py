@@ -709,7 +709,9 @@ class FoldingValidator:
         )
         code = process.wait()
         if code != 0:
-            raise RuntimeError(f"ProteinMPNN run.py failed with code {code}. Args: {' '.join(pmpnn_args)}")
+            raise RuntimeError(
+                f"ProteinMPNN run.py failed with code {code}. Args: {' '.join(pmpnn_args)}"
+            )
 
         # Rename the entries into a new file.
         mpnn_fasta_path = os.path.join(
