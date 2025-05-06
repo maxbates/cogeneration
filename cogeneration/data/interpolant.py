@@ -463,10 +463,23 @@ class Interpolant:
         aatypes_noise = self._aatypes_noise(res_mask=res_mask)
         aatypes_t = mask_blend_1d(aatypes_noise, aatypes_1, corruption_mask)
 
-        # TODO(stochastic) - determine how to add additional noise
-        #   We only have access to the discrete types here, not the logits / rate matrix
-        #   But we want to be able to add additional noise to the rate matrix on trajectory
-        #   Do we just add additional noise now?
+        if self.cfg.aatypes.stochastic:
+            sigma_t = self._compute_sigma_t(
+                t.squeeze(1),  # (B,)
+                scale=self.cfg.aatypes.stochastic_noise_intensity,
+            ).unsqueeze(
+                1
+            )  # (B, 1)
+
+            # probability a residue jumps
+            p_jump = sigma_t.clamp(max=1.0)  # (B, 1)
+            jump_mask = (
+                torch.rand(num_batch, num_res, device=self._device) < p_jump
+            ).int()
+
+            if jump_mask.any():
+                jump_noise = self._aatypes_noise(res_mask=res_mask)
+                aatypes_t = mask_blend_1d(jump_noise, aatypes_t, jump_mask)
 
         # residues outside `res_mask` are set to mask regardless of aatype noise strategy.
         aatypes_t = aatypes_t * res_mask + MASK_TOKEN_INDEX * (1 - res_mask)
@@ -772,22 +785,27 @@ class Interpolant:
 
         return psi_next
 
-    def _regularize_step_probs(self, step_probs, aatypes_t):
+    def _regularize_step_probs(
+        self,
+        step_probs: torch.Tensor,  # (B, N, S)
+        aatypes_t: torch.Tensor,  # (B, N)
+    ):
         """
         Regularize the step probabilities to ensure they conform to the requirements of a rate matrix.
         The rate matrix we learn at `t` needs each row to sum to zero.
         """
-        batch_size, num_res, S = step_probs.shape
+        num_batch, num_res, S = step_probs.shape
         device = step_probs.device
-        assert aatypes_t.shape == (batch_size, num_res)
+        assert aatypes_t.shape == (num_batch, num_res)
 
         # clamp the probabilities in `step_probs` to the range [0.0, 1.0] to ensure valid probability values.
         step_probs = torch.clamp(step_probs, min=0.0, max=1.0)
 
-        # set the probabilities corresponding to the current amino acid types to 0.0
-        batch_idx = torch.arange(batch_size, device=device).repeat_interleave(num_res)
-        residue_idx = torch.arange(num_res, device=device).repeat(batch_size)
+        batch_idx = torch.arange(num_batch, device=device).repeat_interleave(num_res)
+        residue_idx = torch.arange(num_res, device=device).repeat(num_batch)
         curr_states = aatypes_t.long().flatten()
+
+        # set the probabilities corresponding to the current amino acid types to 0.0
         step_probs[batch_idx, residue_idx, curr_states] = 0.0
 
         # adjust the probabilities at the current positions to be the negative sum of all other values in the row
@@ -800,109 +818,90 @@ class Interpolant:
 
         return step_probs
 
-    def _aatypes_euler_step(
-        self, d_t: float, t: float, logits_1: torch.Tensor, aatypes_t: torch.Tensor
+    def _aatypes_euler_step_uniform(
+        self,
+        d_t: float,
+        t: float,
+        logits_1: torch.Tensor,  # (B, N, 20)
+        aatypes_t: torch.Tensor,  # (B, N)
     ):
-        """
-        Perform an Euler step to update amino acid types based on the provided logits and interpolation settings.
+        num_batch, num_res, num_states = logits_1.shape
+        assert aatypes_t.shape == (num_batch, num_res)
+        assert num_states == 20
+        assert (
+            aatypes_t.max() < 20
+        ), "No UNK tokens allowed in the uniform sampling step!"
 
-        This function handles two interpolation strategies:
-        1. "masking": Updates the amino acid types by masking certain positions and sampling new types
-           based on modified probabilities. Assumes S = 21 to include a special MASK token.
-        2. "uniform": Samples new amino acid types uniformly, with the assumption that no MASK tokens are involved.
-           Assumes S = 20.
-        """
-        # d_t:       float timestep delta
-        # t:         current interpolation time in [0,1]   TODO - move to tensor to match other domains
-        # logits_1:  (B, N, S) unscaled probabilities for each aa
-        # aatypes_t: (B, N) current aa types
-
-        # If `purity` enabled, use purity-based Euler step function.
-        if self.cfg.aatypes.do_purity:
-            return self._aatypes_euler_step_purity(d_t, t, logits_1, aatypes_t)
-
-        batch_size, num_res, num_states = logits_1.shape
-        assert aatypes_t.shape == (batch_size, num_res)
         device = logits_1.device
-
         temp = self.cfg.aatypes.temp
         noise = self.cfg.aatypes.noise
 
-        if (
-            self.cfg.aatypes.interpolant_type
-            == InterpolantAATypesInterpolantTypeEnum.masking
-        ):
-            assert num_states == 21
+        # convert logits to probabilities
+        pt_x1_probs = F.softmax(logits_1 / temp, dim=-1)  # (B, N, S)
 
-            # set mask to small negative so won't be picked in softmax
-            logits_1[:, :, MASK_TOKEN_INDEX] = -1e9
+        # probability of x1 matching xt exactly
+        pt_x1_eq_xt_prob = torch.gather(
+            pt_x1_probs, dim=-1, index=aatypes_t.long().unsqueeze(-1)
+        )  # (B, D, 1)
+        assert pt_x1_eq_xt_prob.shape == (num_batch, num_res, 1)
 
-            # convert logits to probabilities
-            pt_x1_probs = F.softmax(logits_1 / temp, dim=-1)  # (B, N, S)
+        # compute step probabilities (scaled by d_t), with noise and time factoring.
+        # encourages transitions with an additional uniform 'noise' term for the matching residue.
+        step_probs = d_t * (
+            pt_x1_probs * ((1.0 + noise + noise * (num_states - 1) * t) / (1.0 - t))
+            + noise * pt_x1_eq_xt_prob
+        )
 
-            # prepare a (0,0,...1) mask vector to help add masking transitions.
-            mask_one_hot = torch.zeros((num_states,), device=device)
-            mask_one_hot[MASK_TOKEN_INDEX] = 1.0
+        # force valid rate matrix
+        step_probs = self._regularize_step_probs(step_probs, aatypes_t)
 
-            # identify which positions are currently mask
-            aatypes_t_is_mask = (
-                (aatypes_t == MASK_TOKEN_INDEX).view(batch_size, num_res, 1).float()
-            )
+        # sample new residues from step_probs
+        new_aatypes = torch.multinomial(step_probs.view(-1, num_states), num_samples=1)
+        return new_aatypes.view(num_batch, num_res)
 
-            # compute step probabilities (scaled by d_t), with noise and time factoring
-            step_probs = (
-                d_t * pt_x1_probs * ((1.0 + noise * t) / (1.0 - t))
-            )  # (B, N, S)
-            # add transitions from non-mask to mask as noise
-            step_probs += (
-                d_t * (1.0 - aatypes_t_is_mask) * mask_one_hot.view(1, 1, -1) * noise
-            )
+    def _aatypes_euler_step_masking(
+        self,
+        d_t: float,
+        t: float,
+        logits_1: torch.Tensor,  # (B, N, 21)
+        aatypes_t: torch.Tensor,  # (B, N)
+    ):
+        num_batch, num_res, num_states = logits_1.shape
+        assert num_states == 21
+        assert aatypes_t.shape == (num_batch, num_res)
 
-            # force valid rate matrix
-            step_probs = self._regularize_step_probs(step_probs, aatypes_t)
+        device = logits_1.device
+        temp = self.cfg.aatypes.temp
+        noise = self.cfg.aatypes.noise
 
-            # sample new residues from step_probs
-            new_aatypes = torch.multinomial(
-                step_probs.view(-1, num_states), num_samples=1
-            )
-            return new_aatypes.view(batch_size, num_res)
-        elif (
-            self.cfg.aatypes.interpolant_type
-            == InterpolantAATypesInterpolantTypeEnum.uniform
-        ):
-            assert num_states == 20
-            assert (
-                aatypes_t.max() < 20
-            ), "No UNK tokens allowed in the uniform sampling step!"
+        # set mask to small negative so won't be picked in softmax
+        logits_1[:, :, MASK_TOKEN_INDEX] = -1e9
 
-            # convert logits to probabilities
-            pt_x1_probs = F.softmax(logits_1 / temp, dim=-1)  # (B, N, S)
+        # convert logits to probabilities
+        pt_x1_probs = F.softmax(logits_1 / temp, dim=-1)  # (B, N, S)
 
-            # probability of x1 matching xt exactly
-            pt_x1_eq_xt_prob = torch.gather(
-                pt_x1_probs, dim=-1, index=aatypes_t.long().unsqueeze(-1)
-            )  # (B, D, 1)
-            assert pt_x1_eq_xt_prob.shape == (batch_size, num_res, 1)
+        # prepare a (0,0,...1) mask vector to help add masking transitions.
+        mask_one_hot = torch.zeros((num_states,), device=device)
+        mask_one_hot[MASK_TOKEN_INDEX] = 1.0
 
-            # compute step probabilities (scaled by d_t), with noise and time factoring.
-            # encourages transitions with an additional uniform 'noise' term for the matching residue.
-            step_probs = d_t * (
-                pt_x1_probs * ((1.0 + noise + noise * (num_states - 1) * t) / (1.0 - t))
-                + noise * pt_x1_eq_xt_prob
-            )
+        # identify which positions are currently mask
+        aatypes_t_is_mask = (
+            (aatypes_t == MASK_TOKEN_INDEX).view(num_batch, num_res, 1).float()
+        )
 
-            # force valid rate matrix
-            step_probs = self._regularize_step_probs(step_probs, aatypes_t)
+        # compute step probabilities (scaled by d_t), with noise and time factoring
+        step_probs = d_t * pt_x1_probs * ((1.0 + noise * t) / (1.0 - t))  # (B, N, S)
+        # add transitions from non-mask to mask as noise
+        step_probs += (
+            d_t * (1.0 - aatypes_t_is_mask) * mask_one_hot.view(1, 1, -1) * noise
+        )
 
-            # sample new residues from step_probs
-            new_aatypes = torch.multinomial(
-                step_probs.view(-1, num_states), num_samples=1
-            )
-            return new_aatypes.view(batch_size, num_res)
-        else:
-            raise ValueError(
-                f"Unknown aatypes interpolant type {self.cfg.aatypes.interpolant_type}"
-            )
+        # force valid rate matrix
+        step_probs = self._regularize_step_probs(step_probs, aatypes_t)
+
+        # sample new residues from step_probs
+        new_aatypes = torch.multinomial(step_probs.view(-1, num_states), num_samples=1)
+        return new_aatypes.view(num_batch, num_res)
 
     def _aatypes_euler_step_purity(self, d_t, t, logits_1, aatypes_t):
         """
@@ -912,10 +911,9 @@ class Interpolant:
         This function identifies masked residues, then picks some number to unmask based on their maximum
         log-probabilities, then re-masks some positions proportional to noise.
         """
-        batch_size, num_res, num_states = logits_1.shape
-        device = logits_1.device
+        num_batch, num_res, num_states = logits_1.shape
 
-        assert aatypes_t.shape == (batch_size, num_res)
+        assert aatypes_t.shape == (num_batch, num_res)
         assert (
             self.cfg.aatypes.interpolant_type
             == InterpolantAATypesInterpolantTypeEnum.masking
@@ -924,6 +922,7 @@ class Interpolant:
             num_states == 21
         ), "Purity-based unmasking only works with masking interpolant type"
 
+        device = logits_1.device
         temp = self.cfg.aatypes.temp
         noise = self.cfg.aatypes.noise
 
@@ -953,7 +952,7 @@ class Interpolant:
         unmasked_samples = torch.multinomial(
             pt_x1_probs.view(-1, num_states - 1), num_samples=1
         )
-        unmasked_samples = unmasked_samples.view(batch_size, num_res)
+        unmasked_samples = unmasked_samples.view(num_batch, num_res)
 
         # Next lines are vectorized version of:
         # for b in range(B):
@@ -963,7 +962,7 @@ class Interpolant:
 
         # create a mask that indicates top positions to unmask in each batch
         D_grid = (
-            torch.arange(num_res, device=device).unsqueeze(0).expand(batch_size, -1)
+            torch.arange(num_res, device=device).unsqueeze(0).expand(num_batch, -1)
         )  # (B, N)
         # 'mask1' is 1 where d < number_to_unmask[b], 0 otherwise
         mask1 = (D_grid < number_to_unmask.view(-1, 1)).float()
@@ -976,11 +975,11 @@ class Interpolant:
         selected_indices = selected_indices.long()
 
         # 'mask2' indicates precisely which positions in aatypes_t we replace
-        mask2 = torch.zeros((batch_size, num_res), device=device)
+        mask2 = torch.zeros((num_batch, num_res), device=device)
         mask2.scatter_(
             dim=1,
             index=selected_indices,
-            src=torch.ones((batch_size, num_res), device=device),
+            src=torch.ones((num_batch, num_res), device=device),
         )
         # if zero are unmasked, we skip altogether
         none_unmasked_mask = (number_to_unmask == 0).unsqueeze(-1).float()
@@ -991,9 +990,119 @@ class Interpolant:
 
         # re-mask some positions as noise with probability (d_t * noise)
         re_mask_prob = d_t * noise
-        rand_vals = torch.rand(batch_size, num_res, device=device)
+        rand_vals = torch.rand(num_batch, num_res, device=device)
         re_mask_mask = (rand_vals < re_mask_prob).float()
         aatypes_t = aatypes_t * (1.0 - re_mask_mask) + (MASK_TOKEN_INDEX * re_mask_mask)
+
+        return aatypes_t
+
+    def _aatype_jump_step(
+        self,
+        d_t: float,
+        t: float,  # t in [0,1]   TODO - move to tensor to match other domains
+        logits_1: torch.Tensor,  # (B, N, S)
+        aatypes_t: torch.Tensor,  # (B, N)
+    ) -> torch.Tensor:
+        """
+        Stochastic CTMC jump for aatypes. discrete analog of gaussian noise for other domains.
+
+        Uses rate matrix to allow sequnce to explore neighboring states
+        in proprtion to the rates the network thinks are possible.
+
+        This is different than the `noise` term, which adds noise to the rate matrix in determinsitic interpolation.
+        """
+        B, N, S = logits_1.shape
+        assert aatypes_t.shape == (B, N)
+
+        device = logits_1.device
+        temp = self.cfg.aatypes.temp
+        noise = self.cfg.aatypes.noise
+
+        # logits -> probabilities
+        prob_rows = F.softmax(logits_1 / temp, dim=-1)  # (B,N,S)
+        prob_rows = prob_rows.clamp(min=1e-8)  # avoid zeros
+
+        # Build rate matrix (positive exits, negative stays)
+        current_idx = aatypes_t.unsqueeze(-1).long()  # (B,N,1)
+        exit_rates = prob_rows.scatter_(-1, current_idx, 0.0)
+        exit_sums = exit_rates.sum(-1, keepdim=True)
+        gen_rates = exit_rates.clone()
+        gen_rates.scatter_(-1, current_idx, -exit_sums)  # current = neg sum of others
+
+        # Multiply by sigma_t so amount of noise mirrors other domains.
+        # Multiplying the whole rate matrix by the same value preserves valid rate matrix.
+        sigma_t = self._compute_sigma_t(
+            torch.ones(aatypes_t.shape[0], device=device) * t,
+            scale=self.cfg.aatypes.stochastic_noise_intensity,
+        )
+        step_rates = gen_rates * sigma_t[..., None, None]  # (B, N, S)
+
+        # decide whether each residue jumps during d_t
+        # total exit rate λ_i = − q_{i, current_state}
+        lambda_step = -step_rates.gather(-1, current_idx).squeeze(-1)  # (B, N), >0
+        p_jump = 1.0 - torch.exp(-lambda_step * d_t)  # (B, N)
+        jump_mask = torch.rand_like(p_jump) < p_jump  # bool (B, N)
+
+        if not jump_mask.any():
+            # no jumps this step
+            return aatypes_t
+
+        # sample new aa for jumped residues
+        jump_aa_probs = step_rates.clone()  # (B, N, S)
+        jump_aa_probs.scatter_(-1, current_idx, 0.0)  # zero out current col
+        jump_aa_probs = jump_aa_probs / lambda_step.clamp_min(1e-8).unsqueeze(
+            -1
+        )  # normalise rows
+
+        # sample new aa only for residues that jump
+        jumped_states = torch.multinomial(
+            jump_aa_probs[jump_mask].reshape(-1, S), 1
+        ).squeeze(-1)
+
+        aatypes_next = aatypes_t.clone()
+        aatypes_next[jump_mask] = jumped_states
+        return aatypes_next
+
+    def _aatypes_euler_step(
+        self,
+        d_t: float,
+        t: float,  # t in [0,1]   TODO - move to tensor to match other domains
+        logits_1: torch.Tensor,  # (B, N, S) unscaled probabilities, S={20, 21}
+        aatypes_t: torch.Tensor,  # (B, N) current amino acid types
+    ):
+        """
+        Perform an Euler step to update amino acid types based on the provided logits and interpolation settings.
+
+        This function handles two interpolation strategies:
+        1. "masking": Updates the amino acid types by masking certain positions and sampling new types
+           based on modified probabilities. Assumes S = 21 to include a special MASK token.
+        2. "uniform": Samples new amino acid types uniformly, with the assumption that no MASK tokens are involved.
+           Assumes S = 20.
+        """
+        if self.cfg.aatypes.do_purity:
+            aatypes_t = self._aatypes_euler_step_purity(d_t, t, logits_1, aatypes_t)
+        elif (
+            self.cfg.aatypes.interpolant_type
+            == InterpolantAATypesInterpolantTypeEnum.masking
+        ):
+            aatypes_t = self._aatypes_euler_step_masking(
+                d_t=d_t, t=t, logits_1=logits_1, aatypes_t=aatypes_t
+            )
+        elif (
+            self.cfg.aatypes.interpolant_type
+            == InterpolantAATypesInterpolantTypeEnum.uniform
+        ):
+            aatypes_t = self._aatypes_euler_step_uniform(
+                d_t=d_t, t=t, logits_1=logits_1, aatypes_t=aatypes_t
+            )
+        else:
+            raise ValueError(
+                f"Unknown aatypes interpolant type {self.cfg.aatypes.interpolant_type}"
+            )
+
+        if self.cfg.aatypes.stochastic:
+            # Additional stochastic CTMC jump step
+            aatypes_t = self._aatype_jump_step(d_t, t, logits_1, aatypes_t)
 
         return aatypes_t
 
@@ -1313,23 +1422,23 @@ class Interpolant:
             # Take next step, size `d_t` from `t_1` (current value) to `t_2` (toward predicted value)
             # We are at `t_1` with state `{domain}_t_1`. The model predicted `pred_{domain}_1`.
             d_t = t_2 - t_1
-            t_tensor = torch.ones((num_batch, 1), device=self._device) * t_1
+            t_1_tensor = torch.ones((num_batch, 1), device=self._device) * t_1
             trans_t_2 = self._trans_euler_step(
                 d_t=d_t,
-                t=t_tensor,
+                t=t_1_tensor,
                 trans_1=pred_trans_1,
                 trans_t=trans_t_1,
                 chain_idx=chain_idx,
             )
             rotmats_t_2 = self._rots_euler_step(
-                d_t=d_t, t=t_tensor, rotmats_1=pred_rotmats_1, rotmats_t=rotmats_t_1
+                d_t=d_t, t=t_1_tensor, rotmats_1=pred_rotmats_1, rotmats_t=rotmats_t_1
             )
             aatypes_t_2 = self._aatypes_euler_step(
                 d_t=d_t, t=t_1, logits_1=pred_logits_1, aatypes_t=aatypes_t_1
             )
             psis_t_2 = (
                 self._psi_euler_step(
-                    d_t=d_t, t=t_tensor, psi_1=pred_psis_1, psi_t=psis_t_1
+                    d_t=d_t, t=t_1_tensor, psi_1=pred_psis_1, psi_t=psis_t_1
                 )
                 if pred_psis_1 is not None
                 else None
@@ -1343,10 +1452,10 @@ class Interpolant:
 
                 # Get interpolated values for motif translations and rotations
                 trans_t_2_motif = self._trans_euler_step(
-                    d_t, t_1, trans_1, trans_t_1, chain_idx=chain_idx
+                    d_t, t_1_tensor, trans_1, trans_t_1, chain_idx=chain_idx
                 )
                 rotmats_t_2_motif = self._rots_euler_step(
-                    d_t, t_1, rotmats_1, rotmats_t_1
+                    d_t, t_1_tensor, rotmats_1, rotmats_t_1
                 )
                 # Set motif positions to interpolated values
                 trans_t_2 = mask_blend_2d(trans_t_2, trans_t_2_motif, diffuse_mask)
@@ -1356,7 +1465,9 @@ class Interpolant:
 
                 # For psi angles, take an Euler step toward known values
                 if psis_t_2 is not None:
-                    psi_t_2_motif = self._psi_euler_step(d_t, t_1, psis_1, pred_psis_1)
+                    psi_t_2_motif = self._psi_euler_step(
+                        d_t, t_1_tensor, psis_1, pred_psis_1
+                    )
                     psis_t_2 = mask_blend_2d(psis_t_2, psi_t_2_motif, diffuse_mask)
 
             # Center diffused residues to maintain translation invariance

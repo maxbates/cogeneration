@@ -2,9 +2,18 @@ import numpy as np
 import pytest
 import torch
 
-from cogeneration.config.base import Config, DatasetFilterConfig
+from cogeneration.config.base import (
+    Config,
+    DatasetFilterConfig,
+    InterpolantAATypesInterpolantTypeEnum,
+)
+from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.interpolant import Interpolant
-from cogeneration.data.noise_mask import centered_gaussian
+from cogeneration.data.noise_mask import (
+    centered_gaussian,
+    centered_harmonic,
+    uniform_so3,
+)
 from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
 from cogeneration.dataset.test_utils import (
     MockDataloader,
@@ -80,6 +89,29 @@ class TestInterpolant:
         result_distances = torch.linalg.norm(result - trans_1, dim=-1)
         assert torch.sum(result_distances) <= torch.sum(original_distances)
 
+    @pytest.mark.parametrize(
+        "task",
+        [DataTask.hallucination, DataTask.inpainting],
+    )
+    @pytest.mark.parametrize(
+        "stochastic",
+        [True, False],
+    )
+    def test_corrupt_batch_works(
+        self,
+        task,
+        stochastic,
+        mock_cfg_uninterpolated,
+    ):
+        mock_cfg_uninterpolated.data.task = task
+        mock_cfg_uninterpolated.shared.stochastic = stochastic
+        cfg = mock_cfg_uninterpolated.interpolate()
+
+        batch = create_pdb_batch(cfg=cfg, training=True)
+
+        interpolant = Interpolant(cfg.interpolant)
+        interpolant.corrupt_batch(batch, task)
+
     @pytest.mark.parametrize("task", [DataTask.hallucination, DataTask.inpainting])
     def test_corrupt_batch_basic_behavior(self, task, mock_cfg_uninterpolated):
         """
@@ -141,6 +173,128 @@ class TestInterpolant:
         assert torch.any(trans_diff.abs() > 1e-6), "trans_t should be corrupted"
         rot_diff = noisy_batch[nbp.rotmats_t] - batch[bp.rotmats_1]
         assert torch.any(rot_diff.abs() > 1e-6), "rotmats_t should be corrupted"
+
+    @pytest.mark.parametrize("stochastic", [False, True])
+    @pytest.mark.parametrize("noise_type", ["gaussian", "harmonic"])
+    def test_corrupt_translations(
+        self, stochastic, noise_type, mock_cfg_uninterpolated
+    ):
+        mock_cfg_uninterpolated.shared.stochastic = stochastic
+        cfg = mock_cfg_uninterpolated.interpolate()
+
+        interpolant = Interpolant(cfg.interpolant)
+        interpolant.set_device(torch.device("cpu"))
+
+        B, N = 5, 30
+        chain_idx = torch.ones(B, N).long()
+        res_mask = torch.ones(B, N).float()
+        diffuse_mask = torch.ones(B, N).float()
+        t = torch.rand(B, 1)
+
+        if noise_type == "gaussian":
+            trans_1 = centered_gaussian(B, N, device=interpolant._device)
+        elif noise_type == "harmonic":
+            trans_1 = centered_harmonic(chain_idx=chain_idx, device=interpolant._device)
+        else:
+            raise ValueError(f"Unknown noise type {noise_type}")
+
+        out = interpolant._corrupt_trans(
+            trans_1,
+            t=t,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
+            chain_idx=chain_idx,
+        )
+
+        assert not torch.allclose(out, trans_1)
+        # TODO - check values better
+
+    @pytest.mark.parametrize("stochastic", [False, True])
+    def test_corrupt_rotations(self, stochastic, mock_cfg_uninterpolated):
+        mock_cfg_uninterpolated.shared.stochastic = stochastic
+        cfg = mock_cfg_uninterpolated.interpolate()
+
+        interpolant = Interpolant(cfg.interpolant)
+        interpolant.set_device(torch.device("cpu"))
+
+        B, N = 4, 16
+        chain_idx = torch.ones(B, N).long()
+        res_mask = torch.ones(B, N).float()
+        diffuse_mask = torch.ones(B, N).float()
+        t = torch.rand(B, 1)
+
+        rotmats_1 = uniform_so3(B, N, device=interpolant._device)
+
+        out = interpolant._corrupt_rotmats(
+            rotmats_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
+        )
+
+        assert not torch.allclose(out, rotmats_1)
+
+        # must remain valid rotations
+        RRT = torch.matmul(out, out.transpose(-1, -2))
+        I3 = torch.eye(3)
+        assert torch.allclose(RRT, I3, atol=1e-3)
+        assert torch.allclose(
+            torch.det(out), torch.ones_like(torch.det(out)), atol=1e-3
+        )
+
+    @pytest.mark.parametrize("stochastic", [False, True])
+    @pytest.mark.parametrize(
+        "interpolant_type",
+        [
+            InterpolantAATypesInterpolantTypeEnum.masking,
+            InterpolantAATypesInterpolantTypeEnum.uniform,
+        ],
+    )
+    @pytest.mark.parametrize("purity", [False, True])
+    def test_corrupt_aatypes(
+        self, stochastic, interpolant_type, purity, mock_cfg_uninterpolated
+    ):
+        if interpolant_type == InterpolantAATypesInterpolantTypeEnum.uniform and purity:
+            pytest.skip()
+
+        cfg = mock_cfg_uninterpolated
+        cfg.shared.stochastic = stochastic
+        cfg.interpolant.aatypes.interpolant_type = interpolant_type
+        cfg.interpolant.aatypes.do_purity = purity
+        cfg = cfg.interpolate()
+
+        interpolant = Interpolant(cfg.interpolant)
+        interpolant.set_device(torch.device("cpu"))
+
+        if interpolant_type == InterpolantAATypesInterpolantTypeEnum.uniform:
+            assert interpolant.num_tokens == 20
+        else:
+            assert interpolant.num_tokens == 21
+
+        B, N = 5, 30
+        chain_idx = torch.ones(B, N).long()
+        res_mask = torch.ones(B, N).float()
+        diffuse_mask = torch.ones(B, N).float()
+        t = torch.rand(B, 1)
+
+        # ground-truth sequence (cyclic so every aa appears, but no mask)
+        aatype_1 = torch.arange(N).repeat(B, 1) % 20  # (B,N)
+
+        out = interpolant._corrupt_aatypes(
+            aatype_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
+        )
+
+        assert not torch.equal(out, aatype_1)  # something corrupted
+        assert out.le(interpolant.num_tokens).all()  # all valid aatypes
+
+        if interpolant_type == InterpolantAATypesInterpolantTypeEnum.masking:
+            if stochastic:
+                # for masking interpolant, when stochastic=True we expect new identities
+                # outside the deterministic noise mechanism; i.e. out ⊈ {original aa, MASK}
+                new_ids = out[out != aatype_1]
+                assert new_ids.numel() > 0
+            else:
+                # for masking interpolant, when stochastic=False there should be **no new identities**
+                # outside the deterministic noise mechanism; i.e. out ⊆ {original aa, MASK}
+                new_ids = out[(out != aatype_1) & (out != MASK_TOKEN_INDEX)]
+                assert new_ids.numel() == 0
 
     @pytest.mark.parametrize("task", [DataTask.hallucination, DataTask.inpainting])
     def test_corrupt_batch_multimer(self, task, mock_cfg_uninterpolated):
@@ -312,30 +466,41 @@ class TestInterpolantSample:
 
         return prot_traj, model_traj
 
-    def test_sample_unconditional(
-        self, mock_cfg_uninterpolated, mock_pred_unconditional_dataloader
-    ):
-        mock_cfg_uninterpolated.inference.task = InferenceTask.unconditional
-        cfg = mock_cfg_uninterpolated.interpolate()
-
-        batch = next(iter(mock_pred_unconditional_dataloader))
-        self._run_sample(cfg=cfg, batch=batch, task=InferenceTask.unconditional)
-
     @pytest.mark.parametrize(
         "task",
         [
+            InferenceTask.unconditional,
             InferenceTask.inpainting,
             InferenceTask.forward_folding,
             InferenceTask.inverse_folding,
         ],
     )
-    def test_sample_conditional(
-        self, task, mock_cfg_uninterpolated, mock_pred_conditional_dataloader
+    @pytest.mark.parametrize("stochastic", [True, False])
+    def test_sample(
+        self,
+        task,
+        stochastic,
+        mock_cfg_uninterpolated,
+        mock_pred_unconditional_dataloader,
+        mock_pred_inpainting_dataloader,
+        mock_pred_conditional_dataloader,
     ):
         mock_cfg_uninterpolated.inference.task = task
+        mock_cfg_uninterpolated.shared.stochastic = stochastic
         cfg = mock_cfg_uninterpolated.interpolate()
 
-        batch = next(iter(mock_pred_conditional_dataloader))
+        if task == InferenceTask.unconditional:
+            dataloader = mock_pred_unconditional_dataloader
+        elif task == InferenceTask.inpainting:
+            dataloader = mock_pred_inpainting_dataloader
+        elif task == InferenceTask.forward_folding:
+            dataloader = mock_pred_conditional_dataloader
+        elif task == InferenceTask.inverse_folding:
+            dataloader = mock_pred_conditional_dataloader
+        else:
+            raise ValueError(f"Unknown task {task}")
+
+        batch = next(iter(dataloader))
         self._run_sample(cfg=cfg, batch=batch, task=task)
 
     def test_inpainting_preserves_motif_sequence_in_sampling(

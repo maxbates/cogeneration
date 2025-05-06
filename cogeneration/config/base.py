@@ -369,8 +369,10 @@ class InterpolantRotationsConfig(BaseClassConfig):
     )
     exp_rate: float = 10
     # stochastic paths
+    # TODO consider min_t for stochastic rotations, so field can settle before injecting noise.
     stochastic: bool = "${shared.stochastic}"
     # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
+    # Roughly, 0.5 => 11°, 1.0 => 23°, 2.0 => 34° over 500 timesteps
     stochastic_noise_intensity: float = 0.5  # `g` in FoldFlow SO3SFM
 
 
@@ -423,7 +425,8 @@ class InterpolantTranslationsConfig(BaseClassConfig):
     # stochastic paths
     stochastic: bool = "${shared.stochastic}"
     # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
-    stochastic_noise_intensity: float = 0.5  # `g` in FoldFlow SO3SFM
+    # Roughly, 0.5 => 0.2Å, 1.0 => 0.4Å, 2.0 => 0.6Å over 500 timesteps
+    stochastic_noise_intensity: float = 1.0  # `g` in FoldFlow SO3SFM
 
 
 class InterpolantAATypesScheduleEnum(StrEnum):
@@ -470,8 +473,11 @@ class InterpolantAATypesConfig(BaseClassConfig):
     do_purity: bool = (
         "${ternary:${equals: ${inference.task}, 'forward_folding'}, False, True}"
     )
-    train_extra_mask: float = 0.0  # TODO reintroduce or DROP
-    # TODO - extra stochastic option, in addition to purity
+    # stochastic CTMC
+    stochastic: bool = "${shared.stochastic}"
+    # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
+    # Roughly, 0.5 => 0.2 jumps/residue, 1.0 = > 0.4, 1.5 => 0.6 over 500 timesteps
+    stochastic_noise_intensity: float = 1.0
 
 
 class InterpolantTrainTimeSamplingEnum(StrEnum):
