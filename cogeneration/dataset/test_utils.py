@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from cogeneration.config.base import Config
 from cogeneration.data.interpolant import Interpolant
+from cogeneration.data.noise_mask import uniform_so3
 from cogeneration.dataset.datasets import DatasetConstructor
 from cogeneration.dataset.protein_dataloader import LengthBatcher
 from cogeneration.type.batch import BatchFeatures
@@ -24,9 +25,9 @@ def mock_feats(N: int, idx: int, multimer: bool = False) -> BatchFeatures:
 
     # N residue protein, random frames
     feats[bp.res_mask] = torch.ones(N)
-    feats[bp.aatypes_1] = torch.randint(0, 20, (N,))  # may contain UNK
-    feats[bp.trans_1] = torch.rand(N, 3)
-    feats[bp.rotmats_1] = torch.rand(N, 3, 3)
+    feats[bp.aatypes_1] = torch.randint(0, 20, (N,))  # may contain UNK (20)
+    feats[bp.trans_1] = torch.rand(N, 3) * 10.0
+    feats[bp.rotmats_1] = uniform_so3(1, N, device=torch.device("cpu")).squeeze(0)
     feats[bp.torsion_angles_sin_cos_1] = torch.rand(N, 7, 2)
     feats[bp.res_plddt] = torch.floor(torch.rand(N) + 0.5)
     feats[bp.plddt_mask] = feats[bp.res_plddt] > 0.6

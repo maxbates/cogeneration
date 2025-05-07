@@ -3,7 +3,7 @@ import os
 import pytest
 
 from cogeneration.config.base import Config
-from cogeneration.scripts.curriculum import Curriculum, TrainingStep
+from cogeneration.config.curriculum import Curriculum, TrainingStep
 from cogeneration.scripts.train import Experiment
 
 
