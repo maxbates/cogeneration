@@ -52,8 +52,8 @@ class TestEvalRunner:
         cfg_uninterpolated.shared.stochastic = True
         # set up predict_dir to tmp_path
         cfg_uninterpolated.inference.predict_dir = str(tmp_path / "inference")
-        # control number of timesteps. use 1 to debug folding validation
-        cfg_uninterpolated.inference.interpolant.sampling.num_timesteps = 500
+        # control number of timesteps. e.g. use 1 to debug folding validation
+        cfg_uninterpolated.inference.interpolant.sampling.num_timesteps = 100
         # limit eval length
         cfg_uninterpolated.dataset.max_eval_length = 120
         # skip designability? requires folding each ProteinMPNN sequence

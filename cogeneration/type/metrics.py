@@ -98,6 +98,7 @@ class OutputFileName(StrEnum):
     x0_traj_pdb = "x0_traj.pdb"
     aa_traj_fa = "aa_traj.fasta"
     logits_traj_anim = "logits_traj.gif"
+    traj_panel_anim = "traj_panel.gif"
 
     # folding validation
     sample_sequence_fa = "sample.fasta"

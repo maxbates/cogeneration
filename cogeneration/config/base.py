@@ -476,8 +476,8 @@ class InterpolantAATypesConfig(BaseClassConfig):
     # stochastic CTMC
     stochastic: bool = "${shared.stochastic}"
     # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
-    # Roughly, 0.5 => 0.2 jumps/residue, 1.0 = > 0.4, 1.5 => 0.6 over 500 timesteps
-    stochastic_noise_intensity: float = 1.0
+    # Roughly, 0.5 => 0.2 jumps/residue, 1.0 = > 0.4, 1.5 => 0.6 over 500 timesteps  TODO doublecheck
+    stochastic_noise_intensity: float = 0.25
 
 
 class InterpolantTrainTimeSamplingEnum(StrEnum):

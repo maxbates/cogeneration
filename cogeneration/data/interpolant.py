@@ -1059,9 +1059,8 @@ class Interpolant:
             jump_aa_probs[jump_mask].reshape(-1, S), 1
         ).squeeze(-1)
 
-        aatypes_next = aatypes_t.clone()
-        aatypes_next[jump_mask] = jumped_states
-        return aatypes_next
+        aatypes_t[jump_mask] = jumped_states.float()
+        return aatypes_t
 
     def _aatypes_euler_step(
         self,
