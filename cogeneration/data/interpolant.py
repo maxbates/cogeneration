@@ -450,7 +450,12 @@ class Interpolant:
         return mask_blend_3d(rotmats_t, rotmats_1, diffuse_mask)
 
     def _corrupt_aatypes(self, aatypes_1, t, res_mask, diffuse_mask):
-        """Corrupt AA residues from t=1 to t, using masking or uniform sampling."""
+        """
+        Corrupt AA residues from t=1 to t, using masking or uniform sampling.
+
+        If `self.cfg.aatypes.stochastic` is True, use a uniform CTMC forward process to swap some residues.
+        (Uniform because we can't use logits to sample more likely residues in a meaningful way without simulation).
+        """
         num_batch, num_res = res_mask.shape
         assert aatypes_1.shape == (num_batch, num_res)
         assert t.shape == (num_batch, 1)
@@ -1004,10 +1009,15 @@ class Interpolant:
         aatypes_t: torch.Tensor,  # (B, N)
     ) -> torch.Tensor:
         """
-        Stochastic CTMC jump for aatypes. discrete analog of gaussian noise for other domains.
+        Stochastic CTMC jump for aatypes.
 
         Uses rate matrix to allow sequnce to explore neighboring states
-        in proprtion to the rates the network thinks are possible.
+        in proportion to the rates the network thinks are possible.
+        So notice that unlike in training, where jumps are to a uniform-random sampled state,
+        here the jumps are to states the network thinks are plausible.
+        The thinking is that during training, the model must learn a broad "restoring drift" and uniform sampling is class balanced.
+        (We can't use logits during training without simulation, they are just a one-hot of the sequence.)
+        However, this training may slow convergence, or the model may only learn to fix very wrong residues.
 
         This is different than the `noise` term, which adds noise to the rate matrix in determinsitic interpolation.
         """
@@ -1015,19 +1025,18 @@ class Interpolant:
         assert aatypes_t.shape == (B, N)
 
         device = logits_1.device
-        temp = self.cfg.aatypes.temp
-        noise = self.cfg.aatypes.noise
 
         # logits -> probabilities
-        prob_rows = F.softmax(logits_1 / temp, dim=-1)  # (B,N,S)
+        stochastic_temp = 1.5  # TODO(cfg) support cfg for `stochastic_temp`
+        prob_rows = F.softmax(logits_1 / stochastic_temp, dim=-1)  # (B,N,S)
         prob_rows = prob_rows.clamp(min=1e-8)  # avoid zeros
 
         # Build rate matrix (positive exits, negative stays)
         current_idx = aatypes_t.unsqueeze(-1).long()  # (B,N,1)
         exit_rates = prob_rows.scatter_(-1, current_idx, 0.0)
         exit_sums = exit_rates.sum(-1, keepdim=True)
-        gen_rates = exit_rates.clone()
-        gen_rates.scatter_(-1, current_idx, -exit_sums)  # current = neg sum of others
+        step_rates = exit_rates.clone()
+        step_rates.scatter_(-1, current_idx, -exit_sums)  # current = neg sum of others
 
         # Multiply by sigma_t so amount of noise mirrors other domains.
         # Multiplying the whole rate matrix by the same value preserves valid rate matrix.
@@ -1035,7 +1044,7 @@ class Interpolant:
             torch.ones(aatypes_t.shape[0], device=device) * t,
             scale=self.cfg.aatypes.stochastic_noise_intensity,
         )
-        step_rates = gen_rates * sigma_t[..., None, None]  # (B, N, S)
+        step_rates = step_rates * sigma_t[..., None, None]  # (B, N, S)
 
         # decide whether each residue jumps during d_t
         # total exit rate λ_i = − q_{i, current_state}
@@ -1059,8 +1068,9 @@ class Interpolant:
             jump_aa_probs[jump_mask].reshape(-1, S), 1
         ).squeeze(-1)
 
-        aatypes_t[jump_mask] = jumped_states.float()
-        return aatypes_t
+        jumped_aatypes_t = aatypes_t.clone()
+        jumped_aatypes_t[jump_mask] = jumped_states.long()
+        return jumped_aatypes_t
 
     def _aatypes_euler_step(
         self,

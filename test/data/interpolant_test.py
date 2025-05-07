@@ -8,6 +8,7 @@ from cogeneration.config.base import (
     InterpolantAATypesInterpolantTypeEnum,
 )
 from cogeneration.data.const import MASK_TOKEN_INDEX
+from cogeneration.data.data_transforms import make_one_hot
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import (
     centered_gaussian,
@@ -295,6 +296,32 @@ class TestInterpolant:
                 # outside the deterministic noise mechanism; i.e. out ⊆ {original aa, MASK}
                 new_ids = out[(out != aatype_1) & (out != MASK_TOKEN_INDEX)]
                 assert new_ids.numel() == 0
+
+    def test_aatype_jump_step(self, mock_cfg_uninterpolated):
+        mock_cfg_uninterpolated.interpolant.aatypes.stochastic = True
+        mock_cfg_uninterpolated.interpolant.aatypes.stochastic_noise_intensity = 1.0
+        cfg = mock_cfg_uninterpolated.interpolate()
+
+        B, N = 10, 50
+        t = 0.5  # max sigma_t
+        d_t = 0.1  # take a large timestep, more likely to jump
+        aatypes_t = torch.randint(0, 20, (B, N)).long()
+        logits_1 = make_one_hot(aatypes_t, num_classes=20)
+        logits_1 *= 3  # confident for current aatypes
+        logits_1 += torch.randn_like(logits_1) * 0.5  # noisy logits
+
+        interpolant = Interpolant(cfg=cfg.interpolant)
+        interpolant.set_device(torch.device("cpu"))
+
+        noisy_aatypes_t = interpolant._aatype_jump_step(
+            d_t = d_t,
+            t = t,
+            logits_1 = logits_1,
+            aatypes_t = aatypes_t,
+        )
+
+        assert not torch.equal(noisy_aatypes_t, aatypes_t)
+        assert (noisy_aatypes_t != aatypes_t).float().mean() >= 0.01
 
     @pytest.mark.parametrize("task", [DataTask.hallucination, DataTask.inpainting])
     def test_corrupt_batch_multimer(self, task, mock_cfg_uninterpolated):
