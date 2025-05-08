@@ -35,6 +35,13 @@ setup wandb
 wandb login
 ```
 
+for animations, install ffmpeg
+```
+sudo apt-get install ffmpeg
+```
+
+TODO install ProteinMPNN and colabfold (localcolabfold?)
+
 ### Training
 
 train with logging

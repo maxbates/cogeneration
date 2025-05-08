@@ -636,6 +636,7 @@ class FlowModule(LightningModule):
                     true_aa=None,  # codesign  # TODO(inpainting) define
                     also_fold_pmpnn_seq=True,  # always fold during validation
                     write_sample_trajectories=False,  # don't write trajectories during validation (just structures)
+                    write_animations=False,
                     n_inverse_folds=1,  # only one during validation
                 )
             )
@@ -852,6 +853,8 @@ class FlowModule(LightningModule):
                 true_aa=to_numpy(true_aatypes),
                 also_fold_pmpnn_seq=self.cfg.inference.also_fold_pmpnn_seq,
                 write_sample_trajectories=self.cfg.inference.write_sample_trajectories,
+                write_animations=self.cfg.inference.write_animations,
+                animation_max_frames=self.cfg.inference.animation_max_frames,
             )
 
             all_top_sample_metrics.append(top_sample_metrics)
@@ -872,8 +875,10 @@ class FlowModule(LightningModule):
         res_index: npt.NDArray,
         true_bb_pos: Optional[npt.NDArray],  # if relevant
         true_aa: Optional[npt.NDArray],  # if relevant
-        also_fold_pmpnn_seq: bool = True,
-        write_sample_trajectories: bool = True,
+        also_fold_pmpnn_seq: bool,
+        write_sample_trajectories: bool,
+        write_animations: bool,
+        animation_max_frames: int = 50,
         n_inverse_folds: Optional[int] = None,
     ) -> Tuple[Dict[str, Any], SavedTrajectory, SavedFoldingValidation]:
         """
@@ -924,15 +929,17 @@ class FlowModule(LightningModule):
         # Save PDBs, trajectories, and a fasta of the final sequence
         saved_trajectory_files = save_trajectory(
             sample_name=sample_id,
-            sample=bb_traj[-1],
-            bb_prot_traj=bb_traj,
-            x0_traj=np.flip(model_bb_traj, axis=0),
+            sample_atom37=bb_traj[-1],
+            protein_structure_traj=bb_traj,
+            model_structure_traj=model_bb_traj,
             diffuse_mask=diffuse_mask,
             output_dir=sample_dir,
-            aa_traj=aa_traj,
+            protein_aa_traj=aa_traj,
             model_aa_traj=model_aa_traj,
             model_logits_traj=model_logits_traj,
             write_trajectories=write_sample_trajectories,
+            write_animations=write_animations,
+            animation_max_frames=animation_max_frames,
         )
 
         top_sample_metrics, folding_validation_paths = (

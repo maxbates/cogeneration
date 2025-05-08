@@ -954,7 +954,10 @@ class InferenceConfig(BaseClassConfig):
     # whether to also fold the generated pmpnn seq for each structure
     also_fold_pmpnn_seq: bool = True
     # whether to also save generation trajectory artifacts when sampling
-    write_sample_trajectories: bool = False
+    write_sample_trajectories: bool = True
+    # whether to include animations, which are slow to generate (~10-15s for 50 frames)
+    write_animations: bool = True
+    animation_max_frames: int = 50
 
 
 @dataclass

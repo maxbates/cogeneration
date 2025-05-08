@@ -97,8 +97,10 @@ class OutputFileName(StrEnum):
     bb_traj_pdb = "bb_traj.pdb"
     x0_traj_pdb = "x0_traj.pdb"
     aa_traj_fa = "aa_traj.fasta"
-    logits_traj_anim = "logits_traj.gif"
-    traj_panel_anim = "traj_panel.gif"
+    logits_traj_gif = "logits_traj.gif"
+    logits_traj_mp4 = "logits_traj.mp4"
+    traj_panel_gif = "traj_panel.gif"
+    traj_panel_mp4 = "traj_panel.mp4"
 
     # folding validation
     sample_sequence_fa = "sample.fasta"
