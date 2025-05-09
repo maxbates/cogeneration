@@ -103,7 +103,7 @@ def batch_features_from_processed_file(
         plddt_mask = (res_plddt > cfg.min_plddt_threshold).int()
 
     # Default diffuse mask is all ones
-    diffuse_mask = torch.ones_like(res_mask)
+    diffuse_mask = torch.ones_like(res_mask).float()
 
     feats: BatchFeatures = {
         bp.res_mask: res_mask,

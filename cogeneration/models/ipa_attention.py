@@ -120,6 +120,7 @@ class AttentionIPATrunk(nn.Module):
                     node_embed * node_mask[..., None]
                 )
 
+                # backbone update only performed on `res_mask & diffuse_mask`
                 update_mask = (node_mask * diffuse_mask)[..., None]
                 curr_rigids_nm = curr_rigids_nm.compose_q_update_vec(
                     rigid_update, update_mask

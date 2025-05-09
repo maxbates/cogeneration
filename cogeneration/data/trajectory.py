@@ -139,17 +139,16 @@ def _rgba_from_logits(logits: npt.NDArray) -> npt.NDArray:
 def _init_logits_heatmap(
     ax: plt.Axes,
     logits: npt.NDArray,  # (N, S) where S = 20 or 21
-    title: Optional[str] = "Logits trajectory",  # None to hide axes
+    title: Optional[str] = "",
 ) -> matplotlib.image.AxesImage:
     rgba = _rgba_from_logits(logits)  # (21, L, 4)
     im = ax.imshow(rgba, origin="lower", interpolation="none")  # 1-time image
 
     if title is not None:
         ax.set_title(title)
-        ax.set_xlabel("Residue")
-        ax.set_ylabel("Amino-acid")
-    else:
-        ax.set_axis_off()
+
+    ax.set_xlabel("Residue")
+    ax.set_ylabel("Amino-acid")
 
     N, S = logits.shape
     ax.set_xticks(np.arange(0, N))
@@ -445,7 +444,7 @@ def animate_trajectories(
     fig_w_in = max(6, min(30, num_res * square_px / dpi))
     seq_h_in = square_px / dpi
     struct_h_in = fig_w_in * 0.45
-    logits_h_in = seq_h_in * 16
+    logits_h_in = seq_h_in * 20
     fig_h_in = logits_h_in + seq_h_in + struct_h_in
     fig = plt.figure(figsize=(fig_w_in, fig_h_in), dpi=dpi, constrained_layout=False)
 
@@ -454,8 +453,8 @@ def animate_trajectories(
         3,
         2,
         height_ratios=[logits_h_in * dpi, seq_h_in * dpi, struct_h_in * dpi],
-        wspace=0.12,
-        hspace=0.03,
+        wspace=0.02,
+        hspace=0.01,
     )
     # ax_logits_prot = fig.add_subplot(gs[0, 0]) # (not used)
     ax_logits_model = fig.add_subplot(gs[0, 1])
@@ -465,8 +464,7 @@ def animate_trajectories(
     ax_structure_model = fig.add_subplot(gs[2, 1], projection="3d")
 
     # tighten outside padding
-    fig.tight_layout()
-    fig.subplots_adjust(left=0.01, right=0.99, top=0.97, bottom=0.01, wspace=0.08)
+    fig.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01)
 
     # initialise artists
     logits_im = _init_logits_heatmap(ax_logits_model, model_logits_traj[0])

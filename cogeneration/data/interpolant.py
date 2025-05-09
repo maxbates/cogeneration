@@ -380,10 +380,12 @@ class Interpolant:
             raise ValueError(f"Unknown trans schedule {self.cfg.trans.train_schedule}")
 
         # stochastic paths
-        if self.cfg.trans.stochastic:
+        if (
+            self.cfg.trans.stochastic
+            and self.cfg.trans.stochastic_noise_intensity > 0.0
+        ):
             # guassian noise added is markovian; just sample from gaussian, scaled by sigma_t, and add.
             # sigma_t is ~parabolic (and ~0 at t=0 and t=1) so corrupted sample reflects marginal distribution at t.
-            # TODO(stochastic) - confirm scaling harmonic noise this way makes sense
             sigma_t = self._compute_sigma_t(
                 t.squeeze(1),  # t is (B, 1), we need (B,)
                 scale=self.cfg.trans.stochastic_noise_intensity,
@@ -427,7 +429,7 @@ class Interpolant:
         rotmats_t = so3_utils.geodesic_t(so3_t[..., None], rotmats_1, rotmats_0)
 
         # stochastic paths
-        if self.cfg.rots.stochastic:
+        if self.cfg.rots.stochastic and self.cfg.rots.stochastic_noise_intensity > 0.0:
             # gaussian noise added is markovian; we are sampling intermediate point directly from marginal
             # so we just need to compute sigma_t for variance of IGSO(3) noise.
             # compute noise std deviation (mean is just rotmats_t)
@@ -469,7 +471,10 @@ class Interpolant:
         aatypes_noise = self._aatypes_noise(res_mask=res_mask)
         aatypes_t = mask_blend_1d(aatypes_noise, aatypes_1, corruption_mask)
 
-        if self.cfg.aatypes.stochastic:
+        if (
+            self.cfg.aatypes.stochastic
+            and self.cfg.aatypes.stochastic_noise_intensity > 0.0
+        ):
             sigma_t = self._compute_sigma_t(
                 t.squeeze(1),  # (B,)
                 scale=self.cfg.aatypes.stochastic_noise_intensity,
@@ -549,17 +554,12 @@ class Interpolant:
                 + (1 - inverse_fold_mask) * normal_structure_t
             )
 
-            # TODO(inpainting-fixed) support fixed motifs
-            #   Requires we have a sane way to center the structures, and tension of doing here vs in dataset.
-            #   See `scaffolding.md` for discussion.
-
             so3_t = structure_t[:, None]
             r3_t = structure_t[:, None]
             cat_t = cat_t[:, None]
 
         # Default: single `t` time is shared by each domain
-        # TODO(inpainting) up for debate what the appropriate `t` is for the sequence.
-        #   Maybe `t + (1-t) * (1-diffuse_mask.mean())` could make sense...
+        # Note: for inpainting, it could make sense to pick an intermediate t depending on how many residues are defined
         else:
             t = self.sample_t(num_batch)[:, None]
             so3_t = t
@@ -606,12 +606,17 @@ class Interpolant:
         #   The motif sequence is fixed. However, the rest is not, and t should be in sync across domains.
         # For other tasks, everything is corrupted i.e. `(diffuse_mask == 1.0).all()`
         #   Though values at t=1 effectively won't be corrupted.
-        corruption_mask_sequence = diffuse_mask
-        corruption_mask_structure = diffuse_mask.clone()
         if task == DataTask.inpainting:
-            # any rows with a fixed motif have a `diffuse_mask.mean() < 1.0`
-            row_inpainting_mask = diffuse_mask.float().mean(dim=1) < 1.0
-            corruption_mask_structure[row_inpainting_mask] = 1.0
+            corruption_mask_sequence = diffuse_mask
+            # We could check for `diffuse_mask.mean() < 1` and set to `1`, but `res_mask` is basically equivalent.
+            corruption_mask_structure = res_mask
+        else:
+            corruption_mask_sequence = diffuse_mask
+            corruption_mask_structure = diffuse_mask
+
+            # TODO(inpainting) update the batch diffuse_mask appropriately, so structure is diffused.
+            #   The motif structure should not be set to t=1, but interpolated like the rest of the structure
+            #   However, we want to pass a meaningful mask to embed vs. mask to use for backbone updates
 
         # Apply corruptions
 
@@ -1203,6 +1208,22 @@ class Interpolant:
         # for inference, all residues under consideration
         res_mask = torch.ones(num_batch, num_res, device=self._device)
 
+        # no self-conditioning during first step sampling, or if self-conditioning disabled
+        trans_sc = torch.zeros(num_batch, num_res, 3, device=self._device)
+        aatypes_sc = torch.zeros(
+            num_batch, num_res, self.num_tokens, device=self._device
+        )
+
+        # Set up batch. This batch object will be modified and be re-used for each time step.
+        batch = {
+            bp.res_mask: res_mask,
+            bp.diffuse_mask: diffuse_mask,
+            bp.chain_idx: chain_idx,
+            bp.res_idx: res_idx,
+            nbp.trans_sc: trans_sc,
+            nbp.aatypes_sc: aatypes_sc,
+        }
+
         # Initialize t=1 values for translations, rotations, psi, and aatypes, if not defined
 
         if trans_1 is None:
@@ -1234,12 +1255,28 @@ class Interpolant:
             # Generate initial psi angles
             psis_0 = self._psi_noise(num_batch, num_res)
 
-        # For inpainting, fix motif sequence. Translations and rotations will be sampled.
-        # TODO(inpainting-fixed) support fixed motifs
+        # For inpainting, adjust motifs.
         if task == InferenceTask.inpainting:
+            # The sequence is fixed to for partial sequence conditioning.
+            aatypes_0 = mask_blend_1d(aatypes_0, aatypes_1, diffuse_mask)
+
+            # TODO(inpainting-fixed) depending on guidance type, set _1 values to t=1 using mask
+            #    Enabling inpainting-fixed is mostly as simple as fixing the motifs and not diffusing the motifs.
+            #    The main difficulty is centering and avoiding biasing the model as to where the scaffolds go.
             # trans_0 = mask_blend_2d(trans_0, trans_1, diffuse_mask)
             # rotmats_0 = mask_blend_3d(rotmats_0, rotmats_1, diffuse_mask)
-            aatypes_0 = mask_blend_1d(aatypes_0, aatypes_1, diffuse_mask)
+
+            # Translations and rotations will be interpolated, by passing `diffuse_mask = res_mask` to the network
+            # (because `diffuse_mask == 0` residues are not updated by backbone update).
+            # TODO - consider separate `motif_mask` batch prop
+            #   so that embeddings can use `motif_mask` to know which positions are motifs,
+            #   instead of just pretending the whole thing is being diffused.
+            #   Should also allow better alignment of training + sampling.
+            batch[bp.diffuse_mask] = res_mask
+
+        # check for NaNs, should only happen for invalid data or diffuse_mask
+        if torch.isnan(trans_0).any():
+            raise ValueError("NaN in trans_0")
 
         # Handle `codesign_separate_t`
         # t=0 values will be fixed to t=1 values throughout where appropriate
@@ -1256,22 +1293,6 @@ class Interpolant:
                 psis_0 = psis_1
             else:
                 raise ValueError(f"Unknown task {task}")
-
-        # no self-conditioning during first step sampling, or if self-conditioning disabled
-        trans_sc = torch.zeros(num_batch, num_res, 3, device=self._device)
-        aatypes_sc = torch.zeros(
-            num_batch, num_res, self.num_tokens, device=self._device
-        )
-
-        # Set up batch. This batch object will be modified and used for each time step.
-        batch = {
-            bp.res_mask: res_mask,
-            bp.diffuse_mask: diffuse_mask,
-            bp.chain_idx: chain_idx,
-            bp.res_idx: res_idx,
-            nbp.trans_sc: trans_sc,
-            nbp.aatypes_sc: aatypes_sc,
-        }
 
         # Helper function to get atom37 structure from residue frames, only for `res_mask`
         # TODO pass `aatypes` with option get a real atom37 representation rather than just backbone
@@ -1419,9 +1440,9 @@ class Interpolant:
                         pred_logits_1, logits_1, diffuse_mask
                     )
                 elif task == InferenceTask.inpainting:
-                    # TODO(inpainting-fixed) set _1 values to t=1 using mask
-                    # batch[nbp.trans_sc] = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
-                    batch[nbp.trans_sc] = pred_trans_1  # interpolate all residues
+                    batch[nbp.trans_sc] = mask_blend_2d(
+                        pred_trans_1, trans_1, diffuse_mask
+                    )
                     batch[nbp.aatypes_sc] = mask_blend_2d(
                         pred_logits_1, logits_1, diffuse_mask
                     )
