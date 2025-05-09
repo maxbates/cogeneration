@@ -363,19 +363,27 @@ class BaseDataset(Dataset):
     @staticmethod
     def reset_residue_index(cfg: DatasetConfig, feats: BatchFeatures):
         """
-        Re-number `res_index` starting from 1 within each chain.
-
-        Each chain is re-numbered by subtracting the largest idx observed in the chain,
-        so that intra-chain distances are preserved.
+        Re-number `res_index`, assuming `feats` is flat i.e. a single sample.
+        - starting from 1 within each chain
+        - strictly increasing within a chain (occasionally, PDBs have duplicate residue index)
+        - preserve chain gaps from input PDB
         """
-        chain_idx = feats[bp.chain_idx]
-        res_idx = feats[bp.res_idx]
-
+        chain_idx = feats[bp.chain_idx]  # (N,)
+        res_idx = feats[bp.res_idx]  # (N,)
         new_res_idx = torch.zeros_like(res_idx)
-        for cid in torch.unique(chain_idx).tolist():
-            chain_mask = (chain_idx == cid).int()
-            chain_min_idx = torch.min(res_idx + (1 - chain_mask) * 1e4).long()
-            new_res_idx += (res_idx - chain_min_idx + 1) * chain_mask
+
+        for cid in torch.unique(chain_idx):
+            chain_mask = chain_idx == cid
+            chain_res = res_idx[chain_mask]
+            # 1 for duplicates
+            dup_flags = torch.diff(chain_res, prepend=chain_res[:1]).le(0).long()
+            # running count of duplicates
+            dup_offset = dup_flags.cumsum(0)
+            # shift everything forward by duplicates
+            fixed_idx = chain_res + dup_offset
+            # start at 1 by substracting minimum value in chain
+            fixed_idx -= fixed_idx.min() - 1
+            new_res_idx[chain_mask] = fixed_idx
 
         feats[bp.res_idx] = new_res_idx
 
