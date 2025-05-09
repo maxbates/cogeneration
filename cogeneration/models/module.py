@@ -625,9 +625,9 @@ class FlowModule(LightningModule):
                     sample_id=sample_id,
                     sample_dir=sample_dir,
                     task=inference_task,
-                    bb_traj=bb_trajs[i],
-                    aa_traj=aa_trajs[i],
-                    model_bb_traj=model_bb_trajs[i],
+                    protein_structure_traj=bb_trajs[i],
+                    protein_aa_traj=aa_trajs[i],
+                    model_structure_traj=model_bb_trajs[i],
                     model_aa_traj=model_aa_trajs[i],
                     model_logits_traj=model_logits_trajs[i],
                     diffuse_mask=to_numpy(diffuse_mask)[0],
@@ -762,15 +762,15 @@ class FlowModule(LightningModule):
 
             # For inpainting, limit true structure to motif positions
             if task == InferenceTask.inpainting:
-                mask = 1 - diffuse_mask
+                true_mask = 1 - diffuse_mask
             else:
-                mask = res_mask
+                true_mask = res_mask
 
             true_bb_pos = all_atom.atom37_from_trans_rot(
                 trans=trans_1,
                 rots=rotmats_1,
                 psi_torsions=psi_torsions_1,
-                res_mask=mask,
+                res_mask=true_mask,
             )
 
             # Ensure only have one valid structure for the batch, extract it
@@ -842,9 +842,9 @@ class FlowModule(LightningModule):
                 sample_id=sample_id,
                 sample_dir=sample_dir,
                 task=task,
-                bb_traj=bb_trajs[i],
-                aa_traj=aa_trajs[i],
-                model_bb_traj=model_bb_trajs[i],
+                protein_structure_traj=bb_trajs[i],
+                protein_aa_traj=aa_trajs[i],
+                model_structure_traj=model_bb_trajs[i],
                 model_aa_traj=model_aa_trajs[i],
                 model_logits_traj=model_logits_trajs[i],
                 diffuse_mask=to_numpy(diffuse_mask[i]),
@@ -866,9 +866,9 @@ class FlowModule(LightningModule):
         sample_id: Union[int, str],
         sample_dir: str,  # inference output directory for this sample
         task: InferenceTask,
-        bb_traj: npt.NDArray,
-        aa_traj: npt.NDArray,
-        model_bb_traj: npt.NDArray,
+        protein_structure_traj: npt.NDArray,
+        protein_aa_traj: npt.NDArray,
+        model_structure_traj: npt.NDArray,
         model_aa_traj: npt.NDArray,
         model_logits_traj: npt.NDArray,
         diffuse_mask: npt.NDArray,
@@ -889,25 +889,25 @@ class FlowModule(LightningModule):
         Note that this function expects numpy inputs. Tensors should be detached and converted.
         """
         # Noisy trajectory and model (clean) trajectory may not be the same number of steps.
-        noisy_traj_length, sample_length, _, _ = bb_traj.shape
-        assert bb_traj.shape == (
+        noisy_traj_length, sample_length, _, _ = protein_structure_traj.shape
+        assert protein_structure_traj.shape == (
             noisy_traj_length,
             sample_length,
             37,
             3,
-        ), f"bb_traj shape {bb_traj.shape}"
-        assert aa_traj.shape == (
+        ), f"bb_traj shape {protein_structure_traj.shape}"
+        assert protein_aa_traj.shape == (
             noisy_traj_length,
             sample_length,
-        ), f"aa_traj shape {aa_traj.shape}"
+        ), f"aa_traj shape {protein_aa_traj.shape}"
 
-        models_traj_length = model_bb_traj.shape[0]
-        assert model_bb_traj.shape == (
+        models_traj_length = model_structure_traj.shape[0]
+        assert model_structure_traj.shape == (
             models_traj_length,
             sample_length,
             37,
             3,
-        ), f"model_traj shape {model_bb_traj.shape}"
+        ), f"model_traj shape {model_structure_traj.shape}"
         assert model_aa_traj.shape == (
             models_traj_length,
             sample_length,
@@ -929,12 +929,12 @@ class FlowModule(LightningModule):
         # Save PDBs, trajectories, and a fasta of the final sequence
         saved_trajectory_files = save_trajectory(
             sample_name=sample_id,
-            sample_atom37=bb_traj[-1],
-            protein_structure_traj=bb_traj,
-            model_structure_traj=model_bb_traj,
+            sample_atom37=protein_structure_traj[-1],
+            protein_structure_traj=protein_structure_traj,
+            model_structure_traj=model_structure_traj,
             diffuse_mask=diffuse_mask,
             output_dir=sample_dir,
-            protein_aa_traj=aa_traj,
+            protein_aa_traj=protein_aa_traj,
             model_aa_traj=model_aa_traj,
             model_logits_traj=model_logits_traj,
             write_trajectories=write_sample_trajectories,
@@ -948,8 +948,8 @@ class FlowModule(LightningModule):
                 sample_name=sample_id,
                 sample_dir=sample_dir,
                 pred_pdb_path=saved_trajectory_files.sample_pdb_path,
-                pred_bb_positions=bb_traj[-1],
-                pred_aa=aa_traj[-1],
+                pred_bb_positions=protein_structure_traj[-1],
+                pred_aa=protein_aa_traj[-1],
                 diffuse_mask=diffuse_mask,
                 res_index=res_index,
                 also_fold_pmpnn_seq=also_fold_pmpnn_seq,

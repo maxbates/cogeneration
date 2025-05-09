@@ -492,7 +492,10 @@ def animate_trajectories(
         limits=camera_limits,
     )
     scat_r = _init_structure_artists(
-        ax_structure_model, positions=model_structure_traj[0], limits=camera_limits
+        ax_structure_model,
+        positions=model_structure_traj[0],
+        diffuse_mask=diffuse_mask,
+        limits=camera_limits,
     )
 
     dynamic_artists = (
@@ -529,8 +532,6 @@ def animate_trajectories(
                 res_colors=res_colors,
             )
             _update_structure_artists(model_structure_traj[timestep - 1], scats=scat_r)
-
-            # update logits + borders
             logits_im.set_data(_rgba_from_logits(model_logits_traj[timestep - 1]))
             for i, r in enumerate(logits_rects):
                 r.set_y(model_aa_traj[timestep - 1, i] - 0.5)

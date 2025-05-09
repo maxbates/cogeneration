@@ -85,7 +85,8 @@ class MotifFactory:
                 length_so_far += scaffold.new_length
             elif re.match(r"^\d+-\d+$", token):  # variable length scaffold e.g. "5-15"
                 scaffold_length = random.randint(
-                    int(token.split("-")[0]), int(token.split("-")[1])
+                    int(token.split("-")[0]),
+                    int(token.split("-")[1] + 1),  # end inclusive
                 )
                 scaffold = Scaffold(
                     start=length_so_far, end=length_so_far, new_length=scaffold_length
@@ -164,7 +165,11 @@ class MotifFactory:
                 seg_end = i - 1
                 # scaffold: randomly scale length of original segment span
                 orig_len = seg_end - seg_start + 1
-                new_len = int(round(orig_len * self.rng.uniform(*random_scale_range)))
+                new_len = (
+                    orig_len
+                    if orig_len <= 5
+                    else int(round(orig_len * self.rng.uniform(*random_scale_range)))
+                )
 
                 # append motif or scaffold segment
                 if current_diff:
@@ -197,8 +202,12 @@ class MotifFactory:
         # final tail segment
         seg_end_inclusive = N - 1
         # scaffold: randomly scale length
-        length = seg_end_inclusive - seg_start + 1
-        new_length = int(round(length * self.rng.uniform(*random_scale_range)))
+        orig_len = seg_end_inclusive - seg_start + 1
+        new_length = (
+            orig_len
+            if orig_len <= 5
+            else int(round(orig_len * self.rng.uniform(*random_scale_range)))
+        )
         if current_diff:
             segments.append(
                 Scaffold(start=seg_start, end=seg_end_inclusive, new_length=new_length)

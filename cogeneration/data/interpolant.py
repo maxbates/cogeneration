@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
+import numpy.typing as npt
 import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment  # noqa
@@ -53,8 +54,8 @@ class SamplingStep:
     tensors should be detached and moved to CPU.
     """
 
-    structure: torch.Tensor  # (batch_size, num_res, 37, 3)  i.e. atom37 representation
-    amino_acids: torch.Tensor  # (batch_size, num_res)
+    structure: torch.Tensor  # (B, N, 37, 3)  i.e. atom37 representation
+    amino_acids: torch.Tensor  # (B, N)
     logits: Optional[torch.Tensor] = None
 
 
@@ -1273,14 +1274,21 @@ class Interpolant:
         }
 
         # Helper function to get atom37 structure from residue frames, only for `res_mask`
-        frames_to_atom37 = lambda trans, rots, psis: to_cpu(
-            all_atom.atom37_from_trans_rot(
-                trans=trans,
-                rots=rots,
-                psi_torsions=psis,
-                res_mask=res_mask,
+        # TODO pass `aatypes` with option get a real atom37 representation rather than just backbone
+        def frames_to_atom37(
+            trans: torch.Tensor,
+            rots: torch.Tensor,
+            aatypes: torch.Tensor,
+            psis: Optional[torch.Tensor],
+        ) -> torch.Tensor:
+            return to_cpu(
+                all_atom.atom37_from_trans_rot(
+                    trans=trans,
+                    rots=rots,
+                    psi_torsions=psis,
+                    res_mask=res_mask,
+                )
             )
-        )
 
         # model_trajectory tracks model outputs
         model_trajectory = SamplingTrajectory(
@@ -1296,7 +1304,9 @@ class Interpolant:
         )
         protein_trajectory.append(
             SamplingStep(
-                structure=frames_to_atom37(trans_0, rotmats_0, psis_0),
+                structure=frames_to_atom37(
+                    trans=trans_0, rots=rotmats_0, aatypes=aatypes_0, psis=psis_0
+                ),
                 amino_acids=to_cpu(aatypes_0),
             )
         )
@@ -1364,10 +1374,14 @@ class Interpolant:
             pred_aatypes_1 = model_out[pbp.pred_aatypes]
             pred_logits_1 = model_out[pbp.pred_logits]
 
+            # clone to values not affected by later masking
             model_trajectory.append(
                 SamplingStep(
                     structure=frames_to_atom37(
-                        pred_trans_1, pred_rotmats_1, pred_psis_1
+                        trans=pred_trans_1,
+                        rots=pred_rotmats_1,
+                        aatypes=pred_aatypes_1,
+                        psis=pred_psis_1,
                     ),
                     amino_acids=to_cpu(pred_aatypes_1),
                     logits=to_cpu(pred_logits_1),
@@ -1453,7 +1467,7 @@ class Interpolant:
                 else None
             )
 
-            # For inpainting, fix motif sequence; set motif structure by interpolating motif toward known t=1.
+            # For inpainting, set motif structure by interpolating motif toward known t=1.
             # TODO(inpainting-fixed) support fixed motifs
             if task == InferenceTask.inpainting:
                 # Sequence is fixed for motifs at t=1
@@ -1471,8 +1485,7 @@ class Interpolant:
                 rotmats_t_2 = mask_blend_3d(
                     rotmats_t_2, rotmats_t_2_motif, diffuse_mask
                 )
-
-                # For psi angles, take an Euler step toward known values
+                # Do the same for angles if defined
                 if psis_t_2 is not None:
                     psi_t_2_motif = self._psi_euler_step(
                         d_t, t_1_tensor, psis_1, pred_psis_1
@@ -1487,7 +1500,12 @@ class Interpolant:
             # Add to trajectory
             protein_trajectory.append(
                 SamplingStep(
-                    structure=frames_to_atom37(trans_t_2, rotmats_t_2, psis_t_2),
+                    structure=frames_to_atom37(
+                        trans=trans_t_2,
+                        rots=rotmats_t_2,
+                        aatypes=aatypes_t_2,
+                        psis=psis_t_2,
+                    ),
                     amino_acids=to_cpu(aatypes_t_2),
                 )
             )
@@ -1521,7 +1539,12 @@ class Interpolant:
 
         model_trajectory.append(
             SamplingStep(
-                structure=frames_to_atom37(pred_trans_1, pred_rotmats_1, pred_psis_1),
+                structure=frames_to_atom37(
+                    trans=pred_trans_1,
+                    rots=pred_rotmats_1,
+                    aatypes=pred_aatypes_1,
+                    psis=pred_psis_1,
+                ),
                 amino_acids=to_cpu(pred_aatypes_1),
                 logits=to_cpu(pred_logits_1),
             )
@@ -1538,11 +1561,8 @@ class Interpolant:
             pred_aatypes_1 = mask_blend_1d(pred_aatypes_1, aatypes_1, diffuse_mask)
             pred_trans_1 = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
             pred_rotmats_1 = mask_blend_3d(pred_rotmats_1, rotmats_1, diffuse_mask)
-            pred_psis_1 = (
-                mask_blend_2d(pred_psis_1, psis_1, diffuse_mask)
-                if pred_psis_1 is not None
-                else None
-            )
+            if pred_psis_1 is not None:
+                pred_psis_1 = mask_blend_2d(pred_psis_1, psis_1, diffuse_mask)
         elif task == InferenceTask.forward_folding:
             pred_logits_1 = logits_1
             pred_aatypes_1 = aatypes_1
@@ -1555,7 +1575,12 @@ class Interpolant:
 
         protein_trajectory.append(
             SamplingStep(
-                structure=frames_to_atom37(pred_trans_1, pred_rotmats_1, pred_psis_1),
+                structure=frames_to_atom37(
+                    trans=pred_trans_1,
+                    rots=pred_rotmats_1,
+                    aatypes=pred_aatypes_1,
+                    psis=pred_psis_1,
+                ),
                 amino_acids=to_cpu(pred_aatypes_1),
             )
         )

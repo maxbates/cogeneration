@@ -45,9 +45,9 @@ class TestEvalRunner:
     def test_public_weights_sampling(self, public_weights_path, tmp_path):
         cfg_uninterpolated = Config.public_multiflow()
 
-        # specify task
-        cfg_uninterpolated.inference.task = InferenceTask.unconditional
-        # cfg_uninterpolated.inference.task = InferenceTask.inpainting
+        # specify task (note public multiflow not trained to support inpainting)
+        # cfg_uninterpolated.inference.task = InferenceTask.unconditional
+        cfg_uninterpolated.inference.task = InferenceTask.inpainting
         # stochastic paths (NOTE public multiflow not trained to support, but can force)
         cfg_uninterpolated.shared.stochastic = False
         # set up predict_dir to tmp_path
