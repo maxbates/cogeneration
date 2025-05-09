@@ -41,18 +41,18 @@ class TestEvalRunner:
         )
 
     # This is a slow test, because it actually samples with real model + many timesteps; can run manually.
-    # @pytest.mark.skip
+    @pytest.mark.skip
     def test_public_weights_sampling(self, public_weights_path, tmp_path):
         cfg = Config.public_multiflow()
 
         # specify task (note public multiflow not trained to support inpainting)
-        # cfg_uninterpolated.inference.task = InferenceTask.unconditional
+        # cfg.inference.task = InferenceTask.unconditional
         cfg.inference.task = InferenceTask.inpainting
         # stochastic paths (NOTE public multiflow not trained to support, but can force)
         cfg.shared.stochastic = True
         cfg.inference.interpolant.trans.stochastic_noise_intensity = 0
         cfg.inference.interpolant.rots.stochastic_noise_intensity = 0
-        cfg.inference.interpolant.aatypes.stochastic_noise_intensity = 0.05
+        cfg.inference.interpolant.aatypes.stochastic_noise_intensity = 0
         # set up predict_dir to tmp_path
         cfg.inference.predict_dir = str(tmp_path / "inference")
         # control number of timesteps. e.g. use 1 to debug folding validation / plotting

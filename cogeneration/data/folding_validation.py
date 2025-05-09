@@ -72,7 +72,8 @@ class FoldingValidator:
         pred_bb_positions: npt.NDArray,  # (N, n_bb_atoms, 3) where n_bb_atoms in {3, 5}
         pred_aa: npt.NDArray,  # (N)
         diffuse_mask: npt.NDArray,  # (N)
-        res_index: npt.NDArray,  # (N)
+        chain_idx: npt.NDArray,  # (N)
+        res_idx: npt.NDArray,  # (N)
         true_bb_positions: Optional[npt.NDArray],  # (N, 37, 3), motifs for inpainting
         true_aa: Optional[npt.NDArray],  # (N)
         also_fold_pmpnn_seq: bool = True,  # also fold inverse-folded sequences
@@ -145,6 +146,8 @@ class FoldingValidator:
                 prot_pos=true_bb_positions,
                 file_path=true_pdb_path,
                 aatype=true_aa,
+                chain_idx=chain_idx,
+                res_idx=res_idx,
             )
 
         # Write fasta for true sequence, if provided
@@ -153,15 +156,13 @@ class FoldingValidator:
             true_fasta_path = os.path.join(sample_dir, OutputFileName.true_sequence_fa)
             true_aa_seq = "".join([restypes_with_x[x] for x in true_aa])
             with open(true_fasta_path, "w") as f:
-                f.write(f">{sample_name}\n")
-                f.write(true_aa_seq)
+                f.write(f">{sample_name}\n{true_aa_seq}\n")
 
         # Write fasta files for predicted sequences
         sample_fasta_path = os.path.join(sample_dir, OutputFileName.sample_sequence_fa)
         pred_aa_seq = "".join([restypes_with_x[x] for x in pred_aa])
         with open(sample_fasta_path, "w") as f:
-            f.write(f">{sample_name}\n")
-            f.write(pred_aa_seq)
+            f.write(f">{sample_name}\n{pred_aa_seq}\n")
 
         # Assessment depends on the task:
         #
@@ -370,7 +371,7 @@ class FoldingValidator:
         top_sample.update(
             calc_ca_ca_metrics(
                 ca_pos=pred_bb_positions[:, residue_constants.atom_order["CA"]],
-                residue_index=res_index,
+                residue_index=res_idx,
             )
         )
         # TODO(inpainting) - calculate scaffold-specific metrics for secondary structure, clashes
@@ -757,8 +758,7 @@ class FoldingValidator:
             pdb_file_path=sample_pdb_path,
             pdb_name=pdb_name,
         )
-        sample_bb_pos = sample_feats[dpc.atom_positions][:, :3]
-        sample_bb_pos = sample_feats[dpc.atom_positions][:, :3]  # (N, 3, 3)
+        sample_bb_pos = sample_feats[dpc.atom_positions][:, :3, :]  # (N, 3, 3)
 
         num_res = sample_bb_pos.shape[0]
         res_mask = torch.ones(num_res)
@@ -792,7 +792,7 @@ class FoldingValidator:
             }
 
             # Calculate RMSD to generated sample
-            folded_bb_pos = folded_feats[dpc.atom_positions][:, :3]  # (N, 3, 3)
+            folded_bb_pos = folded_feats[dpc.atom_positions][:, :3, :]  # (N, 3, 3)
             bb_rmsd = _calc_bb_rmsd(res_mask, sample_bb_pos, folded_bb_pos)
             sample_metrics[MetricName.bb_rmsd_folded] = bb_rmsd
             sample_metrics[MetricName.is_designable] = bb_rmsd <= 2.0

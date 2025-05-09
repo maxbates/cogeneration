@@ -39,6 +39,7 @@ class SavedTrajectory:
     """
 
     sample_pdb_path: str  # OutputFileName.sample_pdb
+    sample_pdb_backbone_path: str  # OutputFileName.sample_pdb_backbone
     traj_path: Optional[str] = None  # OutputFileName.bb_traj_pdb
     x0_traj_path: Optional[str] = None  # OutputFileName.x0_traj_pdb
     aa_traj_fasta_path: Optional[str] = None  # OutputFileName.aa_traj_fa
@@ -567,6 +568,8 @@ def save_trajectory(
     protein_structure_traj: npt.NDArray,  # (noisy_T, N, 37, 3)
     model_structure_traj: npt.NDArray,  # (clean_T, N, 37, 3)
     diffuse_mask: npt.NDArray,  # (N,)
+    chain_idx: npt.NDArray,  # (N,)
+    res_idx: npt.NDArray,  # (N,)
     output_dir: str,
     protein_aa_traj: Optional[npt.NDArray] = None,  # (noisy_T, N)
     model_aa_traj: Optional[npt.NDArray] = None,  # (clean_T, N)
@@ -618,6 +621,9 @@ def save_trajectory(
 
     diffuse_mask = diffuse_mask.astype(bool)
     sample_pdb_path = os.path.join(output_dir, OutputFileName.sample_pdb)
+    sample_pdb_backbone_path = os.path.join(
+        output_dir, OutputFileName.sample_pdb_backbone
+    )
 
     noisy_traj_length, num_res, _, _ = protein_structure_traj.shape
     model_traj_length = model_structure_traj.shape[0]
@@ -639,11 +645,25 @@ def save_trajectory(
         b_factors=b_factors,
         no_indexing=True,
         aatype=protein_aa_traj[-1] if protein_aa_traj is not None else None,
+        chain_idx=chain_idx,
+        res_idx=res_idx,
+    )
+
+    sample_pdb_backbone_path = write_prot_to_pdb(
+        sample_atom37,
+        file_path=sample_pdb_backbone_path,
+        b_factors=b_factors,
+        no_indexing=True,
+        aatype=protein_aa_traj[-1] if protein_aa_traj is not None else None,
+        chain_idx=chain_idx,
+        res_idx=res_idx,
+        backbone_only=True,
     )
 
     if not write_trajectories:
         return SavedTrajectory(
             sample_pdb_path=sample_pdb_path,
+            sample_pdb_backbone_path=sample_pdb_backbone_path,
         )
 
     prot_traj_path = os.path.join(output_dir, OutputFileName.bb_traj_pdb)
@@ -654,6 +674,8 @@ def save_trajectory(
         b_factors=b_factors,
         no_indexing=True,
         aatype=protein_aa_traj,
+        chain_idx=chain_idx,
+        res_idx=res_idx,
     )
     x0_traj_path = write_prot_to_pdb(
         model_structure_traj,
@@ -661,6 +683,8 @@ def save_trajectory(
         b_factors=b_factors,
         no_indexing=True,
         aatype=model_aa_traj,
+        chain_idx=chain_idx,
+        res_idx=res_idx,
     )
 
     log_time("structure trajectory PDBs")
@@ -701,6 +725,7 @@ def save_trajectory(
 
     return SavedTrajectory(
         sample_pdb_path=sample_pdb_path,
+        sample_pdb_backbone_path=sample_pdb_backbone_path,
         traj_path=prot_traj_path,
         x0_traj_path=x0_traj_path,
         aa_traj_fasta_path=aa_traj_fasta_path,

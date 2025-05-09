@@ -23,6 +23,7 @@ import re
 from typing import Any, Mapping, Optional, Union
 
 import numpy as np
+import numpy.typing as npt
 from Bio.PDB import PDBParser
 from Bio.PDB.Chain import Chain
 
@@ -170,7 +171,7 @@ def _chain_end(atom_index, end_resname, chain_name, residue_index) -> str:
     )
 
 
-def to_pdb(prot: Protein, model=1, add_end=True) -> str:
+def prot_to_pdb(prot: Protein, model=1, add_end=True) -> str:
     """Converts a `Protein` instance to a PDB string.
 
     Args:
@@ -283,39 +284,48 @@ def ideal_atom_mask(prot: Protein) -> np.ndarray:
     return residue_constants.STANDARD_ATOM_MASK[prot.aatype]
 
 
-def create_full_prot(
-    atom37: np.ndarray,
-    atom37_mask: np.ndarray,
-    aatype=None,
-    b_factors=None,
+def prot_from_atom37(
+    atom37: npt.NDArray,
+    atom37_mask: npt.NDArray,
+    aatype: Optional[npt.NDArray] = None,
+    chain_idx: Optional[npt.NDArray] = None,
+    res_idx: Optional[npt.NDArray] = None,
+    b_factors: Optional[npt.NDArray] = None,
 ):
     assert atom37.ndim == 3
     assert atom37.shape[-1] == 3
     assert atom37.shape[-2] == 37
     n = atom37.shape[0]
-    residue_index = np.arange(n)
-    chain_index = np.zeros(n)
-    if b_factors is None:
-        b_factors = np.zeros([n, 37])
+
     if aatype is None:
         aatype = np.zeros(n, dtype=int)
+    if res_idx is None:
+        res_idx = np.arange(1, n + 1)
+    if chain_idx is None:
+        chain_idx = np.ones(n)
+    if b_factors is None:
+        b_factors = np.zeros([n, 37])
+
     return Protein(
         atom_positions=atom37,
         atom_mask=atom37_mask,
         aatype=aatype,
-        residue_index=residue_index,
-        chain_index=chain_index,
+        residue_index=res_idx,
+        chain_index=chain_idx,
         b_factors=b_factors,
     )
 
 
 def write_prot_to_pdb(
-    prot_pos: np.ndarray,
+    prot_pos: npt.NDArray,  # (N, 37, 3) or (T, N, 37, 3) if trajectory
     file_path: str,
-    aatype: np.ndarray = None,
+    aatype: Optional[npt.NDArray] = None,
+    chain_idx: Optional[npt.NDArray] = None,
+    res_idx: Optional[npt.NDArray] = None,
+    b_factors: Optional[npt.NDArray] = None,
     overwrite=False,
     no_indexing=False,
-    b_factors=None,
+    backbone_only: bool = False,
 ) -> str:
     """
     Writes a protein (3D tensor) or a trajectory (N steps, 3D tensor) to a PDB file.
@@ -352,19 +362,35 @@ def write_prot_to_pdb(
         if prot_pos.ndim == 4:
             # Trajectory
             for t, pos37 in enumerate(prot_pos):
-                atom37_mask = np.sum(np.abs(pos37), axis=-1) > 1e-7
-                prot = create_full_prot(
-                    pos37, atom37_mask, aatype=aatype[t], b_factors=b_factors
+                atom37_mask = np.sum(np.abs(pos37), axis=-1) > 1e-7  # (N, 37)
+                if backbone_only:
+                    atom37_mask[:, 3:] = False
+
+                prot = prot_from_atom37(
+                    pos37,
+                    atom37_mask,
+                    aatype=aatype[t],
+                    chain_idx=chain_idx,
+                    res_idx=res_idx,
+                    b_factors=b_factors,
                 )
-                pdb_prot = to_pdb(prot, model=t + 1, add_end=False)
+                pdb_prot = prot_to_pdb(prot, model=t + 1, add_end=False)
                 f.write(pdb_prot)
         elif prot_pos.ndim == 3:
             # Single frame
-            atom37_mask = np.sum(np.abs(prot_pos), axis=-1) > 1e-7
-            prot = create_full_prot(
-                prot_pos, atom37_mask, aatype=aatype, b_factors=b_factors
+            atom37_mask = np.sum(np.abs(prot_pos), axis=-1) > 1e-7  # (N, 37)
+            if backbone_only:
+                atom37_mask[:, 3:] = False
+
+            prot = prot_from_atom37(
+                prot_pos,
+                atom37_mask,
+                aatype=aatype,
+                chain_idx=chain_idx,
+                res_idx=res_idx,
+                b_factors=b_factors,
             )
-            pdb_prot = to_pdb(prot, model=1, add_end=False)
+            pdb_prot = prot_to_pdb(prot, model=1, add_end=False)
             f.write(pdb_prot)
         else:
             raise ValueError(f"Invalid positions shape {prot_pos.shape}")

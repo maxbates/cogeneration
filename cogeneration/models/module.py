@@ -253,20 +253,25 @@ class FlowModule(LightningModule):
         n_bb_atoms = 5 if self.cfg.model.predict_psi_torsions else 3
 
         # Ground truth labels
-        gt_trans_1 = batch[bp.trans_1]
-        gt_rotmats_1 = batch[bp.rotmats_1]
+        gt_trans_1 = batch[bp.trans_1]  # (B, N, 3)
+        gt_rotmats_1 = batch[bp.rotmats_1]  # (B, N, 3, 3)
         gt_rot_vf = so3_utils.calc_rot_vf(
             mat_t=batch[nbp.rotmats_t],
             mat_1=gt_rotmats_1.type(torch.float32),
         )
-        gt_aatypes_1 = batch[bp.aatypes_1]
+
+        gt_aatypes_1 = batch[bp.aatypes_1]  # (B, N)
+        # torsions (B, N, 7, 2) -> (B, N, 2)
         gt_psi_torsions_1 = batch[bp.torsion_angles_sin_cos_1][..., 2, :]
-        gt_bb_atoms, atom37_mask, _, _ = all_atom.compute_backbone(
-            rigid=all_atom.create_rigid(gt_rotmats_1, gt_trans_1),
+        gt_bb_atoms, atom37_mask, _, _ = all_atom.rigid_to_atom37(
+            rigid=all_atom.create_rigid(rots=gt_rotmats_1, trans=gt_trans_1),
             psi_torsions=gt_psi_torsions_1,
+            aatype=gt_aatypes_1.int(),
         )
-        gt_bb_atoms = gt_bb_atoms[:, :, :n_bb_atoms]
-        atom37_mask = atom37_mask[:, :, :n_bb_atoms]
+        # atoms (B, N, 37, 3) -> (B, N, n_bb_atoms, 3)
+        gt_bb_atoms = gt_bb_atoms[..., :n_bb_atoms, :]
+        # mask (B, N, 37) -> (B, N, n_bb_atoms)
+        atom37_mask = atom37_mask[..., :n_bb_atoms]
 
         # Timestep used for normalization.
         r3_t = batch[nbp.r3_t]  # (B, 1)
@@ -342,9 +347,11 @@ class FlowModule(LightningModule):
         # TODO(model) consider explicit rotation loss (see FoldFlow2)
 
         # Backbone atom loss
-        pred_bb_atoms = all_atom.to_atom37(pred_trans_1, pred_rotmats_1, pred_psi_1)[
-            :, :, :n_bb_atoms
-        ]
+        pred_bb_atoms = all_atom.atom37_from_trans_rot(
+            trans=pred_trans_1,
+            rots=pred_rotmats_1,
+            psi_torsions=pred_psi_1,
+        )[..., :n_bb_atoms, :]
         gt_bb_atoms *= training_cfg.bb_atom_scale / r3_norm_scale[..., None]
         pred_bb_atoms *= training_cfg.bb_atom_scale / r3_norm_scale[..., None]
         bb_atom_loss_mask = atom37_mask * loss_mask[..., None]
@@ -630,8 +637,9 @@ class FlowModule(LightningModule):
                     model_structure_traj=model_bb_trajs[i],
                     model_aa_traj=model_aa_trajs[i],
                     model_logits_traj=model_logits_trajs[i],
-                    diffuse_mask=to_numpy(diffuse_mask)[0],
-                    res_index=to_numpy(batch[bp.res_idx])[i],
+                    diffuse_mask=to_numpy(diffuse_mask[i]),
+                    chain_idx=to_numpy(batch[bp.chain_idx][i]),
+                    res_idx=to_numpy(batch[bp.res_idx][i]),
                     true_bb_pos=None,  # codesign  # TODO(inpainting) define
                     true_aa=None,  # codesign  # TODO(inpainting) define
                     also_fold_pmpnn_seq=True,  # always fold during validation
@@ -771,6 +779,8 @@ class FlowModule(LightningModule):
                 rots=rotmats_1,
                 psi_torsions=psi_torsions_1,
                 res_mask=true_mask,
+                aatype=true_aatypes,
+                unknown_to_alanine=True,
             )
 
             # Ensure only have one valid structure for the batch, extract it
@@ -848,7 +858,8 @@ class FlowModule(LightningModule):
                 model_aa_traj=model_aa_trajs[i],
                 model_logits_traj=model_logits_trajs[i],
                 diffuse_mask=to_numpy(diffuse_mask[i]),
-                res_index=to_numpy(batch[bp.res_idx][i]),
+                chain_idx=to_numpy(batch[bp.chain_idx][i]),
+                res_idx=to_numpy(batch[bp.res_idx][i]),
                 true_bb_pos=to_numpy(true_bb_pos),
                 true_aa=to_numpy(true_aatypes),
                 also_fold_pmpnn_seq=self.cfg.inference.also_fold_pmpnn_seq,
@@ -872,7 +883,8 @@ class FlowModule(LightningModule):
         model_aa_traj: npt.NDArray,
         model_logits_traj: npt.NDArray,
         diffuse_mask: npt.NDArray,
-        res_index: npt.NDArray,
+        chain_idx: npt.NDArray,
+        res_idx: npt.NDArray,
         true_bb_pos: Optional[npt.NDArray],  # if relevant
         true_aa: Optional[npt.NDArray],  # if relevant
         also_fold_pmpnn_seq: bool,
@@ -933,6 +945,8 @@ class FlowModule(LightningModule):
             protein_structure_traj=protein_structure_traj,
             model_structure_traj=model_structure_traj,
             diffuse_mask=diffuse_mask,
+            chain_idx=chain_idx,
+            res_idx=res_idx,
             output_dir=sample_dir,
             protein_aa_traj=protein_aa_traj,
             model_aa_traj=model_aa_traj,
@@ -951,7 +965,8 @@ class FlowModule(LightningModule):
                 pred_bb_positions=protein_structure_traj[-1],
                 pred_aa=protein_aa_traj[-1],
                 diffuse_mask=diffuse_mask,
-                res_index=res_index,
+                chain_idx=chain_idx,
+                res_idx=res_idx,
                 also_fold_pmpnn_seq=also_fold_pmpnn_seq,
                 true_bb_positions=true_bb_pos,
                 true_aa=true_aa,

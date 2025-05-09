@@ -184,6 +184,10 @@ def mock_folding_validation(tmp_path):
                 print(
                     f"WARNING. mocks currently assume unconditional generation. May impact outputs. Got {cfg.inference.task}"
                 )
+            if len(torch.unique(batch[bp.chain_idx])) > 1:
+                print(
+                    f"WARNING. mocks currently assume single chain generation. May impact outputs. Got {len(torch.unique(batch[bp.chain_idx]))} chains"
+                )
 
             # determine size of batch and residues, handling conditional and unconditional batches
             batch_size, num_res = batch[bp.res_mask].shape
@@ -222,6 +226,8 @@ def mock_folding_validation(tmp_path):
                             trans=batch[bp.trans_1],
                             rots=batch[bp.rotmats_1],
                             psi_torsions=batch[bp.torsion_angles_sin_cos_1][..., 2, :],
+                            aatype=batch[bp.aatypes_1],
+                            unknown_to_alanine=True,
                         )
                         .cpu()
                         .detach()

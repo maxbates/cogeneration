@@ -675,7 +675,7 @@ class Interpolant:
             raise ValueError(f"Invalid schedule: {self.cfg.rots.sample_schedule}")
 
     def _trans_vector_field(
-        self, t: torch.Tensor, trans_1: torch.Tensor, trans_t: torch.Tensor
+        self, t: float, trans_1: torch.Tensor, trans_t: torch.Tensor
     ):
         if self.cfg.trans.sample_schedule == InterpolantTranslationsScheduleEnum.linear:
             trans_vf = (trans_1 - trans_t) / (1 - t)
@@ -700,7 +700,7 @@ class Interpolant:
     def _trans_euler_step(
         self,
         d_t: float,
-        t: torch.Tensor,  # (B, 1)
+        t: float,
         trans_1: torch.Tensor,  # (B, N, 3)
         trans_t: torch.Tensor,  # (B, N, 3)
         chain_idx: torch.Tensor,  # (B, N)
@@ -716,7 +716,7 @@ class Interpolant:
                 chain_idx=chain_idx
             )  # (B, N, 3) in Angstroms
             sigma_t = self._compute_sigma_t(
-                t.squeeze(1),  # (B,)
+                torch.ones(trans_1.shape[0]) * t,  # (B)
                 scale=self.cfg.trans.stochastic_noise_intensity,
             )
             trans_next += base_noise * math.sqrt(d_t) * sigma_t[..., None, None]
@@ -726,7 +726,7 @@ class Interpolant:
     def _rots_euler_step(
         self,
         d_t: float,
-        t: torch.Tensor,  # (B, 1)
+        t: float,
         rotmats_1: torch.Tensor,  # (B, N, 3, 3)
         rotmats_t: torch.Tensor,  # (B, N, 3, 3)
     ) -> torch.Tensor:
@@ -746,7 +746,7 @@ class Interpolant:
             num_batch, num_res, _, _ = rotmats_t.shape
 
             sigma_t = self._compute_sigma_t(
-                t.squeeze(1),  # t is (B, 1), we need (B,)
+                torch.ones(num_batch) * t,  # (B)
                 scale=self.cfg.rots.stochastic_noise_intensity,
             ) * math.sqrt(
                 d_t
@@ -764,7 +764,7 @@ class Interpolant:
     def _psi_euler_step(
         self,
         d_t: float,
-        t: torch.Tensor,  # (B, 1)
+        t: float,
         psi_1: torch.Tensor,  # (B, N, 2)
         psi_t: torch.Tensor,  # (B, N, 2)
     ) -> torch.Tensor:
@@ -781,15 +781,15 @@ class Interpolant:
             # σ_t = σ(t) · √dt with σ(t)=intensity·√(t(1-t))
             sigma_t = (
                 self._compute_sigma_t(
-                    t.squeeze(1),  # (B,)
+                    torch.ones(psi_1.shape[0]) * t,  # (B,)
                     scale=self.cfg.trans.stochastic_noise_intensity,
                 )
-                * math.sqrt(d_t)  # shape (B,)
+                * math.sqrt(d_t)
             ).unsqueeze(
                 1
             )  # (B, 1)
 
-            psi_next = psi_next + torch.randn_like(psi_next) * sigma_t
+            psi_next = psi_next + torch.randn_like(psi_next) * sigma_t[..., None]
 
         # wrap back into (-π, π]
         psi_next = (psi_next + np.pi) % (2 * np.pi) - np.pi
@@ -1295,7 +1295,6 @@ class Interpolant:
                 raise ValueError(f"Unknown task {task}")
 
         # Helper function to get atom37 structure from residue frames, only for `res_mask`
-        # TODO pass `aatypes` with option get a real atom37 representation rather than just backbone
         def frames_to_atom37(
             trans: torch.Tensor,
             rots: torch.Tensor,
@@ -1307,7 +1306,9 @@ class Interpolant:
                     trans=trans,
                     rots=rots,
                     psi_torsions=psis,
+                    aatype=aatypes,
                     res_mask=res_mask,
+                    unknown_to_alanine=True,  # show UNK residues as alanine
                 )
             )
 
@@ -1469,21 +1470,19 @@ class Interpolant:
             t_1_tensor = torch.ones((num_batch, 1), device=self._device) * t_1
             trans_t_2 = self._trans_euler_step(
                 d_t=d_t,
-                t=t_1_tensor,
+                t=t_1,
                 trans_1=pred_trans_1,
                 trans_t=trans_t_1,
                 chain_idx=chain_idx,
             )
             rotmats_t_2 = self._rots_euler_step(
-                d_t=d_t, t=t_1_tensor, rotmats_1=pred_rotmats_1, rotmats_t=rotmats_t_1
+                d_t=d_t, t=t_1, rotmats_1=pred_rotmats_1, rotmats_t=rotmats_t_1
             )
             aatypes_t_2 = self._aatypes_euler_step(
                 d_t=d_t, t=t_1, logits_1=pred_logits_1, aatypes_t=aatypes_t_1
             )
             psis_t_2 = (
-                self._psi_euler_step(
-                    d_t=d_t, t=t_1_tensor, psi_1=pred_psis_1, psi_t=psis_t_1
-                )
+                self._psi_euler_step(d_t=d_t, t=t_1, psi_1=pred_psis_1, psi_t=psis_t_1)
                 if pred_psis_1 is not None
                 else None
             )
@@ -1496,10 +1495,10 @@ class Interpolant:
 
                 # Get interpolated values for motif translations and rotations
                 trans_t_2_motif = self._trans_euler_step(
-                    d_t, t_1_tensor, trans_1, trans_t_1, chain_idx=chain_idx
+                    d_t, t=t_1, trans_1=trans_1, trans_t=trans_t_1, chain_idx=chain_idx
                 )
                 rotmats_t_2_motif = self._rots_euler_step(
-                    d_t, t_1_tensor, rotmats_1, rotmats_t_1
+                    d_t, t=t_1, rotmats_1=rotmats_1, rotmats_t=rotmats_t_1
                 )
                 # Set motif positions to interpolated values
                 trans_t_2 = mask_blend_2d(trans_t_2, trans_t_2_motif, diffuse_mask)
@@ -1509,13 +1508,14 @@ class Interpolant:
                 # Do the same for angles if defined
                 if psis_t_2 is not None:
                     psi_t_2_motif = self._psi_euler_step(
-                        d_t, t_1_tensor, psis_1, pred_psis_1
+                        d_t, t=t_1, psi_1=psis_1, psi_t=pred_psis_1
                     )
                     psis_t_2 = mask_blend_2d(psis_t_2, psi_t_2_motif, diffuse_mask)
 
             # Center diffused residues to maintain translation invariance
             # Definitely should center if inpainting or stochastic, but might as well if unconditional too
             # TODO(inpainting-fixed) keep fixed motifs centered, so condition remains the same (learn scaffold drift)
+            #   The motifs vs structure @ t will have different centers of mass.
             trans_t_2 -= batch_center_of_mass(trans_t_2, mask=res_mask)[:, None]
 
             # Add to trajectory

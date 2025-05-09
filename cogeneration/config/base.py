@@ -784,8 +784,7 @@ class ExperimentTrainingConfig(BaseClassConfig):
     mask_plddt: bool = True
     bb_atom_scale: float = 0.1
     trans_scale: float = 0.1
-    aatypes_loss_weight: float = 0.25  # default 0.0 in multiflow
-    aatypes_label_smoothing: float = 0.0  # TODO drop
+    aatypes_loss_weight: float = 0.5  # default 0.0 in multiflow
     aatypes_loss_mean_or_sum: str = "mean"
     aatypes_loss_use_likelihood_weighting: bool = False
     translation_loss_weight: float = 2.0

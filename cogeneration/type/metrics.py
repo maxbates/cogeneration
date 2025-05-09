@@ -94,6 +94,7 @@ class OutputFileName(StrEnum):
 
     # trajectory
     sample_pdb = "sample.pdb"
+    sample_pdb_backbone = "sample_bb.pdb"
     bb_traj_pdb = "bb_traj.pdb"
     x0_traj_pdb = "x0_traj.pdb"
     aa_traj_fa = "aa_traj.fasta"

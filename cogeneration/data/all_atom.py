@@ -17,19 +17,6 @@ ATOM_MASK = torch.tensor(residue_constants.restype_atom14_mask)
 GROUP_IDX = torch.tensor(residue_constants.restype_atom14_to_rigid_group)
 
 
-def to_atom37(
-    trans: torch.Tensor,
-    rots: torch.Tensor,
-    psi_torsions: Optional[torch.Tensor] = None,
-):
-    num_batch, num_res, _ = trans.shape
-    final_atom37 = compute_backbone(
-        create_rigid(rots, trans),
-        psi_torsions=psi_torsions,
-    )[0]
-    return final_atom37
-
-
 def torsion_angles_to_frames(
     r: Rigid,
     alpha: torch.Tensor,
@@ -153,8 +140,10 @@ def frames_to_atom14_pos(
     return pred_positions
 
 
-def compute_backbone(
-    rigid: Rigid, psi_torsions: Optional[torch.Tensor] = None
+def rigid_to_atom37(
+    rigid: Rigid,
+    psi_torsions: Optional[torch.Tensor] = None,  # (B, N, 2)
+    aatype: Optional[torch.Tensor] = None,  # (B, N)  - int or long
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the backbone atoms from the rigid groups and torsion angles.
@@ -164,12 +153,13 @@ def compute_backbone(
     if psi_torsions is None:
         # rigid shape is (B, N), add one dimension for 2 angles (i.e. 1 torsion)
         psi_torsions = torch.zeros(rigid.shape[:] + (2,), device=rigid.device)
+    if aatype is None:
+        aatype = torch.zeros(rigid.shape, device=rigid.device).int()
 
     torsion_angles = torch.tile(
         psi_torsions[..., None, :],
         tuple([1 for _ in range(len(rigid.shape))]) + (7, 1),
     )
-    aatype = torch.zeros(rigid.shape, device=rigid.device).long()
 
     all_frames = torsion_angles_to_frames(
         r=rigid,
@@ -178,13 +168,49 @@ def compute_backbone(
     )
     atom14_pos = frames_to_atom14_pos(all_frames, aatype)
     atom37_bb_pos = torch.zeros(rigid.shape + (37, 3), device=rigid.device)
+    atom37_bb_pos[..., :14, :] = atom14_pos
     # atom14 bb order = ['N', 'CA', 'C', 'O', 'CB']
     # atom37 bb order = ['N', 'CA', 'C', 'CB', 'O']
-    atom37_bb_pos[..., :3, :] = atom14_pos[..., :3, :]
     atom37_bb_pos[..., 3, :] = atom14_pos[..., 4, :]
     atom37_bb_pos[..., 4, :] = atom14_pos[..., 3, :]
     atom37_mask = torch.any(atom37_bb_pos, axis=-1)
     return atom37_bb_pos, atom37_mask, aatype, atom14_pos
+
+
+def atom37_from_trans_rot(
+    trans: torch.Tensor,  # (B, N, 3)
+    rots: torch.Tensor,  # (B, N, 3, 3)
+    psi_torsions: Optional[torch.Tensor] = None,  # (B, N, 2)
+    aatype: Optional[torch.Tensor] = None,  # (B, N)
+    res_mask: Optional[torch.Tensor] = None,  # (B, N)
+    unknown_to_alanine: bool = True,
+) -> torch.Tensor:
+    """
+    Generate atom37 backbone from translations and rotations.
+    `psi_torsions` is a tensor [*, N, 2] that refines sidechain placement instead of only using the frame.
+    `res_mask` is a tensor [*, N] that indicates which residues are known vs diffused.
+    `unknown_to_alanine` convert UNK to alanine, or residue-specific mask for UNK will be empty and won't show.
+    """
+    if res_mask is None:
+        res_mask = torch.ones([*trans.shape[:-1]], device=trans.device)
+
+    if aatype is None:
+        aatype = torch.zeros([*trans.shape[:-1]], device=trans.device).int()
+    elif unknown_to_alanine:
+        aatype = aatype.clone().int()
+        aatype[aatype == 20] = 0
+
+    atom37 = rigid_to_atom37(
+        rigid=create_rigid(rots, trans),
+        psi_torsions=psi_torsions,
+        aatype=aatype,
+    )[0]
+
+    batch_atom37 = []
+    num_batch = res_mask.shape[0]
+    for i in range(num_batch):
+        batch_atom37.append(adjust_oxygen_pos(atom37[i], pos_is_known=res_mask[i]))
+    return torch.stack(batch_atom37)
 
 
 def calculate_neighbor_angles(R_ac, R_ab):
@@ -231,41 +257,3 @@ def vector_projection(R_ab, P_n):
     a_x_b = torch.sum(R_ab * P_n, dim=-1)
     b_x_b = torch.sum(P_n * P_n, dim=-1)
     return R_ab - (a_x_b / b_x_b)[:, None] * P_n
-
-
-def atom37_from_trans_rot(
-    trans: torch.Tensor,
-    rots: torch.Tensor,
-    psi_torsions: Optional[torch.Tensor] = None,
-    res_mask: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    Generate atom37 backbone from translations and rotations.
-    `psi_torsions` is a tensor [*, N, 2] that refines sidechain placement instead of only using the frame.
-    `res_mask` is a tensor [*, N] that indicates which residues are known vs diffused.
-    """
-    if res_mask is None:
-        res_mask = torch.ones([*trans.shape[:-1]], device=trans.device)
-    rigids = create_rigid(rots, trans)
-    atom37 = compute_backbone(
-        rigids,
-        psi_torsions=psi_torsions,
-    )[0]
-    batch_atom37 = []
-    num_batch = res_mask.shape[0]
-    for i in range(num_batch):
-        batch_atom37.append(adjust_oxygen_pos(atom37[i], pos_is_known=res_mask[i]))
-    return torch.stack(batch_atom37)
-
-
-def transrot_traj_to_atom37(
-    transrot_traj: torch.Tensor,
-    res_mask: Optional[torch.Tensor] = None,
-):
-    """
-    Generate atom37 backbone trajectory from translations and rotations trajectory (multiple time steps).
-    """
-    atom37_traj = []
-    for trans, rots in transrot_traj:
-        atom37_traj.append(atom37_from_trans_rot(trans, rots, res_mask))
-    return atom37_traj
