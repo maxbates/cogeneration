@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
-import numpy.typing as npt
 import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment  # noqa
@@ -607,16 +606,17 @@ class Interpolant:
         # For other tasks, everything is corrupted i.e. `(diffuse_mask == 1.0).all()`
         #   Though values at t=1 effectively won't be corrupted.
         if task == DataTask.inpainting:
-            corruption_mask_sequence = diffuse_mask
-            # We could check for `diffuse_mask.mean() < 1` and set to `1`, but `res_mask` is basically equivalent.
-            corruption_mask_structure = res_mask
-        else:
-            corruption_mask_sequence = diffuse_mask
-            corruption_mask_structure = diffuse_mask
-
             # TODO(inpainting) update the batch diffuse_mask appropriately, so structure is diffused.
             #   The motif structure should not be set to t=1, but interpolated like the rest of the structure
             #   However, we want to pass a meaningful mask to embed vs. mask to use for backbone updates
+
+            # To handle some rows set to other tasks, we could check for `diffuse_mask.mean() < 1` and set to `1`,
+            # but just using `res_mask` is basically equivalent, because all other tasks diffuse everything.
+            corruption_mask_structure = res_mask
+            corruption_mask_sequence = diffuse_mask
+        else:
+            corruption_mask_structure = diffuse_mask
+            corruption_mask_sequence = diffuse_mask
 
         # Apply corruptions
 
@@ -1142,7 +1142,7 @@ class Interpolant:
         t_nn: Union[Callable[[torch.Tensor], torch.Tensor], Any] = None,
     ) -> Tuple[SamplingTrajectory, SamplingTrajectory]:
         """
-        Generate samples using the learned vector fields.
+        Generate samples by interpolating towards model predictions.
 
         In theory, sampling is fairly straight-forward: integrate over a bunch of time steps.
         However, there is a lot of special handling to:
@@ -1268,6 +1268,7 @@ class Interpolant:
 
             # Translations and rotations will be interpolated, by passing `diffuse_mask = res_mask` to the network
             # (because `diffuse_mask == 0` residues are not updated by backbone update).
+            # We still hold on to our `diffuse_mask` reference to handle explicit motif interpolation.
             # TODO - consider separate `motif_mask` batch prop
             #   so that embeddings can use `motif_mask` to know which positions are motifs,
             #   instead of just pretending the whole thing is being diffused.
@@ -1278,8 +1279,7 @@ class Interpolant:
         if torch.isnan(trans_0).any():
             raise ValueError("NaN in trans_0")
 
-        # Handle `codesign_separate_t`
-        # t=0 values will be fixed to t=1 values throughout where appropriate
+        # Handle `codesign_separate_t` so some domains are fixed to t=1.
         if self.cfg.codesign_separate_t:
             if task == InferenceTask.unconditional:
                 pass
@@ -1333,18 +1333,18 @@ class Interpolant:
             )
         )
 
-        # Set-up time
-        ts = torch.linspace(self.cfg.min_t, 1.0, self.cfg.sampling.num_timesteps)  # cpu
-        t_1 = ts[0]
+        # Set-up time steps
+        ts = torch.linspace(self.cfg.min_t, 1.0, self.cfg.sampling.num_timesteps)
 
-        # We will integrate in a loop over ts (handling the last step after the loop)
-        # t_1 is the current time, t_2 is the next time
-        # t_1 starts at t=0
+        # Set up initial values, where *_t_1 start at t=0 values
         trans_t_1 = trans_0
         rotmats_t_1 = rotmats_0
         psis_t_1 = psis_0
         aatypes_t_1 = aatypes_0
 
+        # We will integrate in a loop over ts (handling the last step after the loop)
+        # t_1 is the current time, t_2 is the next time
+        t_1 = ts[0]
         for t_2 in ts[1:]:
             # update batch values
             batch[nbp.trans_t] = trans_t_1 if self.cfg.trans.corrupt else trans_1

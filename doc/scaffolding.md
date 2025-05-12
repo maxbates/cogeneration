@@ -140,12 +140,62 @@ https://github.com/microsoft/protein-frame-flow
     - [x] Update special-casing logic like for unconditional generation
        - if `(diffuse_mask == 1.0).all()`, need another flag to indicate `aatypes_1` fixed
 
-## Future Work
+- Separate `motif_mask` batch prop
+    - The way we do inpainting with guidance rather than fixed motifs presents a problem.
+        - We need to pass `diffuse_mask` to the model.
+        - `diffuse_mask` determines which residues are updated in backbone update, which we want to be all residues.
+        - `diffuse_mask` is embedded in node / edge networks to denote which residues are being modeled, but we want to denote the motifs properly.
+        - Currently we are overloading `diffuse_mask` for guided inpainting, where residues are explicitly interpolated,
+          because we want it to be 1.0 everywhere for the structure, but masked for the sequence + embeddings.
+    - Current state
+        - Training and sampling don't quite match up for inpainting
+        - interpolant **implicitly** sets `diffuse_mask == 1.0` for structure in `corrupt_batch()` to corrupt structure but then doesn't update the batch prop
+            - the embeddings do get the intended diffuse_mask for scaffolds
+            - but the model only predicts backbone updates to the scaffolds and not the motifs
+            - looks ok for sampling using public multiflow (which wasn't trained for inpainting) but will be problematic when training
+            - try to handle task specific behavior in interpolant `corrupt_batch()`
+                - but really the module needs to handle to hold onto original diffuse_mask, unlike `sample()` which is contained
+            - training does not account for `motif_mask` in losses
+        - `sample()` **explicitly** sets batch prop `diffuse_mask = 1.0` but holds on to the original `diffuse_mask` to handle motif interpolation
+            - the embeddings get a diffuse mask like all other tasks and won't learn to treat motifs differently
+            - convoluted handling to support
+        - Thus the `diffuse_mask` is not aligned between training and sampling
+    - Questions
+        - Do we want to have another batch prop `motif_mask` specific to inpainting, or just try to use `diffuse_mask`?
+        - Do we need to embed both `diffuse_mask` and `motif_mask`, or could we just embed `motif_mask` if available otherwise `diffuse_mask`?
+    - Implementations
+        - Basically, want to keep some logic out of the model and module and focus to the dataset / interpolant, and simplify it
+        - We do a bunch of special handling for inpainting diffuse_mask which hopefully we should be able to simplify.
+        - Separate batch props `diffuse_mask` and `motif_mask`
+            - `diffuse_mask` denotes which residues are corrupted / sampled,
+                - `diffuse_mask` still determines which structure residues are updated, i.e. in backbone update and explicit interpolation
+                - roughly == res_mask for structure but fixed for sequence
+            - `motif_mask` denotes the motifs, consistent across sequence and structure
+                - `motif_mask` will only be used for `inpainting`
+                - for node and edge embeddings `motif_mask` is not required and will only be used when it is available, substituting `diffuse_mask`
+                - `motif_mask` will be used to specify which residues are explicitly modeled
+            - We should be able to drop the special handling of `diffuse_mask` and move construction once to `motif_mask` and use where available
+            - Risks
+                - we don't want to create an orphan batch prop that is irrelevant for other tasks
+                    - Not used in inverse folding or forward folding - whole structure / sequence is in play - or in hallucination
+                    - Also not used for inpainting with fixed motifs - `diffuse_mask` can be set like `motif_mask` because motifs are actually fixed
+                    - We can mostly achieve what we want right now with the current `diffuse_mask` implementation
+                        - The main exception is node / edge embeddings that get a `diffuse_mask` not denoting the motifs
+                - Backwards compatibility with MultiFlow means `motif_mask` could be embedded instead of `diffuse_mask` but can't embed both
+    - TODOs 
+        - [ ] add batch prop
+        - [ ] Add `embed_motif_mask` alongside `embed_diffuse_mask` to node and edge network configs
+        - [ ] generate in dataset for inpainting
+             - [ ] update MotifFactory
+             - [ ] update defining diffuse_mask to be more like `res_mask`
+             - [ ] reset appropriately when rows set to another task
+        - [ ] check exists in interpolant corrupt / sample if inpainting
+        - [ ] interpolant uses `motif_mask` if present for corrupt batch, drop separate corruption masks for structure / sequence
+        - ? module still uses `diffuse_mask` for losses if still predicting for all residues, i.e. non fixed motifs
+        - [ ] update trajectory animation to show `motif_mask` / `diffuse_mask` if not given
 
-- Consider setting separate `diffuse_mask` for sequence and structure explicitly
-    - Currently, the model is taking `diffuse_mask` for the scaffolds only, but the motifs are diffusing at the same time
-    - Might simplify some of the special handling in `corrupt_batch()` and `sample()`...
-    - Want to maintain compatibility with MultiFlow...
+
+## Future Work
 
 - Motif Selection
     - [x] set up to allow other methods. abstract into class.

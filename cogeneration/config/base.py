@@ -515,9 +515,9 @@ class InterpolantConfig(BaseClassConfig):
     min_t: float = 1e-2
     # `codesign_separate_t` allows separate `t` times for rots / trans / aatypes so fixed domains are at ~t=1.
     codesign_separate_t: bool = True
-    # `forward_folding` proportion of samples; requires `codesign_separate_t`
+    # `forward_folding` proportion of codesign samples; requires `codesign_separate_t`
     codesign_forward_fold_prop: float = 0.1  # default 0.1 in public MultiFlow
-    # `inverse_folding` proportion of samples; requires `codesign_separate_t`
+    # `inverse_folding` proportion of codesign samples; requires `codesign_separate_t`
     codesign_inverse_fold_prop: float = 0.1  # default 0.1 in public MultiFlow
     # `inpainting_unconditional_prop` in training converts some `inpainting` to `unconditional` batches.
     inpainting_unconditional_prop: float = 0.2

@@ -461,6 +461,7 @@ class FlowModule(LightningModule):
         ):
             with torch.no_grad():
                 # Perform a model pass, and use predicted translations and aatypes for self-conditioning
+                # TODO make sure this matches `interpolant.sample` implementatoin - maybe move to interpolant
                 model_sc = self.model(noisy_batch)
 
                 noisy_batch[nbp.trans_sc] = mask_blend_2d(
@@ -478,7 +479,7 @@ class FlowModule(LightningModule):
                     mask=noisy_batch[bp.diffuse_mask],
                 )
 
-        # Model pass
+        # Model pass, get losses
         batch_losses = self.model_step(noisy_batch)
 
         # Log the calculated and other losses we want to track
@@ -687,7 +688,7 @@ class FlowModule(LightningModule):
         aatypes_1 = batch[bp.aatypes_1] if bp.aatypes_1 in batch else None
         sample_pdb_name = batch[bp.pdb_name][0] if bp.pdb_name in batch else None
 
-        # `(diffuse_mask == 1.0).all()` for all tasks except inpainting (though loss etc. limited to `res_mask`)
+        # `(diffuse_mask == 1.0).all()` for all tasks except inpainting
         diffuse_mask = batch[bp.diffuse_mask]
 
         # Handle single-sample and missing sample_id

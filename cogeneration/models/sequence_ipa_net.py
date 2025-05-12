@@ -79,7 +79,7 @@ class SequenceIPANet(BaseSequencePredictionNet):
             init_edge_embed=edge_embed,
             node_mask=node_mask,
             edge_mask=edge_mask,
-            diffuse_mask=diffuse_mask,
+            diffuse_mask=diffuse_mask,  # unused; no backbone update
             curr_rigids_nm=curr_rigids_nm,
         )
 
