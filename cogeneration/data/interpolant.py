@@ -709,7 +709,10 @@ class Interpolant:
 
         trans_next = trans_t + trans_vf * d_t
 
-        if self.cfg.trans.stochastic:
+        if (
+            self.cfg.trans.stochastic
+            and self.cfg.trans.stochastic_noise_intensity > 0.0
+        ):
             # Sample from either Gaussian or Harmonic prior (zero‐mean, correct covariance)
             # For harmonic noise, each Brownian increment has covariance J^{-1} (the harmonic prior) instead of identity.
             base_noise = self._trans_noise(
@@ -739,7 +742,7 @@ class Interpolant:
 
         rotmats_next = so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)
 
-        if self.cfg.rots.stochastic:
+        if self.cfg.rots.stochastic and self.cfg.rots.stochastic_noise_intensity > 0.0:
             # Brownian increment: σ(t) · √dt with σ(t)=intensity·√(t(1–t))
             # Sample IGSO(3) noise with a time-independent sigma_t, scaled by sqrt(dt)
             # Add IGSO(3) noise to stay on SO(3).
@@ -777,7 +780,10 @@ class Interpolant:
         psi_next = psi_t + psi_vf * d_t
 
         # HACK piggyback on `trans.stochastic`
-        if self.cfg.trans.stochastic:
+        if (
+            self.cfg.trans.stochastic
+            and self.cfg.trans.stochastic_noise_intensity > 0.0
+        ):
             # σ_t = σ(t) · √dt with σ(t)=intensity·√(t(1-t))
             sigma_t = (
                 self._compute_sigma_t(
@@ -1414,12 +1420,16 @@ class Interpolant:
             if task == InferenceTask.unconditional:
                 pass
             elif task == InferenceTask.inpainting:
-                # TODO(inpainting-fixed) depending on guidance type, set _1 values to t=1 using mask
-                # pred_trans_1 = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
-                # pred_rotmats_1 = mask_blend_3d(pred_rotmats_1, rotmats_1, diffuse_mask)
-                # pred_psis_1 = mask_blend_2d(pred_psis_1, psis_1, diffuse_mask)
+                # fix the logits / sequence
                 pred_logits_1 = mask_blend_2d(pred_logits_1, logits_1, diffuse_mask)
                 pred_aatypes_1 = mask_blend_1d(pred_aatypes_1, aatypes_1, diffuse_mask)
+
+                # For inpainting with guidance, set motif structure to t=1
+                # so that we interpolate toward the known motifs. Also for self-conditioning.
+                pred_trans_1 = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
+                pred_rotmats_1 = mask_blend_3d(pred_rotmats_1, rotmats_1, diffuse_mask)
+                if pred_psis_1 is not None:
+                    pred_psis_1 = mask_blend_2d(pred_psis_1, psis_1, diffuse_mask)
             elif task == InferenceTask.forward_folding:
                 # scale logits during integration, assumes will `softmax`
                 pred_logits_1 = 100.0 * logits_1
@@ -1427,7 +1437,8 @@ class Interpolant:
             elif task == InferenceTask.inverse_folding:
                 pred_trans_1 = trans_1
                 pred_rotmats_1 = rotmats_1
-                pred_psis_1 = psis_1
+                if pred_psis_1 is not None:
+                    pred_psis_1 = psis_1
             else:
                 raise ValueError(f"Unknown task {task}")
 
@@ -1461,30 +1472,13 @@ class Interpolant:
                 else None
             )
 
-            # For inpainting, set motif structure by interpolating motif toward known t=1.
-            # TODO(inpainting-fixed) support fixed motifs
             if task == InferenceTask.inpainting:
+                # Because we already set the motif positions in pred_{trans/rots}_1,
+                # we have already interpolated towards them as guidance.
+                # TODO(inpainting-fixed) to support fixed motifs, fix the t_2 structure motifs.
+
                 # Sequence is fixed for motifs at t=1
                 aatypes_t_2 = mask_blend_1d(aatypes_t_2, aatypes_1, diffuse_mask)
-
-                # Get interpolated values for motif translations and rotations
-                trans_t_2_motif = self._trans_euler_step(
-                    d_t, t=t_1, trans_1=trans_1, trans_t=trans_t_1, chain_idx=chain_idx
-                )
-                rotmats_t_2_motif = self._rots_euler_step(
-                    d_t, t=t_1, rotmats_1=rotmats_1, rotmats_t=rotmats_t_1
-                )
-                # Set motif positions to interpolated values
-                trans_t_2 = mask_blend_2d(trans_t_2, trans_t_2_motif, diffuse_mask)
-                rotmats_t_2 = mask_blend_3d(
-                    rotmats_t_2, rotmats_t_2_motif, diffuse_mask
-                )
-                # Do the same for angles if defined
-                if psis_t_2 is not None:
-                    psi_t_2_motif = self._psi_euler_step(
-                        d_t, t=t_1, psi_1=psis_1, psi_t=pred_psis_1
-                    )
-                    psis_t_2 = mask_blend_2d(psis_t_2, psi_t_2_motif, diffuse_mask)
 
             # Center diffused residues to maintain translation invariance
             # Definitely should center if inpainting or stochastic, but might as well if unconditional too

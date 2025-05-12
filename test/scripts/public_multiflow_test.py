@@ -50,9 +50,9 @@ class TestEvalRunner:
         cfg.inference.task = InferenceTask.inpainting
         # stochastic paths (NOTE public multiflow not trained to support, but can force)
         cfg.shared.stochastic = True
-        cfg.inference.interpolant.trans.stochastic_noise_intensity = 0
-        cfg.inference.interpolant.rots.stochastic_noise_intensity = 0
-        cfg.inference.interpolant.aatypes.stochastic_noise_intensity = 0
+        cfg.inference.interpolant.trans.stochastic_noise_intensity = 0.75
+        cfg.inference.interpolant.rots.stochastic_noise_intensity = 0.5
+        cfg.inference.interpolant.aatypes.stochastic_noise_intensity = 0.25
         # set up predict_dir to tmp_path
         cfg.inference.predict_dir = str(tmp_path / "inference")
         # control number of timesteps. e.g. use 1 to debug folding validation / plotting

@@ -390,14 +390,23 @@ class BaseDataset(Dataset):
     @staticmethod
     def recenter_structure(
         feats: BatchFeatures,
+        mask: Optional[torch.Tensor] = None,
     ):
         """
         Centers the structure to be translation invariant.
-        Note, structure should already be centered on load by `parse_pdb_feats`.
+
+        `mask` defaults to `feats[bp.res_mask]` if not provided.
+        For inpainting, may want `motif_mask`.
+
+        Note, complete structure should already be centered on load by `parse_pdb_feats`.
         """
-        center_of_mass = torch.sum(feats[bp.trans_1], dim=0) / torch.sum(
-            feats[bp.res_mask] + 1e-5
-        )
+        if mask is None:
+            mask = feats[bp.res_mask]
+            trans_1 = feats[bp.trans_1]
+        else:
+            trans_1 = feats[bp.trans_1] * mask[:, None]
+
+        center_of_mass = torch.sum(trans_1, dim=0) / torch.sum(mask + 1e-5)
 
         # # TODO(inpainting-fixed) explicit flag to only consider `diffuse_mask` for centering
         # if (feats[bp.diffuse_mask] == 0).any():
@@ -547,7 +556,7 @@ class BaseDataset(Dataset):
 
         # Update `diffuse_mask` depending on task
         if task == DataTask.hallucination:
-            # diffuse_mask = torch.ones()
+            # use default, `diffuse_mask = torch.ones()`
             pass
         elif task == DataTask.inpainting:
             diffuse_mask = motif_factory.generate_diffuse_mask(
@@ -559,6 +568,7 @@ class BaseDataset(Dataset):
                 rotmats_1=feats[bp.rotmats_1],
                 aatypes_1=feats[bp.aatypes_1],
             )
+            # Note, FrameFlow `diffuse_mask` also requires `plddt_mask == 1.0`, but we don't.
             feats[bp.diffuse_mask] = diffuse_mask
         else:
             raise ValueError(f"Unknown task {task}")
@@ -566,22 +576,24 @@ class BaseDataset(Dataset):
         # Ensure have a valid `diffuse_mask` for modeling
         if torch.sum(feats[bp.diffuse_mask]) == 0:
             feats[bp.diffuse_mask] = torch.ones_like(feats[bp.res_mask])
-        feats[bp.diffuse_mask] = feats[bp.diffuse_mask].float()
+        feats[bp.diffuse_mask] = feats[bp.diffuse_mask].int()
 
-        # For inpainting evaluation (i.e. not training), vary scaffold lengths
-        # Using the `diffuse_mask`, modify the scaffold region lengths, and mask out the scaffolds
-        # i.e. {trans,rots,aatypes}_1 only defined for motif positions
-        if (
-            task == DataTask.inpainting
-            and not is_training
-            and (feats[bp.diffuse_mask] == 0).any()
-        ):
-            segments = motif_factory.generate_segments_from_diffuse_mask(
-                diffuse_mask=feats[bp.diffuse_mask],
-                chain_idx=feats[bp.chain_idx],
-            )
-            # apply segmenting (note, generates new chain_idx)
-            feats = BaseDataset.segment_features(feats=feats, segments=segments)
+        # If we are inpainting and have a `motif_mask`, center. And if evaluating, vary scaffolds.
+        if task == DataTask.inpainting and (feats[bp.diffuse_mask] == 0).any():
+            # Center the motifs using `motif_mask`
+            motif_mask = 1 - feats[bp.diffuse_mask]
+            BaseDataset.recenter_structure(feats, mask=motif_mask)
+
+            # For inpainting evaluation (i.e. not training), vary scaffold lengths
+            # Using the `diffuse_mask`, modify the scaffold region lengths, and mask out the scaffolds
+            # i.e. {trans,rots,aatypes}_1 only defined for motif positions
+            if not is_training:
+                segments = motif_factory.generate_segments_from_diffuse_mask(
+                    diffuse_mask=feats[bp.diffuse_mask],
+                    chain_idx=feats[bp.chain_idx],
+                )
+                # apply segmenting (note, generates new chain_idx)
+                feats = BaseDataset.segment_features(feats=feats, segments=segments)
 
         # Randomize chains and reset residue positions
         BaseDataset.randomize_chains(cfg, feats)

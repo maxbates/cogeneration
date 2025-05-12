@@ -160,6 +160,8 @@ https://github.com/microsoft/protein-frame-flow
             - the embeddings get a diffuse mask like all other tasks and won't learn to treat motifs differently
             - convoluted handling to support
         - Thus the `diffuse_mask` is not aligned between training and sampling
+        - However, it is clear from sampling that we *do* need to provide a better `diffuse_mask` / `motif_mask`, 
+          because sampling for inpainting using public model with `diffuse_mask` set to ones leads to chain breaks.
     - Questions
         - Do we want to have another batch prop `motif_mask` specific to inpainting, or just try to use `diffuse_mask`?
         - Do we need to embed both `diffuse_mask` and `motif_mask`, or could we just embed `motif_mask` if available otherwise `diffuse_mask`?
@@ -188,10 +190,11 @@ https://github.com/microsoft/protein-frame-flow
         - [ ] generate in dataset for inpainting
              - [ ] update MotifFactory
              - [ ] update defining diffuse_mask to be more like `res_mask`
-             - [ ] reset appropriately when rows set to another task
+             - [ ] reset appropriately when rows set to another task for `codesign_separate_t`
         - [ ] check exists in interpolant corrupt / sample if inpainting
         - [ ] interpolant uses `motif_mask` if present for corrupt batch, drop separate corruption masks for structure / sequence
-        - ? module still uses `diffuse_mask` for losses if still predicting for all residues, i.e. non fixed motifs
+        - [ ] module ignores `aatypes` loss in `motif_mask` 
+            - module still uses `diffuse_mask` for structure losses if still predicting for all residues, i.e. non fixed motifs
         - [ ] update trajectory animation to show `motif_mask` / `diffuse_mask` if not given
 
 
