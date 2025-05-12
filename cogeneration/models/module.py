@@ -461,7 +461,6 @@ class FlowModule(LightningModule):
         ):
             with torch.no_grad():
                 # Perform a model pass, and use predicted translations and aatypes for self-conditioning
-                # TODO make sure this matches `interpolant.sample` implementatoin - maybe move to interpolant
                 model_sc = self.model(noisy_batch)
 
                 noisy_batch[nbp.trans_sc] = mask_blend_2d(

@@ -523,6 +523,7 @@ class InterpolantConfig(BaseClassConfig):
     inpainting_unconditional_prop: float = 0.2
     # enable self-conditioning
     self_condition: bool = "${model.edge_features.self_condition}"
+    # during training, portion of time to use self-conditioning (on or off during sampling)
     self_condition_prob: float = 0.5  # 0.5 in public MultiFlow
     # kappa allows scaling rotation t exponentially during sampling
     provide_kappa: bool = True

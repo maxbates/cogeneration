@@ -1208,7 +1208,8 @@ class Interpolant:
         # for inference, all residues under consideration
         res_mask = torch.ones(num_batch, num_res, device=self._device)
 
-        # no self-conditioning during first step sampling, or if self-conditioning disabled
+        # no self-conditioning during first step sampling
+        # if self-conditioning disabled these values will not be updated
         trans_sc = torch.zeros(num_batch, num_res, 3, device=self._device)
         aatypes_sc = torch.zeros(
             num_batch, num_res, self.num_tokens, device=self._device
@@ -1396,7 +1397,6 @@ class Interpolant:
             pred_aatypes_1 = model_out[pbp.pred_aatypes]
             pred_logits_1 = model_out[pbp.pred_logits]
 
-            # clone to values not affected by later masking
             model_trajectory.append(
                 SamplingStep(
                     structure=frames_to_atom37(
@@ -1431,43 +1431,17 @@ class Interpolant:
             else:
                 raise ValueError(f"Unknown task {task}")
 
-            # Update self-conditioning values
+            # Update self-conditioning values using model outputs.
+            # Fixed domains depending on task have already been updated above.
             if self.cfg.self_condition:
-                if task == InferenceTask.unconditional:
-                    batch[nbp.trans_sc] = mask_blend_2d(
-                        pred_trans_1, trans_1, diffuse_mask
-                    )
-                    batch[nbp.aatypes_sc] = mask_blend_2d(
-                        pred_logits_1, logits_1, diffuse_mask
-                    )
-                elif task == InferenceTask.inpainting:
-                    batch[nbp.trans_sc] = mask_blend_2d(
-                        pred_trans_1, trans_1, diffuse_mask
-                    )
-                    batch[nbp.aatypes_sc] = mask_blend_2d(
-                        pred_logits_1, logits_1, diffuse_mask
-                    )
-                elif task == InferenceTask.forward_folding:
-                    batch[nbp.trans_sc] = mask_blend_2d(
-                        pred_trans_1, trans_1, diffuse_mask
-                    )
-                    # sequence fixed for self-conditioning
-                    batch[nbp.aatypes_sc] = logits_1
-                elif task == InferenceTask.inverse_folding:
-                    # matching Multiflow, `trans_sc` not fixed
-                    batch[nbp.trans_sc] = mask_blend_2d(
-                        pred_trans_1, trans_1, diffuse_mask
-                    )
-                    batch[nbp.aatypes_sc] = mask_blend_2d(
-                        pred_logits_1, logits_1, diffuse_mask
-                    )
-                else:
-                    raise ValueError(f"Unknown task {task}")
+                batch[nbp.trans_sc] = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
+                batch[nbp.aatypes_sc] = mask_blend_2d(
+                    pred_logits_1, logits_1, diffuse_mask
+                )
 
             # Take next step, size `d_t` from `t_1` (current value) to `t_2` (toward predicted value)
             # We are at `t_1` with state `{domain}_t_1`. The model predicted `pred_{domain}_1`.
             d_t = t_2 - t_1
-            t_1_tensor = torch.ones((num_batch, 1), device=self._device) * t_1
             trans_t_2 = self._trans_euler_step(
                 d_t=d_t,
                 t=t_1,
