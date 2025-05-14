@@ -40,14 +40,16 @@ class TestFlowModel:
             output = model(batch)
             assert output is not None
 
-    def test_model_torch_compiles(self, mock_cfg, pdb_noisy_batch):
-        model = FlowModel(mock_cfg.model)
-        compiled_model = torch.compile(model)
-        output = compiled_model(pdb_noisy_batch)
-        assert output is not None
-
     def test_model_sequence_ipa_net(self, mock_cfg, pdb_noisy_batch):
         mock_cfg.model.sequence_pred_type = ModelSequencePredictionEnum.sequence_ipa_net
         model = FlowModel(mock_cfg.model)
         output = model(pdb_noisy_batch)
+        assert output is not None
+
+    # require 10s completion time
+    @pytest.mark.timeout(10)
+    def test_model_torch_compiles(self, mock_cfg, pdb_noisy_batch):
+        model = FlowModel(mock_cfg.model)
+        compiled_model = torch.compile(model)
+        output = compiled_model(pdb_noisy_batch)
         assert output is not None

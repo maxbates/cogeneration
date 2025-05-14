@@ -72,6 +72,7 @@ class FoldingValidator:
         pred_bb_positions: npt.NDArray,  # (N, n_bb_atoms, 3) where n_bb_atoms in {3, 5}
         pred_aa: npt.NDArray,  # (N)
         diffuse_mask: npt.NDArray,  # (N)
+        motif_mask: Optional[npt.NDArray],  # (N) [inpainting only]
         chain_idx: npt.NDArray,  # (N)
         res_idx: npt.NDArray,  # (N)
         true_bb_positions: Optional[npt.NDArray],  # (N, 37, 3), motifs for inpainting
@@ -231,7 +232,7 @@ class FoldingValidator:
             pdb_name=sample_name,
             folded_df=codesign_df,
             true_bb_positions=true_bb_positions,
-            diffuse_mask=diffuse_mask,
+            motif_mask=motif_mask,
             task=task,
         )
 
@@ -247,7 +248,7 @@ class FoldingValidator:
                 pdb_name=sample_name,
                 folded_df=designability_df,
                 true_bb_positions=true_bb_positions,
-                diffuse_mask=diffuse_mask,
+                motif_mask=motif_mask,
                 task=task,
             )
 
@@ -278,11 +279,12 @@ class FoldingValidator:
             # For inpainting task, compute sequence recovery for fixed motifs
             if task == InferenceTask.inpainting:
                 # Get mask for fixed motifs (where diffuse_mask = 0)
-                motif_mask = diffuse_mask == 0
                 if motif_mask.any():
+                    motif_sel = motif_mask.astype(bool)
+
                     # Calculate sequence recovery for fixed motifs
                     codesign_df[MetricName.motif_sequence_recovery] = (
-                        _calc_seq_recovery(true_aa[motif_mask], pred_aa[motif_mask])
+                        _calc_seq_recovery(true_aa[motif_sel], pred_aa[motif_sel])
                     )
 
                     # Calculate sequence recovery for fixed motifs in inverse folded sequences
@@ -291,8 +293,8 @@ class FoldingValidator:
                             MetricName.motif_inverse_folding_sequence_recovery
                         ] = designability_df[MetricName.sequence].apply(
                             lambda seq: _calc_seq_recovery(
-                                true_aa[motif_mask],
-                                _seq_str_to_np(seq)[motif_mask],
+                                true_aa[motif_sel],
+                                _seq_str_to_np(seq)[motif_sel],
                             )
                         )
 
@@ -739,7 +741,7 @@ class FoldingValidator:
         pdb_name: str,
         folded_df: pd.DataFrame,
         true_bb_positions: Optional[npt.NDArray] = None,  # (N, 37, 3)
-        diffuse_mask: Optional[npt.NDArray] = None,  # (N) inpainting
+        motif_mask: Optional[npt.NDArray] = None,  # (N) inpainting
         task: InferenceTask = InferenceTask.unconditional,  # influences which metrics to compute
     ) -> pd.DataFrame:
         """
@@ -762,17 +764,22 @@ class FoldingValidator:
 
         num_res = sample_bb_pos.shape[0]
         res_mask = torch.ones(num_res)
-        motif_mask = torch.tensor(1 - diffuse_mask)
+
+        # Require meaningful motif_mask for inpainting (e.g. for RMSD calculations)
+        if motif_mask is not None:
+            assert motif_mask.shape == res_mask.shape
+            if not motif_mask.any():
+                motif_mask = None
 
         def _calc_bb_rmsd(
-            mask: torch.Tensor,  # (N)
+            mask: Union[torch.Tensor, npt.NDArray],  # (N)
             pos_1: npt.NDArray,  # (N, 3, 3)
             pos_2: npt.NDArray,  # (N, 3, 3)
         ) -> float:
             aligned_rmsd = superimpose(
                 torch.tensor(pos_1).reshape(-1, 3)[None],  # (1, N*3, 3)
                 torch.tensor(pos_2).reshape(-1, 3)[None],  # (1, N*3, 3)
-                mask=mask[:, None].repeat(1, 3).reshape(-1),  # (1, N*3)
+                mask=torch.tensor(mask)[:, None].repeat(1, 3).reshape(-1),  # (1, N*3)
             )
             return aligned_rmsd[1].item()
 
@@ -798,7 +805,7 @@ class FoldingValidator:
             sample_metrics[MetricName.is_designable] = bb_rmsd <= 2.0
 
             # Calculate RMSD for fixed motifs in folded structures
-            if task == InferenceTask.inpainting:
+            if task == InferenceTask.inpainting and motif_mask is not None:
                 sample_metrics[MetricName.motif_bb_rmsd_folded] = _calc_bb_rmsd(
                     motif_mask, sample_bb_pos, folded_bb_pos
                 )
@@ -828,7 +835,7 @@ class FoldingValidator:
                 )
 
                 # Calculate RMSD to GT for fixed motifs in folded structures
-                if task == InferenceTask.inpainting:
+                if task == InferenceTask.inpainting and motif_mask is not None:
                     sample_metrics[MetricName.motif_bb_rmsd_gt] = _calc_bb_rmsd(
                         motif_mask, sample_bb_pos, true_bb_pos
                     )

@@ -39,7 +39,7 @@ class TestMotifFactory:
             processed_file_path=str(example_pdb_path),
         )
 
-        diffuse_mask = factory.generate_diffuse_mask(
+        motif_mask = factory.generate_motif_mask(
             res_mask=pdb_batch_features[bp.res_mask],
             plddt_mask=pdb_batch_features[bp.plddt_mask],
             chain_idx=pdb_batch_features[bp.chain_idx],
@@ -48,9 +48,10 @@ class TestMotifFactory:
             rotmats_1=pdb_batch_features[bp.rotmats_1],
             aatypes_1=pdb_batch_features[bp.aatypes_1],
         )
+        assert motif_mask.shape == pdb_batch_features[bp.res_mask].shape
+        assert isinstance(motif_mask, torch.Tensor)
 
-        assert isinstance(diffuse_mask, torch.Tensor)
-        assert diffuse_mask.shape == pdb_batch_features[bp.res_mask].shape
+        diffuse_mask = 1 - motif_mask
         assert not (
             diffuse_mask == 0
         ).all(), "At least one residue should be scaffolded"
@@ -105,9 +106,10 @@ class TestMotifFactory:
 
         # Expect three segments: scaffold 0-1 (len 2), motif 2-3 (len 2), scaffold 4-4 (len 1)
         diffuse_mask = torch.tensor([1, 1, 0, 0, 1]).int()
+        motif_mask = 1 - diffuse_mask
 
-        segments = factory.generate_segments_from_diffuse_mask(
-            diffuse_mask,
+        segments = factory.generate_segments_from_motif_mask(
+            motif_mask,
             chain_idx=torch.tensor([1, 1, 1, 1, 1]),
             random_scale_range=(1.0, 1.0),
         )

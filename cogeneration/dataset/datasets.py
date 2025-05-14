@@ -103,7 +103,7 @@ def batch_features_from_processed_file(
         plddt_mask = (res_plddt > cfg.min_plddt_threshold).int()
 
     # Default diffuse mask is all ones
-    diffuse_mask = torch.ones_like(res_mask).float()
+    diffuse_mask = torch.ones_like(res_mask).int()
 
     feats: BatchFeatures = {
         bp.res_mask: res_mask,
@@ -408,17 +408,6 @@ class BaseDataset(Dataset):
 
         center_of_mass = torch.sum(trans_1, dim=0) / torch.sum(mask + 1e-5)
 
-        # # TODO(inpainting-fixed) explicit flag to only consider `diffuse_mask` for centering
-        # if (feats[bp.diffuse_mask] == 0).any():
-        #     # Re-center the structure based on non-diffused (motif) locations. Motifs should not move.
-        #     motif_mask = 1 - feats[bp.diffuse_mask]
-        #     motif_1 = feats[bp.trans_1] * motif_mask[:, None]
-        #     center_of_mass = torch.sum(motif_1, dim=0) / (torch.sum(motif_mask) + 1e-5)
-        # else:
-        #     center_of_mass = torch.sum(feats[bp.trans_1], dim=0) / torch.sum(
-        #         feats[bp.res_mask] + 1e-5
-        #     )
-
         # modify in place
         feats[bp.trans_1] -= center_of_mass[None, :]
 
@@ -482,8 +471,11 @@ class BaseDataset(Dataset):
                         continue
                     new_feats[prop][ns:ne] = feats[prop][os:oe]
 
-                # mark motif fixed
-                new_feats[bp.diffuse_mask][ns:ne] = 0.0
+                # mark motif
+                new_feats[bp.motif_mask][ns:ne] = 1.0
+                # mark diffusable for inpainting with guidance
+                # TODO(inpainting-fixed) mark fixed
+                new_feats[bp.diffuse_mask][ns:ne] = 1.0
                 # enforce idx
                 new_feats[bp.chain_idx][ns:ne] = current_chain_idx
                 new_feats[bp.res_idx][ns:ne] = torch.arange(
@@ -493,6 +485,8 @@ class BaseDataset(Dataset):
             elif isinstance(segment, Scaffold):
                 # Scaffolds mostly retain default `empty_feats` values.
 
+                # mark scaffold
+                new_feats[bp.motif_mask][ns:ne] = 0.0
                 # ensure marked to be diffused
                 new_feats[bp.diffuse_mask][ns:ne] = 1.0
                 # enforce idx
@@ -507,12 +501,6 @@ class BaseDataset(Dataset):
             # advance cursors by segment length
             new_feats_start += segment.length
             current_res_idx += segment.length
-
-        # TODO(inpainting-fixed) If motif positions are fixed, those motifs need to be re-centered
-        # to avoid hinting / memorizing where to place scaffolds.
-        # Need to update `recenter_structure` method to use `diffuse_mask` appropriately.
-        # if add_noise or (diffuse_mask == 0).any()
-        #    BaseDataset.recenter_structure(feats=feats)
 
         return new_feats
 
@@ -554,12 +542,14 @@ class BaseDataset(Dataset):
         # Pass through relevant data from CSV
         feats[bp.pdb_name] = csv_row[dc.pdb_name]
 
-        # Update `diffuse_mask` depending on task
+        # Update `diffuse_mask` and `motif_mask` depending on task
         if task == DataTask.hallucination:
-            # use default, `diffuse_mask = torch.ones()`
-            pass
+            # everything is diffused
+            feats[bp.diffuse_mask] = torch.ones_like(feats[bp.res_mask])
+            # feats[bp.motif_mask] = None  # skip defining motif_mask batch prop
         elif task == DataTask.inpainting:
-            diffuse_mask = motif_factory.generate_diffuse_mask(
+            # Generate motif_mask from MotifFactory
+            motif_mask = motif_factory.generate_motif_mask(
                 res_mask=feats[bp.res_mask],
                 plddt_mask=feats[bp.plddt_mask],
                 chain_idx=feats[bp.chain_idx],
@@ -568,32 +558,33 @@ class BaseDataset(Dataset):
                 rotmats_1=feats[bp.rotmats_1],
                 aatypes_1=feats[bp.aatypes_1],
             )
-            # Note, FrameFlow `diffuse_mask` also requires `plddt_mask == 1.0`, but we don't.
-            feats[bp.diffuse_mask] = diffuse_mask
+            feats[bp.motif_mask] = motif_mask.int()
+
+            # `diffuse_mask` for inpainting with guidance is all ones; whole structure is modeled.
+            # TODO(inpainting-fixed) `diffuse_mask` is complement to `motif_mask`
+            feats[bp.diffuse_mask] = torch.ones_like(feats[bp.res_mask])
         else:
             raise ValueError(f"Unknown task {task}")
 
         # Ensure have a valid `diffuse_mask` for modeling
         if torch.sum(feats[bp.diffuse_mask]) == 0:
-            feats[bp.diffuse_mask] = torch.ones_like(feats[bp.res_mask])
-        feats[bp.diffuse_mask] = feats[bp.diffuse_mask].int()
+            feats[bp.diffuse_mask] = torch.ones_like(feats[bp.res_mask]).int()
 
-        # If we are inpainting and have a `motif_mask`, center. And if evaluating, vary scaffolds.
-        if task == DataTask.inpainting and (feats[bp.diffuse_mask] == 0).any():
-            # Center the motifs using `motif_mask`
-            motif_mask = 1 - feats[bp.diffuse_mask]
-            BaseDataset.recenter_structure(feats, mask=motif_mask)
-
+        # Handle inpainting with an active `motif_mask`
+        if task == DataTask.inpainting and (feats[bp.motif_mask] == 1).any():
             # For inpainting evaluation (i.e. not training), vary scaffold lengths
             # Using the `diffuse_mask`, modify the scaffold region lengths, and mask out the scaffolds
             # i.e. {trans,rots,aatypes}_1 only defined for motif positions
             if not is_training:
-                segments = motif_factory.generate_segments_from_diffuse_mask(
-                    diffuse_mask=feats[bp.diffuse_mask],
+                segments = motif_factory.generate_segments_from_motif_mask(
+                    motif_mask=feats[bp.motif_mask],
                     chain_idx=feats[bp.chain_idx],
                 )
-                # apply segmenting (note, generates new chain_idx)
+                # apply segmenting (note, updates masks and generates new chain_idx)
                 feats = BaseDataset.segment_features(feats=feats, segments=segments)
+
+            # Center the motifs using motif_mask
+            BaseDataset.recenter_structure(feats, mask=feats[bp.motif_mask])
 
         # Randomize chains and reset residue positions
         BaseDataset.randomize_chains(cfg, feats)

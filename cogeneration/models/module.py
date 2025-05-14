@@ -238,6 +238,9 @@ class FlowModule(LightningModule):
         bb_mask = batch[bp.res_mask]
         loss_mask = bb_mask * batch[bp.diffuse_mask]
 
+        # for inpainting, ignore motifs in loss, esp sequence since fixed, but also structure
+        if bp.motif_mask in batch and batch[bp.motif_mask] is not None:
+            loss_mask *= 1 - batch[bp.motif_mask]
         if training_cfg.mask_plddt:
             loss_mask *= batch[bp.plddt_mask]
         if torch.any(torch.sum(loss_mask, dim=-1) < 1):
@@ -572,7 +575,6 @@ class FlowModule(LightningModule):
         res_mask = batch[bp.res_mask]
         num_batch, num_res = res_mask.shape
         csv_idx = batch[bp.csv_idx]
-        diffuse_mask = batch[bp.diffuse_mask]
 
         # Get inference task corresponding to training task
         inference_task = InferenceTask.from_data_task(task=self.cfg.data.task)
@@ -593,7 +595,8 @@ class FlowModule(LightningModule):
             num_res,
             self.model,
             task=inference_task,
-            diffuse_mask=diffuse_mask,
+            diffuse_mask=batch[bp.diffuse_mask],
+            motif_mask=batch.get(bp.motif_mask, None),
             chain_idx=batch[bp.chain_idx],
             res_idx=batch[bp.res_idx],
             # t=0 values will be noise
@@ -626,6 +629,12 @@ class FlowModule(LightningModule):
             )
             os.makedirs(sample_dir, exist_ok=True)
 
+            sample_motif_mask = (
+                batch[bp.motif_mask][i]
+                if (bp.motif_mask in batch and batch[bp.motif_mask] is not None)
+                else None
+            )
+
             # Compute metrics, and inverse fold + fold the designed structure
             top_sample_metrics, saved_trajectory_files, saved_folding_validation = (
                 self.compute_sample_metrics(
@@ -637,7 +646,8 @@ class FlowModule(LightningModule):
                     model_structure_traj=model_bb_trajs[i],
                     model_aa_traj=model_aa_trajs[i],
                     model_logits_traj=model_logits_trajs[i],
-                    diffuse_mask=to_numpy(diffuse_mask[i]),
+                    diffuse_mask=to_numpy(batch[bp.diffuse_mask][i]),
+                    motif_mask=to_numpy(sample_motif_mask),
                     chain_idx=to_numpy(batch[bp.chain_idx][i]),
                     res_idx=to_numpy(batch[bp.res_idx][i]),
                     true_bb_pos=None,  # codesign  # TODO(inpainting) define
@@ -687,8 +697,8 @@ class FlowModule(LightningModule):
         aatypes_1 = batch[bp.aatypes_1] if bp.aatypes_1 in batch else None
         sample_pdb_name = batch[bp.pdb_name][0] if bp.pdb_name in batch else None
 
-        # `(diffuse_mask == 1.0).all()` for all tasks except inpainting
         diffuse_mask = batch[bp.diffuse_mask]
+        motif_mask = batch.get(bp.motif_mask, None)
 
         # Handle single-sample and missing sample_id
         if bp.sample_id in batch:
@@ -821,13 +831,14 @@ class FlowModule(LightningModule):
             num_res=sample_length,
             model=self.model,
             task=task,
+            diffuse_mask=diffuse_mask,
+            motif_mask=motif_mask,
+            chain_idx=batch[bp.chain_idx],
+            res_idx=batch[bp.res_idx],
             trans_1=trans_1,
             rotmats_1=rotmats_1,
             psis_1=psi_torsions_1,
             aatypes_1=aatypes_1,
-            diffuse_mask=diffuse_mask,
-            chain_idx=batch[bp.chain_idx],
-            res_idx=batch[bp.res_idx],
         )
 
         model_bb_trajs = to_numpy(model_traj.structure)
@@ -858,6 +869,7 @@ class FlowModule(LightningModule):
                 model_aa_traj=model_aa_trajs[i],
                 model_logits_traj=model_logits_trajs[i],
                 diffuse_mask=to_numpy(diffuse_mask[i]),
+                motif_mask=to_numpy(motif_mask[i]) if motif_mask is not None else None,
                 chain_idx=to_numpy(batch[bp.chain_idx][i]),
                 res_idx=to_numpy(batch[bp.res_idx][i]),
                 true_bb_pos=to_numpy(true_bb_pos),
@@ -883,6 +895,7 @@ class FlowModule(LightningModule):
         model_aa_traj: npt.NDArray,
         model_logits_traj: npt.NDArray,
         diffuse_mask: npt.NDArray,
+        motif_mask: Optional[npt.NDArray],  # if relevant
         chain_idx: npt.NDArray,
         res_idx: npt.NDArray,
         true_bb_pos: Optional[npt.NDArray],  # if relevant
@@ -945,6 +958,7 @@ class FlowModule(LightningModule):
             protein_structure_traj=protein_structure_traj,
             model_structure_traj=model_structure_traj,
             diffuse_mask=diffuse_mask,
+            motif_mask=motif_mask,
             chain_idx=chain_idx,
             res_idx=res_idx,
             output_dir=sample_dir,
@@ -965,6 +979,7 @@ class FlowModule(LightningModule):
                 pred_bb_positions=protein_structure_traj[-1],
                 pred_aa=protein_aa_traj[-1],
                 diffuse_mask=diffuse_mask,
+                motif_mask=motif_mask,
                 chain_idx=chain_idx,
                 res_idx=res_idx,
                 also_fold_pmpnn_seq=also_fold_pmpnn_seq,

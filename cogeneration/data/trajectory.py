@@ -568,6 +568,7 @@ def save_trajectory(
     protein_structure_traj: npt.NDArray,  # (noisy_T, N, 37, 3)
     model_structure_traj: npt.NDArray,  # (clean_T, N, 37, 3)
     diffuse_mask: npt.NDArray,  # (N,)
+    motif_mask: Optional[npt.NDArray],
     chain_idx: npt.NDArray,  # (N,)
     res_idx: npt.NDArray,  # (N,)
     output_dir: str,
@@ -589,6 +590,7 @@ def save_trajectory(
             N is number of residues.
         model_structure_traj: [clean_T, N, 37, 3] atom37 predictions of clean data at each time step.
         diffuse_mask: [N] which residues are diffused.
+        motif_mask: [N] (inpainting only) which residues are motifs.
         output_dir: where to save samples.
         protein_aa_traj: [noisy_T, N] amino acids (0 - S inclusive where S = 20 or 21).
         model_aa_traj: [clean_T, N] amino acids (0 - S inclusive where S = 20 or 21).

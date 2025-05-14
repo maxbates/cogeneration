@@ -52,8 +52,9 @@ class TestFlowModule:
         mock_cfg = mock_cfg_uninterpolated.interpolate()
 
         pdb_noisy_batch = create_pdb_noisy_batch(mock_cfg)
-        assert pdb_noisy_batch[bp.diffuse_mask].mean() > 0.1
-        assert pdb_noisy_batch[bp.diffuse_mask].mean() < 0.9
+        assert (pdb_noisy_batch[bp.diffuse_mask] == 1).all()
+        assert pdb_noisy_batch[bp.motif_mask].mean() > 0.1
+        assert pdb_noisy_batch[bp.motif_mask].mean() < 0.9
 
         module = FlowModule(mock_cfg)
         module.training_step(pdb_noisy_batch)
@@ -84,8 +85,9 @@ class TestFlowModule:
 
         # create multimer batch using stochastic paths
         pdb_noisy_batch = create_pdb_noisy_batch(mock_cfg)
-        assert pdb_noisy_batch[bp.diffuse_mask].mean() > 0.1
-        assert pdb_noisy_batch[bp.diffuse_mask].mean() < 0.9
+        assert (pdb_noisy_batch[bp.diffuse_mask] == 1).all()
+        assert pdb_noisy_batch[bp.motif_mask].mean() > 0.1
+        assert pdb_noisy_batch[bp.motif_mask].mean() < 0.9
         assert pdb_noisy_batch[bp.chain_idx].unique().shape[0] > 1
 
         module = FlowModule(mock_cfg)

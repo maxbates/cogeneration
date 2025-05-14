@@ -25,6 +25,7 @@ class BatchProp(StrEnum):
     # masks
     res_mask = "res_mask"  # (B, N) residues under consideration (uses `dpc.bb_mask`)
     diffuse_mask = "diffuse_mask"  # (B, N) hallucination mask, residue positions that are corrupted/sampled
+    motif_mask = "motif_mask"  # (B, N) [inpainting only] mask for fixed motif residue
     plddt_mask = (
         "plddt_mask"  # (B, N) pLDDT mask, residue positions above pLDDT threshold
     )
@@ -107,10 +108,11 @@ def empty_feats(N: int) -> BatchFeatures:
         BatchProp.res_idx: torch.arange(N),
         BatchProp.res_plddt: torch.zeros(N),
         BatchProp.diffuse_mask: torch.ones(N),
+        BatchProp.motif_mask: torch.zeros(
+            N
+        ),  # [ inpainting only ]  # TODO arg for optional
         BatchProp.plddt_mask: torch.ones(N),
         BatchProp.pdb_name: "",
-        # metadata
         BatchProp.csv_idx: torch.tensor([1], dtype=torch.long),
-        # inference only
-        BatchProp.sample_id: 0,
+        BatchProp.sample_id: 0,  # [ inference only ]
     }

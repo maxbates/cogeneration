@@ -138,9 +138,9 @@ class MotifFactory:
         length = stop_exclusive - start
         return start, stop_exclusive, length
 
-    def generate_segments_from_diffuse_mask(
+    def generate_segments_from_motif_mask(
         self,
-        diffuse_mask: torch.Tensor,
+        motif_mask: torch.Tensor,
         chain_idx: torch.Tensor,
         random_scale_range=(0.5, 2),
     ):
@@ -150,18 +150,18 @@ class MotifFactory:
         Scaffold regions are randomly scaled by a factor in random_scale_range.
         Chain breaks are inserted when `chain_idx` changes.
         """
-        N = diffuse_mask.shape[0]
+        N = motif_mask.shape[0]
         segments: List[Segment] = []
         seg_start = 0
-        current_diff = diffuse_mask[0]
+        current_is_motif = motif_mask[0]
         current_chain = bool(chain_idx[0].item())
 
         for i in range(1, N):
-            diff = bool(diffuse_mask[i].item())
+            is_motif = bool(motif_mask[i].item())
             chain = int(chain_idx[i].item())
 
             # boundary if mask flips or chain changes
-            if diff != current_diff or chain != current_chain:
+            if is_motif != current_is_motif or chain != current_chain:
                 seg_end = i - 1
                 # scaffold: randomly scale length of original segment span
                 orig_len = seg_end - seg_start + 1
@@ -172,20 +172,20 @@ class MotifFactory:
                 )
 
                 # append motif or scaffold segment
-                if current_diff:
-                    segments.append(
-                        Scaffold(
-                            start=seg_start,
-                            end=seg_end,
-                            new_length=new_len,
-                        )
-                    )
-                else:
+                if current_is_motif:
                     segments.append(
                         Motif(
                             start=seg_start,
                             end=seg_end,
                             chain_idx=current_chain,
+                        )
+                    )
+                else:
+                    segments.append(
+                        Scaffold(
+                            start=seg_start,
+                            end=seg_end,
+                            new_length=new_len,
                         )
                     )
 
@@ -196,7 +196,7 @@ class MotifFactory:
 
                 # reset for next segment
                 seg_start = i
-                current_diff = diff
+                current_is_motif = is_motif
                 current_chain = chain
 
         # final tail segment
@@ -208,13 +208,13 @@ class MotifFactory:
             if orig_len <= 5
             else int(round(orig_len * self.rng.uniform(*random_scale_range)))
         )
-        if current_diff:
+        if current_is_motif:
             segments.append(
-                Scaffold(start=seg_start, end=seg_end_inclusive, new_length=new_length)
+                Motif(start=seg_start, end=seg_end_inclusive, chain_idx=current_chain)
             )
         else:
             segments.append(
-                Motif(start=seg_start, end=seg_end_inclusive, chain_idx=current_chain)
+                Scaffold(start=seg_start, end=seg_end_inclusive, new_length=new_length)
             )
 
         return segments
@@ -663,7 +663,7 @@ class MotifFactory:
         else:
             raise ValueError(f"Unknown motif selection strategy: {self.cfg.strategy}")
 
-    def generate_diffuse_mask(
+    def generate_motif_mask(
         self,
         res_mask: torch.Tensor,
         plddt_mask: torch.Tensor,
@@ -674,7 +674,7 @@ class MotifFactory:
         aatypes_1: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Entrypoint to get a `diffuse_mask` specified by `DatasetInpaintingConfig`
+        Entrypoint to get a `motif_mask` [int tensor] specified by `DatasetInpaintingConfig`
         """
         strategy = self.cfg.strategy
 
@@ -689,7 +689,7 @@ class MotifFactory:
                     continue
                 strategy = new_strategy
 
-        return self.strategy_diffuse_mask(
+        diffuse_mask = self.strategy_diffuse_mask(
             strategy=strategy,
             res_mask=res_mask,
             plddt_mask=plddt_mask,
@@ -699,3 +699,6 @@ class MotifFactory:
             rotmats_1=rotmats_1,
             aatypes_1=aatypes_1,
         )
+        diffuse_mask = diffuse_mask.int()
+        motif_mask = 1 - diffuse_mask
+        return motif_mask

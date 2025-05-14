@@ -160,14 +160,16 @@ https://github.com/microsoft/protein-frame-flow
             - the embeddings get a diffuse mask like all other tasks and won't learn to treat motifs differently
             - convoluted handling to support
         - Thus the `diffuse_mask` is not aligned between training and sampling
-        - However, it is clear from sampling that we *do* need to provide a better `diffuse_mask` / `motif_mask`, 
+        - However, appears that we *do* need to provide a better `diffuse_mask` / `motif_mask`, 
           because sampling for inpainting using public model with `diffuse_mask` set to ones leads to chain breaks.
+          (Though the model was never trained with inpainting, can break assumptions of the flow.)
     - Questions
         - Do we want to have another batch prop `motif_mask` specific to inpainting, or just try to use `diffuse_mask`?
         - Do we need to embed both `diffuse_mask` and `motif_mask`, or could we just embed `motif_mask` if available otherwise `diffuse_mask`?
     - Implementations
         - Basically, want to keep some logic out of the model and module and focus to the dataset / interpolant, and simplify it
         - We do a bunch of special handling for inpainting diffuse_mask which hopefully we should be able to simplify.
+        - Implementation for fixed motifs should basically fall out of the same implementation, just set `diffuse_mask` to be like `motif_mask`
         - Separate batch props `diffuse_mask` and `motif_mask`
             - `diffuse_mask` denotes which residues are corrupted / sampled,
                 - `diffuse_mask` still determines which structure residues are updated, i.e. in backbone update and explicit interpolation
@@ -185,16 +187,25 @@ https://github.com/microsoft/protein-frame-flow
                         - The main exception is node / edge embeddings that get a `diffuse_mask` not denoting the motifs
                 - Backwards compatibility with MultiFlow means `motif_mask` could be embedded instead of `diffuse_mask` but can't embed both
     - TODOs 
-        - [ ] add batch prop
-        - [ ] Add `embed_motif_mask` alongside `embed_diffuse_mask` to node and edge network configs
-        - [ ] generate in dataset for inpainting
-             - [ ] update MotifFactory
-             - [ ] update defining diffuse_mask to be more like `res_mask`
-             - [ ] reset appropriately when rows set to another task for `codesign_separate_t`
-        - [ ] check exists in interpolant corrupt / sample if inpainting
-        - [ ] interpolant uses `motif_mask` if present for corrupt batch, drop separate corruption masks for structure / sequence
-        - [ ] module ignores `aatypes` loss in `motif_mask` 
-            - module still uses `diffuse_mask` for structure losses if still predicting for all residues, i.e. non fixed motifs
+        - [x] add batch prop `motif_mask`
+        - ? Add `embed_motif_mask` alongside `embed_diffuse_mask` to node and edge network configs
+             - or always just embed it?
+             - determine whether substituted for `diffuse_mask` or in addition
+        - [x] generate in dataset for inpainting
+             - [x] update MotifFactory
+             - [x] update defining diffuse_mask to be more like `res_mask`
+             - [x] reset appropriately when rows set to another task for `codesign_separate_t`
+                 - [x] update `set_corruption_times()` to handle diffuse_mask and motif_mask appropriately
+             - [x] cfg to some portion of the time keep motif_mask, some time remove?
+        - [x] check exists in interpolant corrupt_batch()
+        - [x] interpolant uses `motif_mask` if present for corrupt batch, drop separate corruption masks for structure / sequence
+        - [x] interpolant.sample() use `diffuse_mask` and `motif_mask` as expected
+        - [x] update calls to interpolant.sample()  
+        - [x] module ignores `aatypes` loss in `motif_mask` 
+            - ? module still uses `diffuse_mask` for structure losses if still predicting for all residues, i.e. non fixed motifs
+        - [x] update metrics calculation to use motif_mask instead of meaningless diffuse_mask
+        - [ ] confirm alignment of training and testing embeddings + masks
+        - [ ] fix tests
         - [ ] update trajectory animation to show `motif_mask` / `diffuse_mask` if not given
 
 

@@ -73,6 +73,15 @@ class FlowModel(nn.Module):
         node_mask = batch[bp.res_mask]
         edge_mask = node_mask[:, None] * node_mask[:, :, None]
         diffuse_mask = batch[bp.diffuse_mask]
+        motif_mask = batch.get(bp.motif_mask, None)
+        # embed `1-motif_mask` instead of `diffuse_mask` if defined
+        # for inpainting with guidance: `diffuse_mask == 1` for backbone update so `motif_mask` more meaningful
+        embed_diffuse_mask = (
+            (1 - motif_mask)
+            if (motif_mask is not None and motif_mask.any())
+            else diffuse_mask
+        )
+
         chain_index = batch[bp.chain_idx]
         res_index = batch[bp.res_idx]
         so3_t = batch[nbp.so3_t]
@@ -80,7 +89,7 @@ class FlowModel(nn.Module):
         cat_t = batch[nbp.cat_t]
         trans_t = batch[nbp.trans_t]
         rotmats_t = batch[nbp.rotmats_t]
-        aatypes_t = batch[nbp.aatypes_t].long()  # converts to int64
+        aatypes_t = batch[nbp.aatypes_t].long()
         trans_sc = batch[nbp.trans_sc]
         aatypes_sc = batch[nbp.aatypes_sc]
 
@@ -92,7 +101,7 @@ class FlowModel(nn.Module):
             r3_t=r3_t,
             cat_t=cat_t,
             res_mask=node_mask,
-            diffuse_mask=diffuse_mask,
+            diffuse_mask=embed_diffuse_mask,
             chain_index=chain_index,
             res_index=res_index,
             aatypes=aatypes_t,
@@ -103,7 +112,7 @@ class FlowModel(nn.Module):
             trans=trans_t,
             trans_sc=trans_sc,
             edge_mask=edge_mask,
-            diffuse_mask=diffuse_mask,
+            diffuse_mask=embed_diffuse_mask,
             chain_index=chain_index,
         )
 

@@ -352,7 +352,8 @@ class TestInterpolant:
 
         # diffuse masks as expected
         if task == DataTask.inpainting:
-            assert noisy_batch[bp.diffuse_mask].float().mean() < 1.0
+            assert noisy_batch[bp.motif_mask].float().mean() < 1.0
+            assert noisy_batch[bp.diffuse_mask].float().mean() == 1.0
         elif task == DataTask.hallucination:
             assert noisy_batch[bp.diffuse_mask].float().mean() == 1.0
 
@@ -367,7 +368,7 @@ class TestInterpolant:
 
         # Create a mock batch, instead of PDB, because PDBs contain UNK and less predictable
         B = 5
-        N = 20
+        N = 10
         batch = next(
             iter(
                 MockDataloader(
@@ -383,11 +384,18 @@ class TestInterpolant:
         diffuse_mask = torch.zeros((B, N), dtype=torch.int)
         diffuse_mask[:, : N // 2] = 1
         batch[bp.diffuse_mask] = diffuse_mask
+        motif_mask = 1 - diffuse_mask
+        batch[bp.motif_mask] = motif_mask
 
         noisy_batch = interpolant.corrupt_batch(batch, task=DataTask.inpainting)
 
-        motif_mask = diffuse_mask == 0
-        scaffold_mask = diffuse_mask == 1
+        # define selection masks
+        motif_sel = motif_mask.bool()
+        scaffold_sel = ~motif_sel
+
+        assert torch.equal(
+            noisy_batch[nbp.aatypes_t][motif_sel], batch[bp.aatypes_1][motif_sel]
+        ), "Motif amino acids should be preserved in inpainting"
 
         # aatypes fixed in motifs, some percent corrupted in scaffolds dep on `t`
         # We might expect ~0.24 to be corrupted on average:
@@ -395,22 +403,19 @@ class TestInterpolant:
         #    t.mean() == 0.5
         #    (aatypes_1 == UNK).mean() == 0.04
         # But we'll pick a conservative lower bound.
-        assert torch.equal(
-            noisy_batch[nbp.aatypes_t][motif_mask], batch[bp.aatypes_1][motif_mask]
-        ), "Motif amino acids should be preserved in inpainting"
         assert (
-            noisy_batch[nbp.aatypes_t][scaffold_mask]
-            != batch[bp.aatypes_1][scaffold_mask]
+            noisy_batch[nbp.aatypes_t][scaffold_sel]
+            != batch[bp.aatypes_1][scaffold_sel]
         ).float().mean() > 0.05, (
             "Scaffold amino acids should be corrupted in inpainting"
         )
 
         # structure interpolates in scaffolds and motifs
         assert torch.all(
-            noisy_batch[nbp.trans_t][scaffold_mask] != batch[bp.trans_1][scaffold_mask]
+            noisy_batch[nbp.trans_t][scaffold_sel] != batch[bp.trans_1][scaffold_sel]
         ), "scaffold structure should change"
         assert torch.all(
-            noisy_batch[nbp.trans_t][scaffold_mask] != batch[bp.trans_1][scaffold_mask]
+            noisy_batch[nbp.trans_t][scaffold_sel] != batch[bp.trans_1][scaffold_sel]
         ), "motif structure should change"
 
 
@@ -454,6 +459,7 @@ class TestInterpolantSample:
         kwargs = {}
         kwargs.update(
             diffuse_mask=batch[bp.diffuse_mask],
+            motif_mask=batch.get(bp.motif_mask, None),
             chain_idx=batch[bp.chain_idx],
             res_idx=batch[bp.res_idx],
         )
@@ -531,7 +537,7 @@ class TestInterpolantSample:
         self._run_sample(cfg=cfg, batch=batch, task=task)
 
     def test_inpainting_preserves_motif_sequence_in_sampling(
-        self, mock_cfg_uninterpolated, mock_pred_conditional_dataloader
+        self, mock_cfg_uninterpolated, mock_pred_inpainting_dataloader
     ):
         """
         Inpainting sampling should preserve amino acid sequence at motif positions
@@ -540,7 +546,7 @@ class TestInterpolantSample:
         mock_cfg_uninterpolated.interpolant.sampling.num_timesteps = 3
         cfg = mock_cfg_uninterpolated.interpolate()
 
-        batch = next(iter(mock_pred_conditional_dataloader))
+        batch = next(iter(mock_pred_inpainting_dataloader))
         _, model_traj = self._run_sample(
             cfg=cfg, batch=batch, task=InferenceTask.inpainting
         )

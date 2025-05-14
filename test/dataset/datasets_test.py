@@ -28,11 +28,18 @@ class TestBaseDataset:
 
         new_feats = BaseDataset.segment_features(feats=feats, segments=segments)
 
-        # check diffuse_mask
-        assert (feats[bp.diffuse_mask] == 1.0).all()
-        assert (new_feats[bp.diffuse_mask][0:5] == 1.0).all()
-        assert (new_feats[bp.diffuse_mask][5:9] == 0.0).all()
-        assert (new_feats[bp.diffuse_mask][9:10] == 1.0).all()
+        # check diffuse_mask and motif_mask
+        # inpainting with guidance -> whole structure diffused
+        assert (feats[bp.diffuse_mask] == 1).all()
+        # segment 0 = scaffold
+        assert (new_feats[bp.motif_mask][0:5] == 0).all()
+        assert (new_feats[bp.diffuse_mask][0:5] == 1).all()
+        # segment 1 = motif
+        assert (new_feats[bp.motif_mask][5:9] == 1).all()
+        assert (new_feats[bp.diffuse_mask][5:9] == 1).all()
+        # segment 3 = scaffold
+        assert (new_feats[bp.motif_mask][9:10] == 0).all()
+        assert (new_feats[bp.diffuse_mask][9:10] == 1).all()
 
         # Confirm trans + rots + aatypes are preserved in motif in new positions
         assert torch.equal(new_feats[bp.trans_1][5:9], feats[bp.trans_1][2:6])

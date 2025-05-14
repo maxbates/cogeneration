@@ -516,11 +516,12 @@ class InterpolantConfig(BaseClassConfig):
     # `codesign_separate_t` allows separate `t` times for rots / trans / aatypes so fixed domains are at ~t=1.
     codesign_separate_t: bool = True
     # `forward_folding` proportion of codesign samples; requires `codesign_separate_t`
-    codesign_forward_fold_prop: float = 0.1  # default 0.1 in public MultiFlow
+    codesign_forward_fold_prop: float = 0.2  # default 0.1 in public MultiFlow
     # `inverse_folding` proportion of codesign samples; requires `codesign_separate_t`
-    codesign_inverse_fold_prop: float = 0.1  # default 0.1 in public MultiFlow
-    # `inpainting_unconditional_prop` in training converts some `inpainting` to `unconditional` batches.
-    inpainting_unconditional_prop: float = 0.2
+    codesign_inverse_fold_prop: float = 0.2  # default 0.1 in public MultiFlow
+    # `inpainting_unconditional_prop` in training removes motifs `inpainting` examples,
+    # which makes them unconditional, or forward_folding/inverse_folding without motifs.
+    inpainting_unconditional_prop: float = 0.4
     # enable self-conditioning
     self_condition: bool = "${model.edge_features.self_condition}"
     # during training, portion of time to use self-conditioning (on or off during sampling)
@@ -787,7 +788,7 @@ class ExperimentTrainingConfig(BaseClassConfig):
     trans_scale: float = 0.1
     aatypes_loss_weight: float = 0.5  # default 0.0 in multiflow
     aatypes_loss_mean_or_sum: str = "mean"
-    aatypes_loss_use_likelihood_weighting: bool = False
+    aatypes_loss_use_likelihood_weighting: bool = True
     translation_loss_weight: float = 2.0
     # losses scaling normalized up to t
     t_normalize_clip: float = 0.9
