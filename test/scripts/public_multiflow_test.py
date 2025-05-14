@@ -40,7 +40,8 @@ class TestEvalRunner:
             cfg=merged_cfg,
         )
 
-    # This is a slow test, because it actually samples with real model + many timesteps; can run manually.
+    # This is a slow test, because it actually samples with real model, many timesteps, and animates.
+    # Can run manually.
     @pytest.mark.skip
     def test_public_weights_sampling(self, public_weights_path, tmp_path):
         cfg = Config.public_multiflow()
@@ -63,6 +64,7 @@ class TestEvalRunner:
         cfg.inference.also_fold_pmpnn_seq = False
         # write trajectories to inspect
         cfg.inference.write_sample_trajectories = True
+        cfg.inference.write_animations: bool = True
 
         cfg = cfg.interpolate()
 
@@ -103,5 +105,6 @@ class TestEvalRunner:
         # sample
         top_sample_metrics = module.predict_step(batch, batch_idx=0)
 
+        print()
         print(cfg.inference.predict_dir)
         print(top_sample_metrics.to_csv(index=False))

@@ -76,7 +76,7 @@ def _get_letters_res_colors() -> Tuple[List[str], npt.NDArray]:
     # residue colors
 
     # helper – make a lighter shade by linear-mixing with white
-    def tint(hex_code, f=0.35):
+    def tint(hex_code, f: float):
         r, g, b = to_rgb(hex_code)
         return (1 - f) * np.array([r, g, b]) + f * np.ones(3)
 
@@ -84,35 +84,35 @@ def _get_letters_res_colors() -> Tuple[List[str], npt.NDArray]:
     NEG = "#3778bf"  # blue
     POS = "#d62728"  # red
     POL = "#2ca02c"  # green
-    NON = "#7f7f7f"  # grey
+    NON = "#c040c0"  # purple
 
     aa_color = {
         # negative (blue shades)
-        "D": to_rgb(NEG),  # Asp
+        "D": tint(NEG, 0.2),  # Asp
         "E": tint(NEG, 0.4),  # Glu
         # positive (red shades)
-        "K": to_rgb(POS),  # Lys
-        "R": tint(POS, 0.35),  # Arg
-        "H": tint(POS, 0.55),  # His
+        "K": tint(POS, 0.2),  # Lys
+        "R": tint(POS, 0.4),  # Arg
+        "H": tint(POS, 0.8),  # His (positive-ish)
         # polar uncharged (green shades)
-        "N": to_rgb(POL),  # Asn
-        "Q": tint(POL, 0.35),  # Gln
-        "S": tint(POL, 0.50),  # Ser
-        "T": tint(POL, 0.65),  # Thr
-        "C": tint(POL, 0.20),  # Cys
-        "Y": tint(POL, 0.80),  # Tyr
-        "W": tint(POL, 0.10),  # Trp
+        "N": tint(POL, 0.1),  # Asn
+        "Q": tint(POL, 0.4),  # Gln
+        "S": tint(POL, 0.5),  # Ser
+        "T": tint(POL, 0.6),  # Thr
+        "C": tint(POL, 0.3),  # Cys
+        "Y": tint(POL, 0.7),  # Tyr
+        "W": tint(POL, 0.2),  # Trp
         # non-polar / hydrophobic (grey shades)
-        "A": to_rgb(NON),  # Ala
-        "V": tint(NON, 0.25),  # Val
-        "L": tint(NON, 0.10),  # Leu
-        "I": tint(NON, 0.40),  # Ile
-        "M": tint(NON, 0.55),  # Met
-        "F": tint(NON, 0.70),  # Phe
-        "P": tint(NON, 0.85),  # Pro
-        "G": tint(NON, 0.95),  # Gly
+        "A": tint(NON, 0.8),  # Ala is like a default -> light
+        "V": tint(NON, 0.2),  # Val
+        "L": tint(NON, 0.1),  # Leu
+        "I": tint(NON, 0.3),  # Ile
+        "M": tint(NON, 0.4),  # Met
+        "F": tint(NON, 0.5),  # Phe
+        "P": tint(NON, 0.6),  # Pro
+        "G": tint(NON, 0.9),  # Gly is like a default -> light
         # unknown
-        "-": (1.0, 1.0, 1.0),  # white
+        "-": (0.9, 0.9, 0.9),  # light grey
     }
     # build the (21, 3) RGB array in the canonical order
     res_colors = np.array([aa_color[ltr] for ltr in letters])
@@ -165,28 +165,48 @@ def _init_logits_borders(
     ax: plt.Axes,
     logits_traj: npt.NDArray,  # (T, N, S) where S = 20 or 21
     aa_traj: npt.NDArray,  # (T, N)
-    diffuse_mask: npt.NDArray,  # (N,)
+    motif_mask: Optional[npt.NDArray] = None,  # (N,)
 ) -> List[Rectangle]:
     """
-    Draws borders around each residue in the logits heatmap, black for current res or red if fixed.
-    x stays fixed, y will be updated each frame
+    Draws borders around each residue in the logits heatmap.
+    x stays fixed, y will be updated each frame.
+
+    Also draws a line under the logits to indicate diffused / motif residues.
     """
     num_timesteps, num_res, num_tokens = logits_traj.shape
+
     rects = []
     for i in range(num_res):
-        edge = "black" if diffuse_mask[i] else "red"
+        edge = "black"
         r = plt.Rectangle(
             (i - 0.5, aa_traj[0, i] - 0.5), 1, 1, fill=False, edgecolor=edge, lw=0.5
         )
         ax.add_patch(r)
         rects.append(r)
+
+        if motif_mask is not None:
+            if motif_mask[i]:
+                # draw a black line underneath for fixed positions
+                ax.add_patch(
+                    Rectangle(
+                        xy=(i - 0.5, -1),  # under logits
+                        width=1.0,
+                        height=0.3,
+                        facecolor=(0.0, 0.0, 0.0, 0.8),
+                        lw=0,
+                    )
+                )
+
+    if motif_mask is not None:
+        ax.set_ylim(-1, num_tokens)
+
     return rects
 
 
 def save_logits_traj(
     logits_traj: npt.NDArray,  # (T, N, S) where S = 20 or 21
     aa_traj: npt.NDArray,  # (T, N)
-    diffuse_mask: npt.NDArray,  # (N,)
+    motif_mask: Optional[npt.NDArray],  # (N,)
     output_dir: str,
     animation_interval_ms: float = 100,
 ) -> str:
@@ -205,7 +225,7 @@ def save_logits_traj(
     # create image to update, draw frame 1
     im = _init_logits_heatmap(ax, logits=logits_traj[0], title="Logits trajectory")
     rects = _init_logits_borders(
-        ax, logits_traj=logits_traj, aa_traj=aa_traj, diffuse_mask=diffuse_mask
+        ax, logits_traj=logits_traj, aa_traj=aa_traj, motif_mask=motif_mask
     )
 
     def update(frame):
@@ -242,10 +262,11 @@ def save_logits_traj(
 def _init_seq_artists(
     ax: plt.Axes,
     num_res: int,
-    letters: List[str],
-    res_colors: npt.NDArray,
+    motif_mask: Optional[npt.NDArray],  # (N,)
 ) -> Tuple[Sequence[Rectangle], Sequence[Text]]:
-    """Create one rectangle + text per residue; return them for later updates."""
+    """
+    Create one rectangle + text per residue; return them for later updates.
+    """
     ax.set_axis_off()
     rects: List[Rectangle] = []
     texts: List[matplotlib.text.Text] = []
@@ -255,7 +276,7 @@ def _init_seq_artists(
             (i, 0),
             1.0,
             1.0,
-            facecolor=res_colors[20],  # unknown to start
+            facecolor=(1.0, 1.0, 1.0),  # white to start
             edgecolor="white",
             lw=0.5,
             alpha=0.5,
@@ -268,8 +289,24 @@ def _init_seq_artists(
         )
         texts.append(txt)
 
+        # draw a black line underneath for fixed positions
+        if motif_mask is not None:
+            if motif_mask[i]:
+                ax.add_patch(
+                    Rectangle(
+                        xy=(i, -0.3),  # at bottom
+                        width=1.0,
+                        height=0.2,
+                        facecolor=(0.0, 0.0, 0.0, 0.8),
+                        lw=0,
+                    )
+                )
+
     ax.set_xlim(0, num_res)
-    ax.set_ylim(0, 1)
+    if motif_mask is not None:
+        ax.set_ylim(-0.3, 1)
+    else:
+        ax.set_ylim(0, 1)
     ax.set_aspect("equal", adjustable="box")
     return rects, texts
 
@@ -278,17 +315,16 @@ def _update_seq_artists(
     seq: npt.NDArray,  # (N,)
     rects: Sequence[Rectangle],
     texts: Sequence[matplotlib.text.Text],
-    letters: List[str],
-    res_colors: npt.NDArray,
 ) -> Tuple[Rectangle, ...]:
     """Mutate rect/text colors + labels in place and return artists."""
+    letters, res_colors = _get_letters_res_colors()
     for i, aa_idx in enumerate(seq):
         rects[i].set_facecolor(res_colors[int(aa_idx)])
         texts[i].set_text(letters[int(aa_idx)])
     return tuple(rects) + tuple(texts)
 
 
-def plot_seq(ax: Optional[Axes], seq: npt.NDArray):
+def plot_seq(ax: Optional[Axes], seq: npt.NDArray, motif_mask: Optional[npt.NDArray]):
     """
     Plot sequence as line of boxes with AA inside.
     Expects ax with appropriate ratio.
@@ -301,14 +337,8 @@ def plot_seq(ax: Optional[Axes], seq: npt.NDArray):
     ax.cla()
     ax.set_axis_off()
 
-    letters, res_colors = _get_letters_res_colors()
-
-    rects, texts = _init_seq_artists(
-        ax, num_res=len(seq), letters=letters, res_colors=res_colors
-    )
-    _update_seq_artists(
-        seq, rects=rects, texts=texts, letters=letters, res_colors=res_colors
-    )
+    rects, texts = _init_seq_artists(ax, num_res=len(seq), motif_mask=motif_mask)
+    _update_seq_artists(seq, rects=rects, texts=texts)
 
     return rects, texts
 
@@ -423,6 +453,7 @@ def animate_trajectories(
     model_aa_traj: npt.NDArray,  # [clean_T, N]
     model_logits_traj: npt.NDArray,  # [clean_T, N, S] (S = 20, 21)
     diffuse_mask: npt.NDArray,  # [N]
+    motif_mask: Optional[npt.NDArray],  # [N]
     output_dir: str,
     animation_max_frames: int,
 ):
@@ -473,15 +504,14 @@ def animate_trajectories(
         ax_logits_model,
         logits_traj=model_logits_traj,
         aa_traj=prot_aa_traj,
-        diffuse_mask=diffuse_mask,
+        motif_mask=motif_mask,
     )
 
-    letters, res_colors = _get_letters_res_colors()
     seq_rects_l, seq_texts_l = _init_seq_artists(
-        ax_sequence_prot, num_res, letters=letters, res_colors=res_colors
+        ax_sequence_prot, num_res, motif_mask=motif_mask
     )
     seq_rects_r, seq_texts_r = _init_seq_artists(
-        ax_sequence_model, num_res, letters=letters, res_colors=res_colors
+        ax_sequence_model, num_res, motif_mask=motif_mask
     )
 
     scat_l = _init_structure_artists(
@@ -517,8 +547,6 @@ def animate_trajectories(
             prot_aa_traj[timestep],
             rects=seq_rects_l,
             texts=seq_texts_l,
-            letters=letters,
-            res_colors=res_colors,
         )
         _update_structure_artists(prot_structure_traj[timestep], scats=scat_l)
 
@@ -527,8 +555,6 @@ def animate_trajectories(
                 model_aa_traj[timestep - 1],
                 rects=seq_rects_r,
                 texts=seq_texts_r,
-                letters=letters,
-                res_colors=res_colors,
             )
             _update_structure_artists(model_structure_traj[timestep - 1], scats=scat_r)
             logits_im.set_data(_rgba_from_logits(model_logits_traj[timestep - 1]))
@@ -568,7 +594,7 @@ def save_trajectory(
     protein_structure_traj: npt.NDArray,  # (noisy_T, N, 37, 3)
     model_structure_traj: npt.NDArray,  # (clean_T, N, 37, 3)
     diffuse_mask: npt.NDArray,  # (N,)
-    motif_mask: Optional[npt.NDArray],
+    motif_mask: Optional[npt.NDArray],  # (N,)
     chain_idx: npt.NDArray,  # (N,)
     res_idx: npt.NDArray,  # (N,)
     output_dir: str,
@@ -621,7 +647,6 @@ def save_trajectory(
     # ensure directory exists
     os.makedirs(output_dir, exist_ok=True)
 
-    diffuse_mask = diffuse_mask.astype(bool)
     sample_pdb_path = os.path.join(output_dir, OutputFileName.sample_pdb)
     sample_pdb_backbone_path = os.path.join(
         output_dir, OutputFileName.sample_pdb_backbone
@@ -639,6 +664,7 @@ def save_trajectory(
         assert model_aa_traj.shape == (model_traj_length, num_res)
 
     # Use b-factors to specify which residues are diffused.
+    diffuse_mask = diffuse_mask.astype(bool)
     b_factors = np.tile((diffuse_mask * 100)[:, None], (1, 37))
 
     sample_pdb_path = write_prot_to_pdb(
@@ -649,8 +675,8 @@ def save_trajectory(
         aatype=protein_aa_traj[-1] if protein_aa_traj is not None else None,
         chain_idx=chain_idx,
         res_idx=res_idx,
+        backbone_only=False,
     )
-
     sample_pdb_backbone_path = write_prot_to_pdb(
         sample_atom37,
         file_path=sample_pdb_backbone_path,
@@ -720,6 +746,7 @@ def save_trajectory(
             model_aa_traj=model_aa_traj,
             model_logits_traj=model_logits_traj,
             diffuse_mask=diffuse_mask,
+            motif_mask=motif_mask,
             output_dir=output_dir,
             animation_max_frames=animation_max_frames,
         )

@@ -204,9 +204,12 @@ https://github.com/microsoft/protein-frame-flow
         - [x] module ignores `aatypes` loss in `motif_mask` 
             - ? module still uses `diffuse_mask` for structure losses if still predicting for all residues, i.e. non fixed motifs
         - [x] update metrics calculation to use motif_mask instead of meaningless diffuse_mask
+        - [x] fix tests
         - [ ] confirm alignment of training and testing embeddings + masks
-        - [ ] fix tests
-        - [ ] update trajectory animation to show `motif_mask` / `diffuse_mask` if not given
+        - [x] update trajectory animation to show `motif_mask` / `diffuse_mask` if not given
+            - line in logits under position for motifs
+            - line under sequence for motifs
+            - color structure by diffused
 
 
 ## Future Work

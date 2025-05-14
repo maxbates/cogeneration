@@ -553,7 +553,7 @@ class TestInterpolantSample:
 
         final_aa = model_traj.amino_acids[:, -1]
         orig_aa = batch[bp.aatypes_1]
-        motif_mask = batch[bp.diffuse_mask] == 0
+        motif_sel = batch[bp.motif_mask].bool()
         assert torch.equal(
-            final_aa[motif_mask], orig_aa[motif_mask]
+            final_aa[motif_sel], orig_aa[motif_sel]
         ), "Motif amino acids should be preserved in inpainting sampling"

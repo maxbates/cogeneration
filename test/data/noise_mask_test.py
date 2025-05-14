@@ -34,8 +34,8 @@ class TestCenteredHarmonic:
         for b in range(noise.size(0)):
             chain_coms = {}
             for i, c in enumerate(torch.unique(chain_idx[b])):
-                mask = chain_idx[b] == c
-                com = noise[b][mask].mean(dim=0)
+                chain_mask = chain_idx[b] == c
+                com = noise[b][chain_mask].mean(dim=0)
                 chain_coms[i] = com
 
             # check COMs are unique within batch

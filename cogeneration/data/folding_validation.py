@@ -278,7 +278,6 @@ class FoldingValidator:
 
             # For inpainting task, compute sequence recovery for fixed motifs
             if task == InferenceTask.inpainting:
-                # Get mask for fixed motifs (where diffuse_mask = 0)
                 if motif_mask.any():
                     motif_sel = motif_mask.astype(bool)
 
@@ -534,7 +533,7 @@ class FoldingValidator:
         Generates and returns a fasta of inverse folded sequences using ProteinMPNN.
         The number of sequences is determined by cfg.
         """
-        # TODO(inpainting) - support pass fixed residues to ProteinMPNN
+        # TODO(inpainting-fixed) - support pass fixed residues to ProteinMPNN
         #    However, for inpainting, likely want to pass an empty mask,
         #    since some of the metrics check for sequence conservation of motifs.
         # assert diffuse_mask is None or (diffuse_mask == 1.0).all()
@@ -750,7 +749,7 @@ class FoldingValidator:
 
         `folded_df` can be either the single generated sample, or ProteinMPNN re-folds.
 
-        For inpainting, also computes metrics specific to fixed motifs (where diffuse_mask = 0).
+        For inpainting, also computes metrics specific to fixed motifs.
 
         Extends the input `folded_df` rows with these metrics and returns DataFrame.
 

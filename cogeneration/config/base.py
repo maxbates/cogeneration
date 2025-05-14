@@ -1173,6 +1173,9 @@ class Config(BaseClassConfig):
         raw_cfg.interpolant.codesign_forward_fold_prop = 0.0
         raw_cfg.interpolant.codesign_inverse_fold_prop = 0.0
 
+        # skip animations, they are slow to generate
+        raw_cfg.inference.write_animations = False
+
         return raw_cfg
 
     @classmethod
