@@ -222,7 +222,7 @@ https://github.com/microsoft/protein-frame-flow
     - [x] set up to allow other methods. abstract into class.
     - [x] allow trimming low pLDDT ends before selection
     - [x] interacting residues or potential active sites
-    - [x] Allow selecting a residue and then removing / keeping residues within some distance
+    - [x] Allow selecting a residue and then removing / keeping residues within some distance   
     - [ ] cross-chain interactions
         - can we augment dataset looking for large monomers with interacting motifs?
     - [ ] based on secondary structure? e.g. enrich for beta sheets

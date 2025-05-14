@@ -494,3 +494,47 @@ class TestInterpolant:
         assert torch.all(
             noisy_batch[nbp.trans_t][scaffold_sel] != batch[bp.trans_1][scaffold_sel]
         ), "motif structure should change"
+
+    @pytest.mark.parametrize("time", [0, 1])
+    def test_corruption_t_0_1(self, time, mock_cfg_uninterpolated):
+        # no noise should be added at t=0 or t=1 for stochastic paths (boundary condition)
+        mock_cfg_uninterpolated.shared.stochastic = True
+        mock_cfg_uninterpolated.interpolant.trans.batch_ot = False
+        mock_cfg_uninterpolated.interpolant.trans.batch_align = False
+        cfg = mock_cfg_uninterpolated.interpolate()
+
+        interpolant = Interpolant(cfg.interpolant)
+        interpolant.set_device(torch.device("cpu"))
+
+        B, N = 5, 20
+        chain_idx = torch.ones(B, N).long()
+        res_mask = torch.ones(B, N).float()
+        diffuse_mask = torch.ones(B, N).float()
+        t = torch.ones((B, 1)) * time
+
+        assert torch.allclose(
+            interpolant._compute_sigma_t(t, scale=1, min_sigma=0.0),
+            torch.zeros((B, 1)).float(),
+        )
+
+        trans_1 = centered_gaussian(B, N, device=interpolant._device)
+        trans_1 -= batch_center_of_mass(trans_1, mask=res_mask)[:, None]
+        trans_t = interpolant._corrupt_trans(
+            trans_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask, chain_idx=chain_idx
+        )
+        if time == 1:
+            assert torch.allclose(trans_1, trans_t, atol=1e-4)
+
+        rotmats_1 = uniform_so3(B, N, device=interpolant._device)
+        rotmats_t = interpolant._corrupt_rotmats(
+            rotmats_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
+        )
+        if time == 1:
+            assert torch.allclose(rotmats_1, rotmats_t, atol=1e-4)
+
+        aatypes_1 = torch.randint(0, 20, (B, N)).long()
+        aatypes_t = interpolant._corrupt_aatypes(
+            aatypes_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
+        )
+        if time == 1:
+            assert torch.equal(aatypes_1, aatypes_t)

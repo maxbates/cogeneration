@@ -241,13 +241,12 @@ class Interpolant:
         min_t = self.cfg.min_t
         return t * (1 - 2 * min_t) + min_t
 
-    def _compute_sigma_t(self, t: torch.Tensor, scale: float, min_sigma: float = 0.01):
+    def _compute_sigma_t(self, t: torch.Tensor, scale: float, min_sigma: float = 0.0):
         """
         Compute the standard deviation of the noise at time `t`.
-        The standard deviation is a parabolic function of t, with a minimum at t=0 and t=1.
+        The standard deviation is a parabolic function of t, and is zero at t=0 and t=1.
         """
-        sigma_t = scale * torch.sqrt(t * (1 - t) + 1e-4)
-        return torch.clamp(sigma_t, min=min_sigma)
+        return torch.sqrt(scale**2 * t * (1 - t) + min_sigma**2)
 
     def _trans_noise(self, chain_idx: torch.Tensor) -> torch.Tensor:
         """
