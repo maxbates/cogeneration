@@ -467,7 +467,7 @@ class BaseDataset(Dataset):
             if isinstance(segment, Motif):
                 # Motifs mostly preserve data
                 for prop in list(new_feats.keys()):
-                    if prop in METADATA_BATCH_PROPS:
+                    if prop in METADATA_BATCH_PROPS or prop not in feats:
                         continue
                     new_feats[prop][ns:ne] = feats[prop][os:oe]
 

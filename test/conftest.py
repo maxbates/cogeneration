@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 from dataclasses import dataclass
@@ -293,10 +294,6 @@ def mock_checkpoint(mock_folding_validation):
 
     Note this is sort of slow, because we actually have to call `Trainer.fit()`
     to save the checkpoint, though we only train for one step, which takes ~30-60s on a Mac with MPS.
-
-    TODO(test) - memoize, maybe if by hashing `cfg.model`?
-    #   Need to confirm cfg is equivalent enough to use as checkpoint? or overwrite when changes made?
-    #   Maybe we can hash the config (ignoring fields like `shared.id`)
     """
 
     def create_mock_checkpoint(
@@ -323,15 +320,19 @@ def mock_checkpoint(mock_folding_validation):
 
         # We cache a checkpoint across test runs, hashing on `cfg.model` to ensure compatibility
         cache_dir = os.path.join(os.path.dirname(__file__), ".cache", "model_ckpt")
-        model_hash = hash(str(cfg.model))
+        # use md5 because built-in hash() uses new seed each run
+        model_hash = hashlib.md5(str(cfg.model).encode()).hexdigest()
         cache_ckpt_path = os.path.join(cache_dir, f"{model_hash}.ckpt")
         if os.path.exists(cache_ckpt_path):
             print(f"Using cached model checkpoint at {cache_ckpt_path}")
             # copy the cached checkpoint to the new location
-            os.makedirs(ckpt_dir, exist_ok=True)
             os.link(cache_ckpt_path, ckpt_path)
             os.link(cache_ckpt_path, final_ckpt_path)
             return cfg, ckpt_path
+
+        print(
+            f"Creating new model checkpoint at {ckpt_path} -> cache {cache_ckpt_path}"
+        )
 
         # saving a checkpoint with pytorch lightning is annoying.
         # We need to use a lightning `Trainer`, and call `fit()` on it, which requires a datamodule.

@@ -547,15 +547,17 @@ class FlowModule(LightningModule):
         # inpainting / scaffolding metrics
         # note that depending on `cfg.interpolant` some examples may be set to different subtasks.
         if self.cfg.data.task == DataTask.inpainting:
-            diffuse_mask = batch[bp.diffuse_mask].int()
-            scaffold_percent = torch.mean(diffuse_mask).item()
+            motif_mask = batch[bp.motif_mask].float()
+            scaffold_mask = 1 - motif_mask
+
+            scaffold_percent = torch.mean(scaffold_mask).item()
             self._log_scalar(
                 "train/scaffolding_percent",
                 scaffold_percent,
                 prog_bar=False,
                 batch_size=num_batch,
             )
-            num_motif_res = torch.sum(1 - diffuse_mask, dim=-1)
+            num_motif_res = torch.sum(motif_mask, dim=-1)
             self._log_scalar(
                 "train/motif_size",
                 torch.mean(num_motif_res).item(),
