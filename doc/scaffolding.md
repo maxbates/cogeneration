@@ -205,11 +205,15 @@ https://github.com/microsoft/protein-frame-flow
             - ? module still uses `diffuse_mask` for structure losses if still predicting for all residues, i.e. non fixed motifs
         - [x] update metrics calculation to use motif_mask instead of meaningless diffuse_mask
         - [x] fix tests
-        - [ ] confirm alignment of training and testing embeddings + masks
         - [x] update trajectory animation to show `motif_mask` / `diffuse_mask` if not given
             - line in logits under position for motifs
             - line under sequence for motifs
             - color structure by diffused
+        - [x] ensure resetting motif_mask is valid, protein hasn't been truncated
+             - in dataset do we remove t=1 values for scaffolds, but only for eval not for training
+        - [x] confirm alignment of training and testing embeddings + masks
+        - [ ] standardize on `motif_mask == 0` instead of None?
+            - can be reset to zeroes per row, not None, if `codesign_separate_t` is set, so have to check anyways
 
 
 ## Future Work

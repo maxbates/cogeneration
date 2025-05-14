@@ -529,7 +529,6 @@ class Interpolant:
                 # Despite some of the sequence being fixed, we still set intermediate `t` without
                 # taking the motif sequence into account. The fixed domain is set to t=1.
                 #
-                #
                 # |       task      |     motifs    |    no motifs    |
                 # |-----------------|---------------|-----------------|
                 # |    [codesign]   | [inpainting]  | [unconditional] |
@@ -538,6 +537,11 @@ class Interpolant:
                 # | forward_folding | fwd * (1-unc) |    fwd * unc    |
                 # | inverse_folding | inv * (1-unc) |    inv * unc    |
                 # |-----------------|---------------|-----------------|
+
+                assert (
+                    bp.motif_mask in noisy_batch
+                    and noisy_batch[bp.motif_mask] is not None
+                ), "Motif mask is required for inpainting task, but not found in batch."
 
                 # forward_folding and inverse_folding set fixed domain to t=1
                 # and use sampled t for the modeled domains, regardless of motif % defined.
@@ -563,14 +567,12 @@ class Interpolant:
                     torch.zeros_like(noisy_batch[bp.motif_mask]),
                     noisy_batch[bp.motif_mask],
                 ).float()
-                # And re-center only the unconditional structures, since they were centered using the motifs.
+                # Re-center only the unconditional structures, in case they were centered using the motifs.
                 unconditional_com = batch_center_of_mass(
                     pos=noisy_batch[bp.trans_1][unconditional_mask],
                     mask=noisy_batch[bp.res_mask][unconditional_mask],
-                )
-                noisy_batch[bp.trans_1][unconditional_mask] -= unconditional_com[
-                    :, None
-                ]
+                )[:, None]
+                noisy_batch[bp.trans_1][unconditional_mask] -= unconditional_com
 
             elif task == DataTask.hallucination:
                 # proportions: forward, inverse, rest = normal unconditional
@@ -623,7 +625,7 @@ class Interpolant:
         """
         noisy_batch: NoisyFeatures = copy.deepcopy(batch)
 
-        # set t values for each domain, i.e. `bp.so3_t`, `bp.r3_t`, `bp.cat_t`, and potentially modify `diffuse_mask`.
+        # set t values for each domain, i.e. `bp.so3_t`, `bp.r3_t`, `bp.cat_t`, and potentially modify masks.
         self._set_corruption_times(
             noisy_batch=noisy_batch,
             task=task,
@@ -871,7 +873,7 @@ class Interpolant:
         self,
         d_t: float,
         t: float,
-        logits_1: torch.Tensor,  # (B, N, 20)
+        logits_1: torch.Tensor,  # (B, N, S=20)
         aatypes_t: torch.Tensor,  # (B, N)
     ):
         num_batch, num_res, num_states = logits_1.shape
@@ -912,7 +914,7 @@ class Interpolant:
         self,
         d_t: float,
         t: float,
-        logits_1: torch.Tensor,  # (B, N, 21)
+        logits_1: torch.Tensor,  # (B, N, S=21)
         aatypes_t: torch.Tensor,  # (B, N)
     ):
         num_batch, num_res, num_states = logits_1.shape
@@ -952,7 +954,13 @@ class Interpolant:
         new_aatypes = torch.multinomial(step_probs.view(-1, num_states), num_samples=1)
         return new_aatypes.view(num_batch, num_res)
 
-    def _aatypes_euler_step_purity(self, d_t, t, logits_1, aatypes_t):
+    def _aatypes_euler_step_purity(
+        self,
+        d_t: float,
+        t: float,
+        logits_1: torch.Tensor,  # (B, N, S=21)
+        aatypes_t: torch.Tensor,  # (B, N)
+    ):
         """
         Perform an Euler step with a focus on maintaining "purity" by selectively unmasking and updating
         amino acid types. This function is designed specifically for the "masking" interpolant type, where S = 21.
@@ -1048,7 +1056,7 @@ class Interpolant:
     def _aatype_jump_step(
         self,
         d_t: float,
-        t: float,  # t in [0,1]   TODO - move to tensor to match other domains
+        t: float,  # t in [0,1]
         logits_1: torch.Tensor,  # (B, N, S)
         aatypes_t: torch.Tensor,  # (B, N)
     ) -> torch.Tensor:
@@ -1072,7 +1080,7 @@ class Interpolant:
 
         # logits -> probabilities
         stochastic_temp = 1.5  # TODO(cfg) support cfg for `stochastic_temp`
-        prob_rows = F.softmax(logits_1 / stochastic_temp, dim=-1)  # (B,N,S)
+        prob_rows = F.softmax(logits_1 / stochastic_temp, dim=-1)  # (B, N, S)
         prob_rows = prob_rows.clamp(min=1e-8)  # avoid zeros
 
         # Build rate matrix (positive exits, negative stays)

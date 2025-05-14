@@ -425,7 +425,7 @@ class BaseDataset(Dataset):
         Resets `chain_idx` to match Segments provided. Expected to reset indices after calling this function.
         """
         new_total_length = sum([seg.length for seg in segments])
-        new_feats = empty_feats(N=new_total_length)
+        new_feats = empty_feats(N=new_total_length, task=DataTask.inpainting)
 
         # copy over metadata features from original
         for prop in METADATA_BATCH_PROPS:

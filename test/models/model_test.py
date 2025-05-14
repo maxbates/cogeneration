@@ -1,9 +1,9 @@
 import pytest
 import torch
 
-from cogeneration.config.base import Config, ModelConfig, ModelSequencePredictionEnum
+from cogeneration.config.base import ModelSequencePredictionEnum
+from cogeneration.dataset.test_utils import MockDataloader
 from cogeneration.models.model import FlowModel
-from cogeneration.type.batch import BatchProp as bp
 
 
 class TestFlowModel:
@@ -17,25 +17,24 @@ class TestFlowModel:
         assert output is not None
 
     @pytest.mark.parametrize(
-        "mock_corrupted_dataloader",
+        "batch_size, sample_lengths",
         [
-            {"batch_size": 1, "sample_lengths": [10]},
-            {"batch_size": 1, "sample_lengths": [10, 12]},
-            {
-                "batch_size": 2,
-                "sample_lengths": [10, 10],
-            },  # batches must be same length
-            {
-                "batch_size": 2,
-                "sample_lengths": [12, 12, 8, 8],
-            },  # batches must be same length
+            (1, [10]),  # single sample
+            (1, [10, 12]),  # mismatched lengths allowed for batch_size=1
+            (2, [10, 10]),  # batches must be same length
+            (2, [12, 12, 8, 8]),  # two batches of 2 samples each
         ],
-        indirect=True,
     )
-    def test_forward_mock_dataloader(self, mock_cfg, mock_corrupted_dataloader):
+    def test_forward_mock_dataloader(self, mock_cfg, batch_size, sample_lengths):
         model = FlowModel(mock_cfg.model)
 
-        for batch in mock_corrupted_dataloader:
+        mock_dataloader = MockDataloader(
+            corrupt=True,
+            batch_size=batch_size,
+            sample_lengths=sample_lengths,
+        )
+
+        for batch in mock_dataloader:
             assert batch is not None
             output = model(batch)
             assert output is not None

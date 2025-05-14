@@ -4,6 +4,7 @@ import torch
 
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.type.str_enum import StrEnum
+from cogeneration.type.task import DataTask
 
 
 class BatchProp(StrEnum):
@@ -93,11 +94,11 @@ InferenceFeatures = Dict[BatchProp, TensorFeat]
 ModelPrediction = Dict[PredBatchProp, TensorFeat]
 
 
-def empty_feats(N: int) -> BatchFeatures:
+def empty_feats(N: int, task: DataTask = DataTask.hallucination) -> BatchFeatures:
     """
     Create empty features for a protein of length N.
     """
-    return {
+    feats = {
         BatchProp.res_mask: torch.ones(N),
         # assume masking interpolant
         BatchProp.aatypes_1: (torch.ones(N) * MASK_TOKEN_INDEX).long(),
@@ -108,11 +109,13 @@ def empty_feats(N: int) -> BatchFeatures:
         BatchProp.res_idx: torch.arange(N),
         BatchProp.res_plddt: torch.zeros(N),
         BatchProp.diffuse_mask: torch.ones(N),
-        BatchProp.motif_mask: torch.zeros(
-            N
-        ),  # [ inpainting only ]  # TODO arg for optional
         BatchProp.plddt_mask: torch.ones(N),
         BatchProp.pdb_name: "",
         BatchProp.csv_idx: torch.tensor([1], dtype=torch.long),
-        BatchProp.sample_id: 0,  # [ inference only ]
+        BatchProp.sample_id: 0,  # inference only but no impact to training / model
     }
+
+    if task == DataTask.inpainting:
+        feats[BatchProp.motif_mask] = torch.zeros(N)
+
+    return feats

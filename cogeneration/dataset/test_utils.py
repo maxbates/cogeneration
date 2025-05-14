@@ -16,7 +16,9 @@ from cogeneration.type.batch import NoisyFeatures
 from cogeneration.type.task import DataTask
 
 
-def mock_feats(N: int, idx: int, multimer: bool = False) -> BatchFeatures:
+def mock_feats(
+    N: int, idx: int, task: DataTask = DataTask.hallucination, multimer: bool = False
+) -> BatchFeatures:
     """
     Creates random features for a protein of length N
     Assumes `task=unconditional`, i.e. `(diffuse_mask == 1.0).all()`
@@ -24,14 +26,19 @@ def mock_feats(N: int, idx: int, multimer: bool = False) -> BatchFeatures:
     feats: BatchFeatures = {}
 
     # N residue protein, random frames
-    feats[bp.res_mask] = torch.ones(N)
+    feats[bp.res_mask] = torch.ones(N).int()
     feats[bp.aatypes_1] = torch.randint(0, 20, (N,))  # may contain UNK (20)
     feats[bp.trans_1] = torch.rand(N, 3) * 10.0
     feats[bp.rotmats_1] = uniform_so3(1, N, device=torch.device("cpu")).squeeze(0)
     feats[bp.torsion_angles_sin_cos_1] = torch.rand(N, 7, 2)
     feats[bp.res_plddt] = torch.floor(torch.rand(N) + 0.5)
     feats[bp.plddt_mask] = feats[bp.res_plddt] > 0.6
-    feats[bp.diffuse_mask] = torch.ones(N)
+    feats[bp.diffuse_mask] = torch.ones(N).int()
+
+    if task == DataTask.inpainting:
+        # set a motif_mask where some middle portion of the protein is scaffolded
+        feats[bp.motif_mask] = torch.ones(N).int()
+        feats[bp.motif_mask][slice(*sorted(torch.randint(0, N, (2,))))] = 0
 
     # metadata
     feats[bp.pdb_name] = f"test_{idx}"
@@ -52,13 +59,15 @@ def mock_feats(N: int, idx: int, multimer: bool = False) -> BatchFeatures:
     return feats
 
 
-def mock_noisy_feats(N: int, idx: int, multimer: bool = False) -> NoisyFeatures:
+def mock_noisy_feats(
+    N: int, idx: int, task: DataTask = DataTask.hallucination, multimer: bool = False
+) -> NoisyFeatures:
     """
     Create random and corrupted features for a protein of length N.
     Assumes `task=unconditional` generation - the entire sequence + structure is corrupted.
     For other tasks, use `Interpolant.corrupt_batch` to corrupt the features.
     """
-    feats: NoisyFeatures = mock_feats(N=N, idx=idx, multimer=multimer)
+    feats: NoisyFeatures = mock_feats(N=N, idx=idx, task=task, multimer=multimer)
 
     # generate corrupted noisy values for input_feats
     t = torch.rand(1)  # use same value as with unconditional + not separate_t
@@ -76,7 +85,7 @@ def mock_noisy_feats(N: int, idx: int, multimer: bool = False) -> NoisyFeatures:
 
 class MockDataset(Dataset):
     """
-    Creates `task=unconditional` mock dataset with `len(sample_lengths)` samples.
+    Creates mock dataset with `len(sample_lengths)` samples.
 
     If `corrupt`, the samples are mock-corrupted into `NoisyFeatures` as in unconditional generation,
     else they are `BatchFeatures`.
@@ -85,6 +94,7 @@ class MockDataset(Dataset):
     def __init__(
         self,
         sample_lengths: Optional[List[int]] = None,
+        task: DataTask = DataTask.hallucination,
         corrupt: bool = False,
         multimer: bool = False,
     ):
@@ -93,6 +103,7 @@ class MockDataset(Dataset):
         assert len(sample_lengths) > 0
         self.sample_lengths = sample_lengths
 
+        self.task = task
         self.corrupt = corrupt
         self.multimer = multimer
 
@@ -103,9 +114,13 @@ class MockDataset(Dataset):
 
         for i, N in enumerate(self.sample_lengths):
             if self.corrupt:
-                all_items.append(mock_noisy_feats(N=N, idx=i, multimer=self.multimer))
+                all_items.append(
+                    mock_noisy_feats(N=N, idx=i, task=self.task, multimer=self.multimer)
+                )
             else:
-                all_items.append(mock_feats(N=N, idx=i, multimer=self.multimer))
+                all_items.append(
+                    mock_feats(N=N, idx=i, task=self.task, multimer=self.multimer)
+                )
 
         return all_items
 
@@ -128,11 +143,12 @@ class MockDataloader(DataLoader):
         self,
         batch_size: int = 1,
         sample_lengths: Optional[List[int]] = None,
+        task: DataTask = DataTask.hallucination,
         corrupt: bool = False,
         multimer: bool = False,
     ):
         dataset = MockDataset(
-            sample_lengths=sample_lengths, corrupt=corrupt, multimer=multimer
+            sample_lengths=sample_lengths, task=task, corrupt=corrupt, multimer=multimer
         )
         super().__init__(dataset, batch_size=batch_size)
 

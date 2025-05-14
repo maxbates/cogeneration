@@ -18,6 +18,9 @@ class TestBaseDataset:
         N = 7
         feats = empty_feats(N)
 
+        # Don't require input feats contain motif_mask
+        assert bp.motif_mask not in feats
+
         # segment start/end are *inclusive*
         segments = [
             Scaffold(start=0, end=2, new_length=5),  # 0,1,2 -> 0,1,2,3,4
@@ -29,6 +32,8 @@ class TestBaseDataset:
         new_feats = BaseDataset.segment_features(feats=feats, segments=segments)
 
         # check diffuse_mask and motif_mask
+        # adds motif_mask prop
+        assert bp.motif_mask in new_feats
         # inpainting with guidance -> whole structure diffused
         assert (feats[bp.diffuse_mask] == 1).all()
         # segment 0 = scaffold
