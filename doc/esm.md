@@ -20,21 +20,19 @@ Can probably take ESM module from FoldFlow2
 
 - [ ] Confirm handles multiple chains
 
-- [ ] Is there a way to make it work with logits, e.g. `aatype_sc`, or if intermediate timepoints aren't discrete?
-
 - Inpainting
     - should ESM representation only take motifs (sequence fixed, structure chains) or update as `aatypes` change?
         - probably update...
 
 ### TODO
 
-- [ ] Add ESM module
-    - [ ] ESM should be frozen
-    - [ ] Convert AF2 style representation to ESM and back
+- [x] Add ESM module
+    - [x] ESM should be frozen
+    - [x] Convert AF2 style representation to ESM and back
        - alphabet
        - padding / EOS
        - structure representation?
-       - multiple chains
+       - [x] support multiple chains
 
 - [ ] Cfg option to use ESM
     - [ ] Specify ESM model size, adjusts hyperparameters
@@ -49,6 +47,9 @@ Can probably take ESM module from FoldFlow2
         - [ ] important to embed `cat_t`?
     
 - [ ] Pass these merged representations to sequence prediction net
+
+- [x] dummy model for testing in registry
+    - [ ] enable in test suite setup
 
 - [ ] Update checkpointing
     - include in checkpoint?

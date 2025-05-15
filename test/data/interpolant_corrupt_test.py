@@ -520,7 +520,11 @@ class TestInterpolant:
         trans_1 = centered_gaussian(B, N, device=interpolant._device)
         trans_1 -= batch_center_of_mass(trans_1, mask=res_mask)[:, None]
         trans_t = interpolant._corrupt_trans(
-            trans_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask, chain_idx=chain_idx
+            trans_1,
+            t=t,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
+            chain_idx=chain_idx,
         )
         if time == 1:
             assert torch.allclose(trans_1, trans_t, atol=1e-4)
