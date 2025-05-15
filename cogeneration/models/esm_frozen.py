@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Callable, Dict, Optional, Tuple, Any
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import esm
 import torch
@@ -8,58 +8,69 @@ import tree
 from esm.data import Alphabet
 from torch import nn
 
+from cogeneration.config.base import ModelESMKey
 from cogeneration.data.residue_constants import restypes_with_x
+
+ESMRegistryKey = Union[str, ModelESMKey]
+
+ESMRegistryReturn = Tuple[nn.Module, Alphabet]
 
 
 @dataclass
 class EsmRegistry:
-    """Singleton holding factories that return `(model, alphabet)` pairs."""
+    """Singleton holding factories that return ESMRegistryReturn=(model, alphabet)"""
 
-    registry: Dict[str, Callable[[], Tuple[nn.Module, any]]] = field(
+    registry: Dict[ESMRegistryKey, Callable[[], ESMRegistryReturn]] = field(
         default_factory=dict
     )
 
-    def register(self, key: str, factory: Callable[[], Tuple[nn.Module, any]]) -> None:
+    def register(
+        self, key: ESMRegistryKey, factory: Callable[[], ESMRegistryReturn]
+    ) -> None:
         self.registry[key] = factory
 
-    def load(self, key: str) -> Tuple[nn.Module, any]:
+    def load(self, key: ESMRegistryKey) -> ESMRegistryReturn:
         if key not in self.registry:
-            raise KeyError(f"Model key '{key}' is not registered in EsmRegistry")
+            raise KeyError(
+                f"Model key '{key}' is not registered in EsmRegistry, have: {list(self.registry.keys())}"
+            )
         return self.registry[key]()
 
     # helper to register a dummy model for testing
     def register_dummy(
         self,
-        key: str = "dummy",
+        key: ESMRegistryKey = ModelESMKey.DUMMY,
         embedding_size: int = 4,
         n_layers: int = 1,
         n_heads: int = 1,
-    ) -> None:
+    ):
         """Registers a MinimalRandomESM under `key`."""
 
         def factory():
-            model = _MinimalRandomESM(embedding_size, n_layers, n_heads)
+            model = _DummyRandomESM(embedding_size, n_layers, n_heads)
             # use the small 8M model's alphabet
-            _, alphabet = esm.pretrained.load_model_and_alphabet("esm2_t6_8M_UR50D")
+            _, alphabet = esm.pretrained.load_model_and_alphabet(
+                ModelESMKey.esm2_t6_8M_UR50D
+            )
             return model, alphabet
 
         self.register(key, factory)
 
 
-class _MinimalRandomESM(nn.Module):
-    """Dummy ESM-like model that returns random representations/attentions"""
+class _DummyRandomESM(nn.Module):
+    """Dummy ESM-like model for testing that returns random representations/attentions"""
 
     def __init__(self, embed_dim: int, n_layers: int, n_heads: int):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_layers = n_layers
-        self.num_heads = n_heads
+        self.attention_heads = n_heads
 
     @torch.no_grad()
     def forward(
         self,
         tokens: torch.Tensor,  # (B, L)
-        repr_layers: Any, # ignored, use num_layers
+        repr_layers: Any,  # ignored, use num_layers
         need_head_weights: bool = True,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
@@ -71,20 +82,23 @@ class _MinimalRandomESM(nn.Module):
         attn = None
         if need_head_weights:
             attn = torch.randn(
-                B, self.num_layers, self.num_heads, L, L, device=tokens.device
+                B, self.num_layers, self.attention_heads, L, L, device=tokens.device
             )
         return {"representations": reps, "attentions": attn}
 
 
+# ESM registry singleton
 ESM_REGISTRY = EsmRegistry(
     registry={
-        "esm2_8M_270K": esm.pretrained.esm2_t6_8M_UR50D,
-        "esm2_35M_270K": esm.pretrained.esm2_t12_35M_UR50D,
-        "esm2_650M": esm.pretrained.esm2_t33_650M_UR50D,
-        "esm2_3B": esm.pretrained.esm2_t36_3B_UR50D,
-        "esm2_15B": esm.pretrained.esm2_t48_15B_UR50D,
+        ModelESMKey.esm2_t6_8M_UR50D: esm.pretrained.esm2_t6_8M_UR50D,
+        ModelESMKey.esm2_t12_35M_UR50D: esm.pretrained.esm2_t12_35M_UR50D,
+        ModelESMKey.esm2_t30_150M_UR50D: esm.pretrained.esm2_t30_150M_UR50D,
+        ModelESMKey.esm2_t33_650M_UR50D: esm.pretrained.esm2_t33_650M_UR50D,
+        ModelESMKey.esm2_t36_3B_UR50D: esm.pretrained.esm2_t36_3B_UR50D,
+        ModelESMKey.esm2_t48_15B_UR50D: esm.pretrained.esm2_t48_15B_UR50D,
     }
 )
+ESM_REGISTRY.register_dummy()
 
 
 @dataclass
@@ -198,17 +212,29 @@ class FrozenEsmModel(nn.Module):
         self._previous_call = None
         self.repr_layers = tuple(range(self.esm.num_layers + 1))
 
+    @property
+    def embed_dim(self):
+        return self.esm.embed_dim
+
+    @property
+    def num_layers(self):
+        return self.esm.num_layers
+
+    @property
+    def num_heads(self):
+        return self.esm.attention_heads
+
     @torch.no_grad()
     def forward(
         self,
-        aa_sequence: torch.Tensor,
-        chain_idx: torch.Tensor,
+        aatypes: torch.Tensor,
+        chain_index: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
         seq_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         sequence_data = SequenceData.from_af2(
-            aatypes=aa_sequence,
-            chain_idx=chain_idx,
+            aatypes=aatypes,
+            chain_idx=chain_index,
             esm_dict=self.esm_dict,
             attn_mask=attn_mask,
             seq_mask=seq_mask,

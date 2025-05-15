@@ -35,7 +35,6 @@ hydra does not currently support `Literal` and suggests using Enums instead.
 https://github.com/omry/omegaconf/issues/422
 """
 
-
 # TODO - support default configs for `forward_folding` and `inverse folding`
 #   There are a handful of values across the config that need to have other defaults.
 #   i.e. instead of the current `ternary` paradigm
@@ -238,6 +237,39 @@ class ModelEdgeFeaturesConfig(BaseClassConfig):
     embed_diffuse_mask: bool = True
 
 
+class ModelESMKey(StrEnum):
+    """Keys for ESM model selection."""
+
+    esm2_t6_8M_UR50D = "esm2_t6_8M_UR50D"
+    esm2_t12_35M_UR50D = "esm2_t12_35M_UR50D"
+    esm2_t30_150M_UR50D = "esm2_t30_150M_UR50D"
+    esm2_t33_650M_UR50D = "esm2_t33_650M_UR50D"
+    esm2_t36_3B_UR50D = "esm2_t36_3B_UR50D"
+    esm2_t48_15B_UR50D = "esm2_t48_15B_UR50D"
+    DUMMY = "dummy"  # dummy model for testing
+
+
+@dataclass
+class ModelESMCombinerCfg:
+    """
+    Enable ESM and combine simple + ESM / single + pair representations.
+    """
+
+    enabled: bool = True
+    esm_model_key: ModelESMKey = ModelESMKey.esm2_t30_150M_UR50D
+
+    # dims coming from simple node/edge networks
+    node_embed_size: int = "${model.hyper_params.node_embed_size}"
+    edge_embed_size: int = "${model.hyper_params.edge_embed_size}"
+
+    # ESM outputs projection size
+    esm_proj_single_dim: int = "${model.hyper_params.node_embed_size}"
+    esm_proj_pair_dim: int = "${model.hyper_params.edge_embed_size}"
+
+    # hidden size inside the tiny MLP used for projection
+    mlp_proj_hidden_dim: int = "${model.hyper_params.node_embed_size}"
+
+
 @dataclass
 class ModelIPAConfig(BaseClassConfig):
     """
@@ -329,6 +361,7 @@ class ModelConfig(BaseClassConfig):
     edge_features: ModelEdgeFeaturesConfig = field(
         default_factory=ModelEdgeFeaturesConfig
     )
+    esm_combiner: ModelESMCombinerCfg = field(default_factory=ModelESMCombinerCfg)
     ipa: ModelIPAConfig = field(default_factory=ModelIPAConfig)
 
     # predict torsion angles
@@ -835,6 +868,7 @@ class ExperimentTrainerConfig(BaseClassConfig):
     accumulate_grad_batches: int = 2
     # logging
     log_every_n_steps: int = 1
+
     # TODO put somewhere else, invalid argument to Trainer()
     # local_tensorboard_logdir: str = "./tensorboard_logs"
 
@@ -1135,6 +1169,7 @@ class Config(BaseClassConfig):
 
         # default to tiny model for faster model evaluations
         raw_cfg.model.hyper_params = ModelHyperParamsConfig.tiny()
+        raw_cfg.model.esm_combiner.esm_model_key = ModelESMKey.DUMMY
         raw_cfg.model.edge_features.feat_dim = 8
         # and smaller transformers
         raw_cfg.model.ipa.no_heads = 2
@@ -1193,6 +1228,8 @@ class Config(BaseClassConfig):
         # Model
         # Use public MultiFlow model size hyperparameters
         raw_cfg.model.hyper_params = ModelHyperParamsConfig.public_multiflow()
+        # disable ESM combiner
+        raw_cfg.model.esm_combiner.enabled = False
         # Use simple aa_pred_net from public MultiFlow
         raw_cfg.model.sequence_pred_type = ModelSequencePredictionEnum.aa_pred
         # stochastic paths not part of public MultiFlow

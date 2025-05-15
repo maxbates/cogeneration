@@ -34,22 +34,23 @@ Can probably take ESM module from FoldFlow2
        - structure representation?
        - [x] support multiple chains
 
-- [ ] Cfg option to use ESM
-    - [ ] Specify ESM model size, adjusts hyperparameters
-- Should only work with tasks where sequence is provided, e.g. inpainting and forward_folding
+- [x] Cfg option to use ESM
+    - [x] Specify ESM model size, adjusts hyperparameters
+- ? Should only work with tasks where sequence is provided, e.g. inpainting and forward_folding
     - [ ] validate approach with forward_folding
     - [ ] compare IPA to folding blocks approach
 
-- [ ] Merge `node_feature_net` and `edge_feature_net` with ESM embeddings
+- [x] Merge `node_feature_net` and `edge_feature_net` with ESM embeddings
+    - [-] By default, don't `embed_aatype` in `node_network` if using ESM?
+        - [-] how embed `aatype_sc` ?
+        - [-] important to embed `cat_t`?
     - [ ] be sure time + positional information is preserved
-    - [ ] By default, don't `embed_aatype` in `node_network` if using ESM?
-        - [ ] how embed `aatype_sc` ?
-        - [ ] important to embed `cat_t`?
+    - [ ] add folding block trunk to combiner module
     
-- [ ] Pass these merged representations to sequence prediction net
+- [x] Pass these merged representations to sequence prediction net
 
 - [x] dummy model for testing in registry
-    - [ ] enable in test suite setup
+    - [x] enable in test suite setup
 
 - [ ] Update checkpointing
     - include in checkpoint?

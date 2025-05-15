@@ -5,6 +5,7 @@ from cogeneration.data.const import rigids_ang_to_nm, rigids_nm_to_ang
 from cogeneration.data.rigid import create_rigid
 from cogeneration.models.aa_pred import AminoAcidNOOPNet, AminoAcidPredictionNet
 from cogeneration.models.edge_feature_net import EdgeFeatureNet
+from cogeneration.models.esm_combiner import ESMCombinerNetwork
 from cogeneration.models.ipa_attention import AttentionIPATrunk
 from cogeneration.models.node_feature_net import NodeFeatureNet
 from cogeneration.models.sequence_ipa_net import SequenceIPANet
@@ -61,6 +62,9 @@ class FlowModel(nn.Module):
                 f"Invalid sequence prediction type: {self.cfg.sequence_pred_type}"
             )
 
+        if self.cfg.esm_combiner.enabled:
+            self.esm_combiner = ESMCombinerNetwork(cfg=self.cfg.esm_combiner)
+
         # IPA trunk
         # Whether we perform final edge update depends on if used by aa_pred_net
         self.attention_ipa_trunk = AttentionIPATrunk(
@@ -70,8 +74,10 @@ class FlowModel(nn.Module):
         )
 
     def forward(self, batch: NoisyFeatures) -> ModelPrediction:
-        node_mask = batch[bp.res_mask]
-        edge_mask = node_mask[:, None] * node_mask[:, :, None]
+        res_mask = batch[bp.res_mask]
+        node_mask = res_mask
+        edge_mask = res_mask[:, None] * res_mask[:, :, None]
+
         diffuse_mask = batch[bp.diffuse_mask]
         motif_mask = batch.get(bp.motif_mask, None)
         # embed `1-motif_mask` instead of `diffuse_mask` if defined
@@ -100,7 +106,7 @@ class FlowModel(nn.Module):
             so3_t=so3_t,
             r3_t=r3_t,
             cat_t=cat_t,
-            res_mask=node_mask,
+            res_mask=res_mask,
             diffuse_mask=embed_diffuse_mask,
             chain_index=chain_index,
             res_index=res_index,
@@ -116,11 +122,24 @@ class FlowModel(nn.Module):
             chain_index=chain_index,
         )
 
+        # Optionally run ESM + combine with node and edge embeddings
+        if self.cfg.esm_combiner.enabled:
+            node_embed, edge_embed = self.esm_combiner(
+                node_embed=init_node_embed,
+                edge_embed=init_edge_embed,
+                aatypes_t=aatypes_t,
+                chain_index=chain_index,
+                res_mask=res_mask,
+                diffuse_mask=embed_diffuse_mask,
+            )
+        else:
+            node_embed, edge_embed = init_node_embed, init_edge_embed
+
         # Main trunk
         # Note that IPA trunk works in nm scale, rather than angstroms
         node_embed, edge_embed, curr_rigids_nm, psi_pred = self.attention_ipa_trunk(
-            init_node_embed=init_node_embed,
-            init_edge_embed=init_edge_embed,
+            init_node_embed=node_embed,
+            init_edge_embed=edge_embed,
             node_mask=node_mask,
             edge_mask=edge_mask,
             diffuse_mask=diffuse_mask,
