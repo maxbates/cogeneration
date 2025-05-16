@@ -123,15 +123,13 @@ class FlowModel(nn.Module):
         )
 
         # Optionally run ESM + combine with node and edge embeddings
-        # TODO pass node_mask and edge_mask and uses like other modules
         if self.cfg.esm_combiner.enabled:
             node_embed, edge_embed = self.esm_combiner(
-                node_embed=init_node_embed,
-                edge_embed=init_edge_embed,
+                init_node_embed=init_node_embed,
+                init_edge_embed=init_edge_embed,
                 aatypes_t=aatypes_t,
                 chain_index=chain_index,
                 res_mask=res_mask,
-                diffuse_mask=embed_diffuse_mask,
             )
         else:
             node_embed, edge_embed = init_node_embed, init_edge_embed

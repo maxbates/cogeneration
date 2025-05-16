@@ -250,7 +250,7 @@ class ModelESMKey(StrEnum):
 
 
 @dataclass
-class ModelESMCombinerCfg:
+class ModelESMCombinerConfig(BaseClassConfig):
     """
     Enable ESM and combine simple + ESM / single + pair representations.
     """
@@ -360,7 +360,7 @@ class ModelConfig(BaseClassConfig):
     edge_features: ModelEdgeFeaturesConfig = field(
         default_factory=ModelEdgeFeaturesConfig
     )
-    esm_combiner: ModelESMCombinerCfg = field(default_factory=ModelESMCombinerCfg)
+    esm_combiner: ModelESMCombinerConfig = field(default_factory=ModelESMCombinerConfig)
     ipa: ModelIPAConfig = field(default_factory=ModelIPAConfig)
 
     # predict torsion angles

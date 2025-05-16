@@ -115,8 +115,7 @@ class SequenceData:
         aatypes: torch.Tensor,  # (B, L) AF2 indices (0‑20, 0==A)
         chain_idx: torch.Tensor,  # (B, L) chain identifiers
         esm_dict: Alphabet,  # alphabet/dictionary from ESM model
-        attn_mask: Optional[torch.Tensor] = None,  # (B, L) 1 for valid residues
-        seq_mask: Optional[torch.Tensor] = None,  # (B, L) 1 for masked residues
+        res_mask: torch.Tensor,  # (B, L) 1 for valid residues
     ) -> "SequenceData":
         """
         End‑to‑end conversion: AF2‑indices → ESM tokens with BOS/EOS/linkers.
@@ -124,21 +123,19 @@ class SequenceData:
         """
         B, L = aatypes.shape
 
-        if attn_mask is None:
-            attn_mask = torch.ones_like(aatypes, dtype=torch.bool)
-
         # convert AF2 indices -> ESM indices (with padding/masking)
         conv_table = cls._make_af2_to_esm_lookup(esm_dict).to(aatypes.device)
+        bos, eos, pad = esm_dict.cls_idx, esm_dict.eos_idx, esm_dict.padding_idx
 
-        # shift by +1 so 0‑based AA becomes 1..20 and we reserve 0 for PAD
-        seq = (aatypes + 1).masked_fill(~attn_mask.bool(), 0)
+        # shift by +1 so 0‑based AA becomes 1..20
+        seq = aatypes + 1
         seq = conv_table[seq]
-
-        if seq_mask is not None:
-            seq = seq.masked_fill(seq_mask.bool(), esm_dict.mask_idx)
+        # set non-residue positions to <pad> to ignore (<unk> rarely observed so less stable)
+        # TODO - ideally differentiate non-canonical residues from non-residues (e.g. metal ion)
+        #   So that residues in the chain are set to X. We don't differentiate in res_mask.
+        seq = seq.masked_fill(~res_mask.bool(), pad)
 
         # add BOS / EOS / linker tokens between chains
-        bos, eos, pad = esm_dict.cls_idx, esm_dict.eos_idx, esm_dict.padding_idx
         linker = eos  # use <eos> as separator (ESM authors' recommendation)
 
         device, dtype = seq.device, seq.dtype
@@ -232,15 +229,13 @@ class FrozenEsmModel(nn.Module):
         self,
         aatypes: torch.Tensor,
         chain_index: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        seq_mask: Optional[torch.Tensor] = None,
+        res_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         sequence_data = SequenceData.from_af2(
             aatypes=aatypes,
             chain_idx=chain_index,
             esm_dict=self.esm_dict,
-            attn_mask=attn_mask,
-            seq_mask=seq_mask,
+            res_mask=res_mask,
         )
 
         if (
@@ -265,7 +260,7 @@ class FrozenEsmModel(nn.Module):
         # but to support chain breaks / linkers use `non_linker_mask`
 
         residue_mask = sequence_data.non_linker_mask  # (B, L_total)
-        L = sequence_data.orig_len  # original residue count, target length
+        N = sequence_data.orig_len  # original residue count, target length
 
         reps = torch.stack(
             [v for _, v in sorted(res["representations"].items())], dim=2
@@ -273,10 +268,10 @@ class FrozenEsmModel(nn.Module):
         B, L_total, nLayers, C = reps.shape
 
         single_repns = torch.empty(
-            (B, L, nLayers, C), device=reps.device, dtype=reps.dtype
+            (B, N, nLayers, C), device=reps.device, dtype=reps.dtype
         )
         for b in range(B):
-            single_repns[b] = reps[b][residue_mask[b]]  # -> (L, nLayers, C)
+            single_repns[b] = reps[b][residue_mask[b]]
 
         if self.use_esm_attn_map:
             attn = res["attentions"].permute(
@@ -284,7 +279,7 @@ class FrozenEsmModel(nn.Module):
             )  # B, L_total, L_total, nLayers, nHeads
             attn = attn.flatten(3, 4)  # B, L_total, L_total, nLayers*nHeads
             pair_repns = torch.empty(
-                (B, L, L, attn.shape[-1]), device=attn.device, dtype=attn.dtype
+                (B, N, N, attn.shape[-1]), device=attn.device, dtype=attn.dtype
             )
             for b in range(B):
                 idx = residue_mask[b]
@@ -300,4 +295,5 @@ class FrozenEsmModel(nn.Module):
                 ),
             }
 
+        # (B, N, nLayers, C), (B, N, N, nLayers*nHeads)
         return single_repns, pair_repns

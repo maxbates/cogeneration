@@ -17,7 +17,10 @@ class TestSequenceData:
         # AF2 indices 0..20 (restypes + X)
         aatypes = torch.arange(0, 21).unsqueeze(0)  # (1, 21)
         chain_idx = torch.ones_like(aatypes)
-        seq_data = SequenceData.from_af2(aatypes, chain_idx, esm2_alphabet)
+        res_mask = torch.ones_like(aatypes)
+        seq_data = SequenceData.from_af2(
+            aatypes, chain_idx, esm_dict=esm2_alphabet, res_mask=res_mask
+        )
         assert seq_data.orig_len == 21
 
         # Expected: [CLS] + all 21 residues + [EOS]
@@ -40,16 +43,16 @@ class TestSequenceData:
         chain_idx = torch.ones_like(aatypes)
 
         # mask the 5th residue
-        seq_mask = torch.zeros_like(aatypes, dtype=torch.bool)
-        seq_mask[0, 4] = True
+        res_mask = torch.ones_like(aatypes).int()
+        res_mask[0, 4] = 0
         seq_data_masked = SequenceData.from_af2(
-            aatypes, chain_idx, esm2_alphabet, seq_mask=seq_mask
+            aatypes, chain_idx, esm2_alphabet, res_mask=res_mask
         )
         expected = torch.tensor(
             [
                 [esm2_alphabet.cls_idx]
                 + [esm2_alphabet.get_idx(aa) for aa in restypes_with_x[:4]]
-                + [esm2_alphabet.mask_idx]
+                + [esm2_alphabet.padding_idx]
                 + [esm2_alphabet.get_idx(aa) for aa in restypes_with_x[5:]]
                 + [esm2_alphabet.eos_idx]
             ]

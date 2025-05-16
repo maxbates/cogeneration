@@ -75,8 +75,8 @@ class SequenceIPANet(BaseSequencePredictionNet):
 
         # run through IPA trunk
         node_embed, edge_embed, curr_rigids_nm, _ = self.ipa_trunk(
-            init_node_embed=node_embed,
-            init_edge_embed=edge_embed,
+            node_embed=node_embed,
+            edge_embed=edge_embed,
             node_mask=node_mask,
             edge_mask=edge_mask,
             diffuse_mask=diffuse_mask,  # unused; no backbone update

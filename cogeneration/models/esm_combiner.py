@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 
-from cogeneration.config.base import ModelESMCombinerCfg
+from cogeneration.config.base import ModelESMCombinerConfig
 from cogeneration.models.esm_frozen import FrozenEsmModel
 
 
@@ -21,11 +21,14 @@ def _mlp(in_dim: int, out_dim: int, hidden_dim: int) -> nn.Module:
 class ESMCombinerNetwork(nn.Module):
     """Run ESM model and combine single and pair representations"""
 
-    def __init__(self, cfg: ModelESMCombinerCfg):
+    def __init__(self, cfg: ModelESMCombinerConfig):
         super().__init__()
         self.cfg = cfg
 
         self.esm = FrozenEsmModel(model_key=cfg.esm_model_key, use_esm_attn_map=True)
+
+        # learn a scalar mix over all single layers
+        self.esm_single_combine = nn.Parameter(torch.zeros(self.esm.num_layers + 1))
 
         # take last single layer as input (B, N, C) -> (B, N, node_dim)
         self.seq_proj = _mlp(
@@ -47,32 +50,47 @@ class ESMCombinerNetwork(nn.Module):
 
     def forward(
         self,
-        init_node_embed: Tensor,  # (B, N, node_dim)
-        init_edge_embed: Tensor,  # (B, N, N, edge_dim)
-        aatypes_t: Tensor,  # (B, N)
-        chain_index: Tensor,  # (B, N)
-        res_mask: Tensor,  # (B, N)
-        diffuse_mask: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
+        init_node_embed: torch.Tensor,  # (B, N, node_dim)
+        init_edge_embed: torch.Tensor,  # (B, N, N, edge_dim)
+        aatypes_t: torch.Tensor,  # (B, N)
+        chain_index: torch.Tensor,  # (B, N)
+        res_mask: torch.Tensor,  # (B, N)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # get ESM single and pair representations
         esm_single, esm_pair = self.esm(
             aatypes=aatypes_t,
             chain_index=chain_index,
-            attn_mask=res_mask,
-            seq_mask=diffuse_mask,
+            res_mask=res_mask,
         )
+        esm_single = esm_single.detach()  # (B, N, nLayers, node_dim)
+        esm_pair = esm_pair.detach()  # (B, N, N, nLayers*nHeads)
 
-        # embed pair and last single representations
-        esm_pair = self.pair_proj(esm_pair)  # (B, N, N, C_pair) -> (B, N, N, edge_dim)
-        esm_single = esm_single[..., -1, :]  # (B, N, nLayers, C) -> (B, N, C)
+        # flatten `esm_single` using weighted sum `esm_single_combine`
+        weights = self.esm_single_combine.softmax(0)
+        w = weights.view(1, 1, -1, 1)  # (1, 1, nLayers+1, 1)
+        esm_single = (w * esm_single).sum(dim=2)  # (B, N, node_dim)
+
+        # project last single and flattened pair representations
         esm_single = self.seq_proj(esm_single)  # (B, N, node_dim)
+        esm_pair = self.pair_proj(
+            esm_pair
+        )  # (B, N, N, nLayers*nHeads) -> (B, N, N, edge_dim)
 
         # combine + LayerNorm
-        node_embed = init_node_embed + esm_single  # (B, N, node_dim)
-        edge_embed = init_edge_embed + esm_pair  # (B, N, N, edge_dim)
+        node_embed = 0.5 * (esm_single + init_node_embed)  # (B, N, node_dim)
+        edge_embed = 0.5 * (esm_pair + init_edge_embed)  # (B, N, N, edge_dim)
         node_embed = self.single_ln(node_embed)
         edge_embed = self.pair_ln(edge_embed)
 
-        # TODO - support folding blocks, add back in initial representations
-        # TODO - pass in and apply node_mask and edge_mask
+        # TODO - support folding blocks, add back in initial representations.
+        #    Want to enrich pairwise relationships,
+        #    esp for long range contacts at early time points where residues not meaningfully in proximity
+        #    Note requires `openfold` install for Triangle Updates. Can install as local package.
+        # TODO consider adding pairwise positional embedding to `esm_pair` for folding blocks
+
+        # mask
+        edge_mask = res_mask[:, None] * res_mask[:, :, None]
+        node_embed = node_embed * res_mask[..., None]
+        edge_embed = edge_embed * edge_mask[..., None]
 
         return node_embed, edge_embed
