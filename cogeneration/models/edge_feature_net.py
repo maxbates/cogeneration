@@ -27,6 +27,7 @@ class EdgeFeatureNet(nn.Module):
             total_edge_feats += 2
 
         # MLP to embed edge features
+        # (B, N, N, total_edge_feats) -> (B, N, N, c_p)
         self.edge_embedder = nn.Sequential(
             nn.Linear(total_edge_feats, self.cfg.c_p),
             nn.ReLU(),
@@ -103,4 +104,5 @@ class EdgeFeatureNet(nn.Module):
 
         edge_feats = self.edge_embedder(torch.concat(all_edge_feats, dim=-1))
         edge_feats *= edge_mask.unsqueeze(-1)
-        return edge_feats
+
+        return edge_feats  # (B, N, N, c_p)

@@ -255,17 +255,16 @@ class ModelESMCombinerCfg:
     Enable ESM and combine simple + ESM / single + pair representations.
     """
 
+    # Whether ESM is enabled. If so, representations will be combined.
     enabled: bool = True
+    # which ESM model size to use
     esm_model_key: ModelESMKey = ModelESMKey.esm2_t30_150M_UR50D
-
     # dims coming from simple node/edge networks
     node_embed_size: int = "${model.hyper_params.node_embed_size}"
     edge_embed_size: int = "${model.hyper_params.edge_embed_size}"
-
     # ESM outputs projection size
     esm_proj_single_dim: int = "${model.hyper_params.node_embed_size}"
     esm_proj_pair_dim: int = "${model.hyper_params.edge_embed_size}"
-
     # hidden size inside the tiny MLP used for projection
     mlp_proj_hidden_dim: int = "${model.hyper_params.node_embed_size}"
 

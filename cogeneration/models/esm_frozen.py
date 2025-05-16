@@ -118,7 +118,10 @@ class SequenceData:
         attn_mask: Optional[torch.Tensor] = None,  # (B, L) 1 for valid residues
         seq_mask: Optional[torch.Tensor] = None,  # (B, L) 1 for masked residues
     ) -> "SequenceData":
-        """End‑to‑end conversion: AF2‑indices → ESM tokens with BOS/EOS/linkers."""
+        """
+        End‑to‑end conversion: AF2‑indices → ESM tokens with BOS/EOS/linkers.
+        adapted from https://github.com/facebookresearch/esm/blob/main/esm/esmfold/v1/esmfold.py
+        """
         B, L = aatypes.shape
 
         if attn_mask is None:

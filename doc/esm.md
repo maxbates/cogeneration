@@ -33,13 +33,11 @@ Can probably take ESM module from FoldFlow2
        - padding / EOS
        - structure representation?
        - [x] support multiple chains
+       - [x] test conversion 
 
 - [x] Cfg option to use ESM
     - [x] Specify ESM model size, adjusts hyperparameters
-- ? Should only work with tasks where sequence is provided, e.g. inpainting and forward_folding
-    - [ ] validate approach with forward_folding
-    - [ ] compare IPA to folding blocks approach
-
+    
 - [x] Merge `node_feature_net` and `edge_feature_net` with ESM embeddings
     - [-] By default, don't `embed_aatype` in `node_network` if using ESM?
         - [-] how embed `aatype_sc` ?
@@ -56,4 +54,6 @@ Can probably take ESM module from FoldFlow2
     - include in checkpoint?
     - load ESM params directly into network?
 
-
+- Validation
+    - [ ] validate approach with forward_folding
+    - [ ] compare IPA to folding blocks approach

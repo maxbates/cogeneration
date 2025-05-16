@@ -123,6 +123,7 @@ class FlowModel(nn.Module):
         )
 
         # Optionally run ESM + combine with node and edge embeddings
+        # TODO pass node_mask and edge_mask and uses like other modules
         if self.cfg.esm_combiner.enabled:
             node_embed, edge_embed = self.esm_combiner(
                 node_embed=init_node_embed,
@@ -138,8 +139,8 @@ class FlowModel(nn.Module):
         # Main trunk
         # Note that IPA trunk works in nm scale, rather than angstroms
         node_embed, edge_embed, curr_rigids_nm, psi_pred = self.attention_ipa_trunk(
-            init_node_embed=node_embed,
-            init_edge_embed=edge_embed,
+            node_embed=node_embed,
+            edge_embed=edge_embed,
             node_mask=node_mask,
             edge_mask=edge_mask,
             diffuse_mask=diffuse_mask,

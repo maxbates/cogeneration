@@ -47,8 +47,8 @@ class ESMCombinerNetwork(nn.Module):
 
     def forward(
         self,
-        node_embed: Tensor,  # (B, N, node_dim)
-        edge_embed: Tensor,  # (B, N, N, edge_dim)
+        init_node_embed: Tensor,  # (B, N, node_dim)
+        init_edge_embed: Tensor,  # (B, N, N, edge_dim)
         aatypes_t: Tensor,  # (B, N)
         chain_index: Tensor,  # (B, N)
         res_mask: Tensor,  # (B, N)
@@ -61,15 +61,18 @@ class ESMCombinerNetwork(nn.Module):
             seq_mask=diffuse_mask,
         )
 
+        # embed pair and last single representations
+        esm_pair = self.pair_proj(esm_pair)  # (B, N, N, C_pair) -> (B, N, N, edge_dim)
         esm_single = esm_single[..., -1, :]  # (B, N, nLayers, C) -> (B, N, C)
         esm_single = self.seq_proj(esm_single)  # (B, N, node_dim)
 
-        esm_pair = self.pair_proj(esm_pair)  # (B, N, N, C_pair) -> (B, N, N, edge_dim)
-
         # combine + LayerNorm
-        node_embed = node_embed + esm_single  # (B, N, node_dim)
-        edge_embed = edge_embed + esm_pair  # (B, N, N, edge_dim)
+        node_embed = init_node_embed + esm_single  # (B, N, node_dim)
+        edge_embed = init_edge_embed + esm_pair  # (B, N, N, edge_dim)
         node_embed = self.single_ln(node_embed)
         edge_embed = self.pair_ln(edge_embed)
+
+        # TODO - support folding blocks, add back in initial representations
+        # TODO - pass in and apply node_mask and edge_mask
 
         return node_embed, edge_embed

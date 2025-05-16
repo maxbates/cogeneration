@@ -87,16 +87,15 @@ class AttentionIPATrunk(nn.Module):
 
     def forward(
         self,
-        init_node_embed: torch.Tensor,
-        init_edge_embed: torch.Tensor,
+        node_embed: torch.Tensor,
+        edge_embed: torch.Tensor,
         node_mask: torch.Tensor,
         edge_mask: torch.Tensor,
         diffuse_mask: torch.Tensor,
         curr_rigids_nm: Rigid,
     ) -> Tuple[torch.Tensor, torch.Tensor, Rigid, Optional[torch.Tensor]]:
-        init_node_embed = init_node_embed * node_mask[..., None]
-        node_embed = init_node_embed * node_mask[..., None]
-        edge_embed = init_edge_embed * edge_mask[..., None]
+        node_embed = node_embed * node_mask[..., None]
+        edge_embed = edge_embed * edge_mask[..., None]
 
         for b in range(self.cfg.num_blocks):
             ipa_embed = self.trunk[f"ipa_{b}"](
