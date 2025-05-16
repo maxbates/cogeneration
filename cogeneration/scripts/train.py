@@ -157,7 +157,6 @@ class Experiment:
             logger=logger,  # pass w&b logger
             use_distributed_sampler=False,
             enable_progress_bar=True,
-            enable_model_summary=True,
             devices=self._train_device_ids,
             profiler=self.cfg.experiment.profiler,
         )

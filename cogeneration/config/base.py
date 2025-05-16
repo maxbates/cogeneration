@@ -886,6 +886,8 @@ class ExperimentTrainerConfig(BaseClassConfig):
     deterministic: bool = False
     check_val_every_n_epoch: int = 4
     accumulate_grad_batches: int = 2
+    # enable lower precision off MPS
+    precision: Union[str, int] = "${ternary:${equals: ${shared.local}, True}, '32', 'bf16'}"
     # logging
     log_every_n_steps: int = 1
 
