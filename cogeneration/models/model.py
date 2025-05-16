@@ -130,6 +130,7 @@ class FlowModel(nn.Module):
                 aatypes_t=aatypes_t,
                 chain_index=chain_index,
                 res_mask=res_mask,
+                r3_t=r3_t,
             )
         else:
             node_embed, edge_embed = init_node_embed, init_edge_embed

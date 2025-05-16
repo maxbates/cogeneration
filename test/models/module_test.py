@@ -1,8 +1,10 @@
 import numpy as np
 import pandas as pd
+from pytorch_lightning.utilities.model_summary import ModelSummary
 from torch.utils.data import DataLoader
 
 from cogeneration.config.base import (
+    Config,
     DatasetFilterConfig,
     InferenceSamplesConfig,
     InterpolantTranslationsScheduleEnum,
@@ -17,10 +19,18 @@ from cogeneration.type.task import DataTask, InferenceTask
 
 
 class TestFlowModule:
-    def test_init(self, mock_cfg):
+    def test_init_cfg(self):
+        cfg = Config().interpolate()
+        module = FlowModule(cfg)
+        assert module is not None
+        assert module.model is not None
+        print(ModelSummary(module, max_depth=3))
+
+    def test_init_mock_cfg(self, mock_cfg):
         module = FlowModule(mock_cfg)
         assert module is not None
         assert module.model is not None
+        print(ModelSummary(module, max_depth=3))
 
     def test_model_step(self, mock_cfg, pdb_noisy_batch):
         module = FlowModule(mock_cfg)

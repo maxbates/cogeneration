@@ -191,11 +191,16 @@ class SequenceData:
 
     @classmethod
     def from_single_chain(
-        cls, aatypes: torch.Tensor, esm_dict: Alphabet
+        cls,
+        aatypes: torch.Tensor,
+        esm_dict: Alphabet,
+        res_mask: torch.Tensor,
     ) -> "SequenceData":
         B, L = aatypes.shape
         dummy_chain = torch.ones((B, L), dtype=torch.long, device=aatypes.device)
-        return cls.from_af2(aatypes, dummy_chain, esm_dict)
+        return cls.from_af2(
+            aatypes, chain_idx=dummy_chain, esm_dict=esm_dict, res_mask=res_mask
+        )
 
 
 class FrozenEsmModel(nn.Module):
@@ -211,6 +216,11 @@ class FrozenEsmModel(nn.Module):
         self.caching = caching
         self._previous_call = None
         self.repr_layers = tuple(range(self.esm.num_layers + 1))
+
+        # freeze ESM
+        for param in self.esm.parameters():
+            param.requires_grad = False
+        self.esm.eval()
 
     @property
     def embed_dim(self):

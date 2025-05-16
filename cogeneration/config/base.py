@@ -250,6 +250,22 @@ class ModelESMKey(StrEnum):
 
 
 @dataclass
+class ModelESMDoubleAttentionPairConfig(BaseClassConfig):
+    """
+    Config for DoubleAttentionPairBlock.
+    """
+
+    # number of blocks in series, 0 to disable
+    num_blocks: int = 4
+    # input dim
+    edge_embed_size: int = "${model.hyper_params.edge_embed_size}"
+    # reduced dim D for gather/distribute
+    bottleneck_scale: int = 4  # -> 1/N of edge_embed_size
+    # hidden dim for time conditioning MLP
+    time_mlp_hidden_dim: int = "${model.hyper_params.timestep_embed_size}"
+
+
+@dataclass
 class ModelESMCombinerConfig(BaseClassConfig):
     """
     Enable ESM and combine simple + ESM / single + pair representations.
@@ -259,6 +275,11 @@ class ModelESMCombinerConfig(BaseClassConfig):
     enabled: bool = True
     # which ESM model size to use
     esm_model_key: ModelESMKey = ModelESMKey.esm2_t30_150M_UR50D
+    # representation enriched using attention blocks
+    # TODO support folding blocks instead
+    double_attention_pair_trunk: ModelESMDoubleAttentionPairConfig = field(
+        default_factory=ModelESMDoubleAttentionPairConfig
+    )
     # dims coming from simple node/edge networks
     node_embed_size: int = "${model.hyper_params.node_embed_size}"
     edge_embed_size: int = "${model.hyper_params.edge_embed_size}"

@@ -9,6 +9,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.loggers.wandb import WandbLogger
 from pytorch_lightning.trainer import Trainer
+from pytorch_lightning.utilities.model_summary import ModelSummary
 
 from cogeneration.config.base import Config
 from cogeneration.dataset.datasets import DatasetConstructor
@@ -99,6 +100,7 @@ class Experiment:
             self.cfg,
             folding_device_id=folding_device_id,
         )
+        log.info(ModelSummary(self._module, max_depth=2))
 
         # Load model state dict if provided
         if self.cfg.experiment.raw_state_dict_reload is not None:

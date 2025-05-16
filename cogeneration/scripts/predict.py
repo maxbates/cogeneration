@@ -79,7 +79,7 @@ class EvalRunner:
             cfg=self.cfg,
         )
         self._flow_module.folding_validator.set_device_id(0)
-        log.info(ModelSummary(self._flow_module))
+        log.info(ModelSummary(self._flow_module, max_depth=2))
         self._flow_module.eval()
 
     @property
