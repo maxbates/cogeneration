@@ -15,10 +15,6 @@ from cogeneration.type.batch import PredBatchProp as pbp
 """
 TODO(model) Additional losses to consider:
 
-- torsions / side chains
-    would make more sense if were an input and more explicitly modeled, but not necessary
-    currently only implicitly modeled over time (primary just one torsion) when build frames
-
 - translation vector field loss 
     instead of just translation coordinates
 
@@ -39,6 +35,7 @@ class AuxiliaryMetrics:
     batch_trans_loss: torch.Tensor
     batch_bb_atom_loss: torch.Tensor
     batch_dist_mat_loss: torch.Tensor
+    batch_torsions_loss: torch.Tensor
     batch_multimer_interface_loss: torch.Tensor
     batch_multimer_clash_loss: torch.Tensor
     train_loss: torch.Tensor
@@ -46,6 +43,7 @@ class AuxiliaryMetrics:
     trans_loss: torch.Tensor
     bb_atom_loss: torch.Tensor
     dist_mat_loss: torch.Tensor
+    torsions_loss: torch.Tensor
     multimer_interface_loss: torch.Tensor
     multimer_clash_loss: torch.Tensor
     loss_denom_num_res: torch.Tensor
@@ -59,6 +57,7 @@ class TrainingLosses:
 
     trans_loss: torch.Tensor
     rots_vf_loss: torch.Tensor
+    torsions_loss: torch.Tensor
     auxiliary_loss: torch.Tensor
     aatypes_loss: torch.Tensor
     train_loss: torch.Tensor  # aggregated loss
@@ -260,6 +259,27 @@ class LossCalculator:
         ) / (self.loss_denom_num_res * 3)
         return rot_vf_loss
 
+    def loss_torsions(self) -> torch.Tensor:
+        """
+        Torsion loss computes cosine distance using `1 - cos`, if torsions are predicted
+        (smooth, no wrap around issues, simpler than atan2).
+        """
+        pred_psi = self.pred[pbp.pred_psi]  # (B, N, 2)
+
+        if pred_psi is None:
+            return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+
+        # ground‑truth psi torsion: (B, N, 7, 2) -> (B, N, 2)
+        gt_psi = self.batch[bp.torsion_angles_sin_cos_1][..., 2, :]
+
+        # dot product of unit vectors = cosine of angle difference
+        cos_delta = (gt_psi * pred_psi).sum(-1)  # (B, N)
+        # 1 - delta -> 0 when they match, up to 2 if they are opposite
+        loss = 1 - cos_delta  # (B, N)
+
+        loss = (loss * self.loss_mask).sum(-1) / (self.loss_denom_num_res + 1e-10)
+        return loss
+
     def loss_aatypes_ce(self) -> torch.Tensor:
 
         flat_logits = self.pred[pbp.pred_logits].reshape(
@@ -372,7 +392,7 @@ class LossCalculator:
 
         return loss * multi_chain_mask.float()
 
-    def loss_multimer_clash(self) -> torch.Tensor:
+    def loss_multimer_clash(self, clash_dist_ang: float = 2.0) -> torch.Tensor:
         """Penalize backbone atom (Ca, N, C) clashes across chains"""
         chain_idx = self.batch[bp.chain_idx]  # (B, N)
         multi_chain_mask = chain_idx.max(-1).values != chain_idx.min(-1).values  # (B,)
@@ -405,12 +425,8 @@ class LossCalculator:
         )  # (B, M, M, 3)
         pairwise_dists = torch.norm(diff, dim=-1)  # (B, M, M)
         clashes = (
-            (pairwise_dists < self.train_cfg.clash_distance_ang)
-            & inter_chain
-            & valid_pair
-            & not_self
+            (pairwise_dists < clash_dist_ang) & inter_chain & valid_pair & not_self
         )
-
 
         clash_sum = clashes.sum((1, 2))  # (B, )
         clash_denom = valid_pair.float().sum((1, 2)).clamp_min(1.0)  # (B, )
@@ -422,6 +438,7 @@ class LossCalculator:
         """Calculate losses for the batch."""
         loss_trans = self.loss_trans()
         loss_rot_vf = self.loss_rot_vf()
+        loss_torsions = self.loss_torsions()
         loss_aatypes_ce = self.loss_aatypes_ce()
         loss_bb_atoms = self.loss_bb_atoms()
         loss_pairwise_dist = self.loss_pairwise_dist()
@@ -431,6 +448,7 @@ class LossCalculator:
         # scale losses by cfg weights
         loss_trans = loss_trans * self.train_cfg.translation_loss_weight
         loss_rot_vf = loss_rot_vf * self.train_cfg.rotation_loss_weights
+        loss_torsions = loss_torsions * self.train_cfg.torsion_loss_weight
         loss_aatypes_ce = loss_aatypes_ce * self.train_cfg.aatypes_loss_weight
         loss_bb_atoms = loss_bb_atoms * self.train_cfg.aux_loss_use_bb_loss
         loss_pairwise_dist = loss_pairwise_dist * self.train_cfg.aux_loss_use_pair_loss
@@ -471,6 +489,7 @@ class LossCalculator:
             batch_trans_loss=loss_trans,
             batch_bb_atom_loss=loss_bb_atoms,
             batch_dist_mat_loss=loss_pairwise_dist,
+            batch_torsions_loss=loss_torsions,
             batch_multimer_interface_loss=loss_multimer_interface,
             batch_multimer_clash_loss=loss_multimer_clash,
             train_loss=self.normalize_loss(loss_total),
@@ -478,6 +497,7 @@ class LossCalculator:
             trans_loss=self.normalize_loss(loss_trans),
             bb_atom_loss=self.normalize_loss(loss_bb_atoms),
             dist_mat_loss=self.normalize_loss(loss_pairwise_dist),
+            torsions_loss=self.normalize_loss(loss_torsions),
             multimer_interface_loss=self.normalize_loss(loss_multimer_interface),
             multimer_clash_loss=self.normalize_loss(loss_multimer_clash),
             loss_denom_num_res=self.loss_denom_num_res,
@@ -488,6 +508,7 @@ class LossCalculator:
         losses = TrainingLosses(
             trans_loss=loss_trans,
             rots_vf_loss=loss_rot_vf,
+            torsions_loss=loss_torsions,
             auxiliary_loss=loss_auxiliary,
             aatypes_loss=loss_aatypes_ce,
             train_loss=loss_total,

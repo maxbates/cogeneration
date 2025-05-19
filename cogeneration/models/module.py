@@ -290,7 +290,7 @@ class FlowModule(LightningModule):
                 batch_t = cat_t
             elif loss_name == "trans_loss":
                 batch_t = r3_t
-            elif loss_name == "psi_loss":
+            elif loss_name == "torsions_loss":
                 # torsion angles are more impacted by rotation than translation (?)
                 batch_t = so3_t
             elif loss_name == "auxiliary_loss":

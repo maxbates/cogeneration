@@ -840,25 +840,24 @@ class ExperimentTrainingConfig(BaseClassConfig):
     # position scaling (prior to MSE)
     bb_atom_scale: float = 0.1
     trans_scale: float = 0.1
-    # trans
-    translation_loss_weight: float = 2.0
-    # rots
-    rotation_loss_weights: float = 1.0
-    # aatypes
-    aatypes_loss_weight: float = 0.5  # default 0.0 in multiflow
-    aatypes_loss_mean_or_sum: str = "mean"
-    aatypes_loss_use_likelihood_weighting: bool = True
     # losses scaling normalized up to t
     t_normalize_clip: float = 0.9
+    # structure
+    translation_loss_weight: float = 2.0
+    rotation_loss_weights: float = 1.0
+    torsion_loss_weight: float = 0.25
+    # aatypes
+    aatypes_loss_weight: float = 1  # default 0.0 in multiflow
+    aatypes_loss_mean_or_sum: str = "mean"
+    aatypes_loss_use_likelihood_weighting: bool = True
     # Auxiliary losses: clashes, bb pairwise distances
-    aux_loss_weight: float = 0.75  # default 0.0 in multiflow
+    aux_loss_weight: float = 1  # default 0.0 in multiflow
     aux_loss_t_pass: float = 0.5  # minimum t for aux loss
     aux_loss_use_bb_loss: bool = True
     aux_loss_use_pair_loss: bool = True
     # multimers
     aux_loss_use_multimer_interface: bool = True
     aux_loss_use_multimer_clash: bool = True
-    clash_distance_ang: float = 2.0
 
 
 @dataclass
