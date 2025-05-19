@@ -12,6 +12,23 @@ from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
 from cogeneration.type.batch import PredBatchProp as pbp
 
+"""
+TODO(model) Additional losses to consider:
+
+- torsions / side chains
+    would make more sense if were an input and more explicitly modeled, but not necessary
+    currently only implicitly modeled over time (primary just one torsion) when build frames
+
+- translation vector field loss 
+    instead of just translation coordinates
+
+- explicit rotation loss 
+    instead of just rotation VF
+
+- FAPE 
+    requires OpenFold implementation realistically
+"""
+
 
 @dataclass
 class AuxiliaryMetrics:
@@ -22,11 +39,15 @@ class AuxiliaryMetrics:
     batch_trans_loss: torch.Tensor
     batch_bb_atom_loss: torch.Tensor
     batch_dist_mat_loss: torch.Tensor
+    batch_multimer_interface_loss: torch.Tensor
+    batch_multimer_clash_loss: torch.Tensor
     train_loss: torch.Tensor
     rots_vf_loss: torch.Tensor
     trans_loss: torch.Tensor
     bb_atom_loss: torch.Tensor
     dist_mat_loss: torch.Tensor
+    multimer_interface_loss: torch.Tensor
+    multimer_clash_loss: torch.Tensor
     loss_denom_num_res: torch.Tensor
     examples_per_step: torch.Tensor
     res_length: torch.Tensor
@@ -162,7 +183,7 @@ class LossCalculator:
         if torch.any(torch.sum(loss_mask, dim=-1) < 1):
             raise ValueError("Empty batch encountered")
 
-        return loss_mask
+        return loss_mask.bool()
 
     @cached_property
     def loss_denom_num_res(self) -> torch.Tensor:
@@ -228,12 +249,6 @@ class LossCalculator:
             trans_error**2 * self.loss_mask[..., None], dim=(-1, -2)
         ) / (self.loss_denom_num_res * 3)
         return trans_loss
-
-    # TODO(model) - translation vector field loss
-    #   compute vf from t -> gt t=1 vs t -> pred t=1
-    #   See e.g. FoldFlow2
-
-    # TODO(model) consider explicit rotation loss (see e.g. FoldFlow2)
 
     def loss_rot_vf(self) -> torch.Tensor:
         """Calculate rotation vector field loss."""
@@ -325,6 +340,84 @@ class LossCalculator:
 
         return dist_mat_loss
 
+    def loss_multimer_interface(
+        self, interface_distance_ang: float = 10.0
+    ) -> torch.Tensor:
+        """
+        Recapitulation of ground‐truth inter‐chain contacts for Ca < interface_distance_ang
+        """
+        chain_idx = self.batch[bp.chain_idx]  # (B, N)
+        multi_chain_mask = chain_idx.max(-1).values != chain_idx.min(-1).values
+
+        if not multi_chain_mask.any():
+            return torch.zeros(self.num_batch, device=chain_idx.device)
+
+        # ground truth interface
+        gt_pos = self.gt.trans_1  # Ca only (B, N, 3)
+        inter_chain = chain_idx.unsqueeze(1) != chain_idx.unsqueeze(2)  # (B, N, N)
+        gt_pairwise_dist = torch.norm(
+            gt_pos.unsqueeze(2) - gt_pos.unsqueeze(1), dim=-1
+        )  # (B, N, N)
+        interface_mask = inter_chain & (
+            gt_pairwise_dist < interface_distance_ang
+        )  # (B, N, N)
+
+        # predicted interface
+        pred_pos = self.pred[pbp.pred_trans]  # Ca-only (B, N, 3)
+        dist_pred = torch.norm(pred_pos.unsqueeze(2) - pred_pos.unsqueeze(1), dim=-1)
+        missing_contacts = torch.relu(dist_pred - interface_distance_ang)  # (B, N, N)
+        missing_contacts = missing_contacts * interface_mask
+
+        loss = missing_contacts.sum((1, 2)) / interface_mask.sum((1, 2)).clamp_min(1.0)
+
+        return loss * multi_chain_mask.float()
+
+    def loss_multimer_clash(self) -> torch.Tensor:
+        """Penalize backbone atom (Ca, N, C) clashes across chains"""
+        chain_idx = self.batch[bp.chain_idx]  # (B, N)
+        multi_chain_mask = chain_idx.max(-1).values != chain_idx.min(-1).values  # (B,)
+
+        if not multi_chain_mask.any():
+            return torch.zeros(self.num_batch, device=chain_idx.device)
+
+        n_bb_atoms = 3  # only consider backbone collisions
+        pred_bb_atoms = self.pred_bb_atoms[..., :n_bb_atoms, :]  # (B, N, 3, 3)
+        pred_flat_atoms = pred_bb_atoms.reshape(self.num_batch, -1, 3)  # (B, M, 3)
+
+        # limit to valid residues
+        atom_mask = self.gt.atom37_mask[..., :n_bb_atoms]  # (B, N, 3)
+        atom_mask *= self.loss_mask.unsqueeze(-1)  # (B, N, 3)
+        atom_mask_flat = atom_mask.reshape(self.num_batch, -1)  # (B, M, )
+        valid_pair = atom_mask_flat.unsqueeze(-1) & atom_mask_flat.unsqueeze(
+            -2
+        )  # (B, M, M)
+
+        # limit to inter‐chain
+        chains = chain_idx.unsqueeze(-1).expand(-1, -1, 3).reshape(self.num_batch, -1)
+        inter_chain = chains.unsqueeze(-1) != chains.unsqueeze(-2)  # (B, M, M)
+        # limit self‐comparisons
+        eye = torch.eye(valid_pair.size(-1), device=valid_pair.device, dtype=torch.bool)
+        not_self = ~eye.unsqueeze(0)  # (1, M, M)
+
+        # calculate clashes using pairwise squared distances
+        diff = pred_flat_atoms.unsqueeze(2) - pred_flat_atoms.unsqueeze(
+            1
+        )  # (B, M, M, 3)
+        pairwise_dists = torch.norm(diff, dim=-1)  # (B, M, M)
+        clashes = (
+            (pairwise_dists < self.train_cfg.clash_distance_ang)
+            & inter_chain
+            & valid_pair
+            & not_self
+        )
+
+
+        clash_sum = clashes.sum((1, 2))  # (B, )
+        clash_denom = valid_pair.float().sum((1, 2)).clamp_min(1.0)  # (B, )
+        clash_rate = clash_sum / clash_denom
+
+        return clash_rate * multi_chain_mask.float()
+
     def calculate(self) -> Tuple[TrainingLosses, AuxiliaryMetrics]:
         """Calculate losses for the batch."""
         loss_trans = self.loss_trans()
@@ -332,6 +425,8 @@ class LossCalculator:
         loss_aatypes_ce = self.loss_aatypes_ce()
         loss_bb_atoms = self.loss_bb_atoms()
         loss_pairwise_dist = self.loss_pairwise_dist()
+        loss_multimer_interface = self.loss_multimer_interface()
+        loss_multimer_clash = self.loss_multimer_clash()
 
         # scale losses by cfg weights
         loss_trans = loss_trans * self.train_cfg.translation_loss_weight
@@ -339,13 +434,23 @@ class LossCalculator:
         loss_aatypes_ce = loss_aatypes_ce * self.train_cfg.aatypes_loss_weight
         loss_bb_atoms = loss_bb_atoms * self.train_cfg.aux_loss_use_bb_loss
         loss_pairwise_dist = loss_pairwise_dist * self.train_cfg.aux_loss_use_pair_loss
+        loss_multimer_interface = (
+            loss_multimer_interface * self.train_cfg.aux_loss_use_multimer_interface
+        )
+        loss_multimer_clash = (
+            loss_multimer_clash * self.train_cfg.aux_loss_use_multimer_clash
+        )
 
         # auxiliary loss
-        loss_auxiliary = loss_bb_atoms + loss_pairwise_dist
+        loss_auxiliary = (
+            loss_bb_atoms
+            + loss_pairwise_dist
+            + loss_multimer_clash
+            + loss_multimer_interface
+        )
         loss_auxiliary *= self.train_cfg.aux_loss_weight
 
         # limit auxiliary loss to certain times
-        # TODO(model) consider separate t threshold for dist loss vs bb atom loss, add to config
         loss_auxiliary *= self.batch[nbp.r3_t][:, 0] > self.train_cfg.aux_loss_t_pass
         loss_auxiliary *= self.batch[nbp.so3_t][:, 0] > self.train_cfg.aux_loss_t_pass
 
@@ -366,11 +471,15 @@ class LossCalculator:
             batch_trans_loss=loss_trans,
             batch_bb_atom_loss=loss_bb_atoms,
             batch_dist_mat_loss=loss_pairwise_dist,
+            batch_multimer_interface_loss=loss_multimer_interface,
+            batch_multimer_clash_loss=loss_multimer_clash,
             train_loss=self.normalize_loss(loss_total),
             rots_vf_loss=self.normalize_loss(loss_rot_vf),
             trans_loss=self.normalize_loss(loss_trans),
             bb_atom_loss=self.normalize_loss(loss_bb_atoms),
             dist_mat_loss=self.normalize_loss(loss_pairwise_dist),
+            multimer_interface_loss=self.normalize_loss(loss_multimer_interface),
+            multimer_clash_loss=self.normalize_loss(loss_multimer_clash),
             loss_denom_num_res=self.loss_denom_num_res,
             examples_per_step=torch.tensor(self.num_batch),
             res_length=torch.mean(torch.sum(self.batch[bp.res_mask], dim=-1).float()),

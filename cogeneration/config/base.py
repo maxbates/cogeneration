@@ -850,10 +850,15 @@ class ExperimentTrainingConfig(BaseClassConfig):
     aatypes_loss_use_likelihood_weighting: bool = True
     # losses scaling normalized up to t
     t_normalize_clip: float = 0.9
-    aux_loss_weight: float = 0.5  # default 0.0 in multiflow
+    # Auxiliary losses: clashes, bb pairwise distances
+    aux_loss_weight: float = 0.75  # default 0.0 in multiflow
+    aux_loss_t_pass: float = 0.5  # minimum t for aux loss
     aux_loss_use_bb_loss: bool = True
     aux_loss_use_pair_loss: bool = True
-    aux_loss_t_pass: float = 0.5  # minimum t for aux loss
+    # multimers
+    aux_loss_use_multimer_interface: bool = True
+    aux_loss_use_multimer_clash: bool = True
+    clash_distance_ang: float = 2.0
 
 
 @dataclass
