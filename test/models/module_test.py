@@ -12,7 +12,8 @@ from cogeneration.config.base import (
 from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.dataset.datasets import LengthSamplingDataset
 from cogeneration.dataset.test_utils import create_pdb_noisy_batch
-from cogeneration.models.module import FlowModule, TrainingLosses
+from cogeneration.models.loss_calculator import TrainingLosses
+from cogeneration.models.module import FlowModule
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.metrics import MetricName
 from cogeneration.type.task import DataTask, InferenceTask

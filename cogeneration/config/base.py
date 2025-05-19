@@ -837,15 +837,19 @@ class DatasetConfig(BaseClassConfig):
 @dataclass
 class ExperimentTrainingConfig(BaseClassConfig):
     mask_plddt: bool = True
+    # position scaling (prior to MSE)
     bb_atom_scale: float = 0.1
     trans_scale: float = 0.1
+    # trans
+    translation_loss_weight: float = 2.0
+    # rots
+    rotation_loss_weights: float = 1.0
+    # aatypes
     aatypes_loss_weight: float = 0.5  # default 0.0 in multiflow
     aatypes_loss_mean_or_sum: str = "mean"
     aatypes_loss_use_likelihood_weighting: bool = True
-    translation_loss_weight: float = 2.0
     # losses scaling normalized up to t
     t_normalize_clip: float = 0.9
-    rotation_loss_weights: float = 1.0
     aux_loss_weight: float = 0.5  # default 0.0 in multiflow
     aux_loss_use_bb_loss: bool = True
     aux_loss_use_pair_loss: bool = True
@@ -887,7 +891,9 @@ class ExperimentTrainerConfig(BaseClassConfig):
     check_val_every_n_epoch: int = 4
     accumulate_grad_batches: int = 2
     # enable lower precision off MPS
-    precision: Union[str, int] = "${ternary:${equals: ${shared.local}, True}, '32', 'bf16'}"
+    precision: Union[str, int] = (
+        "${ternary:${equals: ${shared.local}, True}, '32', 'bf16'}"
+    )
     # logging
     log_every_n_steps: int = 1
 

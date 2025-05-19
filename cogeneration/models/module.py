@@ -5,7 +5,6 @@ import os
 import time
 import warnings
 from collections import deque
-from dataclasses import dataclass, fields
 from random import random
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -21,7 +20,7 @@ from pytorch_lightning.loggers.wandb import WandbLogger
 
 import wandb
 from cogeneration.config.base import Config
-from cogeneration.data import all_atom, metrics, so3_utils
+from cogeneration.data import all_atom, metrics
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.folding_validation import (
     FoldingValidator,
@@ -30,6 +29,11 @@ from cogeneration.data.folding_validation import (
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import mask_blend_2d
 from cogeneration.data.trajectory import SavedTrajectory, save_trajectory
+from cogeneration.models.loss_calculator import (
+    AuxiliaryMetrics,
+    LossCalculator,
+    TrainingLosses,
+)
 from cogeneration.models.model import FlowModel
 from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProp as bp
@@ -45,41 +49,6 @@ def to_numpy(x: Optional[torch.Tensor]) -> Optional[np.ndarray]:
     if x is None:
         return None
     return x.detach().cpu().numpy()
-
-
-@dataclass
-class AuxiliaryMetrics:
-    """Training auxiliary metrics"""
-
-    batch_train_loss: torch.Tensor
-    batch_rot_loss: torch.Tensor
-    batch_trans_loss: torch.Tensor
-    batch_bb_atom_loss: torch.Tensor
-    batch_dist_mat_loss: torch.Tensor
-    train_loss: torch.Tensor
-    rots_vf_loss: torch.Tensor
-    trans_loss: torch.Tensor
-    bb_atom_loss: torch.Tensor
-    dist_mat_loss: torch.Tensor
-    loss_denom_num_res: torch.Tensor
-    examples_per_step: torch.Tensor
-    res_length: torch.Tensor
-
-
-@dataclass
-class TrainingLosses:
-    """Struct to collect losses from model training step."""
-
-    trans_loss: torch.Tensor
-    rots_vf_loss: torch.Tensor
-    auxiliary_loss: torch.Tensor
-    aatypes_loss: torch.Tensor
-    train_loss: torch.Tensor  # aggregated loss
-
-    def items(self):
-        # avoid using asdict() because deepcopy on Tensors creates issues
-        # instead, return iterater over fields
-        return ((f.name, getattr(self, f.name)) for f in fields(self))
 
 
 class FlowModule(LightningModule):
@@ -233,212 +202,14 @@ class FlowModule(LightningModule):
             self.validation_epoch_metrics.clear()
 
     def model_step(self, batch: NoisyFeatures) -> TrainingLosses:
-        training_cfg = self.cfg.experiment.training
-
-        bb_mask = batch[bp.res_mask]
-        loss_mask = bb_mask * batch[bp.diffuse_mask]
-
-        # for inpainting, ignore motifs in loss, esp sequence since fixed, but also structure
-        if bp.motif_mask in batch and batch[bp.motif_mask] is not None:
-            loss_mask *= 1 - batch[bp.motif_mask]
-        if training_cfg.mask_plddt:
-            loss_mask *= batch[bp.plddt_mask]
-        if torch.any(torch.sum(loss_mask, dim=-1) < 1):
-            raise ValueError("Empty batch encountered")
-
-        num_batch, num_res = loss_mask.shape
-        loss_denom_num_res = torch.sum(loss_mask, dim=-1)
-        batch_loss_mask = torch.any(bb_mask, dim=-1)
-
-        # Number of backbone atoms to consider for loss
-        # 3 for C-alpha, N, C atoms, 5 if we also consider psi angles
-        # We still only use 3 atoms for frames + flow matching, but consider 5 for backbone loss
-        n_bb_atoms = 5 if self.cfg.model.predict_psi_torsions else 3
-
-        # Ground truth labels
-        gt_trans_1 = batch[bp.trans_1]  # (B, N, 3)
-        gt_rotmats_1 = batch[bp.rotmats_1]  # (B, N, 3, 3)
-        gt_rot_vf = so3_utils.calc_rot_vf(
-            mat_t=batch[nbp.rotmats_t],
-            mat_1=gt_rotmats_1.type(torch.float32),
-        )
-
-        gt_aatypes_1 = batch[bp.aatypes_1]  # (B, N)
-        # torsions (B, N, 7, 2) -> (B, N, 2)
-        gt_psi_torsions_1 = batch[bp.torsion_angles_sin_cos_1][..., 2, :]
-        gt_bb_atoms, atom37_mask, _, _ = all_atom.rigid_to_atom37(
-            rigid=all_atom.create_rigid(rots=gt_rotmats_1, trans=gt_trans_1),
-            psi_torsions=gt_psi_torsions_1,
-            aatype=gt_aatypes_1.int(),
-        )
-        # atoms (B, N, 37, 3) -> (B, N, n_bb_atoms, 3)
-        gt_bb_atoms = gt_bb_atoms[..., :n_bb_atoms, :]
-        # mask (B, N, 37) -> (B, N, n_bb_atoms)
-        atom37_mask = atom37_mask[..., :n_bb_atoms]
-
-        # Timestep used for normalization.
-        r3_t = batch[nbp.r3_t]  # (B, 1)
-        so3_t = batch[nbp.so3_t]  # (B, 1)
-        cat_t = batch[nbp.cat_t]  # (B, 1)
-
-        # losses for each domain scaled at `1 - min(t, clip)` (i.e. higher as t -> 1)
-        r3_norm_scale = 1 - torch.min(
-            r3_t[..., None], torch.tensor(training_cfg.t_normalize_clip)
-        )  # (B, 1, 1)
-        so3_norm_scale = 1 - torch.min(
-            so3_t[..., None], torch.tensor(training_cfg.t_normalize_clip)
-        )  # (B, 1, 1)
-        if training_cfg.aatypes_loss_use_likelihood_weighting:
-            cat_norm_scale = 1 - torch.min(
-                cat_t, torch.tensor(training_cfg.t_normalize_clip)
-            )  # (B, 1)
-            assert cat_norm_scale.shape == (num_batch, 1)
-        else:
-            cat_norm_scale = 1.0
-
-        # Model output predictions
-        # Basically, predict translations, rotations, and sequence and compare to ground truth.
-        # Also compute the vector field, from the sampled `t` to predicted trans + rots.
-        # To learn/refine vector field at t (for trans and rots) for init_rigids -> pred_rigids.
         model_output = self.model(batch)
-        pred_trans_1 = model_output[pbp.pred_trans]
-        pred_rotmats_1 = model_output[pbp.pred_rotmats]
-        pred_psi_1 = model_output[pbp.pred_psi]  # might be None
-        pred_logits = model_output[pbp.pred_logits]  # (B, N, aatype_pred_num_tokens)
 
-        pred_rots_vf = so3_utils.calc_rot_vf(
-            mat_t=batch[nbp.rotmats_t],
-            mat_1=pred_rotmats_1,
+        loss_calculator = LossCalculator(
+            cfg=self.cfg,
+            batch=batch,
+            pred=model_output,
         )
-        if torch.any(torch.isnan(pred_rots_vf)):
-            raise ValueError("NaN encountered in pred_rots_vf")
-
-        # aatypes loss
-        ce_loss = (
-            torch.nn.functional.cross_entropy(
-                pred_logits.reshape(-1, self.cfg.model.aa_pred.aatype_pred_num_tokens),
-                gt_aatypes_1.flatten().long(),
-                reduction="none",
-            ).reshape(num_batch, num_res)
-            / cat_norm_scale
-        )
-        aatypes_loss = torch.sum(ce_loss * loss_mask, dim=-1) / loss_denom_num_res
-        aatypes_loss *= training_cfg.aatypes_loss_weight
-
-        # TODO(model) - translation vector field loss
-        #   See FoldFlow2
-        #   compute vf from t -> gt t=1 vs t -> pred t=1
-
-        # Translation loss
-        trans_error = (
-            (gt_trans_1 - pred_trans_1) / r3_norm_scale * training_cfg.trans_scale
-        )
-        trans_loss = (
-            training_cfg.translation_loss_weight
-            * torch.sum(trans_error**2 * loss_mask[..., None], dim=(-1, -2))
-            / (loss_denom_num_res * 3)
-        )
-
-        # Rotation VF loss
-        rots_vf_error = (gt_rot_vf - pred_rots_vf) / so3_norm_scale
-        rots_vf_loss = (
-            training_cfg.rotation_loss_weights
-            * torch.sum(rots_vf_error**2 * loss_mask[..., None], dim=(-1, -2))
-            / (loss_denom_num_res * 3)
-        )
-
-        # TODO(model) consider explicit rotation loss (see FoldFlow2)
-
-        # Backbone atom loss
-        pred_bb_atoms = all_atom.atom37_from_trans_rot(
-            trans=pred_trans_1,
-            rots=pred_rotmats_1,
-            psi_torsions=pred_psi_1,
-        )[..., :n_bb_atoms, :]
-        gt_bb_atoms *= training_cfg.bb_atom_scale / r3_norm_scale[..., None]
-        pred_bb_atoms *= training_cfg.bb_atom_scale / r3_norm_scale[..., None]
-        bb_atom_loss_mask = atom37_mask * loss_mask[..., None]
-        bb_atom_loss = torch.sum(
-            (gt_bb_atoms - pred_bb_atoms) ** 2 * bb_atom_loss_mask[..., None],
-            dim=(-1, -2, -3),
-        ) / (bb_atom_loss_mask.sum(dim=(-1, -2)) + 1e-10)
-
-        # Pairwise distance loss
-        gt_flat_atoms = gt_bb_atoms.reshape([num_batch, num_res * n_bb_atoms, 3])
-        gt_pair_dists = torch.linalg.norm(
-            gt_flat_atoms[:, :, None, :] - gt_flat_atoms[:, None, :, :], dim=-1
-        )
-        pred_flat_atoms = pred_bb_atoms.reshape([num_batch, num_res * n_bb_atoms, 3])
-        pred_pair_dists = torch.linalg.norm(
-            pred_flat_atoms[:, :, None, :] - pred_flat_atoms[:, None, :, :], dim=-1
-        )
-
-        flat_loss_mask = torch.tile(loss_mask[:, :, None], (1, 1, n_bb_atoms))
-        flat_loss_mask = flat_loss_mask.reshape([num_batch, num_res * n_bb_atoms])
-        flat_res_mask = torch.tile(loss_mask[:, :, None], (1, 1, n_bb_atoms))
-        flat_res_mask = flat_res_mask.reshape([num_batch, num_res * n_bb_atoms])
-
-        gt_pair_dists = gt_pair_dists * flat_loss_mask[..., None]
-        pred_pair_dists = pred_pair_dists * flat_loss_mask[..., None]
-        pair_dist_mask = flat_loss_mask[..., None] * flat_res_mask[:, None, :]
-
-        # No loss on anything >6A
-        proximity_mask = gt_pair_dists < 6
-        pair_dist_mask = pair_dist_mask * proximity_mask
-
-        dist_mat_loss = torch.sum(
-            (gt_pair_dists - pred_pair_dists) ** 2 * pair_dist_mask, dim=(1, 2)
-        )
-        dist_mat_loss /= torch.sum(pair_dist_mask, dim=(1, 2)) + 1
-
-        # Auxiliary loss
-        auxiliary_loss = (
-            bb_atom_loss * training_cfg.aux_loss_use_bb_loss
-            + dist_mat_loss * training_cfg.aux_loss_use_pair_loss
-        )
-        # TODO(model) consider separate t threshold for dist loss vs bb atom loss, add to config
-        auxiliary_loss *= (r3_t[:, 0] > training_cfg.aux_loss_t_pass) & (
-            so3_t[:, 0] > training_cfg.aux_loss_t_pass
-        )
-        auxiliary_loss *= training_cfg.aux_loss_weight
-
-        # clamp certain loss terms
-        trans_loss = torch.clamp(trans_loss, max=5)
-        auxiliary_loss = torch.clamp(auxiliary_loss, max=5)
-
-        # Total loss
-        train_loss = trans_loss + rots_vf_loss + auxiliary_loss + aatypes_loss
-
-        if torch.any(torch.isnan(train_loss)):
-            raise ValueError("NaN loss encountered")
-        assert train_loss.shape == (num_batch,)
-
-        def normalize_loss(x):
-            return x.sum() / (batch_loss_mask.sum() + 1e-10)
-
-        aux = AuxiliaryMetrics(
-            batch_train_loss=train_loss,
-            batch_rot_loss=rots_vf_loss,
-            batch_trans_loss=trans_loss,
-            batch_bb_atom_loss=bb_atom_loss,
-            batch_dist_mat_loss=dist_mat_loss,
-            train_loss=normalize_loss(train_loss),
-            rots_vf_loss=normalize_loss(rots_vf_loss),
-            trans_loss=normalize_loss(trans_loss),
-            bb_atom_loss=normalize_loss(bb_atom_loss),
-            dist_mat_loss=normalize_loss(dist_mat_loss),
-            loss_denom_num_res=loss_denom_num_res,
-            examples_per_step=torch.tensor(num_batch),
-            res_length=torch.mean(torch.sum(bb_mask, dim=-1).float()),
-        )
-
-        losses = TrainingLosses(
-            trans_loss=trans_loss,
-            rots_vf_loss=rots_vf_loss,
-            auxiliary_loss=auxiliary_loss,
-            aatypes_loss=aatypes_loss,
-            train_loss=train_loss,
-        )
+        losses, aux = loss_calculator.calculate()
 
         self._data_history.append(
             {
