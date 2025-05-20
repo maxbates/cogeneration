@@ -66,6 +66,9 @@ class TestCurriculum:
 
         # Create a dummy checkpoint for step1
         cfg1, ckpt1 = mock_checkpoint(cfg=cfg1)
+        final_ckpt = os.path.join(cfg1.experiment.checkpointer.dirpath, "final.ckpt")
+        assert ckpt1.replace("last.ckpt", "final.ckpt") == final_ckpt
+        assert os.path.exists(final_ckpt)
 
         # Monkeypatch Experiment to avoid actually training
         called = []
@@ -93,4 +96,4 @@ class TestCurriculum:
         assert len(called) == 1
         assert called[0].shared.id == cfg2.shared.id
         # Step2 warm_start should equal the checkpoint from step1
-        assert cfg2.experiment.warm_start_ckpt == ckpt1
+        assert cfg2.experiment.warm_start_ckpt == final_ckpt

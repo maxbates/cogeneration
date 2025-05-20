@@ -104,7 +104,7 @@ class Curriculum:
 
     def coordinate_steps(self):
         """
-        Tie model checkpoints between step cfgs
+        Tie model checkpoints between step cfgs.
         """
         # `cfg.experiment.checkpointer.dirpath` is used to save the checkpoint and is name spaced by `cfg.shared.id`
         # `cfg.experiment.warm_start_ckpt` is used to load a checkpoint from a previous step
@@ -115,18 +115,17 @@ class Curriculum:
                 step.cfg.experiment.warm_start_ckpt = last_ckpt
                 step.cfg.experiment.warm_start_cfg_override = True
 
-            # Save trained model checkpoint for next step warm start
+            # Save final trained model checkpoint for next step warm start
             last_ckpt = os.path.join(
-                step.cfg.experiment.checkpointer.dirpath, "last.ckpt"
+                step.cfg.experiment.checkpointer.dirpath, "final.ckpt"
             )
 
     def _find_resume(self) -> Tuple[int, Optional[str]]:
         """
-        Scan each step's checkpoint directory for 'last.ckpt'.
+        Scan each step's checkpoint directory for 'last.ckpt' / 'final.ckpt'.
         Returns the index of the last completed step and its checkpoint path.
+        Delegates resuming a step to pytorch lightning warm starts.
         """
-        # TODO - track how many steps / epochs already completed rather than restarting?
-
         last_idx = -1
         last_ckpt = None
         for idx, step in enumerate(self.steps):
@@ -135,6 +134,7 @@ class Curriculum:
             final_ckpt_path = os.path.join(ckpt_dir, "final.ckpt")
 
             # check if this step completed, if so go to the next one
+            # we save a separate `final.ckpt` sentinel when training is complete.
             if os.path.isfile(final_ckpt_path):
                 last_idx = idx + 1
                 last_ckpt = final_ckpt_path
@@ -151,20 +151,34 @@ class Curriculum:
         Execute each TrainingStep sequentially.
         """
         # Resume, if possible
-        start_idx, last_ckpt = self._find_resume()
+        resume_idx, last_ckpt = self._find_resume()
         if last_ckpt:
             log.info(
-                f"Resuming curriculum at step {start_idx}/{len(self.steps)} from {last_ckpt}"
+                f"Resuming curriculum at step {resume_idx+1}/{len(self.steps)} from {last_ckpt}"
             )
         else:
             log.info("Starting curriculum from first step.")
 
-        for idx, step in enumerate(self.steps):
-            if idx < start_idx:
-                log.info(f"Skipping already completed step {idx} ('{step.name}')")
+        for step_idx, step in enumerate(self.steps):
+            if step_idx < resume_idx:
+                log.info(
+                    f"Skipping already completed step {step_idx+1} ('{step.name}')"
+                )
                 continue
 
-            log.info(f"=== Running step: {step.name} ===")
+            # If we are resuming, we need to set the warm start checkpoint
+            # to the current step's `last.ckpt` rather than the previous step's final ckpt.
+            if (
+                step_idx == resume_idx
+                and last_ckpt
+                and step.cfg.experiment.warm_start_ckpt != last_ckpt
+            ):
+                log.info(f"=== Resuming step {step.name} ===")
+                step.cfg.experiment.warm_start_ckpt = last_ckpt
+                step.cfg.experiment.warm_start_cfg_override = True
+            else:
+                log.info(f"=== Running step: {step.name} ===")
+
             if step.cfg.experiment.warm_start_ckpt is not None:
                 log.info(f"Loading ckpt: {step.cfg.experiment.warm_start_ckpt}")
             log.info(f"Saving -> {step.cfg.experiment.checkpointer.dirpath}")
@@ -173,5 +187,3 @@ class Curriculum:
             exp.train()
 
             log.info(f"=== Finished step: {step.name} ===")
-
-            # TODO - cleanup?

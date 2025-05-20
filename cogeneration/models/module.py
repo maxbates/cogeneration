@@ -55,6 +55,7 @@ class FlowModule(LightningModule):
     def __init__(self, cfg: Config, folding_device_id: int = 0):
         super().__init__()
         self.cfg = cfg
+        self.save_hyperparameters("cfg")
 
         self.model = FlowModel(self.cfg.model)
 
@@ -67,8 +68,6 @@ class FlowModule(LightningModule):
 
         # self.logger defined in LightningModule
         self._log = logging.getLogger(__name__)
-
-        self.save_hyperparameters()
 
         self._epoch_start_time = None
         # metrics generated during validation_step()
@@ -149,6 +148,22 @@ class FlowModule(LightningModule):
 
     def on_train_start(self):
         self._epoch_start_time = time.time()
+
+        # Log number of epochs
+        module_id = self.cfg.shared.id
+        epochs_done = getattr(self.trainer, "current_epoch", 0)
+        epochs_total = getattr(self.trainer, "max_epochs", -1)
+
+        # if total is missing or zero, we’re just starting fresh
+        if epochs_total < 0:
+            self._log.info(
+                f"Module {module_id}: starting fresh, will run {epochs_total or 'unspecified'} epochs"
+            )
+        else:
+            epochs_remaining = epochs_total - epochs_done
+            self._log.info(
+                f"Module {module_id}: resuming at epoch {epochs_done}/{epochs_total} ({epochs_remaining} left)"
+            )
 
     def on_train_epoch_end(self):
         epoch_time = (time.time() - self._epoch_start_time) / 60.0
