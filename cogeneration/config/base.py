@@ -384,9 +384,9 @@ class ModelConfig(BaseClassConfig):
     esm_combiner: ModelESMCombinerConfig = field(default_factory=ModelESMCombinerConfig)
     ipa: ModelIPAConfig = field(default_factory=ModelIPAConfig)
 
-    # predict torsion angles
-    # note does not impact frames (trans/rots), just the rigid we construct (from trans/rot/psi)
-    predict_psi_torsions: bool = True
+    # predict torsion angles. Model outputs (B, N, K, 2) depending on K predicted.
+    predict_psi_torsions: bool = True  # -> 1 (psi): orients peptide plane & side chain
+    predict_all_torsions: bool = True  # -> 7 angles: omega, phi, psi, chi1-chi4
 
     # sequence prediction, default is simple aa_pred matching MultiFlow
     sequence_pred_type: ModelSequencePredictionEnum = (
@@ -853,7 +853,7 @@ class ExperimentTrainingConfig(BaseClassConfig):
     # Auxiliary losses: clashes, bb pairwise distances
     aux_loss_weight: float = 1  # default 0.0 in multiflow
     aux_loss_t_pass: float = 0.5  # minimum t for aux loss
-    aux_loss_use_bb_loss: bool = True
+    aux_loss_use_atom_loss: bool = True  # num atoms dep on angles modeled
     aux_loss_use_pair_loss: bool = True
     # multimers
     aux_loss_use_multimer_interface: bool = True
@@ -1275,6 +1275,7 @@ class Config(BaseClassConfig):
         )
         # Don't predict torsion angles
         raw_cfg.model.predict_psi_torsions = False
+        raw_cfg.model.predict_all_torsions = False
         # positional embeddings
         raw_cfg.model.node_features.embed_chain = False
         raw_cfg.model.edge_features.embed_chain = False

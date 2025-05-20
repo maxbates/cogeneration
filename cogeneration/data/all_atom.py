@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 import torch
 
 from cogeneration.data import data_transforms, residue_constants
+from cogeneration.data.noise_mask import fill_torsions
 from cogeneration.data.rigid import Rigid, adjust_oxygen_pos, create_rigid
 from cogeneration.data.rigid_utils import Rotation
 
@@ -142,32 +143,35 @@ def frames_to_atom14_pos(
 
 def rigid_to_atom37(
     rigid: Rigid,
-    psi_torsions: Optional[torch.Tensor] = None,  # (B, N, 2)
-    aatype: Optional[torch.Tensor] = None,  # (B, N)  - int or long
+    torsions: Optional[torch.Tensor] = None,  # (B, N, K, 2)  K={1,5,7}
+    aatype: Optional[torch.Tensor] = None,  # (B, N) - int or long
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the backbone atoms from the rigid groups and torsion angles.
 
     Generates atom37 backbone, atom37 mask, residue types, and atom14 backbone.
     """
-    if psi_torsions is None:
-        # rigid shape is (B, N), add one dimension for 2 angles (i.e. 1 torsion)
-        psi_torsions = torch.zeros(rigid.shape[:] + (2,), device=rigid.device)
-    if aatype is None:
-        aatype = torch.zeros(rigid.shape, device=rigid.device).int()
+    B, N = rigid.shape[:2]
+    device = rigid.device
 
-    torsion_angles = torch.tile(
-        psi_torsions[..., None, :],
-        tuple([1 for _ in range(len(rigid.shape))]) + (7, 1),
+    all_torsions = fill_torsions(
+        shape=(B, N, 7, 2),
+        device=device,
+        torsions=torsions,
     )
+
+    if aatype is None:
+        aatype = torch.zeros(rigid.shape, device=device).int()
 
     all_frames = torsion_angles_to_frames(
         r=rigid,
-        alpha=torsion_angles,
+        alpha=all_torsions,
         aatype=aatype,
     )
     atom14_pos = frames_to_atom14_pos(all_frames, aatype)
-    atom37_bb_pos = torch.zeros(rigid.shape + (37, 3), device=rigid.device)
+
+    # pack into atom37
+    atom37_bb_pos = torch.zeros(rigid.shape + (37, 3), device=device)
     atom37_bb_pos[..., :14, :] = atom14_pos
     # atom14 bb order = ['N', 'CA', 'C', 'O', 'CB']
     # atom37 bb order = ['N', 'CA', 'C', 'CB', 'O']
@@ -180,14 +184,14 @@ def rigid_to_atom37(
 def atom37_from_trans_rot(
     trans: torch.Tensor,  # (B, N, 3)
     rots: torch.Tensor,  # (B, N, 3, 3)
-    psi_torsions: Optional[torch.Tensor] = None,  # (B, N, 2)
+    torsions: Optional[torch.Tensor] = None,  # (B, N, K, 2)
     aatype: Optional[torch.Tensor] = None,  # (B, N)
     res_mask: Optional[torch.Tensor] = None,  # (B, N)
     unknown_to_alanine: bool = True,
 ) -> torch.Tensor:
     """
     Generate atom37 backbone from translations and rotations.
-    `psi_torsions` is a tensor [*, N, 2] that refines sidechain placement instead of only using the frame.
+    `torsions` is a tensor [*, N, K, 2] that refines sidechain placement instead of only using the frame.
     `res_mask` is a tensor [*, N] that indicates which residues are known vs diffused.
     `unknown_to_alanine` convert UNK to alanine, or residue-specific mask for UNK will be empty and won't show.
     """
@@ -202,7 +206,7 @@ def atom37_from_trans_rot(
 
     atom37 = rigid_to_atom37(
         rigid=create_rigid(rots, trans),
-        psi_torsions=psi_torsions,
+        torsions=torsions,
         aatype=aatype,
     )[0]
 

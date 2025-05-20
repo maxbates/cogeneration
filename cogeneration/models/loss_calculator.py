@@ -33,7 +33,7 @@ class AuxiliaryMetrics:
     batch_train_loss: torch.Tensor
     batch_rot_loss: torch.Tensor
     batch_trans_loss: torch.Tensor
-    batch_bb_atom_loss: torch.Tensor
+    batch_atom_loss: torch.Tensor
     batch_dist_mat_loss: torch.Tensor
     batch_torsions_loss: torch.Tensor
     batch_multimer_interface_loss: torch.Tensor
@@ -41,7 +41,7 @@ class AuxiliaryMetrics:
     train_loss: torch.Tensor
     rots_vf_loss: torch.Tensor
     trans_loss: torch.Tensor
-    bb_atom_loss: torch.Tensor
+    atom_loss: torch.Tensor
     dist_mat_loss: torch.Tensor
     torsions_loss: torch.Tensor
     multimer_interface_loss: torch.Tensor
@@ -78,7 +78,7 @@ class BatchGroundTruth:
     def __post_init__(self):
         gt_bb_atoms, atom37_mask, _, _ = all_atom.rigid_to_atom37(
             rigid=all_atom.create_rigid(rots=self.rotmats_1, trans=self.trans_1),
-            psi_torsions=self.psi_torsions_1,
+            torsions=self.torsions_1,
             aatype=self.aatypes_1.int(),
         )
         self.bb_atoms = gt_bb_atoms  # (B, N, 37, 3)
@@ -97,9 +97,8 @@ class BatchGroundTruth:
         return self.batch[bp.aatypes_1]  # (B, N)
 
     @property
-    def psi_torsions_1(self) -> torch.Tensor:
-        # (B, N, 7, 2) -> (B, N, 2)
-        return self.batch[bp.torsion_angles_sin_cos_1][..., 2, :]
+    def torsions_1(self) -> torch.Tensor:
+        return self.batch[bp.torsion_angles_sin_cos_1]  # (B, N, 7, 2)
 
     @property
     def rot_vf(self):
@@ -204,11 +203,15 @@ class LossCalculator:
         return self.batch[bp.res_mask].shape[1]
 
     @cached_property
-    def n_bb_atoms(self) -> int:
-        # Number of backbone atoms to consider for loss
+    def n_atoms_modeled(self) -> int:
+        # Number of backbone atoms able consider for loss
         # 3 for C-alpha, N, C atoms, 5 if we also consider psi angles
         # We still only use 3 atoms for frames + flow matching, but consider 5 for backbone loss
-        n_bb_atoms = 5 if self.cfg.model.predict_psi_torsions else 3
+        n_bb_atoms = 3
+        if self.cfg.model.predict_psi_torsions:
+            n_bb_atoms = 5
+        if self.cfg.model.predict_all_torsions:
+            n_bb_atoms = 14
 
         return n_bb_atoms
 
@@ -218,7 +221,7 @@ class LossCalculator:
         pred_bb_atoms = all_atom.atom37_from_trans_rot(
             trans=self.pred[pbp.pred_trans],
             rots=self.pred[pbp.pred_rotmats],
-            psi_torsions=self.pred[pbp.pred_psi],
+            torsions=self.pred[pbp.pred_torsions],
         )
         return pred_bb_atoms
 
@@ -261,23 +264,35 @@ class LossCalculator:
 
     def loss_torsions(self) -> torch.Tensor:
         """
-        Torsion loss computes cosine distance using `1 - cos`, if torsions are predicted
-        (smooth, no wrap around issues, simpler than atan2).
+        Torsion loss computes cosine distance using `1 - cos`, if torsions are predicted.
+        (use 1-cos because smooth, no wrap around issues, simpler than atan2.)
         """
-        pred_psi = self.pred[pbp.pred_psi]  # (B, N, 2)
+        pred_torsions = self.pred[pbp.pred_torsions]  # (B, N, K, 2)  K={1,5,7}
 
-        if pred_psi is None:
-            return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+        if pred_torsions is None:
+            return torch.zeros(
+                self.num_batch,
+                device=self.batch[bp.res_mask].device,
+                dtype=torch.float32,
+            )
 
-        # ground‑truth psi torsion: (B, N, 7, 2) -> (B, N, 2)
-        gt_psi = self.batch[bp.torsion_angles_sin_cos_1][..., 2, :]
+        # ground‑truth psi torsion: (B, N, 7, 2) -> (B, N, K, 2)
+        K = pred_torsions.shape[2]
+        assert K in (1, 5, 7)
+        gt_torsions = self.batch[bp.torsion_angles_sin_cos_1]
+        if K < 7:
+            gt_torsions = gt_torsions[..., 2 : 2 + K, :]
 
         # dot product of unit vectors = cosine of angle difference
-        cos_delta = (gt_psi * pred_psi).sum(-1)  # (B, N)
+        cos_delta = (gt_torsions * pred_torsions).sum(-1)  # (B, N, K)
         # 1 - delta -> 0 when they match, up to 2 if they are opposite
-        loss = 1 - cos_delta  # (B, N)
+        loss_per_angle = 1.0 - cos_delta  # (B, N, K)
+        # average per residues
+        loss_per_residue = loss_per_angle.mean(dim=-1)  # (B, N)
 
-        loss = (loss * self.loss_mask).sum(-1) / (self.loss_denom_num_res + 1e-10)
+        loss = (loss_per_residue * self.loss_mask).sum(-1) / (
+            self.loss_denom_num_res + 1e-10
+        )
         return loss
 
     def loss_aatypes_ce(self) -> torch.Tensor:
@@ -300,19 +315,18 @@ class LossCalculator:
         )
         return aatypes_loss
 
-    def loss_bb_atoms(self) -> torch.Tensor:
+    def loss_atom_positions(self, n_bb_atoms: int) -> torch.Tensor:
         """Calculate backbone atom loss."""
         r3_norm_scale = self.norm_scales.r3
-        gt_bb_atoms = self.gt.bb_atoms[..., : self.n_bb_atoms, :]
+
+        gt_bb_atoms = self.gt.bb_atoms[..., :n_bb_atoms, :]
         gt_bb_atoms *= self.train_cfg.bb_atom_scale / r3_norm_scale[..., None]
 
-        pred_bb_atoms = self.pred_bb_atoms[..., : self.n_bb_atoms, :]
+        pred_bb_atoms = self.pred_bb_atoms[..., :n_bb_atoms, :]
         pred_bb_atoms *= self.train_cfg.bb_atom_scale / r3_norm_scale[..., None]
 
         bb_atom_loss_mask = self.gt.atom37_mask * self.loss_mask[..., None]
-        bb_atom_loss_mask = bb_atom_loss_mask[
-            ..., : self.n_bb_atoms
-        ]  # (B, N, n_bb_atoms)
+        bb_atom_loss_mask = bb_atom_loss_mask[..., :n_bb_atoms]  # (B, N, n_bb_atoms)
 
         bb_atom_loss = torch.sum(
             (gt_bb_atoms - pred_bb_atoms) ** 2 * bb_atom_loss_mask[..., None],
@@ -361,7 +375,7 @@ class LossCalculator:
         return dist_mat_loss
 
     def loss_multimer_interface(
-        self, interface_distance_ang: float = 10.0
+        self, interface_distance_ang: float = 8.0
     ) -> torch.Tensor:
         """
         Recapitulation of ground‐truth inter‐chain contacts for Ca < interface_distance_ang
@@ -440,7 +454,7 @@ class LossCalculator:
         loss_rot_vf = self.loss_rot_vf()
         loss_torsions = self.loss_torsions()
         loss_aatypes_ce = self.loss_aatypes_ce()
-        loss_bb_atoms = self.loss_bb_atoms()
+        loss_atom_positions = self.loss_atom_positions(n_bb_atoms=self.n_atoms_modeled)
         loss_pairwise_dist = self.loss_pairwise_dist()
         loss_multimer_interface = self.loss_multimer_interface()
         loss_multimer_clash = self.loss_multimer_clash()
@@ -450,7 +464,9 @@ class LossCalculator:
         loss_rot_vf = loss_rot_vf * self.train_cfg.rotation_loss_weights
         loss_torsions = loss_torsions * self.train_cfg.torsion_loss_weight
         loss_aatypes_ce = loss_aatypes_ce * self.train_cfg.aatypes_loss_weight
-        loss_bb_atoms = loss_bb_atoms * self.train_cfg.aux_loss_use_bb_loss
+        loss_atom_positions = (
+            loss_atom_positions * self.train_cfg.aux_loss_use_atom_loss
+        )
         loss_pairwise_dist = loss_pairwise_dist * self.train_cfg.aux_loss_use_pair_loss
         loss_multimer_interface = (
             loss_multimer_interface * self.train_cfg.aux_loss_use_multimer_interface
@@ -461,7 +477,7 @@ class LossCalculator:
 
         # auxiliary loss
         loss_auxiliary = (
-            loss_bb_atoms
+            loss_atom_positions
             + loss_pairwise_dist
             + loss_multimer_clash
             + loss_multimer_interface
@@ -487,7 +503,7 @@ class LossCalculator:
             batch_train_loss=loss_total,
             batch_rot_loss=loss_rot_vf,
             batch_trans_loss=loss_trans,
-            batch_bb_atom_loss=loss_bb_atoms,
+            batch_atom_loss=loss_atom_positions,
             batch_dist_mat_loss=loss_pairwise_dist,
             batch_torsions_loss=loss_torsions,
             batch_multimer_interface_loss=loss_multimer_interface,
@@ -495,7 +511,7 @@ class LossCalculator:
             train_loss=self.normalize_loss(loss_total),
             rots_vf_loss=self.normalize_loss(loss_rot_vf),
             trans_loss=self.normalize_loss(loss_trans),
-            bb_atom_loss=self.normalize_loss(loss_bb_atoms),
+            atom_loss=self.normalize_loss(loss_atom_positions),
             dist_mat_loss=self.normalize_loss(loss_pairwise_dist),
             torsions_loss=self.normalize_loss(loss_torsions),
             multimer_interface_loss=self.normalize_loss(loss_multimer_interface),

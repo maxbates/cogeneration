@@ -185,6 +185,7 @@ class TestFlowModule:
     ):
         # flip the default, whether we predict torsion angles or not
         mock_cfg.model.predict_psi_torsions = not mock_cfg.model.predict_psi_torsions
+        mock_cfg.model.predict_all_torsions = mock_cfg.model.predict_psi_torsions
 
         module = FlowModule(mock_cfg)
         batch = next(iter(mock_pred_unconditional_dataloader))

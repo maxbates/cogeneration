@@ -33,7 +33,7 @@ class BaseSequencePredictionNet(nn.Module):
         edge_embed: torch.Tensor,
         node_mask: torch.Tensor,
         edge_mask: torch.Tensor,
-        curr_rigids_nm: Rigid,
+        pred_rigids_nm: Rigid,
         diffuse_mask: torch.Tensor,
         chain_index: torch.Tensor,
         init_node_embed: torch.Tensor,
@@ -48,7 +48,7 @@ class BaseSequencePredictionNet(nn.Module):
             edge_embed: Pairwise residue embeddings
             node_mask: Mask for valid nodes
             edge_mask: Mask for valid edges
-            curr_rigids_nm: predicted Rigid body representation (following IPA backbone updates)
+            pred_rigids_nm: predicted Rigid body representation (following IPA backbone updates)
             diffuse_mask: Diffusion mask
             chain_index: Chain index
 
@@ -92,7 +92,7 @@ class AminoAcidPredictionNet(BaseSequencePredictionNet):
         edge_embed: torch.Tensor,
         node_mask: torch.Tensor,
         edge_mask: torch.Tensor,
-        curr_rigids_nm: Rigid,
+        pred_rigids_nm: Rigid,
         diffuse_mask: torch.Tensor,
         chain_index: torch.Tensor,
         init_node_embed: torch.Tensor,
@@ -132,7 +132,7 @@ class AminoAcidNOOPNet(BaseSequencePredictionNet):
         edge_embed: torch.Tensor,
         node_mask: torch.Tensor,
         edge_mask: torch.Tensor,
-        curr_rigids_nm: Rigid,
+        pred_rigids_nm: Rigid,
         diffuse_mask: torch.Tensor,
         chain_index: torch.Tensor,
         init_node_embed: torch.Tensor,

@@ -10,7 +10,8 @@ from cogeneration.models.aa_pred import BaseSequencePredictionNet
 from cogeneration.models.ipa_attention import AttentionIPATrunk
 
 # TODO(model) - consider a backwards predictor too, see Discrete Flow Matching
-# in practice, this will predict masks, but allow for "correction"
+#   as an alternative to purity sampling
+#   in practice, this will predict masks, but allow for "correction"
 
 # consider more interesting proability paths than just masking
 #   e.g. could you corrupt ranking by an independent language model’s perplexities
@@ -32,11 +33,13 @@ class SequenceIPANet(BaseSequencePredictionNet):
         super(SequenceIPANet, self).__init__()
         self.cfg = cfg
 
+        # structure already predicted so no backbone updates or torsion predictions
         self.ipa_trunk = AttentionIPATrunk(
             cfg=cfg.ipa,
-            perform_backbone_update=False,  # no backbone update
-            perform_final_edge_update=False,  # no edge update on last block, not used further
-            predict_torsions=False,  # no torsion prediction, leave to structure module
+            perform_backbone_update=False,
+            perform_final_edge_update=False,  # final module
+            predict_psi_torsions=False,
+            predict_all_torsions=False,
         )
 
         # Use final representation to predict amino acid tokens.
@@ -58,7 +61,7 @@ class SequenceIPANet(BaseSequencePredictionNet):
         edge_embed: torch.Tensor,
         node_mask: torch.Tensor,
         edge_mask: torch.Tensor,
-        curr_rigids_nm: Rigid,
+        pred_rigids_nm: Rigid,
         diffuse_mask: torch.Tensor,
         chain_index: torch.Tensor,
         init_node_embed: torch.Tensor,
@@ -74,13 +77,13 @@ class SequenceIPANet(BaseSequencePredictionNet):
             edge_embed = edge_embed * edge_mask[..., None]
 
         # run through IPA trunk
-        node_embed, edge_embed, curr_rigids_nm, _ = self.ipa_trunk(
+        node_embed, edge_embed, _, _ = self.ipa_trunk(
             node_embed=node_embed,
             edge_embed=edge_embed,
             node_mask=node_mask,
             edge_mask=edge_mask,
             diffuse_mask=diffuse_mask,  # unused; no backbone update
-            curr_rigids_nm=curr_rigids_nm,
+            curr_rigids_nm=pred_rigids_nm,  # pass predicted structure
         )
 
         # predict logits from updated representation

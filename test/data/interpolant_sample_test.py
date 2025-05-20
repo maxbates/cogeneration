@@ -3,6 +3,7 @@ import torch
 
 from cogeneration.config.base import Config
 from cogeneration.data.interpolant import Interpolant
+from cogeneration.data.noise_mask import torsions_empty
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import PredBatchProp as pbp
@@ -32,13 +33,15 @@ class TestInterpolantSample:
             def __call__(self, batch):
                 t = batch[nbp.trans_t]
                 r = batch[nbp.rotmats_t]
-                psi = torch.zeros((B, N, 2), dtype=torch.float32)
+                torsions = torsions_empty(
+                    num_batch=B, num_res=N, num_angles=7, device=torch.device("cpu")
+                )
                 aa = batch[nbp.aatypes_t].long()
                 logits = torch.nn.functional.one_hot(aa, num_classes=num_tokens).float()
                 return {
                     pbp.pred_trans: t,
                     pbp.pred_rotmats: r,
-                    pbp.pred_psi: psi,
+                    pbp.pred_torsions: torsions,
                     pbp.pred_aatypes: aa,
                     pbp.pred_logits: logits,
                 }
@@ -59,7 +62,7 @@ class TestInterpolantSample:
             kwargs.update(
                 trans_1=batch[bp.trans_1],
                 rotmats_1=batch[bp.rotmats_1],
-                psis_1=batch[bp.torsion_angles_sin_cos_1][..., 2, :],
+                torsions_1=batch[bp.torsion_angles_sin_cos_1],
                 aatypes_1=batch[bp.aatypes_1],
             )
         elif task == InferenceTask.forward_folding:
@@ -70,7 +73,7 @@ class TestInterpolantSample:
             kwargs.update(
                 trans_1=batch[bp.trans_1],
                 rotmats_1=batch[bp.rotmats_1],
-                psis_1=batch[bp.torsion_angles_sin_cos_1][..., 2, :],
+                torsions_1=batch[bp.torsion_angles_sin_cos_1],
             )
 
         prot_traj, model_traj = interpolant.sample(

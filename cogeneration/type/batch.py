@@ -18,7 +18,7 @@ class BatchProp(StrEnum):
     aatypes_1 = "aatypes_1"  # (B, N) amino acid sequence, as ints (0-20, 20 for UNK)
     trans_1 = "trans_1"  # (B, N, 3) frame translations
     rotmats_1 = "rotmats_1"  # (B, N, 3, 3) frame rotations
-    torsion_angles_sin_cos_1 = "torsion_angles_sin_cos_1"  # (B, N, 7, 2) model predicts 1 psi; take `[..., 2, :]` from ground truth
+    torsion_angles_sin_cos_1 = "torsion_angles_sin_cos_1"  # (B, N, 7, 2)
     # structure metadata
     chain_idx = "chain_idx"  # (B, N) chain index (chains are shuffled, 1-indexed)
     res_idx = "res_idx"  # (B, N) residue index (residues are re-numbered contiguously 1-indexed)
@@ -67,15 +67,15 @@ class PredBatchProp(StrEnum):
     Properties of a predicted batch
     """
 
-    pred_trans = "pred_trans"
-    pred_rotmats = "pred_rotmats"
-    pred_psi = "pred_psi"  # optionally output
-    pred_logits = "pred_logits"
-    pred_aatypes = "pred_aatypes"
+    pred_trans = "pred_trans"  # (B, N, 3)
+    pred_rotmats = "pred_rotmats"  # (B, N, 3, 3)
+    pred_torsions = "pred_torsions"  # Optional (B, N, K, 2), K=1 (psi) or K=7 (all)
+    pred_logits = "pred_logits"  # (B, N, S) where S=21 if masking else S=20
+    pred_aatypes = "pred_aatypes"  # (B, N)
 
     # other model outputs
-    node_embed = "node_embed"
-    edge_embed = "edge_embed"
+    node_embed = "node_embed"  # (B, N, c_s)
+    edge_embed = "edge_embed"  # (B, N, N, c_p)
 
 
 """TensorFeat is a feature in primitive or pytorch"""
@@ -104,10 +104,12 @@ def empty_feats(N: int, task: DataTask = DataTask.hallucination) -> BatchFeature
         BatchProp.aatypes_1: (torch.ones(N) * MASK_TOKEN_INDEX).long(),
         BatchProp.trans_1: torch.zeros(N, 3),
         BatchProp.rotmats_1: torch.eye(3).repeat(N, 1, 1),
-        BatchProp.torsion_angles_sin_cos_1: torch.zeros(N, 7, 2),
-        BatchProp.chain_idx: torch.zeros(N),
-        BatchProp.res_idx: torch.arange(N),
-        BatchProp.res_plddt: torch.zeros(N),
+        BatchProp.torsion_angles_sin_cos_1: torch.stack(
+            [torch.zeros(N, 7), torch.ones(N, 7)], dim=-1  # sin(0) = 0  # cos(0) = 1
+        ),
+        BatchProp.chain_idx: torch.ones(N),
+        BatchProp.res_idx: torch.arange(1, N + 1),
+        BatchProp.res_plddt: torch.full((N,), 100.0),
         BatchProp.diffuse_mask: torch.ones(N),
         BatchProp.plddt_mask: torch.ones(N),
         BatchProp.pdb_name: "",

@@ -33,13 +33,15 @@ class AttentionIPATrunk(nn.Module):
         cfg: ModelIPAConfig,
         perform_final_edge_update: bool = False,
         perform_backbone_update: bool = True,
-        predict_torsions: bool = True,
+        predict_psi_torsions: bool = True,
+        predict_all_torsions: bool = True,
     ):
         super(AttentionIPATrunk, self).__init__()
         self.cfg = cfg
         self.perform_final_edge_update = perform_final_edge_update
         self.perform_backbone_update = perform_backbone_update
-        self.predict_torsions = predict_torsions
+        self.predict_psi_torsions = predict_psi_torsions
+        self.predict_all_torsions = predict_all_torsions
 
         self.trunk = nn.ModuleDict()
         for b in range(self.cfg.num_blocks):
@@ -82,8 +84,22 @@ class AttentionIPATrunk(nn.Module):
                     edge_embed_out=self.cfg.c_z,
                 )
 
-        if self.predict_torsions:
-            self.torsion_pred = TorsionAngles(self.cfg.c_s, num_torsions=1)
+        # torsions optional
+        if self.num_torsions > 0:
+            self.torsion_pred = TorsionAngles(
+                self.cfg.c_s, num_torsions=self.num_torsions
+            )
+
+    @property
+    def num_torsions(self) -> int:
+        """
+        Determine number of torsions to predict.
+        """
+        if self.predict_all_torsions:
+            return 7
+        if self.predict_psi_torsions:
+            return 1
+        return 0
 
     def forward(
         self,
@@ -129,8 +145,13 @@ class AttentionIPATrunk(nn.Module):
                 edge_embed = self.trunk[f"edge_transition_{b}"](node_embed, edge_embed)
                 edge_embed *= edge_mask[..., None]
 
-        psi_pred = None
-        if self.predict_torsions:
-            _, psi_pred = self.torsion_pred(node_embed)
+        torsion_pred = None
+        if self.num_torsions > 0:
+            _, torsion_pred = self.torsion_pred(node_embed)  # (B, N, K * 2)
+            B, N = torsion_pred.shape[:2]
+            torsion_pred = torsion_pred.reshape(
+                B, N, self.num_torsions, 2
+            )  # (B, N, K, 2)
+            torsion_pred = torsion_pred * node_mask[..., None, None]
 
-        return node_embed, edge_embed, curr_rigids_nm, psi_pred
+        return node_embed, edge_embed, curr_rigids_nm, torsion_pred

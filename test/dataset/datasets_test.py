@@ -2,6 +2,7 @@ import torch
 
 from cogeneration.config.base import InferenceSamplesConfig
 from cogeneration.data.const import MASK_TOKEN_INDEX
+from cogeneration.data.noise_mask import torsions_empty
 from cogeneration.dataset.datasets import BaseDataset, LengthSamplingDataset
 from cogeneration.dataset.motif_factory import ChainBreak, Motif, Scaffold
 from cogeneration.type.batch import BatchProp as bp
@@ -64,7 +65,10 @@ class TestBaseDataset:
             new_feats[bp.aatypes_1][0:5], torch.ones(5) * MASK_TOKEN_INDEX
         )
         assert torch.equal(
-            new_feats[bp.torsion_angles_sin_cos_1][0:5], torch.zeros(5, 7, 2)
+            new_feats[bp.torsion_angles_sin_cos_1][0:5],
+            torsions_empty(num_batch=1, num_res=5, num_angles=7, device="cpu").squeeze(
+                0
+            ),
         )
 
         # chain break observed for final scaffold

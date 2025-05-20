@@ -2,6 +2,7 @@ from torch import nn
 
 from cogeneration.config.base import ModelConfig, ModelSequencePredictionEnum
 from cogeneration.data.const import rigids_ang_to_nm, rigids_nm_to_ang
+from cogeneration.data.noise_mask import fill_torsions
 from cogeneration.data.rigid import create_rigid
 from cogeneration.models.aa_pred import AminoAcidNOOPNet, AminoAcidPredictionNet
 from cogeneration.models.edge_feature_net import EdgeFeatureNet
@@ -37,8 +38,8 @@ class FlowModel(nn.Module):
     For ODE (no stochastic paths) the ground truth trajectory is (~simply)
     a linear interpolation from start (noise) to end (structure).
 
-    Optionally we can predict psi torsions. These do not impact the input batch or output translations and rotations
-    directly. Instead, the psi torsions are used to construct the atom14 and atom37 rigits, to better pack side chains.
+    Optionally we can predict torsions. These do not impact the input batch or output translations and rotations
+    directly. Instead, the torsions are used to construct the atom14 and atom37 rigits, to better pack frames and side chains.
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -70,7 +71,8 @@ class FlowModel(nn.Module):
         self.attention_ipa_trunk = AttentionIPATrunk(
             cfg=cfg.ipa,
             perform_final_edge_update=self.aa_pred_net.uses_edge_embed,
-            predict_torsions=self.cfg.predict_psi_torsions,
+            predict_psi_torsions=self.cfg.predict_psi_torsions,
+            predict_all_torsions=self.cfg.predict_all_torsions,
         )
 
     def forward(self, batch: NoisyFeatures) -> ModelPrediction:
@@ -137,18 +139,20 @@ class FlowModel(nn.Module):
 
         # Main trunk
         # Note that IPA trunk works in nm scale, rather than angstroms
-        node_embed, edge_embed, curr_rigids_nm, psi_pred = self.attention_ipa_trunk(
-            node_embed=node_embed,
-            edge_embed=edge_embed,
-            node_mask=node_mask,
-            edge_mask=edge_mask,
-            diffuse_mask=diffuse_mask,
-            curr_rigids_nm=rigids_ang_to_nm(init_rigids_ang),
+        node_embed, edge_embed, pred_rigids_nm, pred_torsions = (
+            self.attention_ipa_trunk(
+                node_embed=node_embed,
+                edge_embed=edge_embed,
+                node_mask=node_mask,
+                edge_mask=edge_mask,
+                diffuse_mask=diffuse_mask,
+                curr_rigids_nm=rigids_ang_to_nm(init_rigids_ang),
+            )
         )
         # Convert back to angstroms, get translations and rotations
-        curr_rigids_ang = rigids_nm_to_ang(curr_rigids_nm)
-        pred_trans = curr_rigids_ang.get_trans()
-        pred_rotmats = curr_rigids_ang.get_rots().get_rot_mats()
+        pred_rigids_ang = rigids_nm_to_ang(pred_rigids_nm)
+        pred_trans = pred_rigids_ang.get_trans()
+        pred_rotmats = pred_rigids_ang.get_rots().get_rot_mats()
 
         # Amino acid prediction
         pred_logits, pred_aatypes = self.aa_pred_net(
@@ -157,7 +161,7 @@ class FlowModel(nn.Module):
             edge_embed=edge_embed,
             node_mask=node_mask,
             edge_mask=edge_mask,
-            curr_rigids_nm=curr_rigids_nm,
+            pred_rigids_nm=pred_rigids_nm,
             diffuse_mask=diffuse_mask,
             chain_index=chain_index,
             init_node_embed=init_node_embed,
@@ -167,7 +171,7 @@ class FlowModel(nn.Module):
         return {
             pbp.pred_trans: pred_trans,
             pbp.pred_rotmats: pred_rotmats,
-            pbp.pred_psi: psi_pred,
+            pbp.pred_torsions: pred_torsions,
             pbp.pred_logits: pred_logits,
             pbp.pred_aatypes: pred_aatypes,
             # other model outputs

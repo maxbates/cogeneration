@@ -198,7 +198,7 @@ def mock_folding_validation(tmp_path):
                         all_atom.atom37_from_trans_rot(
                             trans=batch[bp.trans_1],
                             rots=batch[bp.rotmats_1],
-                            psi_torsions=batch[bp.torsion_angles_sin_cos_1][..., 2, :],
+                            torsions=batch[bp.torsion_angles_sin_cos_1],
                             aatype=batch[bp.aatypes_1],
                             unknown_to_alanine=True,
                         )

@@ -376,7 +376,7 @@ class FlowModule(LightningModule):
             trans_1=batch[bp.trans_1],
             rotmats_1=batch[bp.rotmats_1],
             aatypes_1=batch[bp.aatypes_1],
-            psis_1=batch[bp.torsion_angles_sin_cos_1][..., 2, :],
+            torsions_1=batch[bp.torsion_angles_sin_cos_1],
         )
 
         bb_trajs = to_numpy(protein_traj.structure)
@@ -460,15 +460,11 @@ class FlowModule(LightningModule):
         interpolant.set_device(res_mask.device)
 
         # Pull out metadata and t=1 values, if defined
-        trans_1 = batch[bp.trans_1] if bp.trans_1 in batch else None
-        rotmats_1 = batch[bp.rotmats_1] if bp.rotmats_1 in batch else None
-        psi_torsions_1 = (
-            batch[bp.torsion_angles_sin_cos_1][..., 2, :]
-            if bp.torsion_angles_sin_cos_1 in batch
-            else None
-        )
-        aatypes_1 = batch[bp.aatypes_1] if bp.aatypes_1 in batch else None
-        sample_pdb_name = batch[bp.pdb_name][0] if bp.pdb_name in batch else None
+        trans_1 = batch.get(bp.trans_1, None)
+        rotmats_1 = batch.get(bp.rotmats_1, None)
+        torsions_1 = batch.get(bp.torsion_angles_sin_cos_1, None)
+        aatypes_1 = batch.get(bp.aatypes_1, None)
+        sample_pdb_name = batch.get(bp.pdb_name, [None])[0]
 
         diffuse_mask = batch[bp.diffuse_mask]
         motif_mask = batch.get(bp.motif_mask, None)
@@ -548,7 +544,7 @@ class FlowModule(LightningModule):
         if task == InferenceTask.inpainting or task == InferenceTask.forward_folding:
             assert trans_1 is not None
             assert rotmats_1 is not None
-            assert psi_torsions_1 is not None
+            assert torsions_1 is not None
             assert true_aatypes is not None
 
             # For inpainting, limit true structure to motif positions
@@ -560,7 +556,7 @@ class FlowModule(LightningModule):
             true_bb_pos = all_atom.atom37_from_trans_rot(
                 trans=trans_1,
                 rots=rotmats_1,
-                psi_torsions=psi_torsions_1,
+                torsions=torsions_1,
                 res_mask=true_mask,
                 aatype=true_aatypes,
                 unknown_to_alanine=True,
@@ -585,13 +581,13 @@ class FlowModule(LightningModule):
         # Prepare for sampling - zero out some values, depending on task
         if task == InferenceTask.unconditional:
             # Zero-out structure and sequence
-            trans_1 = rotmats_1 = psi_torsions_1 = aatypes_1 = None
+            trans_1 = rotmats_1 = torsions_1 = aatypes_1 = None
         elif task == InferenceTask.inpainting:
             # Keep all t=1 values (though they may be masked to the motifs)
             pass
         elif task == InferenceTask.forward_folding:
             # Zero-out structure
-            trans_1 = rotmats_1 = psi_torsions_1 = None
+            trans_1 = rotmats_1 = torsions_1 = None
         elif task == InferenceTask.inverse_folding:
             # Zero-out sequence
             aatypes_1 = None
@@ -610,7 +606,7 @@ class FlowModule(LightningModule):
             res_idx=batch[bp.res_idx],
             trans_1=trans_1,
             rotmats_1=rotmats_1,
-            psis_1=psi_torsions_1,
+            torsions_1=torsions_1,
             aatypes_1=aatypes_1,
         )
 

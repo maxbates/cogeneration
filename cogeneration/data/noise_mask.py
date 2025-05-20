@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+from torch.distributions import VonMises
 
 from cogeneration.data.const import MASK_TOKEN_INDEX
 
@@ -122,6 +123,84 @@ def uniform_categorical(num_batch, num_res, num_tokens, device) -> torch.Tensor:
     return torch.randint(
         size=(num_batch, num_res), low=0, high=num_tokens, device=device
     )
+
+
+def torsions_empty(
+    num_batch: int, num_res: int, device, num_angles: int = 7
+) -> torch.Tensor:
+    """Returns 0° torsions. Every slot defaults to the identity rotation (sin=0, cos=1)"""
+    torsions = torch.zeros((num_batch, num_res, num_angles, 2), device=device)
+    torsions[..., 1] = 1.0  # cos(0) = 1
+    return torsions
+
+
+def fill_torsions(
+    shape: torch.Size,
+    device: torch.device,
+    torsions: Optional[torch.Tensor] = None,  # (B, N, K, 2)  K={1,5,7}
+):
+    """
+    Generate full set of torsions (sin, cos) of shape (B, N, 7, 2) from partial set of torsions.
+    The partial set may be undefined, or have 1 (psi), 5 (psi+chi) or 7 (all) angles.
+    """
+    B, N, K, _ = shape
+    full = torsions_empty(
+        num_batch=B, num_res=N, num_angles=7, device=device
+    )  # (B, N, 7, 2)
+    if torsions is None:
+        return full
+
+    K = torsions.shape[2]
+    I = 0 if K == 7 else 2
+    full[..., I : I + K, :] = torsions
+
+    return full
+
+
+def angles_noise(
+    sigma: torch.Tensor,  # (B,)
+    num_samples: int,  # N, e.g. num_res
+    num_angles: int = 7,  # K
+    kappa_max: float = 1e4,
+) -> torch.Tensor:
+    """
+    Sample torsion angles from a Von Mises whose concentration kappa = 1 / sigma^2,
+    clamped to [0, kappa_max], and return angles of shape (B, N, K).
+    """
+    num_batch = sigma.shape[0]
+
+    # Compute kappa from sigma^2, clamped for stability
+    # For large concentration, a Von Mises behaves like a Gaussian with variance ~1/kappa.
+    # Setting kappa = 1 / sigma^2 makes its circular spread match a Normal(theta, sigma^2).
+    kappa = 1.0 / (sigma.square() + 1e-6)  # (B,)
+    kappa = torch.clamp(kappa, max=kappa_max)
+
+    # to support MPS (no float64) need to build VonMises on CPU
+    vm_device = sigma.device if "mps" not in str(sigma.device) else torch.device("cpu")
+    vm = VonMises(
+        loc=torch.zeros((num_batch,), device=vm_device),
+        concentration=kappa.cpu(),
+    )
+    # sample raw angles in (−π, π]
+    angles = vm.sample((num_samples, num_angles))  # (N, K, B)
+    angles = angles.permute(2, 0, 1).to(sigma.device).float()  # (B, N, K)
+    return angles
+
+
+def torsions_noise(
+    sigma: torch.Tensor,  # (B,)
+    num_samples: int,  # N, e.g. num_res
+    num_angles: int = 7,  # K
+    kappa_max: float = 1e4,
+) -> torch.Tensor:
+    """
+    Sample torsion (sin, cos) from a Von Mises whose concentration kappa = 1 / sigma^2,
+    clamped to [0, kappa_max], and return (sin, cos) of shape (B, N, K, 2).
+    """
+    angles = angles_noise(
+        sigma=sigma, num_samples=num_samples, num_angles=num_angles, kappa_max=kappa_max
+    )
+    return torch.stack((angles.sin(), angles.cos()), dim=-1)  # (B, N, K, 2)
 
 
 def mask_blend_1d(

@@ -8,7 +8,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment  # noqa
-from torch.distributions import VonMises
 
 from cogeneration.config.base import (
     InterpolantAATypesInterpolantTypeEnum,
@@ -21,17 +20,20 @@ from cogeneration.config.base import (
 from cogeneration.data import all_atom, so3_utils
 from cogeneration.data.const import MASK_TOKEN_INDEX, NM_TO_ANG_SCALE
 from cogeneration.data.noise_mask import (
+    angles_noise,
     centered_gaussian,
     centered_harmonic,
+    fill_torsions,
     mask_blend_1d,
     mask_blend_2d,
     mask_blend_3d,
     masked_categorical,
+    torsions_empty,
+    torsions_noise,
     uniform_categorical,
     uniform_so3,
 )
 from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
-from cogeneration.dataset.datasets import BaseDataset
 from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyBatchProp as nbp
@@ -165,7 +167,7 @@ class Interpolant:
     - supports "purity" sampling, i.e. masking by max log probs and re-masking noise
 
     (Frames a.k.a. Rigids are therefore in SE(3) = R^3 x SO(3))
-    psi torsion angles are not really considered by the interpolant, except when output by the model to generate Rigids.
+    torsion angles are not really considered by the interpolant, except when output by the model to generate Rigids.
     """
 
     def __init__(self, cfg: InterpolantConfig):
@@ -243,10 +245,10 @@ class Interpolant:
 
     def _compute_sigma_t(self, t: torch.Tensor, scale: float, min_sigma: float = 0.0):
         """
-        Compute the standard deviation of the noise at time `t`.
+        Compute the standard deviation of the noise at time `t` (B,)
         The standard deviation is a parabolic function of t, and is zero at t=0 and t=1.
         """
-        return torch.sqrt(scale**2 * t * (1 - t) + min_sigma**2)
+        return torch.sqrt(scale**2 * t * (1 - t) + min_sigma**2)  # (B,)
 
     def _trans_noise(self, chain_idx: torch.Tensor) -> torch.Tensor:
         """
@@ -301,16 +303,6 @@ class Interpolant:
             raise ValueError(
                 f"Unknown aatypes interpolant type {self.cfg.aatypes.interpolant_type}"
             )
-
-    def _psi_noise(self, num_batch: int, num_res: int, kappa=1.0):
-        """
-        Generate initial psi angles as Von Mises noise
-        keeps angle periodic and roughly centred so the network has less work than with randn
-        """
-        vm = VonMises(torch.zeros(()), torch.tensor(kappa))
-        psis = vm.sample((num_batch, num_res)).to(self._device)  # (B, N)
-        # represent each angle by its sine & cosine
-        return torch.stack((psis.sin(), psis.cos()), dim=-1)  # (B, N, 2)
 
     def _batch_ot(self, trans_0, trans_1, res_mask, center: bool = False):
         """
@@ -738,7 +730,6 @@ class Interpolant:
         chain_idx: torch.Tensor,  # (B, N)
     ) -> torch.Tensor:
         trans_vf = self._trans_vector_field(t, trans_1, trans_t)
-
         trans_next = trans_t + trans_vf * d_t
 
         if (
@@ -797,43 +788,49 @@ class Interpolant:
 
         return rotmats_next
 
-    def _psi_euler_step(
+    def torsions_euler_step(
         self,
         d_t: float,
         t: float,
-        psi_1: torch.Tensor,  # (B, N, 2)
-        psi_t: torch.Tensor,  # (B, N, 2)
+        torsions_1: torch.Tensor,  # (B, N, 7, 2)
+        torsions_t: torch.Tensor,  # (B, N, K, 2)
     ) -> torch.Tensor:
         """
-        Perform an Euler step to update psi angles.
-        Note that only the model predicts psi angles, but they are not an input to the model.
-        Primary use is for inpainting to step towards known psi angles in motifs.
+        Perform an Euler step in angle space to update torsion angles.
         """
-        psi_vf = (psi_1 - psi_t) / (1 - t)
-        psi_next = psi_t + psi_vf * d_t
+        B, N, K = torsions_1.shape[:3]
+
+        # (B, N, K, 2) -> (B, N, 7, 2)
+        torsions_t = fill_torsions(
+            shape=torsions_1.shape,
+            torsions=torsions_t,
+            device=torsions_1.device,
+        )
+
+        angles_1 = torch.atan2(torsions_1[..., 0], torsions_1[..., 1])  # (B, N, K)
+        angles_t = torch.atan2(torsions_t[..., 0], torsions_t[..., 1])  # (B, N, K)
+
+        angles_vf = (angles_1 - angles_t) / (1 - t)
+        angles_next = angles_t + angles_vf * d_t
 
         # HACK piggyback on `trans.stochastic`
         if (
             self.cfg.trans.stochastic
             and self.cfg.trans.stochastic_noise_intensity > 0.0
         ):
-            # σ_t = σ(t) · √dt with σ(t)=intensity·√(t(1-t))
-            sigma_t = (
-                self._compute_sigma_t(
-                    torch.ones(psi_1.shape[0]) * t,  # (B,)
-                    scale=self.cfg.trans.stochastic_noise_intensity,
-                )
-                * math.sqrt(d_t)
-            ).unsqueeze(
-                1
-            )  # (B, 1)
-            sigma_t = sigma_t.to(psi_next.device)
-            psi_next = psi_next + torch.randn_like(psi_next) * sigma_t[..., None]
+            sigma_t = self._compute_sigma_t(
+                torch.full((B,), t, device=angles_next.device),
+                scale=self.cfg.trans.stochastic_noise_intensity,
+            ) * math.sqrt(d_t)
+            # add sampled noisy angles
+            angles_next += angles_noise(sigma=sigma_t, num_samples=N, num_angles=K)
 
         # wrap back into (-π, π]
-        psi_next = (psi_next + np.pi) % (2 * np.pi) - np.pi
+        angles_next = (angles_next + np.pi) % (2 * np.pi) - np.pi
 
-        return psi_next
+        return torch.stack(
+            [angles_next.sin(), angles_next.cos()], dim=-1
+        )  # (B, N, K, 2)
 
     def _regularize_step_probs(
         self,
@@ -1178,11 +1175,11 @@ class Interpolant:
         res_idx: torch.Tensor,
         trans_0: Optional[torch.Tensor] = None,
         rotmats_0: Optional[torch.Tensor] = None,
-        psis_0: Optional[torch.Tensor] = None,
+        torsions_0: Optional[torch.Tensor] = None,
         aatypes_0: Optional[torch.Tensor] = None,
         trans_1: Optional[torch.Tensor] = None,
         rotmats_1: Optional[torch.Tensor] = None,
-        psis_1: Optional[torch.Tensor] = None,
+        torsions_1: Optional[torch.Tensor] = None,
         aatypes_1: Optional[torch.Tensor] = None,
         # t_nn is model/function that generates explicit time steps (r3, so3, cat) given t
         t_nn: Union[Callable[[torch.Tensor], torch.Tensor], Any] = None,
@@ -1228,7 +1225,7 @@ class Interpolant:
             # inputs
             assert trans_1 is not None
             assert rotmats_1 is not None
-            assert psis_1 is not None
+            assert torsions_1 is not None
             assert aatypes_1 is not None
             assert diffuse_mask is not None
             assert motif_mask is not None
@@ -1248,7 +1245,7 @@ class Interpolant:
             # inputs
             assert trans_1 is not None
             assert rotmats_1 is not None
-            assert psis_1 is not None
+            assert torsions_1 is not None
         else:
             raise ValueError(f"Unknown task {task}")
 
@@ -1275,7 +1272,7 @@ class Interpolant:
             nbp.aatypes_sc: aatypes_sc,
         }
 
-        # Initialize t=1 values for translations, rotations, psi, and aatypes, if not defined
+        # Initialize t=1 values for translations, rotations, torsions, and aatypes, if not defined
 
         if trans_1 is None:
             trans_1 = torch.zeros(num_batch, num_res, 3, device=self._device)
@@ -1285,8 +1282,8 @@ class Interpolant:
             )
         if aatypes_1 is None:
             aatypes_1 = torch.zeros((num_batch, num_res), device=self._device).long()
-        if psis_1 is None:
-            psis_1 = torch.zeros((num_batch, num_res, 2), device=self._device)
+        if torsions_1 is None:
+            torsions_1 = torsions_empty(num_batch, num_res, device=self._device)
         logits_1 = torch.nn.functional.one_hot(
             aatypes_1, num_classes=self.num_tokens
         ).float()
@@ -1302,9 +1299,13 @@ class Interpolant:
         if aatypes_0 is None:
             # Generate mask / random aa_types (B, N)
             aatypes_0 = self._aatypes_noise(res_mask=res_mask)
-        if psis_0 is None:
-            # Generate initial psi angles
-            psis_0 = self._psi_noise(num_batch, num_res)
+        if torsions_0 is None:
+            # Generate initial torsion angles
+            torsions_0 = torsions_noise(
+                sigma=torch.ones((num_batch,), device=self._device),
+                num_samples=num_res,
+                num_angles=7,
+            )
 
         # For inpainting, adjust motifs.
         if task == InferenceTask.inpainting:
@@ -1319,6 +1320,7 @@ class Interpolant:
             #    The main difficulty is centering and avoiding biasing the model as to where the scaffolds go.
             # trans_0 = mask_blend_2d(trans_0, trans_1, diffuse_mask)
             # rotmats_0 = mask_blend_3d(rotmats_0, rotmats_1, diffuse_mask)
+            # torsions_0 = mask_blend_3d(torsions_0, torsions_1, diffuse_mask)
 
         # check for NaNs, should only happen for invalid data or diffuse_mask
         if torch.isnan(trans_0).any():
@@ -1335,22 +1337,22 @@ class Interpolant:
             elif task == InferenceTask.inverse_folding:
                 trans_0 = trans_1
                 rotmats_0 = rotmats_1
-                psis_0 = psis_1
+                torsions_0 = torsions_1
             else:
                 raise ValueError(f"Unknown task {task}")
 
         # Helper function to get atom37 structure from residue frames, only for `res_mask`
         def frames_to_atom37(
-            trans: torch.Tensor,
-            rots: torch.Tensor,
-            aatypes: torch.Tensor,
-            psis: Optional[torch.Tensor],
+            trans: torch.Tensor,  # (B, N, 3)
+            rots: torch.Tensor,  # (B, N, 3, 3)
+            aatypes: torch.Tensor,  # (B, N, S)
+            torsions: Optional[torch.Tensor],  # (B, N, K, 2)
         ) -> torch.Tensor:
             return to_cpu(
                 all_atom.atom37_from_trans_rot(
                     trans=trans,
                     rots=rots,
-                    psi_torsions=psis,
+                    torsions=torsions,
                     aatype=aatypes,
                     res_mask=res_mask,
                     unknown_to_alanine=True,  # show UNK residues as alanine
@@ -1372,7 +1374,10 @@ class Interpolant:
         protein_trajectory.append(
             SamplingStep(
                 structure=frames_to_atom37(
-                    trans=trans_0, rots=rotmats_0, aatypes=aatypes_0, psis=psis_0
+                    trans=trans_0,
+                    rots=rotmats_0,
+                    aatypes=aatypes_0,
+                    torsions=torsions_0,
                 ),
                 amino_acids=to_cpu(aatypes_0),
             )
@@ -1384,7 +1389,7 @@ class Interpolant:
         # Set up initial values, where *_t_1 start at t=0 values
         trans_t_1 = trans_0
         rotmats_t_1 = rotmats_0
-        psis_t_1 = psis_0
+        torsions_t_1 = torsions_0
         aatypes_t_1 = aatypes_0
 
         # We will integrate in a loop over ts (handling the last step after the loop)
@@ -1437,7 +1442,7 @@ class Interpolant:
                 model_out = model(batch)
             pred_trans_1 = model_out[pbp.pred_trans]
             pred_rotmats_1 = model_out[pbp.pred_rotmats]
-            pred_psis_1 = model_out[pbp.pred_psi]  # may be None, if not predicting
+            pred_torsions_1 = model_out[pbp.pred_torsions]  # may be None
             pred_aatypes_1 = model_out[pbp.pred_aatypes]
             pred_logits_1 = model_out[pbp.pred_logits]
 
@@ -1447,7 +1452,7 @@ class Interpolant:
                         trans=pred_trans_1,
                         rots=pred_rotmats_1,
                         aatypes=pred_aatypes_1,
-                        psis=pred_psis_1,
+                        torsions=pred_torsions_1,
                     ),
                     amino_acids=to_cpu(pred_aatypes_1),
                     logits=to_cpu(pred_logits_1),
@@ -1466,8 +1471,10 @@ class Interpolant:
                 # so that we interpolate toward the known motifs. Also for self-conditioning.
                 pred_trans_1 = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
                 pred_rotmats_1 = mask_blend_3d(pred_rotmats_1, rotmats_1, diffuse_mask)
-                if pred_psis_1 is not None:
-                    pred_psis_1 = mask_blend_2d(pred_psis_1, psis_1, diffuse_mask)
+                if pred_torsions_1 is not None:
+                    pred_torsions_1 = mask_blend_3d(
+                        pred_torsions_1, torsions_1, diffuse_mask
+                    )
             elif task == InferenceTask.forward_folding:
                 # scale logits during integration, assumes will `softmax`
                 pred_logits_1 = 100.0 * logits_1
@@ -1475,8 +1482,8 @@ class Interpolant:
             elif task == InferenceTask.inverse_folding:
                 pred_trans_1 = trans_1
                 pred_rotmats_1 = rotmats_1
-                if pred_psis_1 is not None:
-                    pred_psis_1 = psis_1
+                if pred_torsions_1 is not None:
+                    pred_torsions_1 = torsions_1
             else:
                 raise ValueError(f"Unknown task {task}")
 
@@ -1504,9 +1511,11 @@ class Interpolant:
             aatypes_t_2 = self._aatypes_euler_step(
                 d_t=d_t, t=t_1, logits_1=pred_logits_1, aatypes_t=aatypes_t_1
             )
-            psis_t_2 = (
-                self._psi_euler_step(d_t=d_t, t=t_1, psi_1=pred_psis_1, psi_t=psis_t_1)
-                if pred_psis_1 is not None
+            torsions_t_2 = (
+                self.torsions_euler_step(
+                    d_t=d_t, t=t_1, torsions_1=pred_torsions_1, torsions_t=torsions_t_1
+                )
+                if pred_torsions_1 is not None
                 else None
             )
 
@@ -1531,7 +1540,7 @@ class Interpolant:
                         trans=trans_t_2,
                         rots=rotmats_t_2,
                         aatypes=aatypes_t_2,
-                        psis=psis_t_2,
+                        torsions=torsions_t_2,
                     ),
                     amino_acids=to_cpu(aatypes_t_2),
                 )
@@ -1541,7 +1550,7 @@ class Interpolant:
             trans_t_1 = trans_t_2
             rotmats_t_1 = rotmats_t_2
             aatypes_t_1 = aatypes_t_2
-            psis_t_1 = psis_t_2
+            torsions_t_1 = torsions_t_2
             t_1 = t_2
 
         # We only integrated to 1-min_t, so need to make a final step
@@ -1560,7 +1569,7 @@ class Interpolant:
             model_out = model(batch)
         pred_trans_1 = model_out[pbp.pred_trans]
         pred_rotmats_1 = model_out[pbp.pred_rotmats]
-        pred_psis_1 = model_out[pbp.pred_psi]  # may be None, if not predicting
+        pred_torsions_1 = model_out[pbp.pred_torsions]  # may be None if not predicting
         pred_aatypes_1 = model_out[pbp.pred_aatypes]
         pred_logits_1 = model_out[pbp.pred_logits]
 
@@ -1570,7 +1579,7 @@ class Interpolant:
                     trans=pred_trans_1,
                     rots=pred_rotmats_1,
                     aatypes=pred_aatypes_1,
-                    psis=pred_psis_1,
+                    torsions=pred_torsions_1,
                 ),
                 amino_acids=to_cpu(pred_aatypes_1),
                 logits=to_cpu(pred_logits_1),
@@ -1588,15 +1597,17 @@ class Interpolant:
             pred_aatypes_1 = mask_blend_1d(pred_aatypes_1, aatypes_1, scaffold_mask)
             pred_trans_1 = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
             pred_rotmats_1 = mask_blend_3d(pred_rotmats_1, rotmats_1, diffuse_mask)
-            if pred_psis_1 is not None:
-                pred_psis_1 = mask_blend_2d(pred_psis_1, psis_1, diffuse_mask)
+            if pred_torsions_1 is not None:
+                pred_torsions_1 = mask_blend_3d(
+                    pred_torsions_1, torsions_1, diffuse_mask
+                )
         elif task == InferenceTask.forward_folding:
             pred_logits_1 = logits_1
             pred_aatypes_1 = aatypes_1
         elif task == InferenceTask.inverse_folding:
             pred_trans_1 = trans_1
             pred_rotmats_1 = rotmats_1
-            pred_psis_1 = psis_1
+            pred_torsions_1 = torsions_1
         else:
             raise ValueError(f"Unknown task {task}")
 
@@ -1606,7 +1617,7 @@ class Interpolant:
                     trans=pred_trans_1,
                     rots=pred_rotmats_1,
                     aatypes=pred_aatypes_1,
-                    psis=pred_psis_1,
+                    torsions=pred_torsions_1,
                 ),
                 amino_acids=to_cpu(pred_aatypes_1),
             )

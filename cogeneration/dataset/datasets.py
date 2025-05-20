@@ -77,7 +77,7 @@ def batch_features_from_processed_file(
     # Run through OpenFold data transforms.
     # Convert atomic representation to frames
     chain_feats = data_transforms.atom37_to_frames(chain_feats)
-    # calculate torsion angles, in case predicting psi angles
+    # calculate torsion angles, in case predicting torsion angles
     chain_feats = data_transforms.atom37_to_torsion_angles()(chain_feats)
 
     # Extract rigids (translations + rotations), check for poorly processed
