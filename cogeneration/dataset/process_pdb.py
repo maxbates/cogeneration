@@ -1,13 +1,15 @@
 import collections
-import dataclasses
 import os
-from typing import Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass
+from itertools import product
+from typing import Dict, List, Optional, Tuple, Union
 
 import mdtraj as md
 import numpy as np
 import tree
 from Bio import PDB
 from numpy import typing as npt
+from scipy.spatial.distance import cdist
 
 from cogeneration.data.const import CA_IDX
 from cogeneration.data.io import read_pkl, write_pkl
@@ -200,6 +202,60 @@ def trim_chain_feats_to_modeled_residues(
     return chain_feats
 
 
+@dataclass
+class Clash:
+    """struct for atom clashes between two chains"""
+
+    chain_id: Union[int, str]
+    other_id: Union[int, str]
+    num_clashes: int
+    num_atoms: int
+
+
+def detect_multimer_clashes(
+    complex_feats: ChainFeatures,  # take merged chains
+    metadata: MetadataCSVRow,
+    clash_threshold_ang: float = 1.7,
+    clash_tolerance_percent: float = 0.15,  # require 15% of atoms to be clashing
+) -> List[Clash]:
+    """Check for clashes across chains"""
+    chain_pairs = [
+        (i, j)
+        for i, j in product(
+            range(metadata[dc.num_chains]), range(metadata[dc.num_chains])
+        )
+        if i < j
+    ]
+
+    clashes = []
+
+    for i, j in chain_pairs:
+        chain_i_atoms = complex_feats[dpc.atom_positions][
+            complex_feats[dpc.chain_index] == i
+        ].reshape(
+            -1, 3
+        )  # (N * 37, 3)
+        chain_j_atoms = complex_feats[dpc.atom_positions][
+            complex_feats[dpc.chain_index] == j
+        ].reshape(
+            -1, 3
+        )  # (N * 37, 3)
+        if chain_i_atoms.shape[0] == 0 or chain_j_atoms.shape[0] == 0:
+            continue
+
+        dists = cdist(chain_i_atoms, chain_j_atoms)
+        _clashes = dists < clash_threshold_ang
+        chain_i_clashes = np.any(_clashes, axis=1).sum().item()
+        chain_j_clashes = np.any(_clashes, axis=0).sum().item()
+
+        if (chain_i_clashes / len(chain_i_atoms)) > clash_tolerance_percent:
+            clashes.append(Clash(i, j, chain_i_clashes, len(chain_i_atoms)))
+        if (chain_j_clashes / len(chain_j_atoms)) > clash_tolerance_percent:
+            clashes.append(Clash(j, i, chain_j_clashes, len(chain_j_atoms)))
+
+    return clashes
+
+
 def _process_chain_feats(
     chain_feats: ChainFeatures,
     center: bool,
@@ -277,9 +333,11 @@ def _process_pdb(
     for chain_id, chain in struct_chains.items():
         chain_id = chain_str_to_int(chain_id)
         chain_protein = process_chain(chain, chain_id=chain_id)
-        chain_feats: ChainFeatures = dataclasses.asdict(chain_protein)  # noqa
+        chain_feats: ChainFeatures = asdict(chain_protein)  # noqa
 
         # check for non-protein chains and skip them
+        if len(chain_feats[dpc.aatype]) == 0:
+            continue
         if np.sum(chain_feats[dpc.aatype] != unk_restype_index) == 0:
             continue
 
@@ -341,6 +399,11 @@ def _process_pdb(
         else:
             metadata[dc.quaternary_category] = "heteromer"
 
+        # quality information
+        plddts = complex_feats[dpc.b_factors]
+        metadata[dc.mean_plddt_all_atom] = float(np.mean(plddts))
+        metadata[dc.mean_plddt_modeled_bb] = float(np.mean(plddts[:, :3][modeled_idx]))
+
         # secondary structure, radius of gyration
         try:
             # MDtraj
@@ -362,6 +425,15 @@ def _process_pdb(
             np.sum(pdb_ss == "E") / metadata[dc.modeled_seq_len]
         )
         metadata[dc.radius_gyration] = pdb_rg[0]
+
+        # check for clashes across chain pairs
+        chain_clashes = detect_multimer_clashes(
+            complex_feats=complex_feats,
+            metadata=metadata,
+        )
+        metadata[dc.num_chains_clashing] = len(
+            set(clash.chain_id for clash in chain_clashes)
+        )
 
     # Save pkl after processing is successful
     if write_dir is not None:

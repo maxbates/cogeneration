@@ -166,6 +166,7 @@ class ESMCombinerNetwork(nn.Module):
         #    Note requires `openfold` install for Triangle Updates.
         #    Can install as local package, but brings in large dependency we've avoided so far.
         #    May wish to add in RelativePosition embedding for folding blocks.
+        # TODO - alternatively, `trifast` https://github.com/latkins/trifast
         if self.cfg.double_attention_pair_trunk.num_blocks > 0:
             for block in self.double_attention_pair_trunk:
                 edge_embed = block(edge_embed=edge_embed, r3_t=r3_t)

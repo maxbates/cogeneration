@@ -12,8 +12,14 @@ from tqdm.auto import tqdm
 
 from cogeneration.data.io import read_pkl
 from cogeneration.dataset.datasets import read_metadata_file
-from cogeneration.dataset.process_pdb import _process_chain_feats, read_processed_file
-from cogeneration.type.dataset import DatasetProteinColumn, MetadataColumn
+from cogeneration.dataset.process_pdb import (
+    _process_chain_feats,
+    detect_multimer_clashes,
+    read_processed_file,
+)
+from cogeneration.type.dataset import DatasetProteinColumn as dpc
+from cogeneration.type.dataset import MetadataColumn as dc
+from cogeneration.type.dataset import MetadataCSVRow
 
 
 class MetadataUpdater:
@@ -50,7 +56,7 @@ class MetadataUpdater:
         for idx, row in tqdm(
             self.df.iterrows(), desc="Updating rows", total=len(self.df)
         ):
-            updates.append(self._update_row(row=row, idx=idx))
+            updates.append(self._update_row(row_metadata=row, idx=idx))
 
         # Convert [{col: val}, ...] to {col: [val, ...]}, assume same columns throughout
         column_updates = {
@@ -64,7 +70,9 @@ class MetadataUpdater:
         # Verify completeness
         self.check_all_columns_present()
 
-    def _update_row(self, row: pd.Series, idx: Union[Hashable, str, int]) -> dict:
+    def _update_row(
+        self, row_metadata: MetadataCSVRow, idx: Union[Hashable, str, int]
+    ) -> dict:
         """
         Compute missing values
         Load raw processed features once and compute all required metrics for a single entry.
@@ -72,41 +80,77 @@ class MetadataUpdater:
         """
         row_updates: dict = {}
 
-        processed_path = self.abs_processed_path(row[MetadataColumn.processed_path])
+        processed_path = self.abs_processed_path(row_metadata[dc.processed_path])
         raw_processed_file = read_pkl(processed_path)
 
-        if MetadataColumn.moduled_num_res not in row:
-            row_updates[MetadataColumn.moduled_num_res] = len(
-                raw_processed_file[DatasetProteinColumn.modeled_idx]
+        # memoize constructing chain_feats
+        whole_complex_trimmed = None  # MultiFlow style trimming
+        chain_independent_trimmed = None  # improved multimer trimming
+
+        def get_whole_complex_trimmed():
+            nonlocal whole_complex_trimmed
+            if whole_complex_trimmed is None:
+                whole_complex_trimmed = _process_chain_feats(
+                    raw_processed_file,
+                    center=True,
+                    trim_to_modeled_residues=True,
+                    trim_chains_independently=False,
+                )
+            return whole_complex_trimmed
+
+        def get_chain_independent_trimmed():
+            nonlocal chain_independent_trimmed
+            if chain_independent_trimmed is None:
+                chain_independent_trimmed = _process_chain_feats(
+                    raw_processed_file,
+                    center=True,
+                    trim_to_modeled_residues=True,
+                    trim_chains_independently=True,
+                )
+            return chain_independent_trimmed
+
+        if dc.moduled_num_res not in row_metadata:
+            row_updates[dc.moduled_num_res] = len(raw_processed_file[dpc.modeled_idx])
+
+        if dc.modeled_seq_len not in row_metadata:
+            whole_complex_trimmed = get_whole_complex_trimmed()
+            row_updates[dc.modeled_seq_len] = len(whole_complex_trimmed[dpc.aatype])
+
+        # independent trimming
+        if dc.modeled_indep_seq_len not in row_metadata:
+            chain_independent_trimmed = get_chain_independent_trimmed()
+            row_updates[dc.modeled_indep_seq_len] = len(
+                chain_independent_trimmed[dpc.aatype]
             )
 
-        if MetadataColumn.modeled_seq_len not in row:
-            whole_complex_trimmed = _process_chain_feats(
-                raw_processed_file,
-                center=True,
-                trim_to_modeled_residues=True,
-                trim_chains_independently=False,
-            )
-            row_updates[MetadataColumn.modeled_seq_len] = len(
-                whole_complex_trimmed[DatasetProteinColumn.aatype]
-            )
+        # plddts
+        if dc.mean_plddt_all_atom not in row_metadata:
+            chain_independent_trimmed = get_chain_independent_trimmed()
+            row_updates[dc.mean_plddt_all_atom] = chain_independent_trimmed[
+                dpc.b_factors
+            ].mean()
+        if dc.mean_plddt_modeled_bb not in row_metadata:
+            chain_independent_trimmed = get_chain_independent_trimmed()
+            row_updates[dc.mean_plddt_modeled_bb] = chain_independent_trimmed[
+                dpc.b_factors
+            ][:, :3][chain_independent_trimmed[dpc.modeled_idx]].mean()
 
-        if MetadataColumn.modeled_indep_seq_len not in row:
-            chain_independent_trimmed = _process_chain_feats(
-                raw_processed_file,
-                center=True,
-                trim_to_modeled_residues=True,
-                trim_chains_independently=True,
+        # clashes
+        if dc.num_chains_clashing not in row_metadata:
+            chain_independent_trimmed = get_chain_independent_trimmed()
+            chain_clashes = detect_multimer_clashes(
+                complex_feats=chain_independent_trimmed,
+                metadata=row_metadata,
             )
-            row_updates[MetadataColumn.modeled_indep_seq_len] = len(
-                chain_independent_trimmed[DatasetProteinColumn.aatype]
+            row_updates[dc.num_chains_clashing] = len(
+                set(clash.chain_id for clash in chain_clashes)
             )
 
         return row_updates
 
     def check_all_columns_present(self):
         """Verify all DatasetColumns are present in the DataFrame."""
-        expected = {col for col in MetadataColumn}
+        expected = {col for col in dc}
         present = set(self.df.columns)
         missing = expected - present
         extra = present - expected

@@ -1,6 +1,7 @@
 import os
 
 import pytest
+from omegaconf import OmegaConf
 
 from cogeneration.config.base import Config
 from cogeneration.config.curriculum import Curriculum, TrainingStep
@@ -48,14 +49,15 @@ class TestCurriculum:
         )
 
         # Verify that the second step warm_start_ckpt is set to the first step's last.ckpt
-        expected_ckpt = os.path.join(cfg1.experiment.checkpointer.dirpath, "last.ckpt")
+        expected_ckpt = os.path.join(cfg1.experiment.checkpointer.dirpath, "final.ckpt")
         assert curriculum.steps[1].cfg.experiment.warm_start_ckpt == expected_ckpt
         assert curriculum.steps[1].cfg.experiment.warm_start_cfg_override is True
 
         # Running the curriculum should invoke our patched Experiment without errors
         curriculum.run()
 
-    def test_resume(self, tmp_path, monkeypatch, mock_checkpoint):
+    @pytest.mark.parametrize("resume_step2", [True, False])
+    def test_resume(self, tmp_path, monkeypatch, mock_checkpoint, resume_step2):
         cfg1 = Config.test_uninterpolated(tmp_path=tmp_path / "step1")
         cfg1.shared.id = "step1"
         cfg1 = cfg1.interpolate()
@@ -69,6 +71,17 @@ class TestCurriculum:
         final_ckpt = os.path.join(cfg1.experiment.checkpointer.dirpath, "final.ckpt")
         assert ckpt1.replace("last.ckpt", "final.ckpt") == final_ckpt
         assert os.path.exists(final_ckpt)
+
+        if resume_step2:
+            # Create a dummy partial checkpoint for step2 at last.ckpt not final.ckpt
+            ckpt2 = os.path.join(cfg2.experiment.checkpointer.dirpath, "last.ckpt")
+            os.makedirs(os.path.dirname(ckpt2), exist_ok=True)
+            os.link(final_ckpt, ckpt2)
+            ckpt2_cfg_path = os.path.join(
+                cfg2.experiment.checkpointer.dirpath, "config.yaml"
+            )
+            with open(ckpt2_cfg_path, "w") as f:
+                OmegaConf.save(config=cfg2, f=f)
 
         # Monkeypatch Experiment to avoid actually training
         called = []
@@ -95,5 +108,10 @@ class TestCurriculum:
         # can't compare directly because some paths will be modified
         assert len(called) == 1
         assert called[0].shared.id == cfg2.shared.id
-        # Step2 warm_start should equal the checkpoint from step1
-        assert cfg2.experiment.warm_start_ckpt == final_ckpt
+
+        if resume_step2:
+            # Step2 warm_start should use the warm start checkpoint
+            assert cfg2.experiment.warm_start_ckpt == ckpt2
+        else:
+            # Step2 warm_start should use the final checkpoint from step1
+            assert cfg2.experiment.warm_start_ckpt == final_ckpt

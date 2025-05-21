@@ -29,11 +29,17 @@ class MetadataColumn(StrEnum):
     modeled_seq_len = "modeled_seq_len"
     # (new) modeled residues, chains independently trimmed
     modeled_indep_seq_len = "modeled_indep_seq_len"
+    # (new) mean pLDDT of all atoms
+    mean_plddt_all_atom = "mean_plddt_all_atom"
+    # (new) mean pLDDT of modeled backbone atoms
+    mean_plddt_modeled_bb = "mean_plddt_modeled_bb"
     # secondary structure stats
     coil_percent = "coil_percent"
     helix_percent = "helix_percent"
     strand_percent = "strand_percent"
     radius_gyration = "radius_gyration"
+    # (new) clashes across chains, multimer only
+    num_chains_clashing = "num_chains_clashing"
 
     # TODO add in process_pdb_files if provided
     resolution = "resolution"
@@ -91,7 +97,7 @@ class DatasetTransformColumn(StrEnum):
 
 
 """NumpyPrimitiveFeat is a feature in primitive or numpy"""
-NumpyPrimitiveFeat = Union[npt.NDArray, str, int]
+NumpyPrimitiveFeat = Union[npt.NDArray, str, int, float]
 
 """MetadataCSVRow type alias for a single row of the metadata CSV file"""
 MetadataCSVRow = Dict[MetadataColumn, NumpyPrimitiveFeat]
