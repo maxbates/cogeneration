@@ -2,7 +2,7 @@ import collections
 import os
 from dataclasses import asdict, dataclass
 from itertools import product
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import mdtraj as md
 import numpy as np
@@ -202,58 +202,177 @@ def trim_chain_feats_to_modeled_residues(
     return chain_feats
 
 
+# clash / interaction constants
+DIST_CLASH_ANGSTROMS = 1.8
+FRAC_RES_FOR_CLASH = 0.1
+DIST_INTERACTION_ATOM = 4.5
+DIST_INTERACTION_BACKBONE = 6.5
+
+
 @dataclass
-class Clash:
-    """struct for atom clashes between two chains"""
+class Interaction:
+    """struct for interactions between two chains"""
 
     chain_id: Union[int, str]
     other_id: Union[int, str]
+    chain_res_index: int
+    chain_atom_idx: int
+    other_res_index: int
+    other_atom_idx: int
+    dist_ang: float
+
+    @property
+    def is_clash(self) -> bool:
+        return self.dist_ang < DIST_CLASH_ANGSTROMS
+
+    @property
+    def is_backbone(self) -> bool:
+        return self.chain_atom_idx < 3 and self.other_atom_idx < 3
+
+
+@dataclass
+class ChainClash:
+    """struct for aggregating clashes between two chains"""
+
+    chain_id: Union[int, str]
+    other_id: Union[int, str]
+    chain_num_res: int
+    residues: Set[int]
     num_clashes: int
-    num_atoms: int
+
+    @property
+    def percent_residues_clash(self) -> float:
+        return len(self.residues) / self.chain_num_res
 
 
-def detect_multimer_clashes(
-    complex_feats: ChainFeatures,  # take merged chains
-    metadata: MetadataCSVRow,
-    clash_threshold_ang: float = 1.7,
-    clash_tolerance_percent: float = 0.15,  # require 15% of atoms to be clashing
-) -> List[Clash]:
-    """Check for clashes across chains"""
-    chain_pairs = [
-        (i, j)
-        for i, j in product(
-            range(metadata[dc.num_chains]), range(metadata[dc.num_chains])
+@dataclass
+class MultimerInteractions:
+    chain_feats: ChainFeatures
+    interactions: List[Interaction]
+
+    @property
+    def chain_clashes(self) -> List[ChainClash]:
+        """Determine ChainClashes between chains"""
+        # aggregate clash interactions per chain interaction
+        potential_clashes = {}
+        for interaction in self.interactions:
+            if interaction.is_clash:
+                key = (interaction.chain_id, interaction.other_id)
+                if key not in potential_clashes:
+                    chain_atoms = self.chain_feats[dpc.atom_positions][
+                        dpc.chain_index == interaction.chain_id
+                    ]
+                    num_res, num_atoms = chain_atoms.shape[:2]
+                    potential_clashes[key] = ChainClash(
+                        chain_id=interaction.chain_id,
+                        other_id=interaction.other_id,
+                        chain_num_res=chain_atoms.shape[0],
+                        num_clashes=0,
+                        residues=set(),
+                    )
+                potential_clashes[key].num_clashes += 1
+                potential_clashes[key].residues.add(interaction.chain_res_index)
+
+        # return a ChainClash if exceeds thresholds
+        return [
+            potential
+            for potential in list(potential_clashes.values())
+            if potential.percent_residues_clash >= FRAC_RES_FOR_CLASH
+        ]
+
+    @property
+    def backbone_interactions(self) -> List[Interaction]:
+        return [
+            interaction for interaction in self.interactions if interaction.is_backbone
+        ]
+
+    @property
+    def atom_interactions(self) -> List[Interaction]:
+        return [
+            interaction
+            for interaction in self.interactions
+            if not interaction.is_backbone
+        ]
+
+    @classmethod
+    def from_complex_feats(
+        cls,
+        complex_feats: ChainFeatures,
+        metadata: MetadataCSVRow,
+    ):
+        all_interactions = []
+
+        chain_pairs = [
+            (i, j)
+            for i, j in product(
+                range(metadata[dc.num_chains]), range(metadata[dc.num_chains])
+            )
+            if i < j
+        ]
+
+        for i, j in chain_pairs:
+            # (n, 37, 3)
+            chain_i_atoms = complex_feats[dpc.atom_positions][
+                complex_feats[dpc.chain_index] == i
+            ]
+            chain_j_atoms = complex_feats[dpc.atom_positions][
+                complex_feats[dpc.chain_index] == j
+            ]
+            if chain_i_atoms.shape[0] == 0 or chain_j_atoms.shape[0] == 0:
+                continue
+
+            # Backbone interactions
+            # (n * 3, 3)
+            chain_i_bb = chain_i_atoms[:, :3].reshape(-1, 3)
+            chain_j_bb = chain_j_atoms[:, :3].reshape(-1, 3)
+            bb_dists = cdist(chain_i_bb, chain_j_bb)
+            _bb_interactions = (DIST_INTERACTION_ATOM < bb_dists) & (
+                bb_dists <= DIST_INTERACTION_BACKBONE
+            )
+
+            idx_i, idx_j = np.where(_bb_interactions)
+            for bb_i, bb_j in zip(idx_i, idx_j):
+                res_i, atom_i = divmod(bb_i, 3)
+                res_j, atom_j = divmod(bb_j, 3)
+                all_interactions.append(
+                    Interaction(
+                        chain_id=i,
+                        other_id=j,
+                        chain_res_index=res_i,
+                        chain_atom_idx=atom_i,
+                        other_res_index=res_j,
+                        other_atom_idx=atom_j,
+                        dist_ang=float(bb_dists[bb_i, bb_j]),
+                    )
+                )
+
+            # All-atom interactions
+            # (n * 37, 3)
+            chain_i_atoms = chain_i_atoms.reshape(-1, 3)
+            chain_j_atoms = chain_j_atoms.reshape(-1, 3)
+            atom_dists = cdist(chain_i_atoms, chain_j_atoms)
+            _atom_interactions = atom_dists <= DIST_INTERACTION_ATOM
+
+            idx_i, idx_j = np.where(_atom_interactions)
+            for a_i, a_j in zip(idx_i, idx_j):
+                res_i, atom_i = divmod(a_i, 37)
+                res_j, atom_j = divmod(a_j, 37)
+                all_interactions.append(
+                    Interaction(
+                        chain_id=i,
+                        other_id=j,
+                        chain_res_index=res_i,
+                        chain_atom_idx=atom_i,
+                        other_res_index=res_j,
+                        other_atom_idx=atom_j,
+                        dist_ang=float(atom_dists[a_i, a_j]),
+                    )
+                )
+
+        return cls(
+            chain_feats=complex_feats,
+            interactions=all_interactions,
         )
-        if i < j
-    ]
-
-    clashes = []
-
-    for i, j in chain_pairs:
-        chain_i_atoms = complex_feats[dpc.atom_positions][
-            complex_feats[dpc.chain_index] == i
-        ].reshape(
-            -1, 3
-        )  # (N * 37, 3)
-        chain_j_atoms = complex_feats[dpc.atom_positions][
-            complex_feats[dpc.chain_index] == j
-        ].reshape(
-            -1, 3
-        )  # (N * 37, 3)
-        if chain_i_atoms.shape[0] == 0 or chain_j_atoms.shape[0] == 0:
-            continue
-
-        dists = cdist(chain_i_atoms, chain_j_atoms)
-        _clashes = dists < clash_threshold_ang
-        chain_i_clashes = np.any(_clashes, axis=1).sum().item()
-        chain_j_clashes = np.any(_clashes, axis=0).sum().item()
-
-        if (chain_i_clashes / len(chain_i_atoms)) > clash_tolerance_percent:
-            clashes.append(Clash(i, j, chain_i_clashes, len(chain_i_atoms)))
-        if (chain_j_clashes / len(chain_j_atoms)) > clash_tolerance_percent:
-            clashes.append(Clash(j, i, chain_j_clashes, len(chain_j_atoms)))
-
-    return clashes
 
 
 def _process_chain_feats(
@@ -329,16 +448,23 @@ def _process_pdb(
 
     # Generate chain features
     struct_feats = []
+    num_invalid_chains = 0
     all_seqs = set()
     for chain_id, chain in struct_chains.items():
         chain_id = chain_str_to_int(chain_id)
         chain_protein = process_chain(chain, chain_id=chain_id)
         chain_feats: ChainFeatures = asdict(chain_protein)  # noqa
 
-        # check for non-protein chains and skip them
-        if len(chain_feats[dpc.aatype]) == 0:
-            continue
-        if np.sum(chain_feats[dpc.aatype] != unk_restype_index) == 0:
+        # check for non-residue chains and count but skip them
+        # TODO track non-res chains, check interactions, not just count.
+        #   requires centering them alongside valid chains.
+        #   want to identify non-single-atom chains involved in interactions
+        #   to filter them out for chain-chain focused training.
+        if (
+            len(chain_feats[dpc.aatype]) == 0
+            or np.sum(chain_feats[dpc.aatype] != unk_restype_index) == 0
+        ):
+            num_invalid_chains += 1
             continue
 
         # Add missing fields
@@ -371,7 +497,10 @@ def _process_pdb(
         metadata[dc.pdb_name] = pdb_name
         metadata[dc.raw_path] = pdb_file_path
 
-        # Track total sequence length, modeled sequence length
+        # track invalid chains
+        metadata[dc.num_invalid_chains] = num_invalid_chains
+
+        # Track total sequence length
         metadata[dc.seq_len] = len(complex_feats[dpc.aatype])
 
         # Track modeled sequence lengths
@@ -426,13 +555,17 @@ def _process_pdb(
         )
         metadata[dc.radius_gyration] = pdb_rg[0]
 
-        # check for clashes across chain pairs
-        chain_clashes = detect_multimer_clashes(
+        # check for interactions across chain pairs
+        interactions = MultimerInteractions.from_complex_feats(
             complex_feats=complex_feats,
             metadata=metadata,
         )
+        metadata[dc.num_backbone_interactions] = len(interactions.backbone_interactions)
+        metadata[dc.num_atom_interactions] = len(interactions.atom_interactions)
+
+        # check for clashes across chain pairs
         metadata[dc.num_chains_clashing] = len(
-            set(clash.chain_id for clash in chain_clashes)
+            set(clash.chain_id for clash in interactions.chain_clashes)
         )
 
     # Save pkl after processing is successful

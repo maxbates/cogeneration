@@ -13,8 +13,10 @@ from tqdm.auto import tqdm
 from cogeneration.data.io import read_pkl
 from cogeneration.dataset.datasets import read_metadata_file
 from cogeneration.dataset.process_pdb import (
+    MultimerInteractions,
     _process_chain_feats,
     detect_multimer_clashes,
+    detect_multimer_interactions,
     read_processed_file,
 )
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
@@ -116,7 +118,6 @@ class MetadataUpdater:
             whole_complex_trimmed = get_whole_complex_trimmed()
             row_updates[dc.modeled_seq_len] = len(whole_complex_trimmed[dpc.aatype])
 
-        # independent trimming
         if dc.modeled_indep_seq_len not in row_metadata:
             chain_independent_trimmed = get_chain_independent_trimmed()
             row_updates[dc.modeled_indep_seq_len] = len(
@@ -135,15 +136,23 @@ class MetadataUpdater:
                 dpc.b_factors
             ][:, :3][chain_independent_trimmed[dpc.modeled_idx]].mean()
 
-        # clashes
-        if dc.num_chains_clashing not in row_metadata:
-            chain_independent_trimmed = get_chain_independent_trimmed()
-            chain_clashes = detect_multimer_clashes(
-                complex_feats=chain_independent_trimmed,
+        # interactions / clashes
+        if (
+            dc.num_backbone_interactions not in row_metadata
+            or dc.num_atom_interactions not in row_metadata
+            or dc.num_chains_clashing not in row_metadata
+        ):
+            interactions = MultimerInteractions.from_complex_feats(
+                complex_feats=get_chain_independent_trimmed(),
                 metadata=row_metadata,
             )
+
+            row_updates[dc.num_backbone_interactions] = len(
+                interactions.backbone_interactions
+            )
+            row_updates[dc.num_atom_interactions] = len(interactions.atom_interactions)
             row_updates[dc.num_chains_clashing] = len(
-                set(clash.chain_id for clash in chain_clashes)
+                set(clash.chain_id for clash in interactions.chain_clashes)
             )
 
         return row_updates

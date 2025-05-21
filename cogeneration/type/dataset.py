@@ -21,6 +21,9 @@ class MetadataColumn(StrEnum):
     oligomeric_detail = "oligomeric_detail"
     # number of chains in protein (ignores non-residue chains)
     num_chains = "num_chains"
+    # (new) count of non-residue or empty chains (atoms, metals, molecules, DNA)
+    # [Can only be added on initial processing, because processed feats omit such chains.]
+    num_invalid_chains = "num_invalid_chains"
     # total number of residues
     seq_len = "seq_len"
     # (new) count of num residues in modeled structure, not including gaps
@@ -38,7 +41,11 @@ class MetadataColumn(StrEnum):
     helix_percent = "helix_percent"
     strand_percent = "strand_percent"
     radius_gyration = "radius_gyration"
-    # (new) clashes across chains, multimer only
+    # (new) backbone interactions across chains, multimer only
+    num_backbone_interactions = "num_backbone_interactions"
+    # (new) atomic interactions across chains, multimer only
+    num_atom_interactions = "num_atom_interactions"
+    # (new) clashes (<1.8 ang, >10% residues) across chains, multimer only
     num_chains_clashing = "num_chains_clashing"
 
     # TODO add in process_pdb_files if provided

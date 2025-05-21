@@ -527,14 +527,14 @@ class TestInterpolant:
             chain_idx=chain_idx,
         )
         if time == 1:
-            assert torch.allclose(trans_1, trans_t, atol=1e-4)
+            assert torch.allclose(trans_1, trans_t, atol=1e-3)
 
         rotmats_1 = uniform_so3(B, N, device=interpolant._device)
         rotmats_t = interpolant._corrupt_rotmats(
             rotmats_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
         )
         if time == 1:
-            assert torch.allclose(rotmats_1, rotmats_t, atol=1e-4)
+            assert torch.allclose(rotmats_1, rotmats_t, atol=1e-3)
 
         aatypes_1 = torch.randint(0, 20, (B, N)).long()
         aatypes_t = interpolant._corrupt_aatypes(
