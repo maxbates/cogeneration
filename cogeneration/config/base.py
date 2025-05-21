@@ -21,24 +21,18 @@ from cogeneration.type.str_enum import StrEnum
 from cogeneration.type.task import DataTask, InferenceTask
 
 """
-Structured configurations for cogeneration.
+Structured configurations
 
-# Public Multiflow
-Several parameters from Multiflow appear to be unused in the public code.
-Many are marked with `# DROP`.
+Note on Public Multiflow:
+Several parameters from Multiflow appear to be unused in the public code, many have been dropped.
 
-# extensions / resolvers 
+Note on extensions / resolvers: 
 See __init__.py for extensions to OmegaConf, e.g. `ternary`.
 
-# Enums 
-hydra does not currently support `Literal` and suggests using Enums instead.
+Note on Enums: 
+hydra does not support `Literal` and suggests using Enums instead:
 https://github.com/omry/omegaconf/issues/422
 """
-
-# TODO - support default configs for `forward_folding` and `inverse folding`
-#   There are a handful of values across the config that need to have other defaults.
-#   i.e. instead of the current `ternary` paradigm
-#   to better differentate the training vs inference interpolant
 
 PATH_PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
 PATH_PUBLIC_WEIGHTS = PATH_PROJECT_ROOT / "multiflow_weights"
@@ -132,23 +126,18 @@ class SharedConfig(BaseClassConfig):
 @dataclass
 class ModelHyperParamsConfig(BaseClassConfig):
     """
-    Shared hyperparameters for the model.
-    Use a structured config for hyperparameters so easy to reference in templates.
-    Default values match those from Multiflow. Use factory methods for different configurations.
+    Shared model hyperparameters.
 
-    TODO register hydra config group to enable easy switching
+    TODO register each factory as hydra config groups?
     https://hydra.cc/docs/tutorials/structured_config/defaults/
     """
 
     node_embed_size: int = 256
     edge_embed_size: int = 128
-
-    aa_num_tokens: int = 21  # number of amino acid types (if masking), 21 = mask
-
+    aa_num_tokens: int = 21  # number of amino acid types (if masking), 21 = mask/UNK
     pos_embed_size: int = 128
     pos_embed_method: PositionalEmbeddingMethod = PositionalEmbeddingMethod.rotary
-    pos_embed_max_len: int = 2048  # 2056 in public multiflow
-
+    pos_embed_max_len: int = 2048
     timestep_embed_size: int = 128
 
     @classmethod
@@ -169,6 +158,8 @@ class ModelHyperParamsConfig(BaseClassConfig):
             edge_embed_size=128,
             pos_embed_size=128,
             timestep_embed_size=128,
+            pos_embed_method=PositionalEmbeddingMethod.sine_cosine,
+            pos_embed_max_len=2056,  # idk
         )
 
     @classmethod

@@ -25,7 +25,7 @@ from cogeneration.data import residue_constants as rc
 from cogeneration.data.rigid_utils import Rigid, Rotation
 from cogeneration.data.tensor_utils import batched_gather, tensor_tree_map, tree_map
 
-# NOTE - these values copied from openfold/config.py
+# NOTE copied from openfold/config.py
 NUM_RES = "num residues placeholder"
 NUM_MSA_SEQ = "msa placeholder"
 NUM_EXTRA_SEQ = "extra msa placeholder"

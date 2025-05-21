@@ -184,8 +184,9 @@ class EvalRunner:
 
 @hydra.main(version_base=None, config_path="../config", config_name="base")
 def run(cfg: Config) -> None:
-    # Read model checkpoint.
-    log.info(f"Starting inference with {cfg.inference.num_gpus} GPUs")
+    log.info(f"Starting inference, using {cfg.inference.num_gpus} GPUs")
+
+    cfg = cfg.interpolate()
 
     sampler = EvalRunner(cfg=cfg)
     sampler.run_sampling()

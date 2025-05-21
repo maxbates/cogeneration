@@ -27,7 +27,7 @@ class Experiment:
     def __init__(self, *, cfg: Config):
         self.cfg = cfg
 
-        # Warm start
+        # Support warm starts
         if cfg.experiment.warm_start_ckpt is not None:
             ckpt_dir = os.path.dirname(cfg.experiment.warm_start_ckpt)
             log.info(f"Warm starting from {ckpt_dir}")
@@ -49,8 +49,8 @@ class Experiment:
                     log.info(f"Checkpoint path changed to {merged_ckpt_path}")
                     cfg.experiment.warm_start_ckpt = merged_ckpt_path
 
-        # Ensure DDP is set up for scenarios were pytorch lightning doesn't handle it
-        # (e.g. debugging on mac laptop)
+        # Handle DDP set up in case pytorch lightning doesn't handle it
+        # (e.g. on mac laptop)
         setup_ddp(
             trainer_strategy=cfg.experiment.trainer.strategy,
             accelerator=cfg.experiment.trainer.accelerator,
@@ -58,7 +58,7 @@ class Experiment:
             world_size=str(cfg.experiment.num_devices),
         )
 
-        # Setup datasets
+        # Dataset + Datamodule
         dataset_constructor = DatasetConstructor.from_cfg(self.cfg)
         train_dataset, valid_dataset = dataset_constructor.create_datasets()
         assert len(train_dataset) > 0, "Training dataset is empty"
@@ -70,10 +70,10 @@ class Experiment:
             valid_dataset=valid_dataset,
         )
 
-        # Determine devices, accounting that folding may be assigned its own device.
+        # Handle devices. Folding may be assigned its own device.
         if self.cfg.experiment.trainer.accelerator == "cpu":
             folding_device_id = 0
-            # set to number of processors, rather than list of devices, this is what Trainer() wants.
+            # set to number of processors, rather than list of devices, for Trainer().
             self._train_device_ids = torch.multiprocessing.cpu_count() // 2
         else:
             total_devices = self.cfg.experiment.num_devices
@@ -95,7 +95,7 @@ class Experiment:
 
         log.info(f"Training with devices: {self._train_device_ids}")
 
-        # Initialize module
+        # Module
         self._module = FlowModule(
             self.cfg,
             folding_device_id=folding_device_id,
@@ -135,7 +135,7 @@ class Experiment:
                 ModelCheckpoint(**self.cfg.experiment.checkpointer.asdict())
             )
 
-        # Save config, only for main process.
+        # Save config if main process
         local_rank = DDPInfo.from_env().local_rank
         if local_rank == 0:
             # write locally
@@ -212,9 +212,6 @@ class Experiment:
 @hydra.main(version_base=None, config_path="../config", config_name="base")
 def run(cfg: Config) -> None:
     log.info(f"Starting training. {cfg.experiment.num_devices} GPUs specified.")
-
-    # Instantiate static config with dataclass as nested objects
-    # to avoid dynamic DictConfig lookups for torch dynamo
     cfg = cfg.interpolate()
 
     trainer = Experiment(cfg=cfg)

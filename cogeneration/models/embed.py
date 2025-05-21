@@ -132,6 +132,7 @@ def sinusoidal_encoding(v, N, D):
 def calc_distogram(pos, min_bin, max_bin, num_bins):
     """
     Calculate 2D distance histogram, binning pairwise distances between pos.
+    takes `pos` (B, N, 3) and returns (B, N, N, num_bins)
     """
     dists_2d = torch.linalg.norm(pos[:, :, None, :] - pos[:, None, :, :], axis=-1)[
         ..., None

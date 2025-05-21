@@ -19,27 +19,16 @@ from cogeneration.type.batch import PredBatchProp as pbp
 
 class FlowModel(nn.Module):
     """
-    Primary model that co-generates sequence and structure.
-    Learns a vector field to generate both structure (frames, i.e. rotations and translations) and sequence
+    Complete model for protein sequence-structure cogeneration with flow matching.
 
-    Takes as input:
-    - a (partially masked) sequence
-    - a protein structure, represented as frames (i.e. translations and rotations)
+    Several portions of the model are optional or highly configurable.
 
-    Structure (and sequence) is embedded to get a linear representation (NodeFeatureNet)
-    Structure residue distances (edges) are embedded to get a pair representation (EdgeFeatureNet)
-    These representations + structure is embedded using IPA (AttentionIPATrunk)
-        Trunk of the model merges representations, runs through folding blocks
-        Returns a new node embedding, edge embedding, and updated structure
-
-    Specifically, it predicts translations, rotations, and amino acid logits.
-    Comparing the predicted translations and rotations to the ground truth structure is main loss.
-    Also, the translation and rotation vector field is computed and compared to the ground truth trajectory.
-    For ODE (no stochastic paths) the ground truth trajectory is (~simply)
-    a linear interpolation from start (noise) to end (structure).
-
-    Optionally we can predict torsions. These do not impact the input batch or output translations and rotations
-    directly. Instead, the torsions are used to construct the atom14 and atom37 rigits, to better pack frames and side chains.
+    The model can work across domains of sequence, rotations, translations, and torsions.
+    The input can be:
+     - nothing (unconditional)
+     - sequence (forward folding)
+     - structure (inverse folding)
+     - or portions of either (inpainting)
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -63,6 +52,7 @@ class FlowModel(nn.Module):
                 f"Invalid sequence prediction type: {self.cfg.sequence_pred_type}"
             )
 
+        # ESM + combiner
         if self.cfg.esm_combiner.enabled:
             self.esm_combiner = ESMCombinerNetwork(cfg=self.cfg.esm_combiner)
 
@@ -103,7 +93,7 @@ class FlowModel(nn.Module):
 
         init_rigids_ang = create_rigid(rots=rotmats_t, trans=trans_t)
 
-        # Initialize node and edge embeddings
+        # Initial node and edge embeddings
         init_node_embed = self.node_feature_net(
             so3_t=so3_t,
             r3_t=r3_t,
@@ -137,8 +127,7 @@ class FlowModel(nn.Module):
         else:
             node_embed, edge_embed = init_node_embed, init_edge_embed
 
-        # Main trunk
-        # Note that IPA trunk works in nm scale, rather than angstroms
+        # IPA trunk - note works in nm scale, not angstroms
         node_embed, edge_embed, pred_rigids_nm, pred_torsions = (
             self.attention_ipa_trunk(
                 node_embed=node_embed,
@@ -149,12 +138,12 @@ class FlowModel(nn.Module):
                 curr_rigids_nm=rigids_ang_to_nm(init_rigids_ang),
             )
         )
-        # Convert back to angstroms, get translations and rotations
+        # Convert rigid back to angstroms
         pred_rigids_ang = rigids_nm_to_ang(pred_rigids_nm)
         pred_trans = pred_rigids_ang.get_trans()
         pred_rotmats = pred_rigids_ang.get_rots().get_rot_mats()
 
-        # Amino acid prediction
+        # Sequence prediction
         pred_logits, pred_aatypes = self.aa_pred_net(
             node_embed=node_embed,
             aatypes_t=aatypes_t,

@@ -11,11 +11,13 @@ from cogeneration.models.ipa_pytorch import TorsionAngles
 
 class AttentionIPATrunk(nn.Module):
     """
-    IPA-based Attention Trunk
-    Performs Invariant Point Attention, which considers trans/rots between points (residues),
-    followed by a transformer block, and linear-ish layers for updating node and edge embeddings.
+    Invariant Point Attention Trunk
+    IPA considers trans/rots between points (residues), followed by a transformer block,
+    and linear-ish layers for updating node and edge embeddings.
 
     The default network matches the public MultiFlow model, and AlphaFold/OpenFold models.
+    (Though instead of taking templates / MSA evoformer as input,
+    we pass the node / edge embeddings we generate)
 
     Performing Backbone Update is optional but on by default.
     Specify `perform_backbone_update=False` to avoid changing backbone coordinates,
@@ -103,11 +105,11 @@ class AttentionIPATrunk(nn.Module):
 
     def forward(
         self,
-        node_embed: torch.Tensor,
-        edge_embed: torch.Tensor,
-        node_mask: torch.Tensor,
-        edge_mask: torch.Tensor,
-        diffuse_mask: torch.Tensor,
+        node_embed: torch.Tensor,  # (B, N, c_s)
+        edge_embed: torch.Tensor,  # (B, N, N, c_z)
+        node_mask: torch.Tensor,  # (B, N)
+        edge_mask: torch.Tensor,  # (B, N, N)
+        diffuse_mask: torch.Tensor,  # (B, N)
         curr_rigids_nm: Rigid,
     ) -> Tuple[torch.Tensor, torch.Tensor, Rigid, Optional[torch.Tensor]]:
         node_embed = node_embed * node_mask[..., None]
@@ -115,9 +117,9 @@ class AttentionIPATrunk(nn.Module):
 
         for b in range(self.cfg.num_blocks):
             ipa_embed = self.trunk[f"ipa_{b}"](
-                node_embed,  # s, single repr
-                edge_embed,  # z, pair repr
-                curr_rigids_nm,  # r, rigid
+                node_embed,  # s = single repr
+                edge_embed,  # z = pair repr
+                curr_rigids_nm,  # r = rigid
                 node_mask,
             )
             ipa_embed *= node_mask[..., None]

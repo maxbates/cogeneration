@@ -14,6 +14,8 @@ def setup_ddp(
     Sets up DistributedDataParallel if Pytorch Lightning won't do it for us (i.e. strategy != "ddp").
     Primarily for use to debug, e.g. on a Mac using CPUs or MPS.
 
+    Required for distributed data loaders.
+
     TODO - properly use from env / set up Pytorch Lightning DDP environment variables
     """
 
@@ -36,7 +38,7 @@ def setup_ddp(
         # Lightning does not support DDP with MPS accelerator, i.e. on a Mac
         # However, DataLoaders use DDP, so we need to initialize it
         if trainer_strategy == "auto":
-            # TODO - ensure each thread has its own rank / device if multipler threads
+            # TODO - ensure each thread has its own rank / device if multiple threads
             local_rank = int(rank)
             world_size = int(world_size)
 
@@ -54,7 +56,7 @@ def setup_ddp(
 
 @dataclass
 class DDPInfo:
-    """Helper to get DDP information, handling when not using DDP."""
+    """Helper to get DDP information and handles DDP not setup."""
 
     node_id: int
     local_rank: int

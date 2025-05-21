@@ -1,4 +1,5 @@
 # Adapted from multiflow/data/utils
+
 import torch
 from torch_scatter import scatter, scatter_add
 

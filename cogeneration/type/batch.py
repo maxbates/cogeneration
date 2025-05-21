@@ -9,9 +9,8 @@ from cogeneration.type.task import DataTask
 
 class BatchProp(StrEnum):
     """
-    Dataloader batches cannot be structs, so we define an enum of batch properties.
-
-    Properties at time `1` (i.e. `"_1"`) are the ground truth, i.e. the original data.
+    Enum of batch properties.
+    "_1" properties @ time == 1 the original data.
     """
 
     # ground truth properties
@@ -47,9 +46,8 @@ METADATA_BATCH_PROPS = [
 
 class NoisyBatchProp(StrEnum):
     """
-    Properties of a noised batch
-
-    Properties at time `t` (i.e. `"_t"`) are data with noise added, scaled by `t`. t=0 is pure noise.
+    Corrupted batch property enum.
+    "_t" properties @ time == t are data corrupted to time `t`, where t=0 is noise.
     """
 
     cat_t = "cat_t"  # (B, 1) tensor, t for amino acids (categoricals)
@@ -64,7 +62,7 @@ class NoisyBatchProp(StrEnum):
 
 class PredBatchProp(StrEnum):
     """
-    Properties of a predicted batch
+    Model output enum
     """
 
     pred_trans = "pred_trans"  # (B, N, 3)

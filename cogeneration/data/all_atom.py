@@ -9,9 +9,6 @@ from cogeneration.data.noise_mask import fill_torsions
 from cogeneration.data.rigid import Rigid, adjust_oxygen_pos, create_rigid
 from cogeneration.data.rigid_utils import Rotation
 
-# Residue Constants from OpenFold/AlphaFold2.
-
-
 IDEALIZED_POS = torch.tensor(residue_constants.restype_atom14_rigid_group_positions)
 DEFAULT_FRAMES = torch.tensor(residue_constants.restype_rigid_group_default_frame)
 ATOM_MASK = torch.tensor(residue_constants.restype_atom14_mask)

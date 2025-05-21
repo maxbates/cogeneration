@@ -7,17 +7,17 @@ from cogeneration.models.embed import get_index_embedding, get_time_embedding
 
 class NodeFeatureNet(nn.Module):
     """
-    Simple network to embed nodes, with position and timestep embeddings.
+    Simple network for initial representation of structure, sequence, masks, positional embeddings, time embeddings.
     """
 
     def __init__(self, cfg: ModelNodeFeaturesConfig):
         super(NodeFeatureNet, self).__init__()
         self.cfg = cfg
 
-        # determine input embedding size
+        # input embedding size
         embed_size = self.cfg.c_pos_emb + self.cfg.c_timestep_emb * 2 + 1
         if self.cfg.embed_aatype:
-            # Always 21 because of 20 amino acids + 1 for unk
+            # Always support 21 (20 AA + UNK)
             num_embeddings = 21
             self.aatype_embedding = nn.Embedding(num_embeddings, self.cfg.c_s)
             embed_size += (
@@ -58,21 +58,19 @@ class NodeFeatureNet(nn.Module):
         aatypes: torch.Tensor,  # (B, N)
         aatypes_sc: torch.Tensor,  # (B, N, aatype_pred_num_tokens)
     ):
-        # [B, N, c_pos_emb]
         pos_emb = get_index_embedding(
             res_index,
             embed_size=self.cfg.c_pos_emb,
             max_len=self.cfg.pos_embed_max_len,
             pos_embed_method=self.cfg.pos_embed_method,
         )
-        pos_emb = pos_emb * res_mask.unsqueeze(-1)
+        pos_emb = pos_emb * res_mask.unsqueeze(-1)  # (B, N, c_pos_emb)
 
-        # [B, N, c_timestep_emb]
         input_feats = [
             pos_emb,
-            diffuse_mask[..., None],
-            self.embed_t(so3_t, res_mask),
-            self.embed_t(r3_t, res_mask),
+            diffuse_mask[..., None],  # (B, N, 1)
+            self.embed_t(so3_t, res_mask),  # (B, N, c_timestep_emb)
+            self.embed_t(r3_t, res_mask),  # (B, N, c_timestep_emb)
         ]
         if self.cfg.embed_aatype:
             input_feats.append(self.aatype_embedding(aatypes))
@@ -85,6 +83,6 @@ class NodeFeatureNet(nn.Module):
                     embed_size=self.cfg.c_pos_emb,
                     max_len=100,  # very unlikely >= 100 chains
                     pos_embed_method=self.cfg.pos_embed_method,
-                )
+                )  # (B, N, c_pos_emb)
             )
         return self.linear(torch.cat(input_feats, dim=-1))

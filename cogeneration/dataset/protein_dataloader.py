@@ -1,8 +1,3 @@
-"""
-Protein data loader.
-Uses DDP, which requires appropriate setup.
-"""
-
 import logging
 import math
 

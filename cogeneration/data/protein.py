@@ -17,14 +17,12 @@
 
 """Protein data type."""
 import dataclasses
-import io
 import os
 import re
 from typing import Any, Mapping, Optional, Union
 
 import numpy as np
 import numpy.typing as npt
-from Bio.PDB import PDBParser
 from Bio.PDB.Chain import Chain
 
 from cogeneration.data import residue_constants

@@ -1,10 +1,8 @@
 """
-Fork of MultiFlow's IPA, which only supports monomers (?) and drops some modules like PointProjection.
-Fork of Openfold's IPA.
+IPA modules.
+Fork of MultiFlow's IPA, which drops some modules like PointProjection.
+Which is a fork of Openfold IPA:
 https://github.com/aqlaboratory/openfold/blob/main/openfold/model/structure_module.py
-
-Instead of integrating into a StructureModule, and taking input from the MSA Evoformer and templates as a dict,
-we pass the single and pair representations (s, z) from a simple embedding network, and frames (r) directly.
 """
 
 import math

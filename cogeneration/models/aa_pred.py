@@ -60,13 +60,8 @@ class BaseSequencePredictionNet(nn.Module):
 
 class AminoAcidPredictionNet(BaseSequencePredictionNet):
     """
-    Linear network to predict amino acid token logits
-
-    This is the simple linear network from public MultiFlow to predict sequence.
-    It's simplicity partially explains why MultiFlow was bad at inverse folding.
-    See SequenceNet for a more advanced network.
-
-    Set cfg.aatype_pred = False to effectively disable the network, just use one-hot of provided aatypes
+    MLP predicts amino acid token logits to use as rate matrix,
+    matches simple network in public MultiFlow.
     """
 
     def __init__(self, cfg: ModelAAPredConfig):
@@ -75,8 +70,8 @@ class AminoAcidPredictionNet(BaseSequencePredictionNet):
 
         node_embed_size = self.cfg.c_s
 
-        # Note: ReLU serves to only allow flow to tokens that are more likely
-        # Note: `aatype_pred_net` name must update with `replacements` to merge model params.
+        # Note: ReLU only allows flow to tokens that are more likely because > 0
+        # Note: if change name `aatype_pred_net` must update `replacements` to merge model params.
         self.aatype_pred_net = nn.Sequential(
             nn.Linear(node_embed_size, node_embed_size),
             nn.ReLU(),
@@ -98,10 +93,10 @@ class AminoAcidPredictionNet(BaseSequencePredictionNet):
         init_node_embed: torch.Tensor,
         init_edge_embed: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Run through network to get logits
+        # Get logits
         pred_logits = self.aatype_pred_net(node_embed)
 
-        # num_tokens can include mask or not. If it does, "mask" the mask logits
+        # If logits include `mask`, ~mask the mask token
         if self.cfg.aatype_pred_num_tokens == NUM_TOKENS + 1:
             pred_logits_wo_mask = pred_logits.clone()
             pred_logits_wo_mask[:, :, MASK_TOKEN_INDEX] = -1e9

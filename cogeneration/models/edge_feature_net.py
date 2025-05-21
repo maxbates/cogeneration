@@ -7,17 +7,17 @@ from cogeneration.models.embed import calc_distogram, get_index_embedding
 
 class EdgeFeatureNet(nn.Module):
     """
-    Simple network to embed edges using distrogram
+    Embed edges using distrogram, plus self-conditioned dist, chain, masks etc.
     """
 
     def __init__(self, cfg: ModelEdgeFeaturesConfig):
         super(EdgeFeatureNet, self).__init__()
         self.cfg = cfg
 
-        # Embed node features with linear layer
+        # linear layer for node features
         self.linear_s_p = nn.Linear(self.cfg.c_s, self.cfg.feat_dim)
 
-        # Embed relative position with linear layer
+        # linear layer for relative position
         self.linear_relpos = nn.Linear(self.cfg.feat_dim, self.cfg.feat_dim)
 
         total_edge_feats = self.cfg.feat_dim * 3 + self.cfg.num_bins * 2
@@ -26,7 +26,7 @@ class EdgeFeatureNet(nn.Module):
         if self.cfg.embed_diffuse_mask:
             total_edge_feats += 2
 
-        # MLP to embed edge features
+        # MLP to embed edge feats
         # (B, N, N, total_edge_feats) -> (B, N, N, c_p)
         self.edge_embedder = nn.Sequential(
             nn.Linear(total_edge_feats, self.cfg.c_p),
@@ -75,24 +75,24 @@ class EdgeFeatureNet(nn.Module):
     ):
         num_batch, num_res, _ = node_embed.shape
 
-        # (B, N, c_p]
         p_i = self.linear_s_p(node_embed)
-        cross_node_feats = self._cross_concat(p_i, num_batch, num_res)
+        cross_node_feats = self._cross_concat(
+            p_i, num_batch, num_res
+        )  # (B, N, N, feat_dim)
 
-        # (B, N)
         r = (
             torch.arange(num_res, device=node_embed.device)
             .unsqueeze(0)
             .repeat(num_batch, 1)
         )
-        relpos_feats = self.embed_relpos(r)
+        relpos_feats = self.embed_relpos(r)  # (B, N, N, feat_dim)
 
         dist_feats = calc_distogram(
             trans, min_bin=1e-4, max_bin=20.0, num_bins=self.cfg.num_bins
-        )
+        )  # (B, N, N, num_bins)
         sc_feats = calc_distogram(
             trans_sc, min_bin=1e-4, max_bin=20.0, num_bins=self.cfg.num_bins
-        )
+        )  # (B, N, N, num_bins)
 
         all_edge_feats = [cross_node_feats, relpos_feats, dist_feats, sc_feats]
         if self.cfg.embed_chain:
