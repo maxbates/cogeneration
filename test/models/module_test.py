@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import torch
 from pytorch_lightning.utilities.model_summary import ModelSummary
 from torch.utils.data import DataLoader
 
@@ -351,3 +352,27 @@ class TestFlowModule:
 
         # just test that it works
         _ = module.predict_step(batch, 0)
+
+    def test_state_dict_excludes_frozen_ESM_model(self, mock_cfg):
+        assert mock_cfg.model.esm_combiner.enabled, "ESM must be enabled"
+        module = FlowModule(mock_cfg)
+        sd = module.state_dict()
+        # expect combiner module
+        assert any(
+            "esm_combiner" in k for k in sd.keys()
+        ), "ESM combiner not in state_dict"
+        # but not ESM model
+        esm_keys = [k for k in sd if "esm." in k]
+        assert len(esm_keys) == 0, f"Found ESM keys in state_dict: {esm_keys}"
+
+    def test_checkpoint_excludes_frozen_ESM_model(self, tmp_path, mock_checkpoint):
+        cfg = Config.test_uninterpolated(tmp_path=tmp_path / "test").interpolate()
+        assert cfg.model.esm_combiner.enabled, "ESM must be enabled"
+        cfg, ckpt_path = mock_checkpoint(cfg=cfg)
+        ckpt = torch.load(ckpt_path)
+        assert any(
+            "esm_combiner" in k for k in ckpt["state_dict"].keys()
+        ), "ESM combiner not in checkpoint"
+        assert not any(
+            "esm." in k for k in ckpt["state_dict"].keys()
+        ), "Found ESM keys in checkpoint"

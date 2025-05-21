@@ -222,6 +222,27 @@ class FrozenEsmModel(nn.Module):
             param.requires_grad = False
         self.esm.eval()
 
+    def state_dict(self, *args, **kwargs):
+        # contibute nothing to state_dict (save space in checkpoints)
+        return {}
+
+    def load_state_dict(self, state_dict, strict, assign):
+        # ignore anything coming from a checkpoint, will load ESM model separately
+        return {}
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # ignore parent module `load_state_dict` nested calls
+        return
+
     @property
     def embed_dim(self):
         return self.esm.embed_dim
