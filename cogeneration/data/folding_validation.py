@@ -15,7 +15,7 @@ from Bio import SeqIO
 
 from cogeneration.config.base import FoldingConfig
 from cogeneration.data import residue_constants
-from cogeneration.data.const import aatype_to_seq
+from cogeneration.data.const import CA_IDX, aatype_to_seq
 from cogeneration.data.io import write_numpy_json
 from cogeneration.data.metrics import calc_ca_ca_metrics, calc_mdtraj_metrics
 from cogeneration.data.protein import write_prot_to_pdb
@@ -371,7 +371,7 @@ class FoldingValidator:
         )
         top_sample.update(
             calc_ca_ca_metrics(
-                ca_pos=pred_bb_positions[:, residue_constants.atom_order["CA"]],
+                ca_pos=pred_bb_positions[:, CA_IDX],
                 residue_index=res_idx,
             )
         )

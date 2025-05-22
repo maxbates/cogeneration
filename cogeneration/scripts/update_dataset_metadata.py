@@ -7,18 +7,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Hashable, List, Union
 
-import pandas as pd
+from Bio import PDB
 from tqdm.auto import tqdm
 
 from cogeneration.data.io import read_pkl
 from cogeneration.dataset.datasets import read_metadata_file
-from cogeneration.dataset.process_pdb import (
+from cogeneration.dataset.interaction import (
     MultimerInteractions,
-    _process_chain_feats,
-    detect_multimer_clashes,
-    detect_multimer_interactions,
-    read_processed_file,
+    NonResidueInteractions,
 )
+from cogeneration.dataset.process_pdb import (
+    _concat_np_features,
+    _pdb_structure_to_chain_feats,
+    process_chain_feats,
+)
+from cogeneration.type.dataset import ChainFeatures
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.dataset import MetadataColumn as dc
 from cogeneration.type.dataset import MetadataCSVRow
@@ -86,55 +89,75 @@ class MetadataUpdater:
         raw_processed_file = read_pkl(processed_path)
 
         # memoize constructing chain_feats
-        whole_complex_trimmed = None  # MultiFlow style trimming
-        chain_independent_trimmed = None  # improved multimer trimming
+        _pdb_structure = None  # PDB structure
+        _whole_complex_trimmed = None  # MultiFlow style trimming
+        _chain_independent_trimmed = None  # improved multimer trimming
+
+        def get_pdb_structure():
+            nonlocal _pdb_structure
+            if _pdb_structure is None:
+                if dc.raw_path not in row_metadata:
+                    raise ValueError(
+                        f"Cannot add non-residue interactions to processed files - non-res chains are omitted. "
+                        f"Require row.raw_path"
+                    )
+
+                parser = PDB.PDBParser(QUIET=True)
+                _pdb_structure = parser.get_structure(
+                    row_metadata[dc.pdb_name], row_metadata[dc.raw_path]
+                )
+            return _pdb_structure
 
         def get_whole_complex_trimmed():
-            nonlocal whole_complex_trimmed
-            if whole_complex_trimmed is None:
-                whole_complex_trimmed = _process_chain_feats(
+            nonlocal _whole_complex_trimmed
+            if _whole_complex_trimmed is None:
+                _whole_complex_trimmed = process_chain_feats(
                     raw_processed_file,
                     center=True,
                     trim_to_modeled_residues=True,
                     trim_chains_independently=False,
                 )
-            return whole_complex_trimmed
+            return _whole_complex_trimmed
 
         def get_chain_independent_trimmed():
-            nonlocal chain_independent_trimmed
-            if chain_independent_trimmed is None:
-                chain_independent_trimmed = _process_chain_feats(
+            nonlocal _chain_independent_trimmed
+            if _chain_independent_trimmed is None:
+                _chain_independent_trimmed = process_chain_feats(
                     raw_processed_file,
                     center=True,
                     trim_to_modeled_residues=True,
                     trim_chains_independently=True,
                 )
-            return chain_independent_trimmed
+            return _chain_independent_trimmed
+
+        if dc.num_all_chains not in row_metadata:
+            structure = get_pdb_structure()
+            row_updates[dc.num_all_chains] = len(structure.get_chains())
 
         if dc.moduled_num_res not in row_metadata:
             row_updates[dc.moduled_num_res] = len(raw_processed_file[dpc.modeled_idx])
 
         if dc.modeled_seq_len not in row_metadata:
-            whole_complex_trimmed = get_whole_complex_trimmed()
-            row_updates[dc.modeled_seq_len] = len(whole_complex_trimmed[dpc.aatype])
+            _whole_complex_trimmed = get_whole_complex_trimmed()
+            row_updates[dc.modeled_seq_len] = len(_whole_complex_trimmed[dpc.aatype])
 
         if dc.modeled_indep_seq_len not in row_metadata:
-            chain_independent_trimmed = get_chain_independent_trimmed()
+            _chain_independent_trimmed = get_chain_independent_trimmed()
             row_updates[dc.modeled_indep_seq_len] = len(
-                chain_independent_trimmed[dpc.aatype]
+                _chain_independent_trimmed[dpc.aatype]
             )
 
         # plddts
         if dc.mean_plddt_all_atom not in row_metadata:
-            chain_independent_trimmed = get_chain_independent_trimmed()
-            row_updates[dc.mean_plddt_all_atom] = chain_independent_trimmed[
+            _chain_independent_trimmed = get_chain_independent_trimmed()
+            row_updates[dc.mean_plddt_all_atom] = _chain_independent_trimmed[
                 dpc.b_factors
             ].mean()
         if dc.mean_plddt_modeled_bb not in row_metadata:
-            chain_independent_trimmed = get_chain_independent_trimmed()
-            row_updates[dc.mean_plddt_modeled_bb] = chain_independent_trimmed[
+            _chain_independent_trimmed = get_chain_independent_trimmed()
+            row_updates[dc.mean_plddt_modeled_bb] = _chain_independent_trimmed[
                 dpc.b_factors
-            ][:, :3][chain_independent_trimmed[dpc.modeled_idx]].mean()
+            ][:, :3][_chain_independent_trimmed[dpc.modeled_idx]].mean()
 
         # interactions / clashes
         if (
@@ -142,18 +165,31 @@ class MetadataUpdater:
             or dc.num_atom_interactions not in row_metadata
             or dc.num_chains_clashing not in row_metadata
         ):
-            interactions = MultimerInteractions.from_complex_feats(
+            interactions = MultimerInteractions.from_chain_feats(
                 complex_feats=get_chain_independent_trimmed(),
                 metadata=row_metadata,
             )
+            interactions.update_metadata(row_updates)
 
-            row_updates[dc.num_backbone_interactions] = len(
-                interactions.backbone_interactions
+        # Cannot add non-residue interactions to processed files - non-res chains are omitted
+        if (
+            dc.num_non_residue_chains not in row_metadata
+            or dc.num_single_atom_chains not in row_metadata
+            or dc.num_metal_interactions not in row_metadata
+            or dc.num_macromolecule_interactions not in row_metadata
+            or dc.num_mediated_interactions not in row_metadata
+        ):
+            structure = get_pdb_structure()
+            struct_feats = _pdb_structure_to_chain_feats(structure)
+            complex_feats: ChainFeatures = _concat_np_features(
+                struct_feats, False
+            )  # noqa
+
+            non_res_interactions = NonResidueInteractions.from_chain_feats(
+                complex_feats=complex_feats,
+                structure=structure,
             )
-            row_updates[dc.num_atom_interactions] = len(interactions.atom_interactions)
-            row_updates[dc.num_chains_clashing] = len(
-                set(clash.chain_id for clash in interactions.chain_clashes)
-            )
+            non_res_interactions.update_metadata(row_updates)
 
         return row_updates
 

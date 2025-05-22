@@ -570,6 +570,60 @@ atom_types = [
 atom_order = {atom_type: i for i, atom_type in enumerate(atom_types)}
 atom_type_num = len(atom_types)  # := 37.
 
+# Set of metal atom types. Not used for modeling.
+metal_types = {
+    "NA",
+    "K",
+    "MG",
+    "CA",
+    "MN",
+    "FE",
+    "CO",
+    "NI",
+    "CU",
+    "ZN",
+    "CD",
+    "MO",
+    "HG",
+    "PB",
+    "PT",
+    "AU",
+}
+
+# Set of common solution atom types, mostly to filter them away.
+solutions = {
+    # water forms
+    "HOH",  # standard PDB water
+    "WAT",  # occasionally used
+    "DOD",  # deuterated water
+    # common cryo‑protectants / solvents
+    "GOL",  # glycerol
+    "EDO",  # ethylene glycol
+    "MPD",  # 2‑methyl‑2,4‑pentanediol
+    "PEG",  # polyethylene glycol fragments
+    "PG4",  # propylene glycol
+    "DMS",  # DMSO (dimethyl sulfoxide)
+    "EOH",  # ethanol
+    "IPA",  # isopropanol
+    # buffer components / small ions
+    "SO4",  # sulfate
+    "PO4",  # phosphate
+    "ACT",  # acetate
+    "FMT",  # formate
+    "ACN",  # acetonitrile
+    "BME",  # β‑mercaptoethanol
+    "MES",  # MES buffer
+    "HEP",  # HEPES buffer (sometimes “HEP”)
+    "ADA",  # ADA buffer
+    "ACE",  # acetate (sometimes ACE or ACT)
+    # common precipitants/crystallants
+    "TAR",  # tartaric acid
+    "TRS",  # Tris
+    "CIT",  # citrate
+    "MOP",  # MOPS
+    "CAP",  # caprylate
+}
+
 # A compact atom encoding with 14 columns
 # pylint: disable=line-too-long
 # pylint: disable=bad-whitespace

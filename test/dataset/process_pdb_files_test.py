@@ -83,6 +83,13 @@ class TestProcessPDBFiles:
         # modeled positions only for valid residues
         assert len(pkl[dpc.modeled_idx]) == metadata[dc.moduled_num_res]
 
+        # check multimer interactions
+        assert metadata[dc.num_backbone_res_interacting] == 22
+        assert metadata[dc.num_chains_clashing] == 0
+
+        # check non-res interactions
+        assert metadata[dc.num_metal_interactions] == 2  # mg ions
+
         # check all expected keys are present
         expected_keys = [key for key in DatasetProteinColumn]
         observed_keys = list(pkl.keys())

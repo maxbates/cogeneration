@@ -1,20 +1,23 @@
 import collections
 import os
-from dataclasses import asdict, dataclass
-from itertools import product
-from typing import Dict, List, Optional, Set, Tuple, Union
+from dataclasses import asdict
+from typing import Dict, List, Optional, Tuple
 
 import mdtraj as md
 import numpy as np
 import tree
 from Bio import PDB
+from Bio.PDB.Structure import Structure
 from numpy import typing as npt
-from scipy.spatial.distance import cdist
 
 from cogeneration.data.const import CA_IDX
 from cogeneration.data.io import read_pkl, write_pkl
 from cogeneration.data.protein import chain_str_to_int, process_chain
 from cogeneration.data.residue_constants import unk_restype_index
+from cogeneration.dataset.interaction import (
+    MultimerInteractions,
+    NonResidueInteractions,
+)
 from cogeneration.type.dataset import OLIGOMERIC_PREFIXES, ChainFeatures
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.dataset import MetadataColumn as dc
@@ -202,180 +205,7 @@ def trim_chain_feats_to_modeled_residues(
     return chain_feats
 
 
-# clash / interaction constants
-DIST_CLASH_ANGSTROMS = 1.8
-FRAC_RES_FOR_CLASH = 0.1
-DIST_INTERACTION_ATOM = 4.5
-DIST_INTERACTION_BACKBONE = 6.5
-
-
-@dataclass
-class Interaction:
-    """struct for interactions between two chains"""
-
-    chain_id: Union[int, str]
-    other_id: Union[int, str]
-    chain_res_index: int
-    chain_atom_idx: int
-    other_res_index: int
-    other_atom_idx: int
-    dist_ang: float
-
-    @property
-    def is_clash(self) -> bool:
-        return self.dist_ang < DIST_CLASH_ANGSTROMS
-
-    @property
-    def is_backbone(self) -> bool:
-        return self.chain_atom_idx < 3 and self.other_atom_idx < 3
-
-
-@dataclass
-class ChainClash:
-    """struct for aggregating clashes between two chains"""
-
-    chain_id: Union[int, str]
-    other_id: Union[int, str]
-    chain_num_res: int
-    residues: Set[int]
-    num_clashes: int
-
-    @property
-    def percent_residues_clash(self) -> float:
-        return len(self.residues) / self.chain_num_res
-
-
-@dataclass
-class MultimerInteractions:
-    chain_feats: ChainFeatures
-    interactions: List[Interaction]
-
-    @property
-    def chain_clashes(self) -> List[ChainClash]:
-        """Determine ChainClashes between chains"""
-        # aggregate clash interactions per chain interaction
-        potential_clashes = {}
-        for interaction in self.interactions:
-            if interaction.is_clash:
-                key = (interaction.chain_id, interaction.other_id)
-                if key not in potential_clashes:
-                    chain_atoms = self.chain_feats[dpc.atom_positions][
-                        dpc.chain_index == interaction.chain_id
-                    ]
-                    num_res, num_atoms = chain_atoms.shape[:2]
-                    potential_clashes[key] = ChainClash(
-                        chain_id=interaction.chain_id,
-                        other_id=interaction.other_id,
-                        chain_num_res=chain_atoms.shape[0],
-                        num_clashes=0,
-                        residues=set(),
-                    )
-                potential_clashes[key].num_clashes += 1
-                potential_clashes[key].residues.add(interaction.chain_res_index)
-
-        # return a ChainClash if exceeds thresholds
-        return [
-            potential
-            for potential in list(potential_clashes.values())
-            if potential.percent_residues_clash >= FRAC_RES_FOR_CLASH
-        ]
-
-    @property
-    def backbone_interactions(self) -> List[Interaction]:
-        return [
-            interaction for interaction in self.interactions if interaction.is_backbone
-        ]
-
-    @property
-    def atom_interactions(self) -> List[Interaction]:
-        return [
-            interaction
-            for interaction in self.interactions
-            if not interaction.is_backbone
-        ]
-
-    @classmethod
-    def from_complex_feats(
-        cls,
-        complex_feats: ChainFeatures,
-        metadata: MetadataCSVRow,
-    ):
-        all_interactions = []
-
-        chain_pairs = [
-            (i, j)
-            for i, j in product(
-                range(metadata[dc.num_chains]), range(metadata[dc.num_chains])
-            )
-            if i < j
-        ]
-
-        for i, j in chain_pairs:
-            # (n, 37, 3)
-            chain_i_atoms = complex_feats[dpc.atom_positions][
-                complex_feats[dpc.chain_index] == i
-            ]
-            chain_j_atoms = complex_feats[dpc.atom_positions][
-                complex_feats[dpc.chain_index] == j
-            ]
-            if chain_i_atoms.shape[0] == 0 or chain_j_atoms.shape[0] == 0:
-                continue
-
-            # Backbone interactions
-            # (n * 3, 3)
-            chain_i_bb = chain_i_atoms[:, :3].reshape(-1, 3)
-            chain_j_bb = chain_j_atoms[:, :3].reshape(-1, 3)
-            bb_dists = cdist(chain_i_bb, chain_j_bb)
-            _bb_interactions = (DIST_INTERACTION_ATOM < bb_dists) & (
-                bb_dists <= DIST_INTERACTION_BACKBONE
-            )
-
-            idx_i, idx_j = np.where(_bb_interactions)
-            for bb_i, bb_j in zip(idx_i, idx_j):
-                res_i, atom_i = divmod(bb_i, 3)
-                res_j, atom_j = divmod(bb_j, 3)
-                all_interactions.append(
-                    Interaction(
-                        chain_id=i,
-                        other_id=j,
-                        chain_res_index=res_i,
-                        chain_atom_idx=atom_i,
-                        other_res_index=res_j,
-                        other_atom_idx=atom_j,
-                        dist_ang=float(bb_dists[bb_i, bb_j]),
-                    )
-                )
-
-            # All-atom interactions
-            # (n * 37, 3)
-            chain_i_atoms = chain_i_atoms.reshape(-1, 3)
-            chain_j_atoms = chain_j_atoms.reshape(-1, 3)
-            atom_dists = cdist(chain_i_atoms, chain_j_atoms)
-            _atom_interactions = atom_dists <= DIST_INTERACTION_ATOM
-
-            idx_i, idx_j = np.where(_atom_interactions)
-            for a_i, a_j in zip(idx_i, idx_j):
-                res_i, atom_i = divmod(a_i, 37)
-                res_j, atom_j = divmod(a_j, 37)
-                all_interactions.append(
-                    Interaction(
-                        chain_id=i,
-                        other_id=j,
-                        chain_res_index=res_i,
-                        chain_atom_idx=atom_i,
-                        other_res_index=res_j,
-                        other_atom_idx=atom_j,
-                        dist_ang=float(atom_dists[a_i, a_j]),
-                    )
-                )
-
-        return cls(
-            chain_feats=complex_feats,
-            interactions=all_interactions,
-        )
-
-
-def _process_chain_feats(
+def process_chain_feats(
     chain_feats: ChainFeatures,
     center: bool,
     trim_to_modeled_residues: bool,
@@ -386,6 +216,7 @@ def _process_chain_feats(
     Parse chain features. Add position information and mask for backbone atoms.
     Returns a complete ProcessedFile.
 
+    Called by `read_processed_file`.
     Used to load a processed file, which may have come from public MultiFlow data dump.
     Field additions should be idempotent.
 
@@ -408,6 +239,48 @@ def _process_chain_feats(
         )
 
     return chain_feats
+
+
+def _pdb_structure_to_chain_feats(
+    structure: Structure,
+    chain_id: Optional[str] = None,
+) -> List[ChainFeatures]:
+    """
+    Convert PDB structure to collection of individual chains as ChainFeatures
+    Optionally limit to `chain_id`.
+    """
+    struct_chains = {chain.id.upper(): chain for chain in structure.get_chains()}
+
+    # Limit to `chain_id` if specified
+    if chain_id is not None:
+        if chain_id not in struct_chains:
+            raise DataError(f"Chain {chain_id} not found in {structure.id}")
+        struct_chains = {chain_id: struct_chains[chain_id]}
+
+    # struct_feats are individual chains, can be concat to complex_feats
+    struct_feats: List[ChainFeatures] = []
+    for chain_id, chain in struct_chains.items():
+        chain_id = chain_str_to_int(chain_id)
+        chain_protein = process_chain(chain, chain_id=chain_id)
+        chain_feats: ChainFeatures = asdict(chain_protein)  # noqa
+
+        # check for non-residue chains and skip them
+        if (
+            len(chain_feats[dpc.aatype]) == 0
+            or np.sum(chain_feats[dpc.aatype] != unk_restype_index) == 0
+        ):
+            continue
+
+        # Add missing fields
+        # `chain_feats` then has almost all the fields of a processed file, save for `concat`
+        # During processing of individual chains, don't center them. We'll center the complex later.
+        # Don't trim modeled residues. Write them. Can trim on load.
+        chain_feats[dpc.bb_mask] = chain_feats[dpc.atom_mask][:, CA_IDX]
+        chain_feats[dpc.bb_positions] = chain_feats[dpc.atom_positions][:, CA_IDX]
+
+        struct_feats.append(chain_feats)
+
+    return struct_feats
 
 
 def _process_pdb(
@@ -438,44 +311,8 @@ def _process_pdb(
 
     parser = PDB.PDBParser(QUIET=True)
     structure = parser.get_structure(pdb_name, pdb_file_path)
-    struct_chains = {chain.id.upper(): chain for chain in structure.get_chains()}
 
-    # Limit to `chain_id` if specified
-    if chain_id is not None:
-        if chain_id not in struct_chains:
-            raise DataError(f"Chain {chain_id} not found in {pdb_name}")
-        struct_chains = {chain_id: struct_chains[chain_id]}
-
-    # Generate chain features
-    struct_feats = []
-    num_invalid_chains = 0
-    all_seqs = set()
-    for chain_id, chain in struct_chains.items():
-        chain_id = chain_str_to_int(chain_id)
-        chain_protein = process_chain(chain, chain_id=chain_id)
-        chain_feats: ChainFeatures = asdict(chain_protein)  # noqa
-
-        # check for non-residue chains and count but skip them
-        # TODO track non-res chains, check interactions, not just count.
-        #   requires centering them alongside valid chains.
-        #   want to identify non-single-atom chains involved in interactions
-        #   to filter them out for chain-chain focused training.
-        if (
-            len(chain_feats[dpc.aatype]) == 0
-            or np.sum(chain_feats[dpc.aatype] != unk_restype_index) == 0
-        ):
-            num_invalid_chains += 1
-            continue
-
-        # Add missing fields
-        # `chain_feats` then has almost all the fields of a processed file, save for `concat`
-        # During processing of individual chains, don't center them. We'll center the complex later.
-        # Don't trim modeled residues. Write them. Can trim on load.
-        chain_feats[dpc.bb_mask] = chain_feats[dpc.atom_mask][:, CA_IDX]
-        chain_feats[dpc.bb_positions] = chain_feats[dpc.atom_positions][:, CA_IDX]
-
-        all_seqs.add(tuple(chain_feats[dpc.aatype]))
-        struct_feats.append(chain_feats)
+    struct_feats = _pdb_structure_to_chain_feats(structure, chain_id=chain_id)
 
     # Concat features for each chain in complex.
     # Note in AlphaFold2, the merging process is more complex, because it has MSAs, templates, etc.
@@ -488,17 +325,11 @@ def _process_pdb(
     # Determine modeled residues.
     complex_feats[dpc.modeled_idx] = determine_modeled_residues(complex_feats)
 
-    # Center the complex
-    complex_feats = center_and_scale_chain_feats(complex_feats)
-
     # Generate metadata file
     metadata: MetadataCSVRow = {}
     if generate_metadata:
         metadata[dc.pdb_name] = pdb_name
         metadata[dc.raw_path] = pdb_file_path
-
-        # track invalid chains
-        metadata[dc.num_invalid_chains] = num_invalid_chains
 
         # Track total sequence length
         metadata[dc.seq_len] = len(complex_feats[dpc.aatype])
@@ -520,10 +351,14 @@ def _process_pdb(
         metadata[dc.modeled_indep_seq_len] = np.sum(independent_keep_mask)
 
         # Track quaternary / oligomeric information
-        metadata[dc.num_chains] = len(struct_chains)
+        metadata[dc.num_chains] = len(struct_feats)
+        metadata[dc.num_all_chains] = len([c for c in structure.get_chains()])
         metadata[dc.oligomeric_count] = _oligomeric_count(struct_feats)
         metadata[dc.oligomeric_detail] = _oligomeric_detail(struct_feats)
-        if len(all_seqs) == 1:
+        uniq_seqs = set(
+            [tuple(chain_feats[dpc.aatype]) for chain_feats in struct_feats]
+        )
+        if len(uniq_seqs) == 1:
             metadata[dc.quaternary_category] = "homomer"
         else:
             metadata[dc.quaternary_category] = "heteromer"
@@ -556,17 +391,23 @@ def _process_pdb(
         metadata[dc.radius_gyration] = pdb_rg[0]
 
         # check for interactions across chain pairs
-        interactions = MultimerInteractions.from_complex_feats(
+        interactions = MultimerInteractions.from_chain_feats(
             complex_feats=complex_feats,
             metadata=metadata,
         )
-        metadata[dc.num_backbone_interactions] = len(interactions.backbone_interactions)
-        metadata[dc.num_atom_interactions] = len(interactions.atom_interactions)
+        interactions.update_metadata(metadata)
 
-        # check for clashes across chain pairs
-        metadata[dc.num_chains_clashing] = len(
-            set(clash.chain_id for clash in interactions.chain_clashes)
+        # non-residue chains and interactions
+        non_residue_interactions = NonResidueInteractions.from_chain_feats(
+            complex_feats=complex_feats,
+            structure=structure,
         )
+        non_residue_interactions.update_metadata(metadata)
+
+    # Center the final complex
+    complex_feats = center_and_scale_chain_feats(
+        complex_feats, scale_factor=scale_factor
+    )
 
     # Save pkl after processing is successful
     if write_dir is not None:
@@ -606,7 +447,7 @@ def read_processed_file(
     Loads a processed PDB pkl from `process_pdb_file` and yields a ProcessedFile.
     """
     processed_feats = read_pkl(processed_file_path)
-    processed_file = _process_chain_feats(
+    processed_file = process_chain_feats(
         processed_feats,
         center=center,
         trim_to_modeled_residues=trim_to_modeled_residues,

@@ -21,9 +21,8 @@ class MetadataColumn(StrEnum):
     oligomeric_detail = "oligomeric_detail"
     # number of chains in protein (ignores non-residue chains)
     num_chains = "num_chains"
-    # (new) count of non-residue or empty chains (atoms, metals, molecules, DNA)
-    # [Can only be added on initial processing, because processed feats omit such chains.]
-    num_invalid_chains = "num_invalid_chains"
+    # (new) number of all chains (includes non-residue chains)
+    num_all_chains = "num_all_chains"
     # total number of residues
     seq_len = "seq_len"
     # (new) count of num residues in modeled structure, not including gaps
@@ -36,17 +35,32 @@ class MetadataColumn(StrEnum):
     mean_plddt_all_atom = "mean_plddt_all_atom"
     # (new) mean pLDDT of modeled backbone atoms
     mean_plddt_modeled_bb = "mean_plddt_modeled_bb"
+
     # secondary structure stats
     coil_percent = "coil_percent"
     helix_percent = "helix_percent"
     strand_percent = "strand_percent"
     radius_gyration = "radius_gyration"
+
+    # interactions / clashes
     # (new) backbone interactions across chains, multimer only
     num_backbone_interactions = "num_backbone_interactions"
+    num_backbone_res_interacting = "num_backbone_res_interacting"
     # (new) atomic interactions across chains, multimer only
-    num_atom_interactions = "num_atom_interactions"
-    # (new) clashes (<1.8 ang, >10% residues) across chains, multimer only
+    # num_atom_interactions = "num_atom_interactions"
+    # (new) clashes across chains, multimer only
     num_chains_clashing = "num_chains_clashing"
+
+    # Non-residue interactions
+    # [Can only be added on initial processing, because processed feats omit such chains.]
+    # (new) count of non-residue or empty chains (atoms, metals, molecules, DNA)
+    num_non_residue_chains = "num_non_residue_chains"
+    num_single_atom_chains = "num_single_atom_chains"
+    # interactions require the chain in proximity to 3+ residues
+    num_metal_interactions = "num_metal_interactions"
+    num_macromolecule_interactions = "num_macromolecule_interactions"
+    # count of protein chain-chain interactions potentially mediated by non-residue chains
+    num_mediated_interactions = "num_mediated_interactions"
 
     # TODO add in process_pdb_files if provided
     resolution = "resolution"
