@@ -6,8 +6,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
 
 from cogeneration.config.base import DatasetConfig
-from cogeneration.type.dataset import MetadataColumn
-from cogeneration.type.dataset import MetadataColumn as dc
+from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.dataset import MetadataDataFrame
 
 
@@ -17,7 +16,7 @@ class DatasetFilterer:
         self._log = logging.getLogger("DatasetFilterer")
 
     @property
-    def modeled_length_col(self) -> MetadataColumn:
+    def modeled_length_col(self) -> mc:
         return self.dataset_cfg.modeled_trim_method.to_dataset_column()
 
     def _rog_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:
@@ -26,7 +25,7 @@ class DatasetFilterer:
         """
         y_quant = pd.pivot_table(
             data_csv,
-            values=dc.radius_gyration,
+            values=mc.radius_gyration,
             index=self.modeled_length_col,
             aggfunc=lambda x: np.quantile(x, self.dataset_cfg.filter.rog_quantile),
         )
@@ -46,7 +45,7 @@ class DatasetFilterer:
         pred_y = poly_reg_model.predict(pred_poly_features) + 0.1
 
         row_rog_cutoffs = data_csv[self.modeled_length_col].map(lambda x: pred_y[x - 1])
-        return data_csv[data_csv[dc.radius_gyration] < row_rog_cutoffs]
+        return data_csv[data_csv[mc.radius_gyration] < row_rog_cutoffs]
 
     def _length_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:
         """Filter by sequence length."""
@@ -68,7 +67,7 @@ class DatasetFilterer:
     def _max_coil_filter(self, data_csv: MetadataDataFrame) -> MetadataDataFrame:
         """Filter proteins which exceed max_coil_percent."""
         return data_csv[
-            data_csv[dc.coil_percent] <= self.dataset_cfg.filter.max_coil_percent
+            data_csv[mc.coil_percent] <= self.dataset_cfg.filter.max_coil_percent
         ]
 
     def _max_percent_unknown_filter(
@@ -76,7 +75,7 @@ class DatasetFilterer:
     ) -> MetadataDataFrame:
         """Filter proteins which exceed `max_percent_residues_unknown`."""
         return data_csv[
-            (data_csv[dc.seq_len] / data_csv[self.modeled_length_col])
+            (data_csv[mc.seq_len] / data_csv[self.modeled_length_col])
             >= self.dataset_cfg.filter.max_percent_residues_unknown
         ]
 
@@ -90,7 +89,7 @@ class DatasetFilterer:
         data_csv = raw_csv.copy()
 
         # monomer / oligomer
-        data_csv = data_csv[data_csv[dc.oligomeric_detail].isin(filter_cfg.oligomeric)]
+        data_csv = data_csv[data_csv[mc.oligomeric_detail].isin(filter_cfg.oligomeric)]
         if len(data_csv) < running_length:
             self._log.debug(
                 f"{running_length} -> {len(data_csv)} examples after oligomeric filter"
@@ -98,7 +97,7 @@ class DatasetFilterer:
             running_length = len(data_csv)
 
         # number of chains
-        data_csv = data_csv[data_csv[dc.num_chains].isin(filter_cfg.num_chains)]
+        data_csv = data_csv[data_csv[mc.num_chains].isin(filter_cfg.num_chains)]
         if len(data_csv) < running_length:
             self._log.debug(
                 f"{running_length} ->{len(data_csv)} examples after num_chains filter"

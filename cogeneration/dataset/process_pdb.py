@@ -20,7 +20,7 @@ from cogeneration.dataset.interaction import (
 )
 from cogeneration.type.dataset import OLIGOMERIC_PREFIXES, ChainFeatures
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
-from cogeneration.type.dataset import MetadataColumn as dc
+from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.dataset import MetadataCSVRow, ProcessedFile
 
 
@@ -290,6 +290,7 @@ def _process_pdb(
     scale_factor: float = 1.0,
     write_dir: Optional[str] = None,
     generate_metadata: bool = True,
+    max_combined_length: int = 2048,
 ) -> Tuple[MetadataCSVRow, ProcessedFile]:
     """
     Process PDB file into concatenated chain features `ProcessedFile` and metadata `MetadataCSVRow`.
@@ -313,6 +314,8 @@ def _process_pdb(
     structure = parser.get_structure(pdb_name, pdb_file_path)
 
     struct_feats = _pdb_structure_to_chain_feats(structure, chain_id=chain_id)
+    if len(struct_feats) == 0:
+        raise DataError(f"No valid chains found in {pdb_file_path}")
 
     # Concat features for each chain in complex.
     # Note in AlphaFold2, the merging process is more complex, because it has MSAs, templates, etc.
@@ -322,51 +325,56 @@ def _process_pdb(
     #   We track in the metadata `dc.seq_len` (the only CHAIN_FEATURE we consider) below.
     complex_feats: ChainFeatures = _concat_np_features(struct_feats, False)  # noqa
 
+    if complex_feats[dpc.aatype].shape[0] > max_combined_length:
+        raise DataError(
+            f"Combined length of {complex_feats[dpc.aatype].shape[0]} exceeds max_combined_length of {max_combined_length}"
+        )
+
     # Determine modeled residues.
     complex_feats[dpc.modeled_idx] = determine_modeled_residues(complex_feats)
 
     # Generate metadata file
     metadata: MetadataCSVRow = {}
     if generate_metadata:
-        metadata[dc.pdb_name] = pdb_name
-        metadata[dc.raw_path] = pdb_file_path
+        metadata[mc.pdb_name] = pdb_name
+        metadata[mc.raw_path] = pdb_file_path
 
         # Track total sequence length
-        metadata[dc.seq_len] = len(complex_feats[dpc.aatype])
+        metadata[mc.seq_len] = len(complex_feats[dpc.aatype])
 
         # Track modeled sequence lengths
         modeled_idx = complex_feats[dpc.modeled_idx]
-        metadata[dc.moduled_num_res] = len(modeled_idx)
+        metadata[mc.moduled_num_res] = len(modeled_idx)
         # complex trimming, just determine start and ends
         complex_keep_mask = determine_modeled_residues_mask(
             chain_feats=complex_feats,
             trim_chains_independently=False,
         )
-        metadata[dc.modeled_seq_len] = np.sum(complex_keep_mask)
+        metadata[mc.modeled_seq_len] = np.sum(complex_keep_mask)
         # chain independent trimming, trim each chain independently
         independent_keep_mask = determine_modeled_residues_mask(
             chain_feats=complex_feats,
             trim_chains_independently=True,
         )
-        metadata[dc.modeled_indep_seq_len] = np.sum(independent_keep_mask)
+        metadata[mc.modeled_indep_seq_len] = np.sum(independent_keep_mask)
 
         # Track quaternary / oligomeric information
-        metadata[dc.num_chains] = len(struct_feats)
-        metadata[dc.num_all_chains] = len([c for c in structure.get_chains()])
-        metadata[dc.oligomeric_count] = _oligomeric_count(struct_feats)
-        metadata[dc.oligomeric_detail] = _oligomeric_detail(struct_feats)
+        metadata[mc.num_chains] = len(struct_feats)
+        metadata[mc.num_all_chains] = len([c for c in structure.get_chains()])
+        metadata[mc.oligomeric_count] = _oligomeric_count(struct_feats)
+        metadata[mc.oligomeric_detail] = _oligomeric_detail(struct_feats)
         uniq_seqs = set(
             [tuple(chain_feats[dpc.aatype]) for chain_feats in struct_feats]
         )
         if len(uniq_seqs) == 1:
-            metadata[dc.quaternary_category] = "homomer"
+            metadata[mc.quaternary_category] = "homomer"
         else:
-            metadata[dc.quaternary_category] = "heteromer"
+            metadata[mc.quaternary_category] = "heteromer"
 
         # quality information
         plddts = complex_feats[dpc.b_factors]
-        metadata[dc.mean_plddt_all_atom] = float(np.mean(plddts))
-        metadata[dc.mean_plddt_modeled_bb] = float(np.mean(plddts[:, :3][modeled_idx]))
+        metadata[mc.mean_plddt_all_atom] = float(np.mean(plddts))
+        metadata[mc.mean_plddt_modeled_bb] = float(np.mean(plddts[:, :3][modeled_idx]))
 
         # secondary structure, radius of gyration
         try:
@@ -379,16 +387,20 @@ def _process_pdb(
         except Exception as e:
             raise DataError(f"Mdtraj failed with error {e}")
 
+        # structure metadata
+        metadata[mc.resolution] = structure.header.get("resolution")
+        metadata[mc.structure_method] = structure.header.get("structure_method")
+
         # use denom `metadata[dc.modeled_seq_len]` to match public MultiFlow
         # though if use chain-independent filtering, values almost certainly higher.
-        metadata[dc.coil_percent] = np.sum(pdb_ss == "C") / metadata[dc.modeled_seq_len]
-        metadata[dc.helix_percent] = (
-            np.sum(pdb_ss == "H") / metadata[dc.modeled_seq_len]
+        metadata[mc.coil_percent] = np.sum(pdb_ss == "C") / metadata[mc.modeled_seq_len]
+        metadata[mc.helix_percent] = (
+            np.sum(pdb_ss == "H") / metadata[mc.modeled_seq_len]
         )
-        metadata[dc.strand_percent] = (
-            np.sum(pdb_ss == "E") / metadata[dc.modeled_seq_len]
+        metadata[mc.strand_percent] = (
+            np.sum(pdb_ss == "E") / metadata[mc.modeled_seq_len]
         )
-        metadata[dc.radius_gyration] = pdb_rg[0]
+        metadata[mc.radius_gyration] = pdb_rg[0]
 
         # check for interactions across chain pairs
         interactions = MultimerInteractions.from_chain_feats(
@@ -412,10 +424,10 @@ def _process_pdb(
     # Save pkl after processing is successful
     if write_dir is not None:
         processed_path = os.path.join(write_dir, f"{pdb_name}.pkl")
-        metadata[dc.processed_path] = os.path.abspath(processed_path)
+        metadata[mc.processed_path] = os.path.abspath(processed_path)
         write_pkl(processed_path, complex_feats)
     else:
-        metadata[dc.processed_path] = ""
+        metadata[mc.processed_path] = ""
 
     return metadata, complex_feats
 

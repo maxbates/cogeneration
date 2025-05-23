@@ -18,7 +18,7 @@ from cogeneration.data.residue_constants import (
 )
 from cogeneration.type.dataset import ChainFeatures
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
-from cogeneration.type.dataset import MetadataColumn as dc
+from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.dataset import MetadataCSVRow
 
 # clash / interaction constants
@@ -307,11 +307,11 @@ class MultimerInteractions:
         self,
         metadata: MetadataCSVRow,
     ):
-        metadata[dc.num_backbone_interactions] = len(self.backbone_interactions)
-        metadata[dc.num_backbone_res_interacting] = len(self.backbone_res_interacting)
+        metadata[mc.num_backbone_interactions] = len(self.backbone_interactions)
+        metadata[mc.num_backbone_res_interacting] = len(self.backbone_res_interacting)
         # metadata[dc.num_atom_interactions] = len(self.atom_interactions)
 
-        metadata[dc.num_chains_clashing] = len(
+        metadata[mc.num_chains_clashing] = len(
             set(clash.chain_id for clash in self.chain_clashes)
         )
 
@@ -612,12 +612,12 @@ class NonResidueInteractions:
 
     def update_metadata(self, metadata: MetadataCSVRow):
         # tally non-residue interactions
-        metadata[dc.num_non_residue_chains] = self.num_non_residue_chains
-        metadata[dc.num_single_atom_chains] = self.num_single_atom_chains
-        metadata[dc.num_metal_interactions] = len(self.metals_interacting)
-        metadata[dc.num_macromolecule_interactions] = len(
+        metadata[mc.num_non_residue_chains] = self.num_non_residue_chains
+        metadata[mc.num_single_atom_chains] = self.num_single_atom_chains
+        metadata[mc.num_metal_interactions] = len(self.metals_interacting)
+        metadata[mc.num_macromolecule_interactions] = len(
             self.macromolecule_chains_interacting
         )
 
         # check for chain-chain interactions mediated by non-residues
-        metadata[dc.num_mediated_interactions] = len(self.mediated_chain_interactions)
+        metadata[mc.num_mediated_interactions] = len(self.mediated_chain_interactions)

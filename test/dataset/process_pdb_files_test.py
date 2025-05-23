@@ -14,7 +14,7 @@ from cogeneration.dataset.process_pdb import (
 from cogeneration.scripts.process_pdb_files import process_pdb_with_metadata
 from cogeneration.type.dataset import DatasetProteinColumn
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
-from cogeneration.type.dataset import MetadataColumn as dc
+from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.task import DataTask
 
 # https://www2.rcsb.org/structure/2QLW
@@ -50,7 +50,7 @@ class TestProcessPDBFiles:
         assert metadata is not None
 
         # check written file exists
-        pkl = read_pkl(metadata[dc.processed_path])
+        pkl = read_pkl(metadata[mc.processed_path])
 
         # DEBUG convert to PDB to inspect
         # pdb_path = tmp_path / "2qlw_rewrite.pdb"
@@ -65,30 +65,30 @@ class TestProcessPDBFiles:
         # print(pdb_path)
 
         # check metadata
-        assert metadata[dc.num_chains] == 2
+        assert metadata[mc.num_chains] == 2
         # 2x 100 residues with known aa types
-        assert metadata[dc.moduled_num_res] == 200
+        assert metadata[mc.moduled_num_res] == 200
         # 2x 227 molecules/residues
-        assert metadata[dc.seq_len] == 454
+        assert metadata[mc.seq_len] == 454
         # 100 modeled + intervening molecules + 100 modeled
-        assert metadata[dc.modeled_seq_len] == 335
-        assert metadata[dc.oligomeric_detail] == "dimeric"
-        assert metadata[dc.quaternary_category] == "homomer"
-        assert metadata[dc.helix_percent] > 0.1
+        assert metadata[mc.modeled_seq_len] == 335
+        assert metadata[mc.oligomeric_detail] == "dimeric"
+        assert metadata[mc.quaternary_category] == "homomer"
+        assert metadata[mc.helix_percent] > 0.1
 
         # modeled sequence includes non-AA residues (i.e. 20 = unknown)
-        assert len(pkl[dpc.aatype]) == metadata[dc.seq_len]
+        assert len(pkl[dpc.aatype]) == metadata[mc.seq_len]
         # check number actual residues in seq
-        assert np.sum(pkl[dpc.aatype] != 20) == metadata[dc.moduled_num_res]
+        assert np.sum(pkl[dpc.aatype] != 20) == metadata[mc.moduled_num_res]
         # modeled positions only for valid residues
-        assert len(pkl[dpc.modeled_idx]) == metadata[dc.moduled_num_res]
+        assert len(pkl[dpc.modeled_idx]) == metadata[mc.moduled_num_res]
 
         # check multimer interactions
-        assert metadata[dc.num_backbone_res_interacting] == 22
-        assert metadata[dc.num_chains_clashing] == 0
+        assert metadata[mc.num_backbone_res_interacting] == 22
+        assert metadata[mc.num_chains_clashing] == 0
 
         # check non-res interactions
-        assert metadata[dc.num_metal_interactions] == 2  # mg ions
+        assert metadata[mc.num_metal_interactions] == 2  # mg ions
 
         # check all expected keys are present
         expected_keys = [key for key in DatasetProteinColumn]
@@ -105,7 +105,7 @@ class TestProcessPDBFiles:
             write_dir=str(tmp_path),
         )
         # Test can load and process
-        _ = read_processed_file(processed_file_path=metadata[dc.processed_path])
+        _ = read_processed_file(processed_file_path=metadata[mc.processed_path])
 
     def test_dataset_using_processed_file(self, tmp_path):
         metadata, _ = process_pdb_with_metadata(
@@ -141,7 +141,7 @@ class TestProcessPDBFiles:
 
         # just test it works
         processed_file = read_processed_file(
-            processed_file_path=metadata[dc.processed_path]
+            processed_file_path=metadata[mc.processed_path]
         )
         _ = dataset.process_processed_file(
             processed_file=processed_file,

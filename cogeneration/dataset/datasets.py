@@ -31,9 +31,10 @@ from cogeneration.dataset.process_pdb import read_processed_file
 from cogeneration.type.batch import METADATA_BATCH_PROPS, BatchFeatures
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import InferenceFeatures, empty_feats
+from cogeneration.type.dataset import DatasetColumn, DatasetCSVRow, DatasetDataFrame
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.dataset import DatasetTransformColumn as dtc
-from cogeneration.type.dataset import MetadataColumn as dc
+from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.dataset import MetadataCSVRow, MetadataDataFrame, ProcessedFile
 from cogeneration.type.task import DataTask
 
@@ -186,11 +187,12 @@ class BaseDataset(Dataset):
 
             self.redesigned_csv = pd.read_csv(self.dataset_cfg.redesigned_csv_path)
             metadata_csv = metadata_csv.merge(
-                self.redesigned_csv, left_on=dc.pdb_name, right_on=dc.example
+                self.redesigned_csv, left_on=mc.pdb_name, right_on=DatasetColumn.example
             )
             # Filter out examples with high RMSD
             metadata_csv = metadata_csv[
-                metadata_csv[dc.best_rmsd] < self.dataset_cfg.redesigned_rmsd_threshold
+                metadata_csv[DatasetColumn.best_rmsd]
+                < self.dataset_cfg.redesigned_rmsd_threshold
             ]
 
         # Add cluster information
@@ -213,7 +215,9 @@ class BaseDataset(Dataset):
                     self._missing_pdbs += 1
                 return self._pdb_to_cluster[pdb]
 
-            metadata_csv[dc.cluster] = metadata_csv[dc.pdb_name].map(cluster_lookup)
+            metadata_csv[DatasetColumn.cluster] = metadata_csv[mc.pdb_name].map(
+                cluster_lookup
+            )
             self._log.debug(
                 f"Assigned {self._max_cluster} clusters. {self._missing_pdbs} of {len(metadata_csv)} PDBs were missing from the cluster file."
             )
@@ -236,7 +240,7 @@ class BaseDataset(Dataset):
             # The actual number is incremented by the number of real clusters.
 
             # Offset all the cluster numbers by the number of real data clusters
-            num_real_clusters = metadata_csv[dc.cluster].max() + 1
+            num_real_clusters = metadata_csv[DatasetColumn.cluster].max() + 1
 
             def synthetic_cluster_lookup(pdb):
                 pdb = pdb.upper()
@@ -246,9 +250,9 @@ class BaseDataset(Dataset):
                     )
                 return self._synthetic_pdb_to_cluster[pdb] + num_real_clusters
 
-            self.synthetic_csv[dc.cluster] = self.synthetic_csv[dc.pdb_name].map(
-                synthetic_cluster_lookup
-            )
+            self.synthetic_csv[DatasetColumn.cluster] = self.synthetic_csv[
+                mc.pdb_name
+            ].map(synthetic_cluster_lookup)
 
             # concat synthetic data to metadata_csv
             metadata_csv = pd.concat([metadata_csv, self.synthetic_csv])
@@ -264,7 +268,7 @@ class BaseDataset(Dataset):
         if self.dataset_cfg.test_set_pdb_ids_path is not None:
             test_set_df = pd.read_csv(dataset_cfg.test_set_pdb_ids_path)
             self.csv = self.csv[
-                self.csv[dc.pdb_name].isin(test_set_df[dc.pdb_name].values)
+                self.csv[mc.pdb_name].isin(test_set_df[mc.pdb_name].values)
             ]
 
     @property
@@ -275,10 +279,10 @@ class BaseDataset(Dataset):
         return len(self.csv)
 
     @property
-    def modeled_length_col(self) -> dc:
+    def modeled_length_col(self) -> mc:
         return self.dataset_cfg.modeled_trim_method.to_dataset_column()
 
-    def _create_split(self, data_csv: MetadataDataFrame):
+    def _create_split(self, data_csv: DatasetDataFrame):
         # Training or validation specific logic.
         # TODO actually split - this isn't really splitting... it's ~ all the samples in both cases
         if self.is_training:
@@ -310,16 +314,14 @@ class BaseDataset(Dataset):
             )
 
         # reset index
-        self.csv[dc.index] = list(range(len(self.csv)))
+        self.csv[DatasetColumn.index] = list(range(len(self.csv)))
 
-    def load_processed_path_with_caching(
-        self, csv_row: MetadataCSVRow
-    ) -> ProcessedFile:
+    def load_processed_path_with_caching(self, csv_row: DatasetCSVRow) -> ProcessedFile:
         """
         Loads a single structure + metadata pickled at `processed_file_path`, with caching.
         """
         processed_file_path = os.path.join(
-            self.dataset_cfg.processed_data_path, csv_row[dc.processed_path]
+            self.dataset_cfg.processed_data_path, csv_row[mc.processed_path]
         )
         seq_len = csv_row[self.modeled_length_col]
         use_cache = seq_len > self.dataset_cfg.cache_num_res
@@ -510,7 +512,7 @@ class BaseDataset(Dataset):
         task: DataTask,
         is_training: bool,
         processed_file: ProcessedFile,
-        csv_row: MetadataCSVRow,
+        csv_row: DatasetCSVRow,
         motif_factory: MotifFactory,
     ) -> BatchFeatures:
         """
@@ -522,7 +524,7 @@ class BaseDataset(Dataset):
         """
         # Redesigned sequences can be used to substitute the original sequence during training.
         if is_training and cfg.use_redesigned:
-            best_seq = csv_row[dc.best_seq]
+            best_seq = csv_row[DatasetColumn.best_seq]
             if not isinstance(best_seq, str):
                 raise ValueError(f"Unexpected value best_seq: {best_seq}")
 
@@ -536,11 +538,11 @@ class BaseDataset(Dataset):
         feats = batch_features_from_processed_file(
             processed_file=processed_file,
             cfg=cfg,
-            processed_file_path=csv_row[dc.processed_path],
+            processed_file_path=csv_row[mc.processed_path],
         )
 
         # Pass through relevant data from CSV
-        feats[bp.pdb_name] = csv_row[dc.pdb_name]
+        feats[bp.pdb_name] = csv_row[mc.pdb_name]
 
         # Update `diffuse_mask` and `motif_mask` depending on task
         if task == DataTask.hallucination:
@@ -593,7 +595,7 @@ class BaseDataset(Dataset):
         return feats
 
     def process_processed_file(
-        self, processed_file: ProcessedFile, csv_row: MetadataCSVRow
+        self, processed_file: ProcessedFile, csv_row: DatasetCSVRow
     ) -> BatchFeatures:
         return self._featurize_processed_file(
             cfg=self.dataset_cfg,
@@ -604,7 +606,7 @@ class BaseDataset(Dataset):
             motif_factory=self.motif_factory,
         )
 
-    def process_csv_row(self, csv_row: MetadataCSVRow) -> BatchFeatures:
+    def process_csv_row(self, csv_row: DatasetCSVRow) -> BatchFeatures:
         """
         Process a single row of the CSV file.
         File loading is cached.
@@ -620,7 +622,7 @@ class BaseDataset(Dataset):
         return processed_row
 
     def __getitem__(self, row_idx) -> BatchFeatures:
-        csv_row = self.csv.iloc[row_idx]
+        csv_row: DatasetCSVRow = self.csv.iloc[row_idx]
         feats = self.process_csv_row(csv_row)
 
         # Storing the csv index is helpful for debugging.

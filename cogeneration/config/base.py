@@ -1173,6 +1173,7 @@ class Config(BaseClassConfig):
                 new_state_dict[key] = value
 
             # Save new checkpoint
+            # TODO - clean it up, esp in tests
             os.makedirs(ckpt_dir, exist_ok=True)
             ckpt["state_dict"] = new_state_dict
             torch.save(ckpt, ckpt_path)

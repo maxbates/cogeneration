@@ -2,9 +2,15 @@
 
 import argparse
 import functools as fn
+import gzip
 import multiprocessing as mp
 import os
+import tempfile
 import time
+
+# Quiet mdtraj/formats/pdb/pdbfile.py
+# UserWarning: Unlikely unit cell vectors detected in PDB file likely resulting from a dummy CRYST1 record. Discarding unit cell vectors.
+import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -12,7 +18,11 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from cogeneration.dataset.process_pdb import DataError, _process_pdb
-from cogeneration.type.dataset import MetadataCSVRow, ProcessedFile
+from cogeneration.type.dataset import MetadataColumn, MetadataCSVRow, ProcessedFile
+
+warnings.filterwarnings(
+    "ignore", message="Unlikely unit cell vectors detected.*"
+)  # turn off that specific warning
 
 
 def process_pdb_with_metadata(
@@ -41,6 +51,65 @@ def process_pdb_with_metadata(
     )
 
 
+def pdb_path_pdb_name(pdb_path: str) -> str:
+    """
+    Convert a PDB file path to a PDB name.
+    """
+    # Remove the directory and file extension
+    pdb_name = os.path.basename(pdb_path).upper()
+    pdb_name = pdb_name.replace(".ENT.GZ", "")
+    pdb_name = pdb_name.replace(".PDB", "")
+    # remove leading pdb e.g. `pdb0000.ent.gz`
+    if pdb_name.startswith("PDB"):
+        pdb_name = pdb_name[3:]
+    return pdb_name
+
+
+def process_fn(
+    file_path: str, write_dir: str, delete_original: bool = False, verbose: bool = False
+) -> Optional[MetadataCSVRow]:
+    try:
+        start_time = time.time()
+
+        is_compressed = file_path.endswith(".ent.gz")
+
+        if is_compressed:
+            pdb_name = pdb_path_pdb_name(file_path)
+
+            with gzip.open(file_path, "rt") as gz:
+                # write decompressed content to a temp file with correct pdb_name
+                tmp_dir = tempfile.mkdtemp()
+                tmp_path = os.path.join(tmp_dir, f"{pdb_name}.pdb")
+                with open(tmp_path, "wb") as tmp:
+                    tmp.write(gz.read().encode("utf-8"))
+
+            metadata, _ = process_pdb_with_metadata(
+                pdb_file_path=tmp_path, pdb_name=pdb_name, write_dir=write_dir
+            )
+
+            # remove the temporary file
+            os.remove(tmp_path)
+        else:
+            metadata, _ = process_pdb_with_metadata(
+                pdb_file_path=file_path, write_dir=write_dir
+            )
+
+        elapsed_time = time.time() - start_time
+        if verbose:
+            print(f"[{file_path}] Finished in {elapsed_time:2.2f}s")
+        if delete_original:
+            os.remove(file_path)
+        return metadata
+
+    # TODO - clean up file when errors are encountered?
+    except DataError as e:
+        if verbose:
+            print(f"[{file_path}] DataError: {e}")
+    except ValueError as e:
+        # log unhandled errors
+        print(f"[{file_path}] ⚠️ Unhandled Processing Error: {e}")
+
+
 def process_serially(
     all_paths: List[str],
     write_dir: str,
@@ -49,40 +118,14 @@ def process_serially(
 ) -> List[MetadataCSVRow]:
     all_metadata = []
     for i, file_path in tqdm(enumerate(all_paths), desc="Processing PDBs"):
-        try:
-            start_time = time.time()
-            metadata, _ = process_pdb_with_metadata(
-                pdb_file_path=file_path, write_dir=write_dir
-            )
-            elapsed_time = time.time() - start_time
-            if verbose:
-                print(f"Finished {file_path} in {elapsed_time:2.2f}s")
-            all_metadata.append(metadata)
-            if delete_original:
-                os.remove(file_path)
-        except DataError as e:
-            if verbose:
-                print(f"Failed {file_path}: {e}")
-    return all_metadata
-
-
-def process_fn(
-    file_path: str, write_dir: str, delete_original: bool = False, verbose: bool = False
-):
-    try:
-        start_time = time.time()
-        metadata, _ = process_pdb_with_metadata(
-            pdb_file_path=file_path, write_dir=write_dir
+        metadata = process_fn(
+            file_path=file_path,
+            write_dir=write_dir,
+            delete_original=delete_original,
+            verbose=verbose,
         )
-        elapsed_time = time.time() - start_time
-        if verbose:
-            print(f"Finished {file_path} in {elapsed_time:2.2f}s")
-        if delete_original:
-            os.remove(file_path)
-        return metadata
-    except DataError as e:
-        if verbose:
-            print(f"Failed {file_path}: {e}")
+        all_metadata.append(metadata)
+    return all_metadata
 
 
 @dataclass
@@ -92,6 +135,7 @@ class Args:
     write_dir: str = "preprocessed"
     delete_original: bool = False
     debug: bool = False
+    max_structures: int = -1
     verbose: bool = False
 
     def __post_init__(self):
@@ -99,7 +143,7 @@ class Args:
             self.num_processes = 1
             self.verbose = True
         if self.num_processes is None:
-            self.num_processes = mp.cpu_count()
+            self.num_processes = max(1, mp.cpu_count() - 4)
         if not os.path.exists(self.write_dir):
             os.makedirs(self.write_dir)
 
@@ -127,6 +171,12 @@ class Args:
             "--debug", help="Turn on for debugging.", action="store_true"
         )
         parser.add_argument(
+            "--max_structures",
+            help="Debugging, max number of files to process",
+            type=int,
+            default=-1,
+        )
+        parser.add_argument(
             "--verbose", help="Whether to log everything.", action="store_true"
         )
         args = parser.parse_args()
@@ -137,29 +187,75 @@ class Args:
             write_dir=args.write_dir,
             delete_original=args.delete_original,
             debug=args.debug,
+            max_structures=args.max_structures,
             verbose=args.verbose,
         )
 
 
 def main(args: Args):
     pdb_dir = args.pdb_dir
-    all_file_paths = [
-        os.path.join(pdb_dir, x) for x in os.listdir(args.pdb_dir) if ".pdb" in x
-    ]
-    total_num_paths = len(all_file_paths)
     write_dir = args.write_dir
+
+    # support divided directories and compressed files (e.g. `07/107L.ent.gz`)
+    all_paths = []
+    for root, _, files in os.walk(pdb_dir):
+        for file_name in files:
+            if file_name.endswith(".ent.gz") or file_name.endswith(".pdb"):
+                all_paths.append(os.path.join(root, file_name))
+    os.makedirs(write_dir, exist_ok=True)
+    total_num_files = len(all_paths)
+    print(f"Processing {total_num_files} files, writing to {write_dir}")
 
     if args.debug:
         metadata_file_name = "metadata_debug.csv"
     else:
         metadata_file_name = "metadata.csv"
     metadata_path = os.path.join(write_dir, metadata_file_name)
-    print(f"Files will be written to {write_dir}")
+
+    # Skip already processed files if in metadata and processed file exists.
+    # Avoid holding onto DF, in case it is large.
+    existing_metadata_columns = None
+    existing_processed_files = 0
+    if os.path.exists(metadata_path):
+        existing_metadata_df = pd.read_csv(metadata_path)
+
+        missing_columns = set(MetadataColumn).difference(existing_metadata_df.columns)
+        extra_columns = set(existing_metadata_df.columns).difference(MetadataColumn)
+        # ensure all required columns exist, otherwise regenerate
+        if len(missing_columns) > 0 or len(extra_columns) > 0:
+            print(f"Existing Metadata file has column mismatch and will be overwritten")
+            print(f"Missing columns: {missing_columns}")
+            print(f"Extra columns: {extra_columns}")
+            # TODO - consider moving it instead of overwriting?
+        else:
+            # For rows that do exist, check if the processed file exists
+            # If it does, no need to re-process
+            existing_metadata_df = existing_metadata_df[
+                existing_metadata_df[MetadataColumn.processed_path].apply(
+                    lambda x: os.path.exists(os.path.join(write_dir, x))
+                )
+            ]
+            existing_processed_files = len(existing_metadata_df)
+            all_paths = [
+                path
+                for path in all_paths
+                if pdb_path_pdb_name(path)
+                not in existing_metadata_df[MetadataColumn.pdb_name].values
+            ]
+            # save the columns to ensure new metadata written the same way
+            existing_metadata_columns = existing_metadata_df.columns
+            print(
+                f"Dropping already processed files, have {len(existing_metadata_df)}, processing {len(all_paths)} remaining."
+            )
+
+    if args.max_structures > 0:
+        all_paths = all_paths[: args.max_structures]
+        print(f"Debugging, limiting to {args.max_structures} files")
 
     # Process each file
     if args.num_processes == 1 or args.debug:
         all_metadata = process_serially(
-            all_file_paths,
+            all_paths,
             write_dir=write_dir,
             delete_original=args.delete_original,
             verbose=args.verbose,
@@ -174,17 +270,27 @@ def main(args: Args):
         with mp.Pool(processes=args.num_processes) as pool:
             all_metadata = []
             for metadata in tqdm(
-                pool.imap_unordered(_process_fn, all_file_paths), total=total_num_paths
+                pool.imap_unordered(_process_fn, all_paths), total=len(all_paths)
             ):
                 all_metadata.append(metadata)
 
-    # filter empty
+    # filter if empty/failed
     all_metadata = [x for x in all_metadata if x is not None]
-
     metadata_df = pd.DataFrame(all_metadata)
-    metadata_df.to_csv(metadata_path, index=False)
-    succeeded = len(all_metadata)
-    print(f"Finished processing {succeeded}/{total_num_paths} files")
+
+    # append to existing metadata
+    if existing_metadata_columns is not None:
+        metadata_df = metadata_df.reindex(columns=existing_metadata_columns)
+        metadata_df.to_csv(metadata_path, mode="a", header=False, index=False)
+        print(
+            f"Finished processing {len(metadata_df)} more -> {len(metadata_df) + existing_processed_files} of {total_num_files} files"
+        )
+    else:
+        metadata_df.to_csv(metadata_path, index=False)
+        print(
+            f"Finished processing {len(metadata_df)} structures of {total_num_files} files"
+        )
+    print(f"Metadata written to {metadata_path}")
 
 
 if __name__ == "__main__":

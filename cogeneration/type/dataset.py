@@ -42,6 +42,10 @@ class MetadataColumn(StrEnum):
     strand_percent = "strand_percent"
     radius_gyration = "radius_gyration"
 
+    # structure metadata if provided
+    resolution = "resolution"
+    structure_method = "structure_method"
+
     # interactions / clashes
     # (new) backbone interactions across chains, multimer only
     num_backbone_interactions = "num_backbone_interactions"
@@ -62,9 +66,9 @@ class MetadataColumn(StrEnum):
     # count of protein chain-chain interactions potentially mediated by non-residue chains
     num_mediated_interactions = "num_mediated_interactions"
 
-    # TODO add in process_pdb_files if provided
-    resolution = "resolution"
-    structure_method = "structure_method"
+
+class DatasetColumn(StrEnum):
+    """Columns added by dataset, alongside MetadataColumns"""
 
     # cluster metadata (added by loading clusters csv)
     cluster = "cluster"
@@ -125,6 +129,12 @@ MetadataCSVRow = Dict[MetadataColumn, NumpyPrimitiveFeat]
 
 """MetadataDataFrame type alias for the metadata CSV file, composed of MetadataCSVRow"""
 MetadataDataFrame = pd.DataFrame
+
+"""DatasetCSVRow is row of MetadatDataFrame augmented with clusters, redesigned data, etc."""
+DatasetCSVRow = Dict[Union[MetadataColumn, DatasetColumn], NumpyPrimitiveFeat]
+
+"""DatasetDataFrame is the full dataset, composed of DatasetCSVRow"""
+DatasetDataFrame = pd.DataFrame
 
 """
 ChainFeatures represents an intermediate state converting `asdict(Protein)` to `ProcessedFile`.
