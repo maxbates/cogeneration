@@ -113,12 +113,13 @@ def process_chain(chain: Chain, chain_id: int) -> Protein:
     b_factors = []
     chain_ids = []
     for res in chain:
-        # copy AF2 behavior (note: missing in public MultiFlow)
-        if res.id[2] != " ":
-            raise ValueError(
-                f"PDB/mmCIF contains an insertion code at chain {chain.id} and"
-                f" residue index {res.id[1]}. These are not supported."
-            )
+        # AF2 behavior is to not tolerate insertion codes.
+        # We re-number the residues during processing, so these aren't deal breakers.
+        # if res.id[2] != " ":
+        #     raise ValueError(
+        #         f"PDB/mmCIF contains an insertion code at chain {chain.id} and"
+        #         f" residue index {res.id[1]}. These are not supported."
+        #     )
 
         res_shortname = residue_constants.restype_3to1.get(res.resname, "X")
         restype_idx = residue_constants.restype_order.get(
