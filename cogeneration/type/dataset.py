@@ -19,6 +19,8 @@ class MetadataColumn(StrEnum):
     oligomeric_count = "oligomeric_count"
     # per-unique seq details
     oligomeric_detail = "oligomeric_detail"
+    # (new) residue chain lengths
+    chain_lengths = "chain_lengths"
     # number of chains in protein (ignores non-residue chains)
     num_chains = "num_chains"
     # (new) number of all chains (includes non-residue chains)
@@ -55,11 +57,12 @@ class MetadataColumn(StrEnum):
     # (new) clashes across chains, multimer only
     num_chains_clashing = "num_chains_clashing"
 
-    # Non-residue interactions
+    # Non-residue chains + interactions
     # [Can only be added on initial processing, because processed feats omit such chains.]
     # (new) count of non-residue or empty chains (atoms, metals, molecules, DNA)
     num_non_residue_chains = "num_non_residue_chains"
     num_single_atom_chains = "num_single_atom_chains"
+    num_solution_molecules = "num_solution_molecules"
     # interactions require the chain in proximity to 3+ residues
     num_metal_interactions = "num_metal_interactions"
     num_macromolecule_interactions = "num_macromolecule_interactions"

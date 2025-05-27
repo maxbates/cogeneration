@@ -19,6 +19,7 @@ from cogeneration.dataset.interaction import (
 from cogeneration.dataset.process_pdb import (
     _concat_np_features,
     _pdb_structure_to_chain_feats,
+    get_uncompressed_pdb_path,
     process_chain_feats,
 )
 from cogeneration.type.dataset import ChainFeatures
@@ -102,10 +103,19 @@ class MetadataUpdater:
                         f"Require row.raw_path"
                     )
 
+                uncompressed_pdb_path, is_temp_file = get_uncompressed_pdb_path(
+                    row_metadata[mc.raw_path]
+                )
+
                 parser = PDB.PDBParser(QUIET=True)
                 _pdb_structure = parser.get_structure(
-                    row_metadata[mc.pdb_name], row_metadata[mc.raw_path]
+                    row_metadata[mc.pdb_name], uncompressed_pdb_path
                 )
+
+                if is_temp_file:
+                    # Remove temporary file after reading
+                    os.remove(uncompressed_pdb_path)
+
             return _pdb_structure
 
         def get_whole_complex_trimmed():
@@ -133,6 +143,13 @@ class MetadataUpdater:
         if mc.num_all_chains not in row_metadata:
             structure = get_pdb_structure()
             row_updates[mc.num_all_chains] = len(structure.get_chains())
+
+        if mc.chain_lengths not in row_metadata:
+            structure = get_pdb_structure()
+            struct_feats = _pdb_structure_to_chain_feats(structure)
+            row_updates[mc.chain_lengths] = ",".join(
+                [str(len(chain_feats[dpc.aatype])) for chain_feats in struct_feats]
+            )
 
         if mc.moduled_num_res not in row_metadata:
             row_updates[mc.moduled_num_res] = len(raw_processed_file[dpc.modeled_idx])
@@ -171,10 +188,11 @@ class MetadataUpdater:
             )
             interactions.update_metadata(row_updates)
 
-        # Cannot add non-residue interactions to processed files - non-res chains are omitted
+        # non-residue interactions requires raw file - non-res chains are omitted when processed.
         if (
             mc.num_non_residue_chains not in row_metadata
             or mc.num_single_atom_chains not in row_metadata
+            or mc.num_solution_molecules not in row_metadata
             or mc.num_metal_interactions not in row_metadata
             or mc.num_macromolecule_interactions not in row_metadata
             or mc.num_mediated_interactions not in row_metadata

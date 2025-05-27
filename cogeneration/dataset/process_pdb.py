@@ -51,6 +51,8 @@ def get_uncompressed_pdb_path(
 ) -> Tuple[str, bool]:
     """
     Uncompress a PDB file if it is compressed, returns path and whether it is a temp path
+
+    TODO consider moving to context handler to close file more easily.
     """
     is_compressed = file_path.endswith(".ent.gz")
 
@@ -329,7 +331,7 @@ def _process_pdb(
     scale_factor: float = 1.0,
     write_dir: Optional[str] = None,
     generate_metadata: bool = True,
-    max_combined_length: int = 2048,
+    max_combined_length: int = 4096,  # TODO expose in cfg
 ) -> Tuple[MetadataCSVRow, ProcessedFile]:
     """
     Process PDB file into concatenated chain features `ProcessedFile` and metadata `MetadataCSVRow`.
@@ -348,6 +350,7 @@ def _process_pdb(
     """
     if pdb_name is None:
         pdb_name = pdb_path_pdb_name(pdb_file_path)
+
     uncompressed_pdb_path, is_temp_file = get_uncompressed_pdb_path(pdb_file_path)
 
     try:
@@ -411,6 +414,9 @@ def _process_pdb(
                 metadata[mc.quaternary_category] = "homomer"
             else:
                 metadata[mc.quaternary_category] = "heteromer"
+            metadata[mc.chain_lengths] = ",".join(
+                [str(len(chain_feats[dpc.aatype])) for chain_feats in struct_feats]
+            )
 
             # quality information
             plddts = complex_feats[dpc.b_factors]
@@ -474,6 +480,10 @@ def _process_pdb(
         else:
             metadata[mc.processed_path] = ""
 
+        # If we created a temp file, remove it
+        if is_temp_file:
+            os.remove(uncompressed_pdb_path)
+
         return metadata, complex_feats
 
     except Exception as e:
@@ -488,18 +498,54 @@ def _process_pdb(
 def process_pdb_file(
     pdb_file_path: str,
     pdb_name: str,
+    write_dir: Optional[str] = None,
     chain_id: Optional[str] = None,
     scale_factor: float = 1.0,
 ) -> ProcessedFile:
+    """
+    Process PDB file into concatenated chain features `ProcessedFile`.
+
+    If `write_dir` is provided, saves ProcessedFile pickle to `{write_dir}/{pdb_name}.pkl`.
+    If `chain_id` is provided, only that chain is processed.
+    `pdb_name` if provided is used for metadata and written file name.
+
+    Raises DataError if a known filtering rule is hit. All other errors propogated.
+    """
     _, processed_file = _process_pdb(
         pdb_file_path=pdb_file_path,
         chain_id=chain_id,
         pdb_name=pdb_name,
         scale_factor=scale_factor,
-        write_dir=None,
+        write_dir=write_dir,
         generate_metadata=False,
     )
     return processed_file
+
+
+def process_pdb_with_metadata(
+    pdb_file_path: str,
+    write_dir: Optional[str] = None,
+    chain_id: Optional[str] = None,
+    pdb_name: Optional[str] = None,
+    scale_factor: float = 1.0,
+) -> Tuple[MetadataCSVRow, ProcessedFile]:
+    """
+    Process PDB file into concatenated chain features `ProcessedFile` and metadata `MetadataCSVRow`.
+
+    If `write_dir` is provided, saves ProcessedFile pickle to `{write_dir}/{pdb_name}.pkl`.
+    If `chain_id` is provided, only that chain is processed.
+    `pdb_name` if provided is used for metadata and written file name.
+
+    Raises DataError if a known filtering rule is hit. All other errors propogated.
+    """
+    return _process_pdb(
+        pdb_file_path=pdb_file_path,
+        chain_id=chain_id,
+        pdb_name=pdb_name,
+        scale_factor=scale_factor,
+        write_dir=write_dir,
+        generate_metadata=True,
+    )
 
 
 def read_processed_file(

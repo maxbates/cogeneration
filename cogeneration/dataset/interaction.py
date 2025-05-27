@@ -352,6 +352,9 @@ class NonResidueInteractions:
             structure=self.structure, chain_ids=self.non_res_chain_ids
         )
 
+        # count solution atoms
+        self.num_solution_molecules = self.count_solution_molecules(self.structure)
+
         # Find interactions between non-residue chain atoms and residue chains
         self.non_res_interactions = NonResidueInteractions.get_residue_interactions(
             atoms=self.all_non_res_chain_atoms,
@@ -412,9 +415,25 @@ class NonResidueInteractions:
     def num_single_atom_chains(self) -> int:
         return sum(1 for count in self.non_res_chain_atom_counts.values() if count == 1)
 
+    def count_solution_molecules(self, structure: Structure) -> int:
+        """
+        Count water / solution molecules in the structure.
+        """
+        count = 0
+
+        for chain in structure.get_chains():
+            for res in chain:
+                # count water / solution atoms
+                if res.get_resname().strip() in solutions:
+                    count += 1
+
+        return count
+
     @staticmethod
     def get_all_chain_atoms(
-        structure, chain_ids: Optional[Iterable[int]], filter_solution: bool = True
+        structure: Structure,
+        chain_ids: Optional[Iterable[int]],
+        filter_solution: bool = True,
     ) -> List[ChainAtom]:
         """
         Get all atoms in `chain_ids`, e.g. atoms in non-valid chains
@@ -614,6 +633,7 @@ class NonResidueInteractions:
         # tally non-residue interactions
         metadata[mc.num_non_residue_chains] = self.num_non_residue_chains
         metadata[mc.num_single_atom_chains] = self.num_single_atom_chains
+        metadata[mc.num_solution_molecules] = self.num_solution_molecules
         metadata[mc.num_metal_interactions] = len(self.metals_interacting)
         metadata[mc.num_macromolecule_interactions] = len(
             self.macromolecule_chains_interacting

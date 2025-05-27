@@ -1,10 +1,12 @@
 #! /usr/bin/env python3
 
 """
-Script to preprocessing PDB files, generating metadata file and pkls expected by DataLoader
+Script to preprocessing PDB files, generating metadata file and pkls expected by DataLoader.
+Supports partial processing and restarts and appending metadata, if has the same fields.
 """
 
 import argparse
+import csv
 import logging
 import multiprocessing as mp
 import os
@@ -16,8 +18,12 @@ from typing import Optional, Tuple
 import pandas as pd
 from tqdm.auto import tqdm
 
-from cogeneration.dataset.process_pdb import DataError, _process_pdb, pdb_path_pdb_name
-from cogeneration.type.dataset import MetadataColumn, MetadataCSVRow, ProcessedFile
+from cogeneration.dataset.process_pdb import (
+    DataError,
+    pdb_path_pdb_name,
+    process_pdb_with_metadata,
+)
+from cogeneration.type.dataset import MetadataColumn, MetadataCSVRow
 
 # Quiet mdtraj/formats/pdb/pdbfile.py
 # UserWarning: Unlikely unit cell vectors detected in PDB file likely resulting from a dummy CRYST1 record. Discarding unit cell vectors.
@@ -61,7 +67,7 @@ class Args:
             "--num_processes",
             help="Number of processes.",
             type=int,
-            default=max(1, mp.cpu_count() // 2, mp.cpu_count() - 4),
+            default=max(1, mp.cpu_count() // 2, mp.cpu_count() - 2),
         )
         parser.add_argument(
             "--delete_original",
@@ -93,32 +99,6 @@ class Args:
         )
 
 
-def process_pdb_with_metadata(
-    pdb_file_path: str,
-    write_dir: str,
-    chain_id: Optional[str] = None,
-    pdb_name: Optional[str] = None,
-    scale_factor: float = 1.0,
-) -> Tuple[MetadataCSVRow, ProcessedFile]:
-    """
-    Process PDB file into concatenated chain features `ProcessedFile` and metadata `MetadataCSVRow`.
-    Saves ProcessedFile pickle to `{write_dir}/{pdb_name}.pkl`.
-
-    If `chain_id` is provided, only that chain is processed.
-    `pdb_name` if provided is used for metadata and written file name.
-
-    Raises DataError if a known filtering rule is hit. All other errors propogated.
-    """
-    return _process_pdb(
-        pdb_file_path=pdb_file_path,
-        chain_id=chain_id,
-        pdb_name=pdb_name,
-        scale_factor=scale_factor,
-        write_dir=write_dir,
-        generate_metadata=True,
-    )
-
-
 def process_fn(
     raw_pdb_path: str,
     write_dir: str,
@@ -138,20 +118,29 @@ def process_fn(
 
     # known DataError exceptions
     except DataError as e:
-        return None, f"[{raw_pdb_path}] DataError: {e}"
+        return None, f"{raw_pdb_path} | DataError: {e}"
 
     # unhandled processing errors
     except ValueError as e:
-        return None, f"[{raw_pdb_path}] ⚠️ Processing Error: {e}"
+        return None, f"{raw_pdb_path} | ⚠️ Processing Error: {e}"
 
     # catch and log unhandled errors
     except Exception as e:
-        return None, f"[{raw_pdb_path}] 🔴 Unhandled Error: {e}"
+        return None, f"{raw_pdb_path} | 🔴 Unhandled Error: {e}"
 
 
 def main(args: Args):
     pdb_dir = args.pdb_dir
     write_dir = args.write_dir
+
+    # track failures in a log
+    error_log_path = os.path.join(write_dir, "_errors.log")
+    logging.basicConfig(
+        filename=error_log_path,
+        level=logging.ERROR,
+        format="%(asctime)s\t| %(message)s",
+        filemode="a",
+    )
 
     # support divided directories and compressed files (e.g. `07/107L.ent.gz`)
     all_paths = []
@@ -175,6 +164,7 @@ def main(args: Args):
     existing_metadata_columns = None
     existing_processed_files = 0
     if os.path.exists(metadata_path):
+        print(f"Found existing metadata file at {metadata_path}, checking...")
         existing_metadata_df = pd.read_csv(metadata_path)
 
         missing_columns = set(MetadataColumn).difference(existing_metadata_df.columns)
@@ -186,48 +176,72 @@ def main(args: Args):
             raise Exception(
                 f"⚠️ Existing Metadata file @ {metadata_path} has column mismatch.\nDelete it or rename it and rerun.\nYou may wish to also delete the processed PDB files."
             )
-        else:
-            # For rows that do exist, check if the processed file exists
-            # If it does, no need to re-process
-            existing_metadata_df = existing_metadata_df[
-                existing_metadata_df[MetadataColumn.processed_path].apply(
-                    lambda x: os.path.exists(os.path.join(write_dir, x))
-                )
-            ]
-            existing_processed_files = len(existing_metadata_df)
-            all_paths = [
-                path
-                for path in all_paths
-                if pdb_path_pdb_name(path)
-                not in existing_metadata_df[MetadataColumn.pdb_name].values
-            ]
-            # save the columns to ensure new metadata written the same way
-            existing_metadata_columns = existing_metadata_df.columns
-            print(
-                f"Dropping already processed files, have {len(existing_metadata_df)}, processing {len(all_paths)} remaining."
+
+        # For rows that do exist, check if the processed file exists
+        # If it does, no need to re-process
+        existing_metadata_df = existing_metadata_df[
+            existing_metadata_df[MetadataColumn.processed_path].apply(
+                lambda x: os.path.exists(os.path.join(write_dir, x))
             )
+        ]
+        existing_processed_files = len(existing_metadata_df)
+        all_paths = [
+            path
+            for path in all_paths
+            if pdb_path_pdb_name(path)
+            not in existing_metadata_df[MetadataColumn.pdb_name].values
+        ]
+        # save the columns to ensure new metadata written the same way
+        existing_metadata_columns = existing_metadata_df.columns
+        print(
+            f"Dropping already processed files, have {len(existing_metadata_df)}, processing {len(all_paths)} remaining."
+        )
+
+        # drop reference to DF
+        del existing_metadata_df
+
+    # Rows will be written as available using CSV DictWriter
+    # open CSV for streaming
+    csv_file = open(
+        metadata_path,
+        mode="a" if existing_metadata_columns is not None else "w",
+        newline="",
+    )
+    writer = csv.DictWriter(
+        csv_file,
+        fieldnames=(
+            existing_metadata_columns
+            if existing_metadata_columns is not None
+            else [c for c in MetadataColumn]
+        ),
+    )
+    if existing_metadata_columns is None:
+        writer.writeheader()
 
     if args.max_structures > 0:
         all_paths = all_paths[: args.max_structures]
-        print(f"Debugging, limiting to {args.max_structures} files")
-
-    all_metadata = []
+        print(f"--max_structures limiting to {args.max_structures} structures")
 
     # set up progress bar
     pbar = tqdm(
         total=len(all_paths), desc="Processing PDBs", smoothing=0.01, unit="pdbs"
     )
 
-    # track failures in a log
-    error_log_path = os.path.join(write_dir, "_errors.log")
-    logging.basicConfig(
-        filename=error_log_path,
-        level=logging.ERROR,
-        format="%(asctime)s\t| %(message)s",
-        filemode="a",
-    )
+    def handle_result(metadata_row, error_msg):
+        nonlocal processed_count
+
+        if metadata_row is not None and error_msg is None:
+            writer.writerow(metadata_row)
+            processed_count += 1
+        elif error_msg is not None:
+            logging.error(error_msg)
+            pbar.write(error_msg)
+        else:
+            logging.error(f"Unknown error for {metadata_row[MetadataColumn.raw_path]}")
+            pbar.write(f"Unknown error for {metadata_row[MetadataColumn.raw_path]}")
 
     # Series
+    processed_count = 0
     if args.num_processes == 1 or args.debug:
         for raw_pdb_path in all_paths:
             metadata_row, error_msg = process_fn(
@@ -236,14 +250,8 @@ def main(args: Args):
                 delete_original=args.delete_original,
                 verbose=args.verbose,
             )
-
+            handle_result(metadata_row, error_msg)
             pbar.update(1)
-
-            if error_msg is None:
-                all_metadata.append(metadata_row)
-            else:
-                logging.error(error_msg)
-                pbar.write(error_msg)
 
     # Parallel
     else:
@@ -262,31 +270,23 @@ def main(args: Args):
             for future in as_completed(future_to_path):
                 pbar.update(1)
                 metadata_row, error_msg = future.result()
-
-                if error_msg is None:
-                    all_metadata.append(metadata_row)
-                else:
-                    logging.error(error_msg)
-                    pbar.write(error_msg)
+                handle_result(metadata_row, error_msg)
 
     pbar.close()
+    csv_file.close()
 
-    # filter if empty/failed
-    all_metadata = [x for x in all_metadata if x is not None]
-    metadata_df = pd.DataFrame(all_metadata)
+    # determine total count and file size of all processed files
+    total_done = existing_processed_files + processed_count
+    total_size = 0
+    for dirpath, dirnames, filenames in os.walk(write_dir):
+        for filename in filenames:
+            file_path = os.path.join(dirpath, filename)
+            total_size += os.path.getsize(file_path)
+    print(
+        f"Finished processing {processed_count} structures -> {total_done} of {total_num_files} files"
+    )
+    print(f"Total size of processed files: {total_size / (1024 * 1024 * 1024):.2f} GB")
 
-    # append to existing metadata
-    if existing_metadata_columns is not None:
-        metadata_df = metadata_df.reindex(columns=existing_metadata_columns)
-        metadata_df.to_csv(metadata_path, mode="a", header=False, index=False)
-        print(
-            f"Finished processing {len(metadata_df)} more -> {len(metadata_df) + existing_processed_files} of {total_num_files} files"
-        )
-    else:
-        metadata_df.to_csv(metadata_path, index=False)
-        print(
-            f"Finished processing {len(metadata_df)} structures of {total_num_files} files"
-        )
     print(f"Metadata written to {metadata_path}")
     print(f"Errors tracked in {error_log_path}")
 
