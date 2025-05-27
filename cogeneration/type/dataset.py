@@ -10,7 +10,7 @@ class MetadataColumn(StrEnum):
     """Columns in the training/synthetic/redesign/test metadata CSVs"""
 
     pdb_name = "pdb_name"
-    # (optional) original PDB file
+    # (optional) original PDB file, may be compressed
     raw_path = "raw_path"
     # pkl file for processed structure/sequence
     processed_path = "processed_path"
