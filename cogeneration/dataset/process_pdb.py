@@ -349,7 +349,7 @@ def _process_pdb(
     scale_factor: float = 1.0,
     write_dir: Optional[str] = None,
     generate_metadata: bool = True,
-    max_combined_length: int = 4096,  # TODO expose in cfg
+    max_combined_length: int = 8192,
 ) -> Tuple[MetadataCSVRow, ProcessedFile]:
     """
     Process PDB file into concatenated chain features `ProcessedFile` and metadata `MetadataCSVRow`.
@@ -528,6 +528,7 @@ def process_pdb_file(
     write_dir: Optional[str] = None,
     chain_id: Optional[str] = None,
     scale_factor: float = 1.0,
+    max_combined_length: int = 8192,
 ) -> ProcessedFile:
     """
     Process PDB file into concatenated chain features `ProcessedFile`.
@@ -545,6 +546,7 @@ def process_pdb_file(
         scale_factor=scale_factor,
         write_dir=write_dir,
         generate_metadata=False,
+        max_combined_length=max_combined_length,
     )
     return processed_file
 
@@ -555,6 +557,7 @@ def process_pdb_with_metadata(
     chain_id: Optional[str] = None,
     pdb_name: Optional[str] = None,
     scale_factor: float = 1.0,
+    max_combined_length: int = 8192,
 ) -> Tuple[MetadataCSVRow, ProcessedFile]:
     """
     Process PDB file into concatenated chain features `ProcessedFile` and metadata `MetadataCSVRow`.
@@ -572,6 +575,7 @@ def process_pdb_with_metadata(
         scale_factor=scale_factor,
         write_dir=write_dir,
         generate_metadata=True,
+        max_combined_length=max_combined_length,
     )
 
 

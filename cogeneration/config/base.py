@@ -617,11 +617,11 @@ class DatasetFilterConfig(BaseClassConfig):
 
     max_num_res: int = 384
     min_num_res: int = 60
-    max_coil_percent: float = 0.667  # was 0.5 in public MultiFlow
+    max_coil_percent: float = 0.667  # 0.5 in public MultiFlow
     rog_quantile: float = 0.96
     # minimum percent of known and modelable residues in the structure of total sequence.
-    max_percent_residues_unknown: float = 0.5
-    oligomeric: List[str] = field(
+    max_percent_residues_unknown: float = 0.333  # 0.5 in public MultiFlow
+    oligomeric: Optional[List[str]] = field(
         default_factory=lambda: [
             "monomer",
             "monomeric",
@@ -629,25 +629,37 @@ class DatasetFilterConfig(BaseClassConfig):
             "homomer",
         ]
     )
-    num_chains: List[int] = field(default_factory=lambda: [1])
+    oligomeric_skip: Optional[List[str]] = None
+    num_chains: Optional[List[int]] = field(default_factory=lambda: [1])
+    num_chains_skip: Optional[List[int]] = field(default_factory=lambda: [0])
 
     @classmethod
     def multimeric(cls) -> "DatasetFilterConfig":
         """Factory for multimeric configuration"""
-
-        # generate reasonable combos: {name}, {name,name}, {name,name,name}
-        oligomeric_names = [
-            f"{prefix}meric" for i, prefix in OLIGOMERIC_PREFIXES.items()
-        ]
-        oligomeric_combos = [
-            ",".join(combo)
-            for i in range(1, 4)
-            for combo in itertools.combinations(oligomeric_names, i)
-        ]
-
         return cls(
-            oligomeric=oligomeric_combos,
-            num_chains=list(range(2, 20)),
+            oligomeric=None,
+            num_chains=None,
+            # skip monomers
+            oligomeric_skip=[
+                "monomer",
+                "monomeric",
+                "monomeric,monomeric",
+                "homomer",
+            ],
+            num_chains_skip=[0, 1],
+        )
+
+    @classmethod
+    def lenient(cls) -> "DatasetFilterConfig":
+        """Lenient configuration for filtering during processing"""
+        return cls(
+            max_num_res=8192,
+            min_num_res=8,
+            max_coil_percent=1,
+            rog_quantile=1,
+            max_percent_residues_unknown=0.75,
+            oligomeric=None,
+            num_chains=None,
         )
 
 
@@ -772,6 +784,9 @@ class DatasetConfig(BaseClassConfig):
     # TODO cfg to only add noise if t below some threshold (requires moving out of dataset)
     # TODO ensure noise added each time accessed and not cached
     noise_atom_positions_angstroms: float = 0.1
+
+    # debug/test, take first N rows of metadata_csv
+    debug_head_samples: Optional[int] = None
 
     # Redesigned, i.e. use ProteinMPNN to generate sequences for a structure
     use_redesigned: bool = True
@@ -1202,6 +1217,7 @@ class Config(BaseClassConfig):
         raw_cfg.model.sequence_ipa_net.ipa.num_blocks = 1
 
         # filter to small PDBs for faster model + sampling
+        raw_cfg.dataset.debug_head_samples = 1000
         raw_cfg.dataset.filter.min_num_res = 20
         raw_cfg.dataset.filter.max_num_res = 40
         # avoid synthetic + redesigned samples

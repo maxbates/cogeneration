@@ -18,6 +18,12 @@ from typing import Optional, Tuple
 import pandas as pd
 from tqdm.auto import tqdm
 
+from cogeneration.config.base import (
+    DatasetConfig,
+    DatasetFilterConfig,
+    DatasetTrimMethod,
+)
+from cogeneration.dataset.filterer import DatasetFilterer
 from cogeneration.dataset.process_pdb import (
     DataError,
     pdb_path_pdb_name,
@@ -99,15 +105,18 @@ class Args:
         )
 
 
-def process_fn(
+def safe_process_pdb(
     raw_pdb_path: str,
     write_dir: str,
     delete_original: bool = False,
     verbose: bool = False,
+    max_combined_length: int = 8192,
 ) -> Tuple[Optional[MetadataCSVRow], Optional[str]]:
     try:
         metadata, _ = process_pdb_with_metadata(
-            pdb_file_path=raw_pdb_path, write_dir=write_dir
+            pdb_file_path=raw_pdb_path,
+            write_dir=write_dir,
+            max_combined_length=max_combined_length,
         )
 
         # TODO - clean up file when errors are encountered?
@@ -130,7 +139,6 @@ def process_fn(
 
 
 def main(args: Args):
-    pdb_dir = args.pdb_dir
     write_dir = args.write_dir
 
     # track failures in a log
@@ -144,7 +152,7 @@ def main(args: Args):
 
     # support divided directories and compressed files (e.g. `07/107L.ent.gz`)
     all_paths = []
-    for root, _, files in os.walk(pdb_dir):
+    for root, _, files in os.walk(args.pdb_dir):
         for file_name in files:
             if file_name.endswith(".ent.gz") or file_name.endswith(".pdb"):
                 all_paths.append(os.path.join(root, file_name))
@@ -152,6 +160,7 @@ def main(args: Args):
     total_num_files = len(all_paths)
     print(f"Processing {total_num_files} files, writing to {write_dir}")
 
+    # Determine metadata file path
     if args.debug:
         metadata_file_name = "metadata_debug.csv"
     else:
@@ -223,6 +232,12 @@ def main(args: Args):
         all_paths = all_paths[: args.max_structures]
         print(f"--max_structures limiting to {args.max_structures} structures")
 
+    # Set up DatasetFilterer to filter bad structures, but use lenient criteria
+    dataset_filterer = DatasetFilterer(
+        cfg=DatasetFilterConfig.lenient(),
+        modeled_trim_method=DatasetTrimMethod.chains_independently,
+    )
+
     # set up progress bar
     pbar = tqdm(
         total=len(all_paths), desc="Processing PDBs", smoothing=0.01, unit="pdbs"
@@ -231,9 +246,23 @@ def main(args: Args):
     def handle_result(metadata_row, error_msg):
         nonlocal processed_count
 
+        # Processed successfully
         if metadata_row is not None and error_msg is None:
+            # Filter out bad structures
+            if not dataset_filterer.check_row(csv_row=metadata_row):
+                error_msg = f"{metadata_row[MetadataColumn.raw_path]} | filtered by DatasetFilterer."
+                logging.error(error_msg)
+                pbar.write(error_msg)
+                # Original file already deleted, but delete the processed file
+                if args.delete_original:
+                    os.remove(metadata_row[MetadataColumn.processed_path])
+                return
+
+            # Otherwise, valid! Write metadata row to CSV
             writer.writerow(metadata_row)
             processed_count += 1
+
+        # Encountered error
         elif error_msg is not None:
             logging.error(error_msg)
             pbar.write(error_msg)
@@ -245,11 +274,12 @@ def main(args: Args):
     processed_count = 0
     if args.num_processes == 1 or args.debug:
         for raw_pdb_path in all_paths:
-            metadata_row, error_msg = process_fn(
+            metadata_row, error_msg = safe_process_pdb(
                 raw_pdb_path,
                 write_dir=write_dir,
                 delete_original=args.delete_original,
                 verbose=args.verbose,
+                max_combined_length=DatasetFilterer.cfg.max_num_res,
             )
             handle_result(metadata_row, error_msg)
             pbar.update(1)
@@ -259,11 +289,12 @@ def main(args: Args):
         with ProcessPoolExecutor(max_workers=args.num_processes) as executor:
             future_to_path = {
                 executor.submit(
-                    process_fn,
+                    safe_process_pdb,
                     raw_pdb_path=raw_pdb_path,
                     write_dir=write_dir,
                     delete_original=args.delete_original,
                     verbose=args.verbose,
+                    max_combined_length=DatasetFilterer.cfg.max_num_res,
                 ): raw_pdb_path
                 for raw_pdb_path in all_paths
             }

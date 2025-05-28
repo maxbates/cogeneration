@@ -142,13 +142,14 @@ def _read_clusters(cluster_path: Union[Path, str], synthetic=False) -> Dict[str,
 
 def read_metadata_file(
     metadata_path: Union[Path, str],
+    max_rows: Optional[int] = None,
 ) -> MetadataDataFrame:
     """
     Reads a metadata CSV file and returns a DataFrame.
     """
     if not os.path.exists(metadata_path):
         raise FileNotFoundError(f"Metadata file {metadata_path} does not exist")
-    metadata_df = pd.read_csv(metadata_path)
+    metadata_df = pd.read_csv(metadata_path, nrows=max_rows)
     return metadata_df
 
 
@@ -175,13 +176,19 @@ class BaseDataset(Dataset):
         )
 
         # Process structures and clusters
-        self.raw_csv = read_metadata_file(self.dataset_cfg.csv_path)
+        self.raw_csv = read_metadata_file(
+            metadata_path=self.dataset_cfg.csv_path,
+            max_rows=dataset_cfg.debug_head_samples,
+        )
         self._log.debug(
             f"Loaded {len(self.raw_csv)} examples from {self.dataset_cfg.csv_path}"
         )
 
         # Initial filtering
-        dataset_filterer = DatasetFilterer(dataset_cfg)
+        dataset_filterer = DatasetFilterer(
+            cfg=dataset_cfg.filter,
+            modeled_trim_method=dataset_cfg.modeled_trim_method,
+        )
         metadata_csv = dataset_filterer.filter_metadata(self.raw_csv)
 
         # Concat redesigned data, if provided
