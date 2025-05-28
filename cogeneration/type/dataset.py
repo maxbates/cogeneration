@@ -70,16 +70,19 @@ class MetadataColumn(StrEnum):
     num_mediated_interactions = "num_mediated_interactions"
 
 
+class RedesignColumn(StrEnum):
+    example = "example"
+    wildtype_seq = "wildtype_seq"  # original sequence
+    wildtype_rmsd = "wildtype_rmsd"  # RMSD of original sequence to reference structure
+    best_seq = "best_seq"  # best 1 redesign per structure
+    best_rmsd = "best_rmsd"  # RMSD of best redesign to reference structure
+
+
 class DatasetColumn(StrEnum):
     """Columns added by dataset, alongside MetadataColumns"""
 
     # cluster metadata (added by loading clusters csv)
     cluster = "cluster"
-
-    # redesign columns
-    example = "example"
-    best_seq = "best_seq"  # best 1 redesign per structure
-    best_rmsd = "best_rmsd"
 
     # added during load
     index = "index"
@@ -134,7 +137,9 @@ MetadataCSVRow = Dict[MetadataColumn, NumpyPrimitiveFeat]
 MetadataDataFrame = pd.DataFrame
 
 """DatasetCSVRow is row of MetadatDataFrame augmented with clusters, redesigned data, etc."""
-DatasetCSVRow = Dict[Union[MetadataColumn, DatasetColumn], NumpyPrimitiveFeat]
+DatasetCSVRow = Dict[
+    Union[MetadataColumn, RedesignColumn, DatasetColumn], NumpyPrimitiveFeat
+]
 
 """DatasetDataFrame is the full dataset, composed of DatasetCSVRow"""
 DatasetDataFrame = pd.DataFrame

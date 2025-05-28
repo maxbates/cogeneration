@@ -35,7 +35,12 @@ from cogeneration.type.dataset import DatasetColumn, DatasetCSVRow, DatasetDataF
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.dataset import DatasetTransformColumn as dtc
 from cogeneration.type.dataset import MetadataColumn as mc
-from cogeneration.type.dataset import MetadataCSVRow, MetadataDataFrame, ProcessedFile
+from cogeneration.type.dataset import (
+    MetadataCSVRow,
+    MetadataDataFrame,
+    ProcessedFile,
+    RedesignColumn,
+)
 from cogeneration.type.task import DataTask
 
 
@@ -187,11 +192,13 @@ class BaseDataset(Dataset):
 
             self.redesigned_csv = pd.read_csv(self.dataset_cfg.redesigned_csv_path)
             metadata_csv = metadata_csv.merge(
-                self.redesigned_csv, left_on=mc.pdb_name, right_on=DatasetColumn.example
+                self.redesigned_csv,
+                left_on=mc.pdb_name,
+                right_on=RedesignColumn.example,
             )
             # Filter out examples with high RMSD
             metadata_csv = metadata_csv[
-                metadata_csv[DatasetColumn.best_rmsd]
+                metadata_csv[RedesignColumn.best_rmsd]
                 < self.dataset_cfg.redesigned_rmsd_threshold
             ]
 
@@ -524,7 +531,7 @@ class BaseDataset(Dataset):
         """
         # Redesigned sequences can be used to substitute the original sequence during training.
         if is_training and cfg.use_redesigned:
-            best_seq = csv_row[DatasetColumn.best_seq]
+            best_seq = csv_row[RedesignColumn.best_seq]
             if not isinstance(best_seq, str):
                 raise ValueError(f"Unexpected value best_seq: {best_seq}")
 

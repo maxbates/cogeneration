@@ -21,7 +21,7 @@ from cogeneration.data.metrics import calc_ca_ca_metrics, calc_mdtraj_metrics
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restype_order_with_x, restypes_with_x
 from cogeneration.data.superimposition import superimpose
-from cogeneration.dataset.process_pdb import process_pdb_file
+from cogeneration.dataset.process_pdb import get_uncompressed_pdb_path, process_pdb_file
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.metrics import MetricName, OutputFileName
 from cogeneration.type.task import InferenceTask
@@ -513,6 +513,11 @@ class FoldingValidator:
     def fold_fasta(self, fasta_path: str, output_dir: str) -> pd.DataFrame:
         """
         Fold sequences in a fasta file.
+
+        Recommend `output_dir` to be empty,
+        since content inside it will be removed to prevent AF2 artifact bloat.
+
+        Returns a dataframe with `header`, `sequence`, `folded_pdb_path`, `mean_plddt`
         """
         if self.cfg.folding_model == "af2":
             folded_output = self._run_alphafold2(
@@ -541,13 +546,23 @@ class FoldingValidator:
         if num_sequences is None:
             num_sequences = self.cfg.seq_per_sample
 
+        assert os.path.exists(
+            pdb_input_path
+        ), f"PDB path {pdb_input_path} does not exist"
+
+        uncompressed_pdb_path, is_temp_file = get_uncompressed_pdb_path(pdb_input_path)
+
         modified_fasta_path = self._run_protein_mpnn(
-            input_pdb_path=pdb_input_path,
+            input_pdb_path=uncompressed_pdb_path,
             output_dir=output_dir,
             num_sequences=num_sequences,
             seed=self.cfg.pmpnn_seed,
             device_id=self.device_id,
         )
+
+        if is_temp_file:
+            os.remove(uncompressed_pdb_path)
+
         return modified_fasta_path
 
     def _run_alphafold2(self, fasta_path: str, output_dir: str) -> pd.DataFrame:
@@ -567,6 +582,10 @@ class FoldingValidator:
             self.cfg.colabfold_path
         ), f"ColabFold path {self.cfg.colabfold_path} does not exist"
 
+        # Require an empty output directory, so we can safely clean up outputs.
+        assert (
+            not os.path.exists(output_dir) or len(os.listdir(output_dir)) == 0
+        ), f"Output folding directory {output_dir} is not empty"
         os.makedirs(output_dir, exist_ok=True)
 
         # NOTE - public MultiFlow only runs model 4, but may want to consider running others.
@@ -581,7 +600,7 @@ class FoldingValidator:
             "--num-models",
             "1",
             "--random-seed",
-            "123",
+            str(self.cfg.pmpnn_seed),
             "--model-order",
             "4",
             "--num-recycle",
@@ -603,6 +622,7 @@ class FoldingValidator:
         af2_model_4_pdbs = {}
         af2_model_4_jsons = {}
         for x in all_af2_files:
+            # Only keep the model_4 PDB and json, delete everything else.
             if "model_4" in x:
                 seq_name = os.path.basename(x)
                 if x.endswith(".json"):
@@ -615,7 +635,7 @@ class FoldingValidator:
                 os.remove(x)
 
         all_fold_metrics = []
-        for header, _ in fasta_seqs.items():
+        for header, seq_record in fasta_seqs.items():
             af2_folded_path = af2_model_4_pdbs[header]
             af2_json_path = af2_model_4_jsons[header]
             with open(af2_json_path, "r") as f:
@@ -626,6 +646,7 @@ class FoldingValidator:
             all_fold_metrics.append(
                 {
                     MetricName.header: header,
+                    MetricName.sequence: seq_record.seq,
                     MetricName.folded_pdb_path: af2_folded_path,
                     MetricName.plddt_mean: np.mean(fold_metrics["plddt"]),
                 }
@@ -651,9 +672,6 @@ class FoldingValidator:
         assert os.path.exists(
             self.cfg.pmpnn_path
         ), f"PMPNN path {self.cfg.pmpnn_path} does not exist"
-        assert os.path.exists(
-            input_pdb_path
-        ), f"PDB path {input_pdb_path} does not exist"
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -730,9 +748,42 @@ class FoldingValidator:
                     continue
                 # record names are like `T=0.1, sample=1, score=0.4789, global_score=0.4789, seq_recovery=0.2188`
                 # but drop and we'll compute ourselves.
-                f.write(f">{pdb_name}_pmpnn_seq_{i}\n{record.seq}\n")
+                f.write(f">{pdb_name}_pmpnn_seq_{i}\n")
+                # replace chain breaks ProteinMPNN serializes with "/" -> ":" for AF2 compatibility
+                f.write(str(record.seq).replace("/", ":") + "\n")
 
         return modified_fasta_path
+
+    @staticmethod
+    def calc_backbone_rmsd(
+        mask: Optional[Union[torch.Tensor, npt.NDArray]],  # (N)
+        pos_1: npt.NDArray,  # (N, 3, 3)
+        pos_2: npt.NDArray,  # (N, 3, 3)
+    ) -> float:
+        if mask is None:
+            mask = np.ones(pos_1.shape[0], dtype=bool)
+
+        # tolerate either Ca (1) or Ca-C-N (3) atoms
+        assert pos_1.shape == pos_2.shape, f"pos_1 {pos_1.shape} != pos_2 {pos_2.shape}"
+        assert pos_1.shape[1] in [
+            1,
+            3,
+        ], f"pos_1 {pos_1.shape} must have 1 or 3 backbone atoms"
+
+        if pos_1.shape[1] == 3:
+            aligned_rmsd = superimpose(
+                torch.tensor(pos_1).reshape(-1, 3)[None],  # (1, N*3, 3)
+                torch.tensor(pos_2).reshape(-1, 3)[None],  # (1, N*3, 3)
+                mask=torch.tensor(mask)[:, None].repeat(1, 3).reshape(-1),  # (1, N*3)
+            )
+        else:
+            aligned_rmsd = superimpose(
+                torch.tensor(pos_1)[None],  # (1, N, 3)
+                torch.tensor(pos_2)[None],  # (1, N, 3)
+                mask=torch.tensor(mask)[:, None].repeat(1, 1),  # (1, N)
+            )
+
+        return aligned_rmsd[1].item()
 
     @staticmethod
     def assess_folded_structures(
@@ -770,18 +821,6 @@ class FoldingValidator:
             if not motif_mask.any():
                 motif_mask = None
 
-        def _calc_bb_rmsd(
-            mask: Union[torch.Tensor, npt.NDArray],  # (N)
-            pos_1: npt.NDArray,  # (N, 3, 3)
-            pos_2: npt.NDArray,  # (N, 3, 3)
-        ) -> float:
-            aligned_rmsd = superimpose(
-                torch.tensor(pos_1).reshape(-1, 3)[None],  # (1, N*3, 3)
-                torch.tensor(pos_2).reshape(-1, 3)[None],  # (1, N*3, 3)
-                mask=torch.tensor(mask)[:, None].repeat(1, 3).reshape(-1),  # (1, N*3)
-            )
-            return aligned_rmsd[1].item()
-
         # Calculate RMSD etc. for each folded structured in folded_df
         all_metrics = []
         for _, row in folded_df.iterrows():
@@ -799,14 +838,18 @@ class FoldingValidator:
 
             # Calculate RMSD to generated sample
             folded_bb_pos = folded_feats[dpc.atom_positions][:, :3, :]  # (N, 3, 3)
-            bb_rmsd = _calc_bb_rmsd(res_mask, sample_bb_pos, folded_bb_pos)
+            bb_rmsd = FoldingValidator.calc_backbone_rmsd(
+                res_mask, sample_bb_pos, folded_bb_pos
+            )
             sample_metrics[MetricName.bb_rmsd_folded] = bb_rmsd
             sample_metrics[MetricName.is_designable] = bb_rmsd <= 2.0
 
             # Calculate RMSD for fixed motifs in folded structures
             if task == InferenceTask.inpainting and motif_mask is not None:
-                sample_metrics[MetricName.motif_bb_rmsd_folded] = _calc_bb_rmsd(
-                    motif_mask, sample_bb_pos, folded_bb_pos
+                sample_metrics[MetricName.motif_bb_rmsd_folded] = (
+                    FoldingValidator.calc_backbone_rmsd(
+                        motif_mask, sample_bb_pos, folded_bb_pos
+                    )
                 )
 
             # If provided ground truth bb positions, also compare to them
@@ -826,20 +869,28 @@ class FoldingValidator:
                 assert true_bb_pos.shape == sample_bb_pos.shape
                 assert true_bb_pos.shape == folded_bb_pos.shape
 
-                sample_metrics[MetricName.bb_rmsd_gt] = _calc_bb_rmsd(
-                    res_mask, sample_bb_pos, true_bb_pos
+                sample_metrics[MetricName.bb_rmsd_gt] = (
+                    FoldingValidator.calc_backbone_rmsd(
+                        res_mask, sample_bb_pos, true_bb_pos
+                    )
                 )
-                sample_metrics[MetricName.bb_rmsd_folded_gt] = _calc_bb_rmsd(
-                    res_mask, folded_bb_pos, true_bb_pos
+                sample_metrics[MetricName.bb_rmsd_folded_gt] = (
+                    FoldingValidator.calc_backbone_rmsd(
+                        res_mask, folded_bb_pos, true_bb_pos
+                    )
                 )
 
                 # Calculate RMSD to GT for fixed motifs in folded structures
                 if task == InferenceTask.inpainting and motif_mask is not None:
-                    sample_metrics[MetricName.motif_bb_rmsd_gt] = _calc_bb_rmsd(
-                        motif_mask, sample_bb_pos, true_bb_pos
+                    sample_metrics[MetricName.motif_bb_rmsd_gt] = (
+                        FoldingValidator.calc_backbone_rmsd(
+                            motif_mask, sample_bb_pos, true_bb_pos
+                        )
                     )
-                    sample_metrics[MetricName.motif_bb_rmsd_folded_gt] = _calc_bb_rmsd(
-                        motif_mask, folded_bb_pos, true_bb_pos
+                    sample_metrics[MetricName.motif_bb_rmsd_folded_gt] = (
+                        FoldingValidator.calc_backbone_rmsd(
+                            motif_mask, folded_bb_pos, true_bb_pos
+                        )
                     )
 
             all_metrics.append(sample_metrics)

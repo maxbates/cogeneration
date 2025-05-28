@@ -42,14 +42,42 @@ sudo apt-get install ffmpeg
 
 TODO install ProteinMPNN and colabfold (localcolabfold?)
 
+### Data Pipeline
+
+If you want to download PDB and process (or reprocess) it to support new metadata or structure processing etc.
+
+Both are long running processes (~1 hr each) but support resuming. 
+
+```
+python cogeneration/dataset/scripts/download_pdb.py --pdb_dir pdbs
+
+python cogeneration/dataset/scripts/process_pdb_files.py --pdb_dir pdbs --output_dir processed_pdbs
+```
+
+#### Inverse Fold to Redesign Structures
+
+You can also generate redesigned sequences using ProteinMPNN. 
+
+This takes a very long time. You should merge with the ones provided by Multiflow. See notes in script.
+
+```
+python cogeneration/dataset/scripts/redesign_structures.py --pdb_dir processed_pdbs --output_dir redesigned_pdbs
+```
+
 ### Training
 
-train with logging
+Simple training with logging
 ```
 python cogeneration/scripts/train.py 2>&1 | tee train.log
 ```
 
 view results at [wandb.ai](https://wandb.ai/)
+
+#### Curricula
+
+You can also specify a `Curriculum` to train a series of checkpoints with different configurations.
+
+Each `Curriculum` takes its own `Config`, which is specified in python.
 
 #### Copy desired results
 
@@ -71,6 +99,16 @@ copy a specific checkpoint:
 CHECKPOINT="hallucination_pdb_20250130_204335/20250130_204335"
 mkdir -p "ckpt/cogeneration/${CHECKPOINT}"
 scp -r ubuntu@lambda_labs_tester:"/home/ubuntu/cogeneration/ckpt/cogeneration/${CHECKPOINT}/" "ckpt/cogeneration/${CHECKPOINT}/"
+```
+
+### Sampling
+
+To sample from a trained model, you can use the `predict.py` script.
+
+All configuration, including checkpoints, number of samples, lengths etc. are specified in the `Config`
+
+```
+python cogeneration/scripts/predict.py --output_dir samples
 ```
 
 ### Troubleshooting
