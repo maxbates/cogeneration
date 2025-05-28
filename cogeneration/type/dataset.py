@@ -19,8 +19,10 @@ class MetadataColumn(StrEnum):
     oligomeric_count = "oligomeric_count"
     # per-unique seq details
     oligomeric_detail = "oligomeric_detail"
-    # (new) residue chain lengths
+    # (new) residue chain lengths, "<chain_id>:<num_res>,..." format
     chain_lengths = "chain_lengths"
+    # (new) residue chain lengths, "<chain_id>:<num_modeled_residues>,..." format
+    chain_lengths_modeled = "chain_lengths_modeled"
     # number of chains in protein (ignores non-residue chains)
     num_chains = "num_chains"
     # (new) number of all chains (includes non-residue chains)
@@ -48,18 +50,20 @@ class MetadataColumn(StrEnum):
     resolution = "resolution"
     structure_method = "structure_method"
 
-    # interactions / clashes
-    # (new) backbone interactions across chains, multimer only
+    # (new, multimer-only) interactions / clashes
+    # chain-chain interactions: "<chain_a>:<chain_b>:<num_bb_res_xing_a>:<num_bb_res_xing_b>,...."
+    chain_interactions = "chain_interactions"
+    # backbone interactions across chains
     num_backbone_interactions = "num_backbone_interactions"
     num_backbone_res_interacting = "num_backbone_res_interacting"
-    # (new) atomic interactions across chains, multimer only
+    # atomic interactions across chains
     # num_atom_interactions = "num_atom_interactions"
-    # (new) clashes across chains, multimer only
+    # clashes across chains
     num_chains_clashing = "num_chains_clashing"
 
-    # Non-residue chains + interactions
+    # (new) Non-residue chains + interactions
     # [Can only be added on initial processing, because processed feats omit such chains.]
-    # (new) count of non-residue or empty chains (atoms, metals, molecules, DNA)
+    # count of non-residue or empty chains (atoms, metals, molecules, DNA)
     num_non_residue_chains = "num_non_residue_chains"
     num_single_atom_chains = "num_single_atom_chains"
     num_solution_molecules = "num_solution_molecules"

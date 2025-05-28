@@ -72,8 +72,8 @@ def get_uncompressed_pdb_path(
 
 
 def _concat_np_features(
-    np_dicts: List[Dict[str, npt.NDArray]], add_batch_dim: bool
-) -> Dict[str, npt.NDArray]:
+    np_dicts: List[ChainFeatures], add_batch_dim: bool
+) -> ChainFeatures:
     """Performs a nested concatenation of feature dicts.
 
     Args:
@@ -97,7 +97,7 @@ def _concat_np_features(
 
 
 def _oligomeric_count(
-    struct_feats: List[Dict[str, np.ndarray]],
+    struct_feats: List[ChainFeatures],
 ) -> str:
     """
     Generate comma-separated oligomeric counts for each unique sequence.
@@ -113,7 +113,7 @@ def _oligomeric_count(
 
 
 def _oligomeric_detail(
-    struct_feats: List[Dict[str, np.ndarray]],
+    struct_feats: List[ChainFeatures],
 ) -> str:
     """
     Describe oligomeric detail of each unique sequence in the structure.
@@ -130,6 +130,27 @@ def _oligomeric_detail(
             )
             for x in counts
         ]
+    )
+
+
+def _chain_lengths(
+    struct_feats: List[ChainFeatures],
+    modeled_only: bool,
+) -> str:
+    """
+    Generate chain lengths in format "<chain_id>:<num_residues>,..."
+    or "<chain_id>:<num_modeled_residues>,..." if `modeled_only` is True.
+    """
+    counts = {}
+    for chain_dict in struct_feats:
+        chain_id = chain_dict[dpc.chain_index][0]
+        seq = chain_dict[dpc.aatype]
+        if modeled_only:
+            seq = seq[determine_modeled_residues(chain_dict)]
+        counts[chain_id] = len(seq)
+
+    return ",".join(
+        [f"{chain_id}:{count}" for chain_id, count in sorted(counts.items())]
     )
 
 
@@ -158,10 +179,7 @@ def determine_modeled_residues(
 ) -> npt.NDArray:
     """
     Determines the modeled residues in `chain_feats`.
-    Most appropriate for a chain, rather than complex, but can be used for either.
-    However, it is 0-indexed given input, so don't use for multimer chains and then concat.
-
-    raises DataError if no modeled residues are found.
+    It is 0-indexed given input, so don't use for multimer chains independently then concat.
 
     Returns an array like `[0, 1, 4, 5, ...]` (e.g. if 2, 3 are invalid) of valid residues.
     """
@@ -282,7 +300,7 @@ def process_chain_feats(
     return chain_feats
 
 
-def _pdb_structure_to_chain_feats(
+def pdb_structure_to_chain_feats(
     structure: Structure,
     chain_id: Optional[str] = None,
 ) -> List[ChainFeatures]:
@@ -357,7 +375,7 @@ def _process_pdb(
         parser = PDB.PDBParser(QUIET=True)
         structure = parser.get_structure(pdb_name, uncompressed_pdb_path)
 
-        struct_feats = _pdb_structure_to_chain_feats(structure, chain_id=chain_id)
+        struct_feats = pdb_structure_to_chain_feats(structure, chain_id=chain_id)
         if len(struct_feats) == 0:
             raise DataError(f"No valid chains found")
 
@@ -376,6 +394,10 @@ def _process_pdb(
 
         # Determine modeled residues.
         complex_feats[dpc.modeled_idx] = determine_modeled_residues(complex_feats)
+        if len(complex_feats[dpc.modeled_idx]) == 0:
+            raise DataError(
+                f"No modeled residues found in {pdb_name} {'chain ' + chain_id if chain_id is not None else ''}"
+            )
 
         # Generate metadata file
         metadata: MetadataCSVRow = {}
@@ -414,8 +436,13 @@ def _process_pdb(
                 metadata[mc.quaternary_category] = "homomer"
             else:
                 metadata[mc.quaternary_category] = "heteromer"
-            metadata[mc.chain_lengths] = ",".join(
-                [str(len(chain_feats[dpc.aatype])) for chain_feats in struct_feats]
+
+            # chain lengths
+            metadata[mc.chain_lengths] = _chain_lengths(
+                struct_feats, modeled_only=False
+            )
+            metadata[mc.chain_lengths_modeled] = _chain_lengths(
+                struct_feats, modeled_only=True
             )
 
             # quality information

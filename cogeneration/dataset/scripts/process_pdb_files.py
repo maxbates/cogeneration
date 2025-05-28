@@ -157,6 +157,7 @@ def main(args: Args):
     else:
         metadata_file_name = "metadata.csv"
     metadata_path = os.path.join(write_dir, metadata_file_name)
+    print(f"Metadata will be written to {metadata_path}")
 
     # If metadata file exists, check it is valid, and re-use existing files.
     # Skip already processed files if in metadata and processed file exists.

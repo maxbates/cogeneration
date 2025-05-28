@@ -225,7 +225,7 @@ class MultimerInteractions:
         ]
 
     @property
-    def backbone_interactions(self) -> List[Interaction]:
+    def unique_backbone_interactions(self) -> List[Interaction]:
         """Return unique backbone residue interactions (i.e. one per res-res pair)"""
         mapping = {}
         for interaction in self.interactions:
@@ -258,8 +258,37 @@ class MultimerInteractions:
         """
         return {
             (interaction.chain_id, interaction.chain_res_index)
-            for interaction in self.backbone_interactions
+            for interaction in self.unique_backbone_interactions
         }
+
+    def serialize_chain_interactions(self) -> str:
+        """
+        Serialize chain interactions to a string.
+        Format: "<chain_a>:<chain_b>:<num_res_chain_a>:<num_res_chain_b>,...."
+        """
+        # count {(chain_a, chain_b): (set(res_a), set(res_b))}
+        chain_chain_counts = {}
+        for interaction in self.unique_backbone_interactions:
+            chain_a = interaction.chain_id
+            chain_b = interaction.other_id
+            res_a = interaction.chain_res_index
+            res_b = interaction.other_res_index
+
+            # ensure chain_a < chain_b for consistent ordering
+            if chain_a > chain_b:
+                chain_a, chain_b = chain_b, chain_a
+            chain_key = (chain_a, chain_b)
+
+            if chain_key not in chain_chain_counts:
+                chain_chain_counts[chain_key] = (set(), set())
+            chain_chain_counts[chain_key][0].add(res_a)
+            chain_chain_counts[chain_key][1].add(res_b)
+
+        # format as "<chain_a>:<chain_b>:<num_bb_res_xing_a>:<num_bb_res_xing_b>,...."
+        return ",".join(
+            f"{chain_a}:{chain_b}:{len(set_a)}:{len(set_b)}"
+            for (chain_a, chain_b), (set_a, set_b) in chain_chain_counts.items()
+        )
 
     @classmethod
     def from_chain_feats(
@@ -307,7 +336,8 @@ class MultimerInteractions:
         self,
         metadata: MetadataCSVRow,
     ):
-        metadata[mc.num_backbone_interactions] = len(self.backbone_interactions)
+        metadata[mc.chain_interactions] = self.serialize_chain_interactions()
+        metadata[mc.num_backbone_interactions] = len(self.unique_backbone_interactions)
         metadata[mc.num_backbone_res_interacting] = len(self.backbone_res_interacting)
         # metadata[dc.num_atom_interactions] = len(self.atom_interactions)
 

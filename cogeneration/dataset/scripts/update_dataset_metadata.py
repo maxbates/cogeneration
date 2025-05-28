@@ -1,4 +1,9 @@
-"""Script to update dataset metadata CSV with new columns."""
+"""
+Script to update dataset metadata CSV with new columns.
+To be run on an ad-hoc basis if certain fields are required.
+
+TODO consider deprecating? Or improve how kept in sync with `process_pdb.py`
+"""
 
 import argparse
 import logging
@@ -17,9 +22,10 @@ from cogeneration.dataset.interaction import (
     NonResidueInteractions,
 )
 from cogeneration.dataset.process_pdb import (
+    _chain_lengths,
     _concat_np_features,
-    _pdb_structure_to_chain_feats,
     get_uncompressed_pdb_path,
+    pdb_structure_to_chain_feats,
     process_chain_feats,
 )
 from cogeneration.type.dataset import ChainFeatures
@@ -146,9 +152,15 @@ class MetadataUpdater:
 
         if mc.chain_lengths not in row_metadata:
             structure = get_pdb_structure()
-            struct_feats = _pdb_structure_to_chain_feats(structure)
-            row_updates[mc.chain_lengths] = ",".join(
-                [str(len(chain_feats[dpc.aatype])) for chain_feats in struct_feats]
+            struct_feats = pdb_structure_to_chain_feats(structure)
+            row_updates[mc.chain_lengths] = _chain_lengths(
+                struct_feats, modeled_only=False
+            )
+        if mc.chain_lengths_modeled not in row_metadata:
+            structure = get_pdb_structure()
+            struct_feats = pdb_structure_to_chain_feats(structure)
+            row_updates[mc.chain_lengths_modeled] = _chain_lengths(
+                struct_feats, modeled_only=True
             )
 
         if mc.moduled_num_res not in row_metadata:
@@ -178,7 +190,8 @@ class MetadataUpdater:
 
         # interactions / clashes
         if (
-            mc.num_backbone_interactions not in row_metadata
+            mc.chain_interactions not in row_metadata
+            or mc.num_backbone_interactions not in row_metadata
             or mc.num_backbone_res_interacting not in row_metadata
             or mc.num_chains_clashing not in row_metadata
         ):
@@ -198,7 +211,7 @@ class MetadataUpdater:
             or mc.num_mediated_interactions not in row_metadata
         ):
             structure = get_pdb_structure()
-            struct_feats = _pdb_structure_to_chain_feats(structure)
+            struct_feats = pdb_structure_to_chain_feats(structure)
             complex_feats = _concat_np_features(struct_feats, False)
 
             non_res_interactions = NonResidueInteractions.from_chain_feats(
