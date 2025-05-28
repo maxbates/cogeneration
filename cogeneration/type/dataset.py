@@ -75,6 +75,8 @@ class MetadataColumn(StrEnum):
 
 
 class RedesignColumn(StrEnum):
+    """Columns in the redesign metadata CSVs"""
+
     example = "example"
     wildtype_seq = "wildtype_seq"  # original sequence
     wildtype_rmsd = "wildtype_rmsd"  # RMSD of original sequence to reference structure
@@ -83,7 +85,7 @@ class RedesignColumn(StrEnum):
 
 
 class DatasetColumn(StrEnum):
-    """Columns added by dataset, alongside MetadataColumns"""
+    """Columns added by BaseDataset"""
 
     # cluster metadata (added by loading clusters csv)
     cluster = "cluster"

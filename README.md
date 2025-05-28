@@ -4,7 +4,7 @@ Cogeneration is a protein generative model that simultaneously generates protein
 
 This project is based on MultiFlow, but introduces several extensions over the original:
 - support for multimers
-- support for inpainting (conditional generation)
+- inpainting (conditional generation)
 - stochastic paths, for the structure and sequence
 - model architecture changes:
     - support for existing protein language models (e.g. ESM) to get frozen embeddings
@@ -26,3 +26,13 @@ This project is based on MultiFlow:
   year={2024}
 }
 ```
+
+And benefits from the following works:
+
+FoldFlow-2: https://github.com/DreamFold/FoldFlow
+FrameFlow: https://github.com/microsoft/protein-frame-flow
+ESM: https://github.com/facebookresearch/esm
+RFDiffusion: https://github.com/RosettaCommons/RFdiffusion
+Boltz: https://github.com/jwohlwend/boltz
+ProteinMPNN: https://github.com/dauparas/ProteinMPNN
+AlphaFold2: https://github.com/google-deepmind/alphafold
