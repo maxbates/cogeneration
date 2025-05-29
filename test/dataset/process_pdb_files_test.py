@@ -120,7 +120,7 @@ class TestProcessPDBFiles:
 
         # Use BaseDataset because does not require clusters
         dataset = BaseDataset(
-            dataset_cfg=DatasetConfig(
+            cfg=DatasetConfig(
                 seed=0,
                 processed_data_path=str(tmp_path),
                 csv_path=csv_path,
@@ -143,7 +143,7 @@ class TestProcessPDBFiles:
         processed_file = read_processed_file(
             processed_file_path=metadata[mc.processed_path]
         )
-        _ = dataset.process_processed_file(
+        _ = dataset.featurize_processed_file(
             processed_file=processed_file,
             csv_row=metadata,
         )

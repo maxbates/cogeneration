@@ -10,7 +10,7 @@ from cogeneration.config.base import (
     DatasetInpaintingConfig,
     DatasetInpaintingMotifStrategy,
 )
-from cogeneration.dataset.datasets import batch_features_from_processed_file
+from cogeneration.dataset.datasets import BatchFeaturizer
 from cogeneration.dataset.motif_factory import ChainBreak, Motif, MotifFactory, Scaffold
 from cogeneration.dataset.process_pdb import process_pdb_file
 from cogeneration.type.batch import BatchProp as bp
@@ -33,7 +33,7 @@ class TestMotifFactory:
             pdb_file_path=str(example_pdb_path),
             pdb_name="2qlw",
         )
-        pdb_batch_features = batch_features_from_processed_file(
+        pdb_batch_features = BatchFeaturizer.batch_features_from_processed_file(
             processed_file=processed_pdb,
             cfg=DatasetConfig(),
             processed_file_path=str(example_pdb_path),

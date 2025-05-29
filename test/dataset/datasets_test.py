@@ -3,7 +3,7 @@ import torch
 from cogeneration.config.base import InferenceSamplesConfig
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.noise_mask import torsions_empty
-from cogeneration.dataset.datasets import BaseDataset, LengthSamplingDataset
+from cogeneration.dataset.datasets import BaseDataset, LengthSamplingDataset, BatchFeaturizer
 from cogeneration.dataset.motif_factory import ChainBreak, Motif, Scaffold
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import empty_feats
@@ -30,7 +30,7 @@ class TestBaseDataset:
             Scaffold(start=5, end=7, new_length=1),  # 6,7 -> 9
         ]
 
-        new_feats = BaseDataset.segment_features(feats=feats, segments=segments)
+        new_feats = BatchFeaturizer.segment_features(feats=feats, segments=segments)
 
         # check diffuse_mask and motif_mask
         # adds motif_mask prop

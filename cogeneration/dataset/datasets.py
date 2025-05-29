@@ -44,321 +44,30 @@ from cogeneration.type.dataset import (
 from cogeneration.type.task import DataTask
 
 
-def batch_features_from_processed_file(
-    processed_file: ProcessedFile,
-    cfg: DatasetConfig,
-    processed_file_path: str,
-) -> BatchFeatures:
+@dataclass
+class BatchFeaturizer:
     """
-    Converts a ProcessedFile (numpy) into BatchFeatures (tensors, frames).
-    Defaults to `diffuse_mask` of all ones. Can be modified by caller.
+    Helper for generating BatchFeatures from a ProcessedFile.
+    Requires as input an already-loaded `ProcessedFile` and already-merged DatasetCSVRow.
     """
 
-    # Check the sequence
-    aatypes_1 = processed_file[dpc.aatype]
-    num_unique_aatypes = len(set(aatypes_1))
-    if num_unique_aatypes <= 1:
-        raise ValueError(
-            f"Example @ {processed_file_path} has only {num_unique_aatypes} unique amino acids."
-        )
-    aatypes_1 = torch.tensor(aatypes_1).long()
+    cfg: DatasetConfig
+    task: DataTask
+    is_training: bool
+    motif_factory: Optional[MotifFactory] = None
 
-    # Construct an intermediate `chain_feats` for OpenFold pipeline
-    chain_feats = {
-        "aatype": aatypes_1,
-        "all_atom_positions": torch.tensor(processed_file[dpc.atom_positions]).double(),
-        "all_atom_mask": torch.tensor(processed_file[dpc.atom_mask]).double(),
-    }
-
-    # Add noise to atom position tensor.
-    # Features are in angstrom-scale.
-    add_noise = cfg.noise_atom_positions_angstroms > 0
-    if add_noise:
-        atom_position_noise = (
-            torch.randn_like(chain_feats["all_atom_positions"])
-            * cfg.noise_atom_positions_angstroms
-        )
-        chain_feats["all_atom_positions"] += atom_position_noise
-
-    # Run through OpenFold data transforms.
-    # Convert atomic representation to frames
-    chain_feats = data_transforms.atom37_to_frames(chain_feats)
-    # calculate torsion angles, in case predicting torsion angles
-    chain_feats = data_transforms.atom37_to_torsion_angles()(chain_feats)
-
-    # Extract rigids (translations + rotations), check for poorly processed
-    rigids_1 = rigid_utils.Rigid.from_tensor_4x4(
-        chain_feats[dtc.rigidgroups_gt_frames]
-    )[:, 0]
-    rotmats_1 = rigids_1.get_rots().get_rot_mats()
-    trans_1 = rigids_1.get_trans()
-    if torch.isnan(trans_1).any() or torch.isnan(rotmats_1).any():
-        raise ValueError(f"Found NaNs in {processed_file_path}")
-
-    # res_mask for residues under consideration uses `dpc.bb_mask`
-    res_mask = torch.tensor(processed_file[dpc.bb_mask]).int()
-
-    # pull out res_idx and chain_idx
-    res_idx = torch.tensor(processed_file[dpc.residue_index])
-    chain_idx = torch.tensor(processed_file[dpc.chain_index])
-
-    # Mask low pLDDT residues
-    res_plddt = torch.tensor(processed_file[dpc.b_factors][:, 1])
-    plddt_mask = torch.ones_like(res_mask)
-    if cfg.add_plddt_mask:
-        plddt_mask = (res_plddt > cfg.min_plddt_threshold).int()
-
-    # Default diffuse mask is all ones
-    diffuse_mask = torch.ones_like(res_mask).int()
-
-    feats: BatchFeatures = {
-        bp.res_mask: res_mask,
-        bp.aatypes_1: aatypes_1,
-        bp.trans_1: trans_1,
-        bp.rotmats_1: rotmats_1,
-        bp.torsion_angles_sin_cos_1: chain_feats[dtc.torsion_angles_sin_cos],
-        bp.chain_idx: chain_idx,
-        bp.res_idx: res_idx,
-        bp.res_plddt: res_plddt,
-        bp.diffuse_mask: diffuse_mask,
-        bp.plddt_mask: plddt_mask,
-    }
-
-    return feats
-
-
-def _read_clusters(cluster_path: Union[Path, str], synthetic=False) -> Dict[str, Any]:
-    pdb_to_cluster = {}
-    with open(cluster_path, "r") as f:
-        for i, line in enumerate(f):
-            for chain in line.split(" "):
-                if not synthetic:
-                    pdb = chain.split("_")[0].strip()
-                else:
-                    pdb = chain.strip()
-                pdb_to_cluster[pdb.upper()] = i
-    return pdb_to_cluster
-
-
-def read_metadata_file(
-    metadata_path: Union[Path, str],
-    max_rows: Optional[int] = None,
-) -> MetadataDataFrame:
-    """
-    Reads a metadata CSV file and returns a DataFrame.
-    """
-    if not os.path.exists(metadata_path):
-        raise FileNotFoundError(f"Metadata file {metadata_path} does not exist")
-    metadata_df = pd.read_csv(metadata_path, nrows=max_rows)
-    return metadata_df
-
-
-class BaseDataset(Dataset):
-    def __init__(
-        self,
-        *,
-        dataset_cfg: DatasetConfig,
-        is_training: bool,
-        task: DataTask,
-    ):
-        self._log = logging.getLogger(__name__)
-        self._is_training = is_training
-        self.dataset_cfg = dataset_cfg
-        self.task = task
-
-        self._cache = {}
-        self._rng = np.random.default_rng(seed=self.dataset_cfg.seed)
+    def __post_init__(self):
+        self._rng = np.random.default_rng(seed=self.cfg.seed)
         self._rng_fixed = np.random.default_rng(seed=42069)
 
-        self.motif_factory = MotifFactory(
-            cfg=self.dataset_cfg.inpainting,
-            rng=self._rng if self.is_training else self._rng_fixed,
-        )
-
-        # Process structures and clusters
-        self.raw_csv = read_metadata_file(
-            metadata_path=self.dataset_cfg.csv_path,
-            max_rows=dataset_cfg.debug_head_samples,
-        )
-        self._log.debug(
-            f"Loaded {len(self.raw_csv)} examples from {self.dataset_cfg.csv_path}"
-        )
-
-        # Initial filtering
-        dataset_filterer = DatasetFilterer(
-            cfg=dataset_cfg.filter,
-            modeled_trim_method=dataset_cfg.modeled_trim_method,
-        )
-        metadata_csv = dataset_filterer.filter_metadata(self.raw_csv)
-
-        # Concat redesigned data, if provided
-        if self.dataset_cfg.use_redesigned:
-            assert os.path.exists(
-                self.dataset_cfg.redesigned_csv_path
-            ), f"Redesigned CSV path {self.dataset_cfg.redesigned_csv_path} does not exist"
-
-            self.redesigned_csv = pd.read_csv(self.dataset_cfg.redesigned_csv_path)
-            metadata_csv = metadata_csv.merge(
-                self.redesigned_csv,
-                left_on=mc.pdb_name,
-                right_on=RedesignColumn.example,
+        if self.motif_factory is None:
+            self.motif_factory = MotifFactory(
+                cfg=self.cfg.inpainting,
+                rng=self._rng if self.is_training else self._rng_fixed,
             )
-            # Filter out examples with high RMSD
-            metadata_csv = metadata_csv[
-                metadata_csv[RedesignColumn.best_rmsd]
-                < self.dataset_cfg.redesigned_rmsd_threshold
-            ]
-
-        # Add cluster information
-        if self.dataset_cfg.cluster_path is not None:
-            assert os.path.exists(
-                self.dataset_cfg.cluster_path
-            ), f"Cluster path {self.dataset_cfg.cluster_path} does not exist"
-
-            self._pdb_to_cluster = _read_clusters(
-                self.dataset_cfg.cluster_path, synthetic=False
-            )
-            self._max_cluster = max(self._pdb_to_cluster.values())
-            self._missing_pdbs = 0
-
-            def cluster_lookup(pdb):
-                pdb = pdb.upper()
-                if pdb not in self._pdb_to_cluster:
-                    self._pdb_to_cluster[pdb] = self._max_cluster + 1
-                    self._max_cluster += 1
-                    self._missing_pdbs += 1
-                return self._pdb_to_cluster[pdb]
-
-            metadata_csv[DatasetColumn.cluster] = metadata_csv[mc.pdb_name].map(
-                cluster_lookup
-            )
-            self._log.debug(
-                f"Assigned {self._max_cluster} clusters. {self._missing_pdbs} of {len(metadata_csv)} PDBs were missing from the cluster file."
-            )
-
-        # Add synthetic data if provided, and offset cluster numbers
-        if self.dataset_cfg.use_synthetic:
-            assert os.path.exists(
-                self.dataset_cfg.synthetic_csv_path
-            ), f"Synthetic CSV path {self.dataset_cfg.redesigned_csv_path} does not exist"
-            self.synthetic_csv = pd.read_csv(self.dataset_cfg.synthetic_csv_path)
-
-            assert os.path.exists(
-                self.dataset_cfg.synthetic_cluster_path
-            ), f"Synthetic cluster path {self.dataset_cfg.synthetic_cluster_path} does not exist"
-            self._synthetic_pdb_to_cluster = _read_clusters(
-                self.dataset_cfg.synthetic_cluster_path, synthetic=True
-            )
-
-            # Clusters simply must be defined.
-            # The actual number is incremented by the number of real clusters.
-
-            # Offset all the cluster numbers by the number of real data clusters
-            num_real_clusters = metadata_csv[DatasetColumn.cluster].max() + 1
-
-            def synthetic_cluster_lookup(pdb):
-                pdb = pdb.upper()
-                if pdb not in self._synthetic_pdb_to_cluster:
-                    raise ValueError(
-                        f"Synthetic example {pdb} not in synthetic cluster file!"
-                    )
-                return self._synthetic_pdb_to_cluster[pdb] + num_real_clusters
-
-            self.synthetic_csv[DatasetColumn.cluster] = self.synthetic_csv[
-                mc.pdb_name
-            ].map(synthetic_cluster_lookup)
-
-            # concat synthetic data to metadata_csv
-            metadata_csv = pd.concat([metadata_csv, self.synthetic_csv])
-
-        # We just use the synthetic and re-designed data as is without additional filtering.
-        # Some filtering would be difficult, e.g. because designed structures/sequences may have
-        # values like pLDDT assigned by the tool that generated them.
-        # Also, presumably the synthetic data is generated from already-filtered structures/sequences.
-
-        self._create_split(metadata_csv)
-
-        # If test set IDs defined, remove from training set
-        if self.dataset_cfg.test_set_pdb_ids_path is not None:
-            test_set_df = pd.read_csv(dataset_cfg.test_set_pdb_ids_path)
-            self.csv = self.csv[
-                self.csv[mc.pdb_name].isin(test_set_df[mc.pdb_name].values)
-            ]
-
-    @property
-    def is_training(self):
-        return self._is_training
-
-    def __len__(self):
-        return len(self.csv)
-
-    @property
-    def modeled_length_col(self) -> mc:
-        return self.dataset_cfg.modeled_trim_method.to_dataset_column()
-
-    def _create_split(self, data_csv: DatasetDataFrame):
-        # Training or validation specific logic.
-        # TODO actually split - this isn't really splitting... it's ~ all the samples in both cases
-        if self.is_training:
-            self.csv = data_csv
-            self._log.info(f"Training: {len(self.csv)} examples")
-        else:
-            # pick all samples in data_csv with valid eval length
-            eval_lengths = data_csv[self.modeled_length_col]
-            if self.dataset_cfg.max_eval_length is not None:
-                eval_lengths = eval_lengths[
-                    eval_lengths <= self.dataset_cfg.max_eval_length
-                ]
-            all_lengths = np.sort(eval_lengths.unique())
-            length_indices = (len(all_lengths) - 1) * np.linspace(
-                0.0, 1.0, self.dataset_cfg.num_eval_lengths
-            )
-            length_indices = length_indices.astype(int)
-            eval_lengths = all_lengths[length_indices]
-            eval_csv = data_csv[data_csv[self.modeled_length_col].isin(eval_lengths)]
-
-            # Fix a random seed to get the same split each time.
-            eval_csv = eval_csv.groupby(self.modeled_length_col).sample(
-                self.dataset_cfg.samples_per_eval_length, replace=True, random_state=123
-            )
-            eval_csv = eval_csv.sort_values(self.modeled_length_col, ascending=False)
-            self.csv = eval_csv
-            self._log.info(
-                f"Validation: {len(self.csv)} examples with lengths {eval_lengths}"
-            )
-
-        # reset index
-        self.csv[DatasetColumn.index] = list(range(len(self.csv)))
-
-    def load_processed_path_with_caching(self, csv_row: DatasetCSVRow) -> ProcessedFile:
-        """
-        Loads a single structure + metadata pickled at `processed_file_path`, with caching.
-        """
-        processed_file_path = os.path.join(
-            self.dataset_cfg.processed_data_path, csv_row[mc.processed_path]
-        )
-        seq_len = csv_row[self.modeled_length_col]
-        use_cache = seq_len > self.dataset_cfg.cache_num_res
-
-        if use_cache and processed_file_path in self._cache:
-            return self._cache[processed_file_path]
-
-        trim_chains_independently = (
-            self.dataset_cfg.modeled_trim_method
-            == DatasetTrimMethod.chains_independently
-        )
-        processed_feats = read_processed_file(
-            processed_file_path,
-            trim_chains_independently=trim_chains_independently,
-        )
-
-        if use_cache:
-            self._cache[processed_file_path] = processed_feats
-
-        return processed_feats
 
     @staticmethod
-    def randomize_chains(cfg: DatasetConfig, feats: BatchFeatures):
+    def randomize_chains(feats: BatchFeatures):
         """
         Randomly permute chain indices; new chain IDs start at 1.
         """
@@ -377,7 +86,7 @@ class BaseDataset(Dataset):
         feats[bp.chain_idx] = new_chain_idx.long()
 
     @staticmethod
-    def reset_residue_index(cfg: DatasetConfig, feats: BatchFeatures):
+    def reset_residue_index(feats: BatchFeatures):
         """
         Re-number `res_index`, assuming `feats` is flat i.e. a single sample.
         - starting from 1 within each chain
@@ -521,13 +230,98 @@ class BaseDataset(Dataset):
         return new_feats
 
     @staticmethod
-    def _featurize_processed_file(
+    def batch_features_from_processed_file(
+        processed_file: ProcessedFile,
         cfg: DatasetConfig,
-        task: DataTask,
-        is_training: bool,
+        processed_file_path: str,
+    ) -> BatchFeatures:
+        """
+        Direct conversion of a ProcessedFile (numpy) into BatchFeatures (tensors, frames).
+        Keep as a static method so easy to construct direct batch features from ProcessedFile.
+
+        Does not support inpainting and motif mask generation.
+        Defaults to `diffuse_mask` of all ones.
+        Does not center, re-index, randomize, etc.
+        """
+
+        # Check the sequence
+        aatypes_1 = processed_file[dpc.aatype]
+        num_unique_aatypes = len(set(aatypes_1))
+        if num_unique_aatypes <= 1:
+            raise ValueError(
+                f"Example @ {processed_file_path} has only {num_unique_aatypes} unique amino acids."
+            )
+        aatypes_1 = torch.tensor(aatypes_1).long()
+
+        # Construct an intermediate `chain_feats` for OpenFold pipeline
+        chain_feats = {
+            "aatype": aatypes_1,
+            "all_atom_positions": torch.tensor(
+                processed_file[dpc.atom_positions]
+            ).double(),
+            "all_atom_mask": torch.tensor(processed_file[dpc.atom_mask]).double(),
+        }
+
+        # Add noise to atom position tensor.
+        # Features are in angstrom-scale.
+        add_noise = cfg.noise_atom_positions_angstroms > 0
+        if add_noise:
+            atom_position_noise = (
+                torch.randn_like(chain_feats["all_atom_positions"])
+                * cfg.noise_atom_positions_angstroms
+            )
+            chain_feats["all_atom_positions"] += atom_position_noise
+
+        # Run through OpenFold data transforms.
+        # Convert atomic representation to frames
+        chain_feats = data_transforms.atom37_to_frames(chain_feats)
+        # calculate torsion angles, in case predicting torsion angles
+        chain_feats = data_transforms.atom37_to_torsion_angles()(chain_feats)
+
+        # Extract rigids (translations + rotations), check for poorly processed
+        rigids_1 = rigid_utils.Rigid.from_tensor_4x4(
+            chain_feats[dtc.rigidgroups_gt_frames]
+        )[:, 0]
+        rotmats_1 = rigids_1.get_rots().get_rot_mats()
+        trans_1 = rigids_1.get_trans()
+        if torch.isnan(trans_1).any() or torch.isnan(rotmats_1).any():
+            raise ValueError(f"Found NaNs in {processed_file_path}")
+
+        # res_mask for residues under consideration uses `dpc.bb_mask`
+        res_mask = torch.tensor(processed_file[dpc.bb_mask]).int()
+
+        # pull out res_idx and chain_idx
+        res_idx = torch.tensor(processed_file[dpc.residue_index])
+        chain_idx = torch.tensor(processed_file[dpc.chain_index])
+
+        # Mask low pLDDT residues
+        res_plddt = torch.tensor(processed_file[dpc.b_factors][:, 1])
+        plddt_mask = torch.ones_like(res_mask)
+        if cfg.add_plddt_mask:
+            plddt_mask = (res_plddt > cfg.min_plddt_threshold).int()
+
+        # Default diffuse mask is all ones
+        diffuse_mask = torch.ones_like(res_mask).int()
+
+        feats: BatchFeatures = {
+            bp.res_mask: res_mask,
+            bp.aatypes_1: aatypes_1,
+            bp.trans_1: trans_1,
+            bp.rotmats_1: rotmats_1,
+            bp.torsion_angles_sin_cos_1: chain_feats[dtc.torsion_angles_sin_cos],
+            bp.chain_idx: chain_idx,
+            bp.res_idx: res_idx,
+            bp.res_plddt: res_plddt,
+            bp.diffuse_mask: diffuse_mask,
+            bp.plddt_mask: plddt_mask,
+        }
+
+        return feats
+
+    def featurize_processed_file(
+        self,
         processed_file: ProcessedFile,
         csv_row: DatasetCSVRow,
-        motif_factory: MotifFactory,
     ) -> BatchFeatures:
         """
         Processes a pickled features from single structure + metadata.
@@ -537,7 +331,10 @@ class BaseDataset(Dataset):
         because it adds noise to atom positions, picks motif positions, etc. as defined by cfg.
         """
         # Redesigned sequences can be used to substitute the original sequence during training.
-        if is_training and cfg.use_redesigned:
+        if self.is_training and self.cfg.use_redesigned:
+            assert (
+                RedesignColumn.best_seq in csv_row
+            ), f"cfg.use_redesigned but redesign column {RedesignColumn.best_seq} not in CSV row {csv_row}"
             best_seq = csv_row[RedesignColumn.best_seq]
             if not isinstance(best_seq, str):
                 raise ValueError(f"Unexpected value best_seq: {best_seq}")
@@ -549,9 +346,10 @@ class BaseDataset(Dataset):
                 processed_file[dpc.aatype].shape == best_aatype.shape
             ), f"best_seq different length: {processed_file[dpc.aatype].shape} vs {best_aatype.shape}"
 
-        feats = batch_features_from_processed_file(
+        # Construct feats from processed_file.
+        feats = BatchFeaturizer.batch_features_from_processed_file(
             processed_file=processed_file,
-            cfg=cfg,
+            cfg=self.cfg,
             processed_file_path=csv_row[mc.processed_path],
         )
 
@@ -559,13 +357,13 @@ class BaseDataset(Dataset):
         feats[bp.pdb_name] = csv_row[mc.pdb_name]
 
         # Update `diffuse_mask` and `motif_mask` depending on task
-        if task == DataTask.hallucination:
+        if self.task == DataTask.hallucination:
             # everything is diffused
             feats[bp.diffuse_mask] = torch.ones_like(feats[bp.res_mask])
             # feats[bp.motif_mask] = None  # skip defining motif_mask batch prop
-        elif task == DataTask.inpainting:
+        elif self.task == DataTask.inpainting:
             # Generate motif_mask from MotifFactory
-            motif_mask = motif_factory.generate_motif_mask(
+            motif_mask = self.motif_factory.generate_motif_mask(
                 res_mask=feats[bp.res_mask],
                 plddt_mask=feats[bp.plddt_mask],
                 chain_idx=feats[bp.chain_idx],
@@ -579,45 +377,293 @@ class BaseDataset(Dataset):
             # `diffuse_mask` for inpainting with guidance is all ones; whole structure is modeled.
             # TODO(inpainting-fixed) `diffuse_mask` is complement to `motif_mask`
             feats[bp.diffuse_mask] = torch.ones_like(feats[bp.res_mask])
+
+            # For inpainting evaluation (i.e. not training), vary scaffold lengths
+            # Using the `diffuse_mask`, modify the scaffold region lengths, and mask out the scaffolds
+            # i.e. {trans,rots,aatypes}_1 only defined for motif positions
+            if not self.is_training and (feats[bp.motif_mask] == 1).any():
+                segments = self.motif_factory.generate_segments_from_motif_mask(
+                    motif_mask=feats[bp.motif_mask],
+                    chain_idx=feats[bp.chain_idx],
+                )
+                # apply segmenting (note, updates masks and generates new chain_idx)
+                feats = BatchFeaturizer.segment_features(feats=feats, segments=segments)
         else:
-            raise ValueError(f"Unknown task {task}")
+            raise ValueError(f"Unknown task {self.task}")
 
         # Ensure have a valid `diffuse_mask` for modeling
         if torch.sum(feats[bp.diffuse_mask]) == 0:
             feats[bp.diffuse_mask] = torch.ones_like(feats[bp.res_mask]).int()
 
-        # Handle inpainting with an active `motif_mask`
-        if task == DataTask.inpainting and (feats[bp.motif_mask] == 1).any():
-            # For inpainting evaluation (i.e. not training), vary scaffold lengths
-            # Using the `diffuse_mask`, modify the scaffold region lengths, and mask out the scaffolds
-            # i.e. {trans,rots,aatypes}_1 only defined for motif positions
-            if not is_training:
-                segments = motif_factory.generate_segments_from_motif_mask(
-                    motif_mask=feats[bp.motif_mask],
-                    chain_idx=feats[bp.chain_idx],
-                )
-                # apply segmenting (note, updates masks and generates new chain_idx)
-                feats = BaseDataset.segment_features(feats=feats, segments=segments)
-
+        # Centering
+        if bp.motif_mask in feats and (feats[bp.motif_mask] == 1).any():
             # Center the motifs using motif_mask
-            BaseDataset.recenter_structure(feats, mask=feats[bp.motif_mask])
+            BatchFeaturizer.recenter_structure(feats, mask=feats[bp.motif_mask])
+        else:
+            # Center the whole structure
+            BatchFeaturizer.recenter_structure(feats)
 
         # Randomize chains and reset residue positions
-        BaseDataset.randomize_chains(cfg, feats)
-        BaseDataset.reset_residue_index(cfg, feats)
+        BatchFeaturizer.randomize_chains(feats)
+        BatchFeaturizer.reset_residue_index(feats)
 
         return feats
 
-    def process_processed_file(
+
+def _read_clusters(cluster_path: Union[Path, str], synthetic=False) -> Dict[str, Any]:
+    pdb_to_cluster = {}
+    with open(cluster_path, "r") as f:
+        for i, line in enumerate(f):
+            for chain in line.split(" "):
+                if not synthetic:
+                    pdb = chain.split("_")[0].strip()
+                else:
+                    pdb = chain.strip()
+                pdb_to_cluster[pdb.upper()] = i
+    return pdb_to_cluster
+
+
+def read_metadata_file(
+    metadata_path: Union[Path, str],
+    max_rows: Optional[int] = None,
+) -> MetadataDataFrame:
+    """
+    Reads a metadata CSV file and returns a DataFrame.
+    """
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(f"Metadata file {metadata_path} does not exist")
+    metadata_df = pd.read_csv(metadata_path, nrows=max_rows)
+    return metadata_df
+
+
+class BaseDataset(Dataset):
+    def __init__(
+        self,
+        *,
+        cfg: DatasetConfig,
+        is_training: bool,
+        task: DataTask,
+    ):
+        """
+        BaseDataset collects all dataset files into a single Dataset, and yields samples.
+        Metadata CSV defines the dataset, and `ProcessedFile` samples are read when yielded,
+        and featurized by `BatchFeaturizer` into `BatchFeatures`.
+
+        MetadataDataFrame (collection of MetadataCSVRow) is loaded from `cfg.csv_path`.
+        The dataset is filtered by `DatasetFilterer` according to `cfg.filter`.
+
+        If `cfg.use_redesigned`, redesigned sequences (e.g. from ProteinMPNN)
+        can substitute the original sequence during training.
+
+        if `cfg.use_synthetic`, synthetic data (e.g. from AlphaFold)
+        can be used to augment the dataset.
+
+        For inpainting, `MotifFactory` generates motifs and scaffolds.
+        This happens during training (scaffolds are masked) *and* eval (scaffold lengths vary).
+        """
+        self.cfg = cfg
+        self.task = task
+        self._is_training = is_training
+
+        self._log = logging.getLogger(__name__)
+        self._cache = {}
+
+        self.featurizer = BatchFeaturizer(
+            cfg=cfg,
+            task=task,
+            is_training=self.is_training,
+        )
+
+        # Process structures and clusters
+        self.raw_csv = read_metadata_file(
+            metadata_path=self.cfg.csv_path,
+            max_rows=cfg.debug_head_samples,
+        )
+        self._log.debug(f"Loaded {len(self.raw_csv)} examples from {self.cfg.csv_path}")
+
+        # Initial filtering
+        dataset_filterer = DatasetFilterer(
+            cfg=cfg.filter,
+            modeled_trim_method=cfg.modeled_trim_method,
+        )
+        metadata_csv = dataset_filterer.filter_metadata(self.raw_csv)
+
+        # Concat redesigned data, if provided
+        if self.cfg.use_redesigned:
+            assert os.path.exists(
+                self.cfg.redesigned_csv_path
+            ), f"Redesigned CSV path {self.cfg.redesigned_csv_path} does not exist"
+
+            self.redesigned_csv = pd.read_csv(self.cfg.redesigned_csv_path)
+            metadata_csv = metadata_csv.merge(
+                self.redesigned_csv,
+                left_on=mc.pdb_name,
+                right_on=RedesignColumn.example,
+            )
+            # Filter out examples with high RMSD
+            metadata_csv = metadata_csv[
+                metadata_csv[RedesignColumn.best_rmsd]
+                < self.cfg.redesigned_rmsd_threshold
+            ]
+
+        # Add cluster information
+        if self.cfg.cluster_path is not None:
+            assert os.path.exists(
+                self.cfg.cluster_path
+            ), f"Cluster path {self.cfg.cluster_path} does not exist"
+
+            self._pdb_to_cluster = _read_clusters(
+                self.cfg.cluster_path, synthetic=False
+            )
+            self._max_cluster = max(self._pdb_to_cluster.values())
+            self._missing_pdbs = 0
+
+            def cluster_lookup(pdb_name):
+                pdb_name = pdb_name.upper()
+                if pdb_name not in self._pdb_to_cluster:
+                    self._pdb_to_cluster[pdb_name] = self._max_cluster + 1
+                    self._max_cluster += 1
+                    self._missing_pdbs += 1
+                return self._pdb_to_cluster[pdb_name]
+
+            metadata_csv[DatasetColumn.cluster] = metadata_csv[mc.pdb_name].map(
+                cluster_lookup
+            )
+            self._log.debug(
+                f"Assigned {self._max_cluster} clusters. {self._missing_pdbs} of {len(metadata_csv)} PDBs were missing from the cluster file."
+            )
+
+        # Add synthetic data if provided, and offset cluster numbers
+        if self.cfg.use_synthetic:
+            assert os.path.exists(
+                self.cfg.synthetic_csv_path
+            ), f"Synthetic CSV path {self.cfg.redesigned_csv_path} does not exist"
+            self.synthetic_csv = pd.read_csv(self.cfg.synthetic_csv_path)
+
+            assert os.path.exists(
+                self.cfg.synthetic_cluster_path
+            ), f"Synthetic cluster path {self.cfg.synthetic_cluster_path} does not exist"
+            self._synthetic_pdb_to_cluster = _read_clusters(
+                self.cfg.synthetic_cluster_path, synthetic=True
+            )
+
+            # Clusters simply must be defined.
+            # The actual number is incremented by the number of real clusters.
+
+            # Offset all the cluster numbers by the number of real data clusters
+            num_real_clusters = metadata_csv[DatasetColumn.cluster].max() + 1
+
+            def synthetic_cluster_lookup(pdb):
+                pdb = pdb.upper()
+                if pdb not in self._synthetic_pdb_to_cluster:
+                    raise ValueError(
+                        f"Synthetic example {pdb} not in synthetic cluster file!"
+                    )
+                return self._synthetic_pdb_to_cluster[pdb] + num_real_clusters
+
+            self.synthetic_csv[DatasetColumn.cluster] = self.synthetic_csv[
+                mc.pdb_name
+            ].map(synthetic_cluster_lookup)
+
+            # concat synthetic data to metadata_csv
+            metadata_csv = pd.concat([metadata_csv, self.synthetic_csv])
+
+        # We just use the synthetic and re-designed data as is without additional filtering.
+        # Some filtering would be difficult, e.g. because designed structures/sequences may have
+        # values like pLDDT assigned by the tool that generated them.
+        # Also, presumably the synthetic data is generated from already-filtered structures/sequences.
+
+        # TODO support augmenting dataset:
+        #   multimers: chain selections
+        #     based on MetadataColumn.chain_interactions
+        #   too long: crop to target length
+        #     for single chains, simply crop
+        #     for multiple chains, select interacting chains and trim non-interacting positions
+        #
+        #   Likely makes sense to augment MotifFactory to support these sorts of things,
+        #     and reuse some of the motif selection logic.
+
+        self._create_split(metadata_csv)
+
+        # If test set IDs defined, remove from training set
+        if self.cfg.test_set_pdb_ids_path is not None:
+            test_set_df = pd.read_csv(cfg.test_set_pdb_ids_path)
+            self.csv = self.csv[
+                self.csv[mc.pdb_name].isin(test_set_df[mc.pdb_name].values)
+            ]
+
+    @property
+    def is_training(self):
+        return self._is_training
+
+    @property
+    def modeled_length_col(self) -> mc:
+        return self.cfg.modeled_trim_method.to_dataset_column()
+
+    def _create_split(self, data_csv: DatasetDataFrame):
+        # Training or validation specific logic.
+        # TODO actually split - this isn't really splitting... it's ~ all the samples in both cases
+        if self.is_training:
+            self.csv = data_csv
+            self._log.info(f"Training: {len(self.csv)} examples")
+        else:
+            # pick all samples in data_csv with valid eval length
+            eval_lengths = data_csv[self.modeled_length_col]
+            if self.cfg.max_eval_length is not None:
+                eval_lengths = eval_lengths[eval_lengths <= self.cfg.max_eval_length]
+            all_lengths = np.sort(eval_lengths.unique())
+            length_indices = (len(all_lengths) - 1) * np.linspace(
+                0.0, 1.0, self.cfg.num_eval_lengths
+            )
+            length_indices = length_indices.astype(int)
+            eval_lengths = all_lengths[length_indices]
+            eval_csv = data_csv[data_csv[self.modeled_length_col].isin(eval_lengths)]
+
+            # Fix a random seed to get the same split each time.
+            eval_csv = eval_csv.groupby(self.modeled_length_col).sample(
+                self.cfg.samples_per_eval_length, replace=True, random_state=123
+            )
+            eval_csv = eval_csv.sort_values(self.modeled_length_col, ascending=False)
+            self.csv = eval_csv
+            self._log.info(
+                f"Validation: {len(self.csv)} examples with lengths {eval_lengths}"
+            )
+
+        # reset index
+        self.csv[DatasetColumn.index] = list(range(len(self.csv)))
+
+    def load_processed_file_with_caching(self, csv_row: DatasetCSVRow) -> ProcessedFile:
+        """
+        Loads a single structure + metadata pickled at `processed_file_path`, with caching.
+        """
+        processed_file_path = os.path.join(
+            self.cfg.processed_data_path, csv_row[mc.processed_path]
+        )
+        seq_len = csv_row[self.modeled_length_col]
+        use_cache = seq_len > self.cfg.cache_num_res
+
+        if use_cache and processed_file_path in self._cache:
+            return self._cache[processed_file_path]
+
+        trim_chains_independently = (
+            self.cfg.modeled_trim_method == DatasetTrimMethod.chains_independently
+        )
+        processed_feats = read_processed_file(
+            processed_file_path,
+            trim_chains_independently=trim_chains_independently,
+        )
+
+        if use_cache:
+            self._cache[processed_file_path] = processed_feats
+
+        return processed_feats
+
+    def featurize_processed_file(
         self, processed_file: ProcessedFile, csv_row: DatasetCSVRow
     ) -> BatchFeatures:
-        return self._featurize_processed_file(
-            cfg=self.dataset_cfg,
-            task=self.task,
-            is_training=self.is_training,
+        return self.featurizer.featurize_processed_file(
             processed_file=processed_file,
             csv_row=csv_row,
-            motif_factory=self.motif_factory,
         )
 
     def process_csv_row(self, csv_row: DatasetCSVRow) -> BatchFeatures:
@@ -626,14 +672,17 @@ class BaseDataset(Dataset):
         File loading is cached.
         Addition of noise, determination of masks etc. is not cached.
         """
-        processed_file = self.load_processed_path_with_caching(
+        processed_file = self.load_processed_file_with_caching(
             csv_row=csv_row,
         )
-        processed_row = self.process_processed_file(
+        processed_row = self.featurize_processed_file(
             processed_file=processed_file,
             csv_row=csv_row,
         )
         return processed_row
+
+    def __len__(self):
+        return len(self.csv)
 
     def __getitem__(self, row_idx) -> BatchFeatures:
         csv_row: DatasetCSVRow = self.csv.iloc[row_idx]
@@ -655,17 +704,15 @@ class PdbDataset(BaseDataset):
     It may make sense to separate them in the future.
     """
 
-    def __init__(
-        self, *, dataset_cfg: DatasetConfig, is_training: bool, task: DataTask
-    ):
+    def __init__(self, *, cfg: DatasetConfig, is_training: bool, task: DataTask):
         assert (
-            dataset_cfg.cluster_path is not None
+            cfg.cluster_path is not None
         ), "Cluster path must be provided for PDB dataset"
         assert os.path.exists(
-            dataset_cfg.cluster_path
-        ), f"Cluster path {dataset_cfg.cluster_path} does not exist"
+            cfg.cluster_path
+        ), f"Cluster path {cfg.cluster_path} does not exist"
         super().__init__(
-            dataset_cfg=dataset_cfg,
+            cfg=cfg,
             is_training=is_training,
             task=task,
         )
@@ -787,13 +834,13 @@ class DatasetConstructor:
     def create_datasets(self) -> Tuple[DatasetClassT, Optional[DatasetClassT]]:
         """generate dataset, and possibly validation dataset"""
         train_dataset = self.dataset_class(
-            dataset_cfg=self.cfg,
+            cfg=self.cfg,
             task=self.task,
             is_training=True,
         )
 
         eval_dataset = self.dataset_class(
-            dataset_cfg=self.cfg,
+            cfg=self.cfg,
             task=self.task,
             is_training=False,
         )

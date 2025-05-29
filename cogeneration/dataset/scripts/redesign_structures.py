@@ -2,6 +2,7 @@
 
 """
 CLI program to generate redesigned sequences using ProteinMPNN for structures in a metadata CSV.
+This is a slow process: ProteinMPNN is relatively quick but AlphaFold is slow.
 
 Fine-tuning on ProteinMPNN sequences was necessary in MultiFlow to generate high-designability samples.
 
@@ -187,7 +188,7 @@ class SequenceRedesigner:
         self, metadata_row: MetadataCSVRow, processed_file: ProcessedFile
     ) -> Tuple[List[Redesign], BestRedesign]:
         """Generate multiple redesigns for one structure and pick the best."""
-        work_dir = self.args.output_dir / "work" / metadata_row[mc.pdb_name]
+        work_dir = self.args.output_dir / "redesigns" / metadata_row[mc.pdb_name]
         work_dir.mkdir(parents=True, exist_ok=True)
 
         # TODO write fasta for original sequence, fold it, calculate RMSD to original structure

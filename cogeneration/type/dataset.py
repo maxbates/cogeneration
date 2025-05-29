@@ -77,7 +77,7 @@ class MetadataColumn(StrEnum):
 class RedesignColumn(StrEnum):
     """Columns in the redesign metadata CSVs"""
 
-    example = "example"
+    example = "example"  # pdb_name
     wildtype_seq = "wildtype_seq"  # original sequence
     wildtype_rmsd = "wildtype_rmsd"  # RMSD of original sequence to reference structure
     best_seq = "best_seq"  # best 1 redesign per structure
