@@ -7,7 +7,11 @@ from cogeneration.type.str_enum import StrEnum
 
 
 class MetadataColumn(StrEnum):
-    """Columns in the training/synthetic/redesign/test metadata CSVs"""
+    """
+    Columns in the pre-processed PDB metadata CSVs
+
+    Note that any column addition may require reprocessing or updating the existing metadata CSV.
+    """
 
     pdb_name = "pdb_name"
     # (optional) original PDB file, may be compressed

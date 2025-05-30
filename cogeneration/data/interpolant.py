@@ -89,7 +89,7 @@ class SamplingTrajectory:
     @property
     def structure(self) -> torch.Tensor:
         """
-        Returns structure / backbone tensor [num_batch, traj_length, sample_length, 37, 3]
+        Returns structure / backbone tensor [num_batch, num_steps, sample_length, 37, 3]
         """
         t = torch.stack([step.structure for step in self.steps], dim=0).transpose(0, 1)
         if self.check_dimensions:
@@ -102,7 +102,7 @@ class SamplingTrajectory:
     @property
     def amino_acids(self) -> torch.Tensor:
         """
-        Returns amino acid types tensor [num_batch, traj_length, sample_length]
+        Returns amino acid types tensor [num_batch, num_steps, sample_length]
         """
         t = (
             torch.stack([step.amino_acids for step in self.steps], dim=0)
@@ -119,7 +119,7 @@ class SamplingTrajectory:
     @property
     def logits(self) -> Optional[torch.Tensor]:
         """
-        Returns logits tensor if available [num_batch, traj_length, sample_length, num_tokens]
+        Returns logits tensor if available [num_batch, num_steps, sample_length, num_tokens]
         Currently only available for model steps, not protein steps, since we don't flow for logits.
         """
         if self.steps[0].logits is None:
@@ -136,6 +136,53 @@ class SamplingTrajectory:
                 t.shape == expected_shape
             ), f"Unexpected logits shape {t.shape}, expected {expected_shape}"
         return t
+
+
+@dataclass
+class BatchTrueFeatures:
+    """
+    Struct for time=1 features of a batch.
+    Used during sampling for conditional generation (e.g. if a domain is fixed, motifs in inpainting)
+    """
+
+    trans: torch.Tensor  # (B, N, 3)
+    rotmats: torch.Tensor  # (B, N, 3, 3)
+    torsions: torch.Tensor  # (B, N, 7, 2)
+    aatypes: torch.Tensor  # (B, N)
+    logits: torch.Tensor  # (B, N, S) where S=21 if masking else S=20
+
+    @classmethod
+    def from_optional(
+        cls,
+        res_mask: torch.Tensor,
+        num_tokens: int,
+        trans: Optional[torch.Tensor] = None,
+        rotmats: Optional[torch.Tensor] = None,
+        torsions: Optional[torch.Tensor] = None,
+        aatypes: Optional[torch.Tensor] = None,
+    ):
+        num_batch, num_res = res_mask.shape
+
+        if trans is None:
+            trans = torch.zeros(num_batch, num_res, 3, device=res_mask.device)
+        if rotmats is None:
+            rotmats = torch.eye(3, device=res_mask.device)[None, None].repeat(
+                num_batch, num_res, 1, 1
+            )
+        if torsions is None:
+            torsions = torsions_empty(num_batch, num_res, device=res_mask.device)
+        if aatypes is None:
+            aatypes = torch.zeros(num_batch, num_res, device=res_mask.device).long()
+
+        logits_1 = torch.nn.functional.one_hot(aatypes, num_classes=num_tokens).float()
+
+        return cls(
+            trans=trans,
+            rotmats=rotmats,
+            torsions=torsions,
+            aatypes=aatypes,
+            logits=logits_1,
+        )
 
 
 class Interpolant:
@@ -281,9 +328,27 @@ class Interpolant:
                 f"Unknown translation noise type {self.cfg.trans.noise_type}"
             )
 
+    def _rotmats_noise(self, res_mask: torch.Tensor):
+        """
+        Generate t=0 SO(3) noise rotation matrices
+        """
+        num_batch, num_res = res_mask.shape
+        return uniform_so3(num_batch, num_res, device=self._device)
+
+    def _torsions_noise(self, res_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Generate t=0 torsion angles noise
+        """
+        num_batch, num_res = res_mask.shape
+        return torsions_noise(
+            sigma=torch.ones((num_batch,), device=self._device),
+            num_samples=num_res,
+            num_angles=7,
+        )
+
     def _aatypes_noise(self, res_mask: torch.Tensor) -> torch.Tensor:
         """
-        Generate initial amino acid types based on the interpolant type
+        Generate t=0 amino acid types based on the interpolant type
         """
         num_batch, num_res = res_mask.shape
 
@@ -378,12 +443,12 @@ class Interpolant:
             # guassian noise added is markovian; just sample from gaussian, scaled by sigma_t, and add.
             # sigma_t is ~parabolic (and ~0 at t=0 and t=1) so corrupted sample reflects marginal distribution at t.
             sigma_t = self._compute_sigma_t(
-                t.squeeze(1),  # t is (B, 1), we need (B,)
+                t.squeeze(1),  # (B,)
                 scale=self.cfg.trans.stochastic_noise_intensity,
             )
             intermediate_noise = self._trans_noise(chain_idx=chain_idx)  # (B, N, 3)
             intermediate_noise = intermediate_noise * sigma_t[..., None, None]
-            trans_t = trans_t + intermediate_noise
+            trans_t += intermediate_noise
 
         # Fix non-diffused residues to t=1
         trans_t = mask_blend_2d(trans_t, trans_1, diffuse_mask)
@@ -425,7 +490,7 @@ class Interpolant:
             # so we just need to compute sigma_t for variance of IGSO(3) noise.
             # compute noise std deviation (mean is just rotmats_t)
             sigma_t = self._compute_sigma_t(
-                so3_t.squeeze(1),  # t is (B, 1), we need (B,)
+                so3_t.squeeze(1),  # (B,)
                 scale=self.cfg.rots.stochastic_noise_intensity,
             )
             sigma_t = sigma_t.cpu()  # ensure on cpu for igso3 calculation
@@ -442,6 +507,41 @@ class Interpolant:
 
         # only corrupt residues in `diffuse_mask`
         return mask_blend_3d(rotmats_t, rotmats_1, diffuse_mask)
+
+    def _corrupt_torsions(self, torsions_1, t, res_mask, diffuse_mask):
+        """
+        Corrupt torsions from t=1 to t using noise.
+        """
+        num_batch, num_res = res_mask.shape
+        torsions_0 = self._torsions_noise(res_mask=res_mask)
+
+        # interpolate in angle space using linear schedule
+        angles_1 = torch.atan2(torsions_1[..., 0], torsions_1[..., 1])  # (B, N, 7)
+        angles_0 = torch.atan2(torsions_0[..., 0], torsions_0[..., 1])  # (B, N, 7)
+        t_broadcast = t.view(num_batch, 1, 1)  # (B, 1, 1)
+        angles_t = (1.0 - t_broadcast) * angles_0 + t_broadcast * angles_1
+
+        # HACK piggy back on trans.stochastic for stochastic torsions
+        if (
+            self.cfg.trans.stochastic
+            and self.cfg.trans.stochastic_noise_intensity > 0.0
+        ):
+            sigma_t = self._compute_sigma_t(
+                t.squeeze(1),  # (B,)
+                scale=self.cfg.trans.stochastic_noise_intensity,
+            )
+            angles_t += angles_noise(sigma=sigma_t, num_samples=num_res, num_angles=7)
+
+        # wrap to keep angles in (-π,π]
+        angles_t = (angles_t + math.pi) % (2.0 * math.pi) - math.pi
+
+        # angles -> (sin, cos)
+        torsions_t = torch.stack((torch.sin(angles_t), torch.cos(angles_t)), dim=-1)
+
+        # Fix non-diffused residues to t=1
+        torsions_t = mask_blend_3d(torsions_t, torsions_1, diffuse_mask)
+
+        return torsions_t * res_mask[..., None, None]
 
     def _corrupt_aatypes(self, aatypes_1, t, res_mask, diffuse_mask):
         """
@@ -624,6 +724,7 @@ class Interpolant:
 
         trans_1 = batch[bp.trans_1]  # (B, N, 3) in Angstroms
         rotmats_1 = batch[bp.rotmats_1]  # (B, N, 3, 3)
+        torsions_1 = batch[bp.torsions_1]  # (B, N, 7, 2)
         aatypes_1 = batch[bp.aatypes_1]  # (B, N)
         res_mask = batch[bp.res_mask]  # (B, N)
         diffuse_mask = batch[bp.diffuse_mask]  # (B, N)
@@ -670,6 +771,20 @@ class Interpolant:
         if torch.any(torch.isnan(rotmats_t)):
             raise ValueError("NaN in rotmats_t during corruption")
         noisy_batch[nbp.rotmats_t] = rotmats_t
+
+        # HACK piggy back on trans.corrupt for torsions
+        if self.cfg.trans.corrupt:
+            torsions_t = self._corrupt_torsions(
+                torsions_1,
+                t=r3_t,
+                res_mask=res_mask,
+                diffuse_mask=diffuse_mask,
+            )
+        else:
+            torsions_t = torsions_1
+        if torch.any(torch.isnan(torsions_t)):
+            raise ValueError("NaN in torsions_t during corruption")
+        noisy_batch[nbp.torsions_t] = torsions_t
 
         if self.cfg.aatypes.corrupt:
             aatypes_t = self._corrupt_aatypes(
@@ -794,9 +909,12 @@ class Interpolant:
         t: float,
         torsions_1: torch.Tensor,  # (B, N, 7, 2)
         torsions_t: torch.Tensor,  # (B, N, K, 2)
-    ) -> torch.Tensor:
+    ) -> torch.Tensor:  # (B, N, 7, 2)
         """
         Perform an Euler step in angle space to update torsion angles.
+
+        `K` can be 1 or 7, depending on the number of torsions predicted by the model.
+        However, torsions_1 is always 7, and torsions_t is filled to 7 if K < 7.
         """
         B, N, K = torsions_1.shape[:3]
 
@@ -807,8 +925,8 @@ class Interpolant:
             device=torsions_1.device,
         )
 
-        angles_1 = torch.atan2(torsions_1[..., 0], torsions_1[..., 1])  # (B, N, K)
-        angles_t = torch.atan2(torsions_t[..., 0], torsions_t[..., 1])  # (B, N, K)
+        angles_1 = torch.atan2(torsions_1[..., 0], torsions_1[..., 1])  # (B, N, 7)
+        angles_t = torch.atan2(torsions_t[..., 0], torsions_t[..., 1])  # (B, N, 7)
 
         angles_vf = (angles_1 - angles_t) / (1 - t)
         angles_next = angles_t + angles_vf * d_t
@@ -830,7 +948,7 @@ class Interpolant:
 
         return torch.stack(
             [angles_next.sin(), angles_next.cos()], dim=-1
-        )  # (B, N, K, 2)
+        )  # (B, N, 7, 2)
 
     def _regularize_step_probs(
         self,
@@ -958,11 +1076,16 @@ class Interpolant:
         aatypes_t: torch.Tensor,  # (B, N)
     ):
         """
-        Perform an Euler step with a focus on maintaining "purity" by selectively unmasking and updating
-        amino acid types. This function is designed specifically for the "masking" interpolant type, where S = 21.
+        Perform an Euler step with purity sampling scheme, which decides which tokens to unmask
+        based on their log-probabilities.
 
-        This function identifies masked residues, then picks some number to unmask based on their maximum
-        log-probabilities, then re-masks some positions proportional to noise.
+        This function identifies masked residues, ranks them by max log prob,
+        picks some number to unmask, and re-masks some positions proportional to (d_t, noise, t).
+
+        On average more dimensions are unmasked at each step, with the probability of ultimately
+        selecting the correct token increasing as noise increases.
+
+        This function is designed specifically for the "masking" interpolant type, where S = 21.
         """
         num_batch, num_res, num_states = logits_1.shape
 
@@ -1163,6 +1286,208 @@ class Interpolant:
 
         return aatypes_t
 
+    @staticmethod
+    def frames_to_atom37(
+        res_mask: torch.Tensor,  # (B, N)
+        trans: torch.Tensor,  # (B, N, 3)
+        rots: torch.Tensor,  # (B, N, 3, 3)
+        aatypes: torch.Tensor,  # (B, N, S)
+        torsions: Optional[torch.Tensor],  # (B, N, K, 2)
+    ) -> torch.Tensor:
+        return to_cpu(
+            all_atom.atom37_from_trans_rot(
+                trans=trans,
+                rots=rots,
+                torsions=torsions,
+                aatype=aatypes,
+                res_mask=res_mask,
+                unknown_to_alanine=True,  # show UNK residues as alanine
+            )
+        )
+
+    def sample_step(
+        self,
+        noisy_batch: NoisyFeatures,
+        true_feats: BatchTrueFeatures,
+        model,
+        task: InferenceTask,
+        t_1: float,  # [scalar Tensor]
+        t_2: Optional[float],  # [scalar Tensor] None if final step
+    ) -> Tuple[NoisyFeatures, SamplingStep, SamplingStep]:
+        """
+        Perform a single step of sampling, integrating from `t_1` toward `t_2`.
+        Batch `_t` properties should be at `t_1`.
+
+        Returns a batch with noisy features updated to t_2, and model + protein intermediate states.
+
+        Note on torsions:
+        Currently, torsions are not an input to the model.
+        `torsions_1` are always defined.
+        `torsions_t` are always defined by `corrupt_batch`.
+        `torsions_t` will always be defined during sampling, but may not be used.
+        However, torsions are only optionally predicted by the model, and are used to generate
+        the predicted structure if the model predicts them.
+        If any torsions are predicted, `fill_torsions` fills them (B, N, K, 2) to (B, N, 7, 2).
+        """
+
+        is_final_step = t_2 is None
+
+        # Pull out masks + idx
+        res_mask = noisy_batch[bp.res_mask]
+        diffuse_mask = noisy_batch[bp.diffuse_mask]
+        chain_idx = noisy_batch[bp.chain_idx]
+        # for inpainting, define `scaffold_mask` for sequence corruption using `1-motif_mask`
+        motif_mask = noisy_batch.get(bp.motif_mask, None)
+        scaffold_mask = (1 - motif_mask) if motif_mask is not None else diffuse_mask
+
+        # Pull out t_1 values
+        trans_t_1 = noisy_batch[nbp.trans_t]
+        rotmats_t_1 = noisy_batch[nbp.rotmats_t]
+        aatypes_t_1 = noisy_batch[nbp.aatypes_t]
+        torsions_t_1 = noisy_batch[nbp.torsions_t]
+
+        # Get model output given batch at time `t`
+        with torch.no_grad():
+            model_out = model(noisy_batch)
+        pred_trans_1 = model_out[pbp.pred_trans]
+        pred_rotmats_1 = model_out[pbp.pred_rotmats]
+        pred_torsions_1 = model_out[pbp.pred_torsions]  # may be None
+        pred_aatypes_1 = model_out[pbp.pred_aatypes]
+        pred_logits_1 = model_out[pbp.pred_logits]
+
+        model_step = SamplingStep(
+            structure=Interpolant.frames_to_atom37(
+                res_mask=res_mask,
+                trans=pred_trans_1,
+                rots=pred_rotmats_1,
+                aatypes=pred_aatypes_1,
+                torsions=pred_torsions_1,
+            ),
+            amino_acids=to_cpu(pred_aatypes_1),
+            logits=to_cpu(pred_logits_1),
+        )
+
+        # Mask fixed values to prepare for integration and update the batch for next step.
+        if task == InferenceTask.unconditional:
+            pass
+        elif task == InferenceTask.inpainting:
+            # fix the logits / sequence
+            pred_logits_1 = mask_blend_2d(
+                pred_logits_1, true_feats.logits, scaffold_mask
+            )
+            pred_aatypes_1 = mask_blend_1d(
+                pred_aatypes_1, true_feats.aatypes, scaffold_mask
+            )
+
+            # For inpainting with guidance, set motif structure to t=1
+            # so that we interpolate toward the known motifs. Also for self-conditioning.
+            pred_trans_1 = mask_blend_2d(pred_trans_1, true_feats.trans, diffuse_mask)
+            pred_rotmats_1 = mask_blend_3d(
+                pred_rotmats_1, true_feats.rotmats, diffuse_mask
+            )
+            if pred_torsions_1 is not None:
+                pred_torsions_1 = mask_blend_3d(
+                    pred_torsions_1, true_feats.torsions, diffuse_mask
+                )
+        elif task == InferenceTask.forward_folding:
+            # scale logits during integration, assumes will `softmax`
+            pred_logits_1 = 100.0 * true_feats.logits
+            pred_aatypes_1 = true_feats.aatypes
+        elif task == InferenceTask.inverse_folding:
+            pred_trans_1 = true_feats.trans
+            pred_rotmats_1 = true_feats.rotmats
+            if pred_torsions_1 is not None:
+                pred_torsions_1 = true_feats.torsions
+        else:
+            raise ValueError(f"Unknown task {task}")
+
+        # During sampling, update the self-conditioned values and take Euler steps for each domain.
+        # On the final step, just use the cleaned up model predictions.
+        if is_final_step:
+            # Note we deviate from the convention in FrameFlow which does not mask with true values,
+            # as we do above. Forcing them, like `forward_folding` or `inverse_folding`
+            # seems to make sense if they are used for guidance and were fixed throughout.
+            trans_t_2 = pred_trans_1
+            rotmats_t_2 = pred_rotmats_1
+            aatypes_t_2 = pred_aatypes_1
+            torsions_t_2 = pred_torsions_1
+        else:
+            # Update self-conditioning values using model outputs.
+            # Fixed domains depending on task have already been updated above.
+            if self.cfg.self_condition:
+                noisy_batch[nbp.trans_sc] = mask_blend_2d(
+                    pred_trans_1, true_feats.trans, diffuse_mask
+                )
+                noisy_batch[nbp.aatypes_sc] = mask_blend_2d(
+                    pred_logits_1, true_feats.logits, scaffold_mask
+                )
+
+            # Take next step, size `d_t` from `t_1` (current value) to `t_2` (toward predicted value)
+            # We are at `t_1` with state `{domain}_t_1`. The model predicted `pred_{domain}_1`.
+            d_t = t_2 - t_1
+            trans_t_2 = self._trans_euler_step(
+                d_t=d_t,
+                t=t_1,
+                trans_1=pred_trans_1,
+                trans_t=trans_t_1,
+                chain_idx=chain_idx,
+            )
+            rotmats_t_2 = self._rots_euler_step(
+                d_t=d_t, t=t_1, rotmats_1=pred_rotmats_1, rotmats_t=rotmats_t_1
+            )
+            aatypes_t_2 = self._aatypes_euler_step(
+                d_t=d_t, t=t_1, logits_1=pred_logits_1, aatypes_t=aatypes_t_1
+            )
+            torsions_t_2 = (
+                self.torsions_euler_step(
+                    d_t=d_t, t=t_1, torsions_1=pred_torsions_1, torsions_t=torsions_t_1
+                )
+                if pred_torsions_1 is not None
+                else None
+            )
+
+            if task == InferenceTask.inpainting:
+                # Because we already set the motif positions in pred_{trans/rots}_1,
+                # we have already interpolated towards them as guidance.
+                # TODO(inpainting-fixed) to support fixed motifs, fix the t_2 structure motifs.
+
+                # Sequence is fixed for motifs at t=1
+                aatypes_t_2 = mask_blend_1d(
+                    aatypes_t_2, true_feats.aatypes, scaffold_mask
+                )
+
+        # Center diffused residues to maintain translation invariance
+        # Definitely should center if inpainting or stochastic, but might as well if unconditional too
+        # TODO(inpainting-fixed) keep fixed motifs centered, so condition remains the same (learn scaffold drift)
+        #   The motifs vs structure @ t will have different centers of mass.
+        trans_t_2 -= batch_center_of_mass(trans_t_2, mask=res_mask)[:, None]
+
+        protein_step = SamplingStep(
+            structure=Interpolant.frames_to_atom37(
+                res_mask=res_mask,
+                trans=trans_t_2,
+                rots=rotmats_t_2,
+                aatypes=aatypes_t_2,
+                torsions=torsions_t_2,
+            ),
+            amino_acids=to_cpu(aatypes_t_2),
+        )
+
+        # update batch to t_2
+        noisy_batch[nbp.trans_t] = (
+            trans_t_2 if self.cfg.trans.corrupt else true_feats.trans
+        )
+        noisy_batch[nbp.rotmats_t] = (
+            rotmats_t_2 if self.cfg.rots.corrupt else true_feats.rotmats
+        )
+        noisy_batch[nbp.aatypes_t] = (
+            aatypes_t_2 if self.cfg.aatypes.corrupt else true_feats.aatypes
+        )
+        if torsions_t_2 is not None:
+            noisy_batch[nbp.torsions_t] = torsions_t_2
+
+        return noisy_batch, model_step, protein_step
+
     def sample(
         self,
         num_batch: int,
@@ -1254,7 +1579,7 @@ class Interpolant:
         # for inpainting, define `scaffold_mask` for sequence corruption using `1-motif_mask`
         scaffold_mask = (1 - motif_mask) if motif_mask is not None else diffuse_mask
 
-        # no self-conditioning during first step sampling
+        # set up empty self-conditioning values, to be filled during sampling.
         # if self-conditioning disabled these values will not be updated
         trans_sc = torch.zeros(num_batch, num_res, 3, device=self._device)
         aatypes_sc = torch.zeros(
@@ -1272,21 +1597,16 @@ class Interpolant:
             nbp.aatypes_sc: aatypes_sc,
         }
 
-        # Initialize t=1 values for translations, rotations, torsions, and aatypes, if not defined
-
-        if trans_1 is None:
-            trans_1 = torch.zeros(num_batch, num_res, 3, device=self._device)
-        if rotmats_1 is None:
-            rotmats_1 = torch.eye(3, device=self._device)[None, None].repeat(
-                num_batch, num_res, 1, 1
-            )
-        if aatypes_1 is None:
-            aatypes_1 = torch.zeros((num_batch, num_res), device=self._device).long()
-        if torsions_1 is None:
-            torsions_1 = torsions_empty(num_batch, num_res, device=self._device)
-        logits_1 = torch.nn.functional.one_hot(
-            aatypes_1, num_classes=self.num_tokens
-        ).float()
+        # Capture t=1 values for translations, rotations, torsions, and aatypes
+        # Set to empty/identity values if they are not provided.
+        true_feats = BatchTrueFeatures.from_optional(
+            res_mask=res_mask,
+            num_tokens=self.num_tokens,
+            trans=trans_1,
+            rotmats=rotmats_1,
+            torsions=torsions_1,
+            aatypes=aatypes_1,
+        )
 
         # Initialize t=0 prior samples i.e. noise (technically `t=cfg.min_t`)
 
@@ -1295,22 +1615,18 @@ class Interpolant:
             trans_0 = self._trans_noise(chain_idx=chain_idx)
         if rotmats_0 is None:
             # Generate uniform SO(3) rotation matrices (B, N, 3, 3)
-            rotmats_0 = uniform_so3(num_batch, num_res, device=self._device)
+            rotmats_0 = self._rotmats_noise(res_mask=res_mask)
         if aatypes_0 is None:
             # Generate mask / random aa_types (B, N)
             aatypes_0 = self._aatypes_noise(res_mask=res_mask)
         if torsions_0 is None:
             # Generate initial torsion angles
-            torsions_0 = torsions_noise(
-                sigma=torch.ones((num_batch,), device=self._device),
-                num_samples=num_res,
-                num_angles=7,
-            )
+            torsions_0 = self._torsions_noise(res_mask=res_mask)  # (B, N, 7, 2)
 
         # For inpainting, adjust motifs.
         if task == InferenceTask.inpainting:
             # The sequence is fixed to for partial sequence conditioning.
-            aatypes_0 = mask_blend_1d(aatypes_0, aatypes_1, scaffold_mask)
+            aatypes_0 = mask_blend_1d(aatypes_0, true_feats.aatypes, scaffold_mask)
 
             # Translations and rotations will be interpolated, by passing `diffuse_mask == 1` to the network
             # (because `diffuse_mask == 0` residues are not updated by backbone update).
@@ -1318,9 +1634,9 @@ class Interpolant:
             # TODO(inpainting-fixed) depending on guidance type, set _1 values to t=1 using mask
             #    Enabling inpainting-fixed is mostly as simple as fixing the motifs and not diffusing the motifs.
             #    The main difficulty is centering and avoiding biasing the model as to where the scaffolds go.
-            # trans_0 = mask_blend_2d(trans_0, trans_1, diffuse_mask)
-            # rotmats_0 = mask_blend_3d(rotmats_0, rotmats_1, diffuse_mask)
-            # torsions_0 = mask_blend_3d(torsions_0, torsions_1, diffuse_mask)
+            # trans_0 = mask_blend_2d(trans_0, true_feats.trans, diffuse_mask)
+            # rotmats_0 = mask_blend_3d(rotmats_0, true_feats.rotmats, diffuse_mask)
+            # torsions_0 = mask_blend_3d(torsions_0, true_feats.torsions, diffuse_mask)
 
         # check for NaNs, should only happen for invalid data or diffuse_mask
         if torch.isnan(trans_0).any():
@@ -1333,31 +1649,13 @@ class Interpolant:
             elif task == InferenceTask.inpainting:
                 pass
             elif task == InferenceTask.forward_folding:
-                aatypes_0 = aatypes_1
+                aatypes_0 = true_feats.aatypes
             elif task == InferenceTask.inverse_folding:
-                trans_0 = trans_1
-                rotmats_0 = rotmats_1
-                torsions_0 = torsions_1
+                trans_0 = true_feats.trans
+                rotmats_0 = true_feats.rotmats
+                torsions_0 = true_feats.torsions
             else:
                 raise ValueError(f"Unknown task {task}")
-
-        # Helper function to get atom37 structure from residue frames, only for `res_mask`
-        def frames_to_atom37(
-            trans: torch.Tensor,  # (B, N, 3)
-            rots: torch.Tensor,  # (B, N, 3, 3)
-            aatypes: torch.Tensor,  # (B, N, S)
-            torsions: Optional[torch.Tensor],  # (B, N, K, 2)
-        ) -> torch.Tensor:
-            return to_cpu(
-                all_atom.atom37_from_trans_rot(
-                    trans=trans,
-                    rots=rots,
-                    torsions=torsions,
-                    aatype=aatypes,
-                    res_mask=res_mask,
-                    unknown_to_alanine=True,  # show UNK residues as alanine
-                )
-            )
 
         # model_trajectory tracks model outputs
         model_trajectory = SamplingTrajectory(
@@ -1371,9 +1669,11 @@ class Interpolant:
             num_res=num_res,
             num_tokens=self.num_tokens,
         )
+
         protein_trajectory.append(
             SamplingStep(
-                structure=frames_to_atom37(
+                structure=Interpolant.frames_to_atom37(
+                    res_mask=res_mask,
                     trans=trans_0,
                     rots=rotmats_0,
                     aatypes=aatypes_0,
@@ -1383,27 +1683,20 @@ class Interpolant:
             )
         )
 
+        # Set up initial t=0 values in batch
+        batch[nbp.trans_t] = trans_0
+        batch[nbp.rotmats_t] = rotmats_0
+        batch[nbp.torsions_t] = torsions_0
+        batch[nbp.aatypes_t] = aatypes_0
+
         # Set-up time steps
         ts = torch.linspace(self.cfg.min_t, 1.0, self.cfg.sampling.num_timesteps)
-
-        # Set up initial values, where *_t_1 start at t=0 values
-        trans_t_1 = trans_0
-        rotmats_t_1 = rotmats_0
-        torsions_t_1 = torsions_0
-        aatypes_t_1 = aatypes_0
 
         # We will integrate in a loop over ts (handling the last step after the loop)
         # t_1 is the current time, t_2 is the next time
         t_1 = ts[0]
         for t_2 in ts[1:]:
-            # update batch values
-            batch[nbp.trans_t] = trans_t_1 if self.cfg.trans.corrupt else trans_1
-            batch[nbp.rotmats_t] = rotmats_t_1 if self.cfg.rots.corrupt else rotmats_1
-            batch[nbp.aatypes_t] = (
-                aatypes_t_1 if self.cfg.aatypes.corrupt else aatypes_1
-            )
-
-            # determine time for each domain
+            # Determine time for each domain
             t = torch.ones((num_batch, 1), device=self._device) * t_1
             if t_nn is not None:
                 (
@@ -1437,190 +1730,41 @@ class Interpolant:
                 else:
                     raise ValueError(f"Unknown task {task}")
 
-            # Get model output at translations/rotations/aatypes respective `t`
-            with torch.no_grad():
-                model_out = model(batch)
-            pred_trans_1 = model_out[pbp.pred_trans]
-            pred_rotmats_1 = model_out[pbp.pred_rotmats]
-            pred_torsions_1 = model_out[pbp.pred_torsions]  # may be None
-            pred_aatypes_1 = model_out[pbp.pred_aatypes]
-            pred_logits_1 = model_out[pbp.pred_logits]
-
-            model_trajectory.append(
-                SamplingStep(
-                    structure=frames_to_atom37(
-                        trans=pred_trans_1,
-                        rots=pred_rotmats_1,
-                        aatypes=pred_aatypes_1,
-                        torsions=pred_torsions_1,
-                    ),
-                    amino_acids=to_cpu(pred_aatypes_1),
-                    logits=to_cpu(pred_logits_1),
-                )
+            # Take a single step, updating the batch in place
+            batch, model_step, protein_step = self.sample_step(
+                noisy_batch=batch,
+                true_feats=true_feats,
+                model=model,
+                task=task,
+                t_1=t_1,
+                t_2=t_2,
             )
 
-            # Mask fixed values to prepare for integration and update the batch for next step.
-            if task == InferenceTask.unconditional:
-                pass
-            elif task == InferenceTask.inpainting:
-                # fix the logits / sequence
-                pred_logits_1 = mask_blend_2d(pred_logits_1, logits_1, scaffold_mask)
-                pred_aatypes_1 = mask_blend_1d(pred_aatypes_1, aatypes_1, scaffold_mask)
+            model_trajectory.append(model_step)
+            protein_trajectory.append(protein_step)
 
-                # For inpainting with guidance, set motif structure to t=1
-                # so that we interpolate toward the known motifs. Also for self-conditioning.
-                pred_trans_1 = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
-                pred_rotmats_1 = mask_blend_3d(pred_rotmats_1, rotmats_1, diffuse_mask)
-                if pred_torsions_1 is not None:
-                    pred_torsions_1 = mask_blend_3d(
-                        pred_torsions_1, torsions_1, diffuse_mask
-                    )
-            elif task == InferenceTask.forward_folding:
-                # scale logits during integration, assumes will `softmax`
-                pred_logits_1 = 100.0 * logits_1
-                pred_aatypes_1 = aatypes_1
-            elif task == InferenceTask.inverse_folding:
-                pred_trans_1 = trans_1
-                pred_rotmats_1 = rotmats_1
-                if pred_torsions_1 is not None:
-                    pred_torsions_1 = torsions_1
-            else:
-                raise ValueError(f"Unknown task {task}")
-
-            # Update self-conditioning values using model outputs.
-            # Fixed domains depending on task have already been updated above.
-            if self.cfg.self_condition:
-                batch[nbp.trans_sc] = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
-                batch[nbp.aatypes_sc] = mask_blend_2d(
-                    pred_logits_1, logits_1, scaffold_mask
-                )
-
-            # Take next step, size `d_t` from `t_1` (current value) to `t_2` (toward predicted value)
-            # We are at `t_1` with state `{domain}_t_1`. The model predicted `pred_{domain}_1`.
-            d_t = t_2 - t_1
-            trans_t_2 = self._trans_euler_step(
-                d_t=d_t,
-                t=t_1,
-                trans_1=pred_trans_1,
-                trans_t=trans_t_1,
-                chain_idx=chain_idx,
-            )
-            rotmats_t_2 = self._rots_euler_step(
-                d_t=d_t, t=t_1, rotmats_1=pred_rotmats_1, rotmats_t=rotmats_t_1
-            )
-            aatypes_t_2 = self._aatypes_euler_step(
-                d_t=d_t, t=t_1, logits_1=pred_logits_1, aatypes_t=aatypes_t_1
-            )
-            torsions_t_2 = (
-                self.torsions_euler_step(
-                    d_t=d_t, t=t_1, torsions_1=pred_torsions_1, torsions_t=torsions_t_1
-                )
-                if pred_torsions_1 is not None
-                else None
-            )
-
-            if task == InferenceTask.inpainting:
-                # Because we already set the motif positions in pred_{trans/rots}_1,
-                # we have already interpolated towards them as guidance.
-                # TODO(inpainting-fixed) to support fixed motifs, fix the t_2 structure motifs.
-
-                # Sequence is fixed for motifs at t=1
-                aatypes_t_2 = mask_blend_1d(aatypes_t_2, aatypes_1, scaffold_mask)
-
-            # Center diffused residues to maintain translation invariance
-            # Definitely should center if inpainting or stochastic, but might as well if unconditional too
-            # TODO(inpainting-fixed) keep fixed motifs centered, so condition remains the same (learn scaffold drift)
-            #   The motifs vs structure @ t will have different centers of mass.
-            trans_t_2 -= batch_center_of_mass(trans_t_2, mask=res_mask)[:, None]
-
-            # Add to trajectory
-            protein_trajectory.append(
-                SamplingStep(
-                    structure=frames_to_atom37(
-                        trans=trans_t_2,
-                        rots=rotmats_t_2,
-                        aatypes=aatypes_t_2,
-                        torsions=torsions_t_2,
-                    ),
-                    amino_acids=to_cpu(aatypes_t_2),
-                )
-            )
-
-            # Get ready for the next step
-            trans_t_1 = trans_t_2
-            rotmats_t_1 = rotmats_t_2
-            aatypes_t_1 = aatypes_t_2
-            torsions_t_1 = torsions_t_2
+            # Update t_1 to t_2 for the next step
             t_1 = t_2
 
-        # We only integrated to 1-min_t, so need to make a final step
-        t = torch.ones((num_batch, 1), device=self._device) * ts[-1]
+        # We only integrated to ts[-1], so need to make a final step
+
+        # update times to final `t`
+        assert t_1 == ts[-1]
+        t = torch.ones((num_batch, 1), device=self._device) * t_1
         batch[nbp.so3_t] = t
         batch[nbp.r3_t] = t
         batch[nbp.cat_t] = t
 
-        batch[nbp.trans_t] = trans_t_1 if self.cfg.trans.corrupt else trans_1
-        batch[nbp.rotmats_t] = rotmats_t_1 if self.cfg.rots.corrupt else rotmats_1
-        # Note - assigned to 'aatype_t' not 'aatypes_t' in public MultiFlow code, assume a bug.
-        # Perhaps impacted inverse folding performance, was timestep behind (but also network was small).
-        batch[nbp.aatypes_t] = aatypes_t_1 if self.cfg.aatypes.corrupt else aatypes_1
-
-        with torch.no_grad():
-            model_out = model(batch)
-        pred_trans_1 = model_out[pbp.pred_trans]
-        pred_rotmats_1 = model_out[pbp.pred_rotmats]
-        pred_torsions_1 = model_out[pbp.pred_torsions]  # may be None if not predicting
-        pred_aatypes_1 = model_out[pbp.pred_aatypes]
-        pred_logits_1 = model_out[pbp.pred_logits]
-
-        model_trajectory.append(
-            SamplingStep(
-                structure=frames_to_atom37(
-                    trans=pred_trans_1,
-                    rots=pred_rotmats_1,
-                    aatypes=pred_aatypes_1,
-                    torsions=pred_torsions_1,
-                ),
-                amino_acids=to_cpu(pred_aatypes_1),
-                logits=to_cpu(pred_logits_1),
-            )
+        batch, model_step, protein_step = self.sample_step(
+            noisy_batch=batch,
+            true_feats=true_feats,
+            model=model,
+            task=task,
+            t_1=t_1,
+            t_2=None,  # final step
         )
 
-        # Clean up the final outputs
-        if task == InferenceTask.unconditional:
-            pass
-        elif task == InferenceTask.inpainting:
-            # Here, deviate from the convention in FrameFlow which leaves these alone.
-            # Forcing them, like `forward_folding` or `inverse_folding` seems to make sense
-            # if they are used for guidance.
-            pred_logits_1 = mask_blend_2d(pred_logits_1, logits_1, scaffold_mask)
-            pred_aatypes_1 = mask_blend_1d(pred_aatypes_1, aatypes_1, scaffold_mask)
-            pred_trans_1 = mask_blend_2d(pred_trans_1, trans_1, diffuse_mask)
-            pred_rotmats_1 = mask_blend_3d(pred_rotmats_1, rotmats_1, diffuse_mask)
-            if pred_torsions_1 is not None:
-                pred_torsions_1 = mask_blend_3d(
-                    pred_torsions_1, torsions_1, diffuse_mask
-                )
-        elif task == InferenceTask.forward_folding:
-            pred_logits_1 = logits_1
-            pred_aatypes_1 = aatypes_1
-        elif task == InferenceTask.inverse_folding:
-            pred_trans_1 = trans_1
-            pred_rotmats_1 = rotmats_1
-            pred_torsions_1 = torsions_1
-        else:
-            raise ValueError(f"Unknown task {task}")
-
-        protein_trajectory.append(
-            SamplingStep(
-                structure=frames_to_atom37(
-                    trans=pred_trans_1,
-                    rots=pred_rotmats_1,
-                    aatypes=pred_aatypes_1,
-                    torsions=pred_torsions_1,
-                ),
-                amino_acids=to_cpu(pred_aatypes_1),
-            )
-        )
+        model_trajectory.append(model_step)
+        protein_trajectory.append(protein_step)
 
         return protein_trajectory, model_trajectory

@@ -31,7 +31,7 @@ from cogeneration.data.noise_mask import mask_blend_2d
 from cogeneration.data.trajectory import SavedTrajectory, save_trajectory
 from cogeneration.models.loss_calculator import (
     AuxiliaryMetrics,
-    LossCalculator,
+    BatchLossCalculator,
     TrainingLosses,
 )
 from cogeneration.models.model import FlowModel
@@ -219,7 +219,7 @@ class FlowModule(LightningModule):
     def model_step(self, batch: NoisyFeatures) -> TrainingLosses:
         model_output = self.model(batch)
 
-        loss_calculator = LossCalculator(
+        loss_calculator = BatchLossCalculator(
             cfg=self.cfg,
             batch=batch,
             pred=model_output,
@@ -391,7 +391,7 @@ class FlowModule(LightningModule):
             trans_1=batch[bp.trans_1],
             rotmats_1=batch[bp.rotmats_1],
             aatypes_1=batch[bp.aatypes_1],
-            torsions_1=batch[bp.torsion_angles_sin_cos_1],
+            torsions_1=batch[bp.torsions_1],
         )
 
         bb_trajs = to_numpy(protein_traj.structure)
@@ -477,7 +477,7 @@ class FlowModule(LightningModule):
         # Pull out metadata and t=1 values, if defined
         trans_1 = batch.get(bp.trans_1, None)
         rotmats_1 = batch.get(bp.rotmats_1, None)
-        torsions_1 = batch.get(bp.torsion_angles_sin_cos_1, None)
+        torsions_1 = batch.get(bp.torsions_1, None)
         aatypes_1 = batch.get(bp.aatypes_1, None)
         sample_pdb_name = batch.get(bp.pdb_name, [None])[0]
 

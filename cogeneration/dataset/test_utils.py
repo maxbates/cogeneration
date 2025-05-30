@@ -30,7 +30,7 @@ def mock_feats(
     feats[bp.aatypes_1] = torch.randint(0, 20, (N,))  # may contain UNK (20)
     feats[bp.trans_1] = torch.rand(N, 3) * 10.0
     feats[bp.rotmats_1] = uniform_so3(1, N, device=torch.device("cpu")).squeeze(0)
-    feats[bp.torsion_angles_sin_cos_1] = torch.rand(N, 7, 2)
+    feats[bp.torsions_1] = torch.rand(N, 7, 2)
     feats[bp.res_plddt] = torch.floor(torch.rand(N) + 0.5)
     feats[bp.plddt_mask] = feats[bp.res_plddt] > 0.6
     feats[bp.diffuse_mask] = torch.ones(N).int()
@@ -76,6 +76,7 @@ def mock_noisy_feats(
     feats[nbp.cat_t] = t
     feats[nbp.trans_t] = torch.rand(N, 3)
     feats[nbp.rotmats_t] = torch.rand(N, 3, 3)
+    feats[nbp.torsions_t] = torch.rand(N, 7, 2)
     feats[nbp.aatypes_t] = torch.rand(N) * 20  # AA seq as floats
     feats[nbp.trans_sc] = torch.rand(N, 3)
     feats[nbp.aatypes_sc] = torch.rand(N, 21)  # include mask token

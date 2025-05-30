@@ -98,7 +98,7 @@ class BatchGroundTruth:
 
     @property
     def torsions_1(self) -> torch.Tensor:
-        return self.batch[bp.torsion_angles_sin_cos_1]  # (B, N, 7, 2)
+        return self.batch[bp.torsions_1]  # (B, N, 7, 2)
 
     @property
     def rot_vf(self):
@@ -151,7 +151,7 @@ class BatchNormScales:
 
 
 @dataclass
-class LossCalculator:
+class BatchLossCalculator:
     cfg: Config
     batch: NoisyFeatures
     pred: ModelPrediction
@@ -279,7 +279,7 @@ class LossCalculator:
         # ground‑truth psi torsion: (B, N, 7, 2) -> (B, N, K, 2)
         K = pred_torsions.shape[2]
         assert K in (1, 5, 7)
-        gt_torsions = self.batch[bp.torsion_angles_sin_cos_1]
+        gt_torsions = self.batch[bp.torsions_1]
         if K < 7:
             gt_torsions = gt_torsions[..., 2 : 2 + K, :]
 

@@ -6,6 +6,7 @@ from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import torsions_empty
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyBatchProp as nbp
+from cogeneration.type.batch import NoisyFeatures
 from cogeneration.type.batch import PredBatchProp as pbp
 from cogeneration.type.task import InferenceTask
 
@@ -29,20 +30,22 @@ class TestInterpolantSample:
         T = cfg.inference.interpolant.sampling.num_timesteps
 
         # Dummy model
+        # TODO consider returning noise rather than the same `_t` values each step
         class ModelStub:
-            def __call__(self, batch):
-                t = batch[nbp.trans_t]
-                r = batch[nbp.rotmats_t]
-                torsions = torsions_empty(
-                    num_batch=B, num_res=N, num_angles=7, device=torch.device("cpu")
-                )
-                aa = batch[nbp.aatypes_t].long()
-                logits = torch.nn.functional.one_hot(aa, num_classes=num_tokens).float()
+            def __call__(self, noisy_batch: NoisyFeatures):
+                trans = noisy_batch[nbp.trans_t]
+                rotmats = noisy_batch[nbp.rotmats_t]
+                torsions = noisy_batch[nbp.torsions_t]
+                aatypes = noisy_batch[nbp.aatypes_t].long()
+                logits = torch.nn.functional.one_hot(
+                    aatypes, num_classes=num_tokens
+                ).float()
+
                 return {
-                    pbp.pred_trans: t,
-                    pbp.pred_rotmats: r,
+                    pbp.pred_trans: trans,
+                    pbp.pred_rotmats: rotmats,
                     pbp.pred_torsions: torsions,
-                    pbp.pred_aatypes: aa,
+                    pbp.pred_aatypes: aatypes,
                     pbp.pred_logits: logits,
                 }
 
@@ -62,7 +65,7 @@ class TestInterpolantSample:
             kwargs.update(
                 trans_1=batch[bp.trans_1],
                 rotmats_1=batch[bp.rotmats_1],
-                torsions_1=batch[bp.torsion_angles_sin_cos_1],
+                torsions_1=batch[bp.torsions_1],
                 aatypes_1=batch[bp.aatypes_1],
             )
         elif task == InferenceTask.forward_folding:
@@ -73,7 +76,7 @@ class TestInterpolantSample:
             kwargs.update(
                 trans_1=batch[bp.trans_1],
                 rotmats_1=batch[bp.rotmats_1],
-                torsions_1=batch[bp.torsion_angles_sin_cos_1],
+                torsions_1=batch[bp.torsions_1],
             )
 
         prot_traj, model_traj = interpolant.sample(

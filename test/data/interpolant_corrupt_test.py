@@ -11,6 +11,7 @@ from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import (
     centered_gaussian,
     centered_harmonic,
+    torsions_noise,
     uniform_so3,
 )
 from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
@@ -213,6 +214,7 @@ class TestInterpolant:
             nbp.r3_t,
             nbp.trans_t,
             nbp.rotmats_t,
+            nbp.torsions_t,
             nbp.aatypes_t,
             nbp.trans_sc,
             nbp.aatypes_sc,
@@ -230,6 +232,8 @@ class TestInterpolant:
         assert noisy_batch[nbp.trans_sc].shape == (B, N, 3)
         # rotations
         assert noisy_batch[nbp.rotmats_t].shape == (B, N, 3, 3)
+        # torsions
+        assert noisy_batch[nbp.torsions_t].shape == (B, N, 7, 2)
         # amino acids and self-cond logits
         assert noisy_batch[nbp.aatypes_t].shape == (B, N)
         assert noisy_batch[nbp.aatypes_sc].shape == (B, N, interpolant.num_tokens)
@@ -246,11 +250,13 @@ class TestInterpolant:
         assert torch.all(t_vals >= min_t - 1e-6)
         assert torch.all(t_vals <= 1 + 1e-6)
 
-        # Corrupted translations and rotations should differ from originals
+        # Corrupted structure should differ from originals
         trans_diff = noisy_batch[nbp.trans_t] - batch[bp.trans_1]
         assert torch.any(trans_diff.abs() > 1e-6), "trans_t should be corrupted"
         rot_diff = noisy_batch[nbp.rotmats_t] - batch[bp.rotmats_1]
         assert torch.any(rot_diff.abs() > 1e-6), "rotmats_t should be corrupted"
+        torsions_diff = noisy_batch[nbp.torsions_t] - batch[bp.torsions_1]
+        assert torch.any(torsions_diff.abs() > 1e-6), "torsions_t should be corrupted"
 
     @pytest.mark.parametrize("stochastic", [False, True])
     @pytest.mark.parametrize("noise_type", ["gaussian", "harmonic"])
@@ -276,7 +282,7 @@ class TestInterpolant:
         else:
             raise ValueError(f"Unknown noise type {noise_type}")
 
-        out = interpolant._corrupt_trans(
+        trans_t = interpolant._corrupt_trans(
             trans_1,
             t=t,
             res_mask=res_mask,
@@ -284,8 +290,7 @@ class TestInterpolant:
             chain_idx=chain_idx,
         )
 
-        assert not torch.allclose(out, trans_1)
-        # TODO - check values better
+        assert not torch.allclose(trans_t, trans_1)
 
     @pytest.mark.parametrize("stochastic", [False, True])
     def test_corrupt_rotations(self, stochastic, mock_cfg_uninterpolated):
@@ -303,19 +308,45 @@ class TestInterpolant:
 
         rotmats_1 = uniform_so3(B, N, device=interpolant._device)
 
-        out = interpolant._corrupt_rotmats(
+        rotmats_t = interpolant._corrupt_rotmats(
             rotmats_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
         )
 
-        assert not torch.allclose(out, rotmats_1)
+        assert not torch.allclose(rotmats_t, rotmats_1)
 
         # must remain valid rotations
-        RRT = torch.matmul(out, out.transpose(-1, -2))
+        RRT = torch.matmul(rotmats_t, rotmats_t.transpose(-1, -2))
         I3 = torch.eye(3)
         assert torch.allclose(RRT, I3, atol=1e-3)
         assert torch.allclose(
-            torch.det(out), torch.ones_like(torch.det(out)), atol=1e-3
+            torch.det(rotmats_t), torch.ones_like(torch.det(rotmats_t)), atol=1e-3
         )
+
+    @pytest.mark.parametrize("stochastic", [False, True])
+    def test_corrupt_torsions(self, stochastic, mock_cfg_uninterpolated):
+        mock_cfg_uninterpolated.shared.stochastic = stochastic
+        cfg = mock_cfg_uninterpolated.interpolate()
+
+        interpolant = Interpolant(cfg.interpolant)
+        interpolant.set_device(torch.device("cpu"))
+
+        B, N = 4, 16
+        res_mask = torch.ones(B, N).float()
+        diffuse_mask = torch.ones(B, N).float()
+        t = torch.rand(B, 1)
+
+        torsions_1 = torsions_noise(
+            sigma=torch.ones(B, device=interpolant._device),
+            num_samples=N,
+            num_angles=7,
+        )
+
+        torsions_t = interpolant._corrupt_torsions(
+            torsions_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
+        )
+
+        assert torsions_t.shape == (B, N, 7, 2)
+        assert not torch.allclose(torsions_t, torsions_1)
 
     @pytest.mark.parametrize("stochastic", [False, True])
     @pytest.mark.parametrize(
@@ -492,7 +523,7 @@ class TestInterpolant:
             noisy_batch[nbp.trans_t][scaffold_sel] != batch[bp.trans_1][scaffold_sel]
         ), "scaffold structure should change"
         assert torch.all(
-            noisy_batch[nbp.trans_t][scaffold_sel] != batch[bp.trans_1][scaffold_sel]
+            noisy_batch[nbp.trans_t][motif_sel] != batch[bp.trans_1][motif_sel]
         ), "motif structure should change"
 
     @pytest.mark.parametrize("time", [0, 1])
@@ -501,6 +532,7 @@ class TestInterpolant:
         mock_cfg_uninterpolated.shared.stochastic = True
         mock_cfg_uninterpolated.interpolant.trans.batch_ot = False
         mock_cfg_uninterpolated.interpolant.trans.batch_align = False
+        mock_cfg_uninterpolated.dataset.noise_atom_positions_angstroms = 0.0
         cfg = mock_cfg_uninterpolated.interpolate()
 
         interpolant = Interpolant(cfg.interpolant)
@@ -512,10 +544,20 @@ class TestInterpolant:
         diffuse_mask = torch.ones(B, N).float()
         t = torch.ones((B, 1)) * time
 
+        # at both t=0 and t=1, sigma_t should be 0
         assert torch.allclose(
             interpolant._compute_sigma_t(t, scale=1, min_sigma=0.0),
             torch.zeros((B, 1)).float(),
         )
+
+        # Inspect corruptions
+
+        aatypes_1 = torch.randint(0, 20, (B, N)).long()
+        aatypes_t = interpolant._corrupt_aatypes(
+            aatypes_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
+        )
+        if time == 1:
+            assert torch.equal(aatypes_1, aatypes_t)
 
         trans_1 = centered_gaussian(B, N, device=interpolant._device)
         trans_1 -= batch_center_of_mass(trans_1, mask=res_mask)[:, None]
@@ -535,10 +577,3 @@ class TestInterpolant:
         )
         if time == 1:
             assert torch.allclose(rotmats_1, rotmats_t, atol=1e-3)
-
-        aatypes_1 = torch.randint(0, 20, (B, N)).long()
-        aatypes_t = interpolant._corrupt_aatypes(
-            aatypes_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
-        )
-        if time == 1:
-            assert torch.equal(aatypes_1, aatypes_t)

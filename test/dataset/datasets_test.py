@@ -3,7 +3,11 @@ import torch
 from cogeneration.config.base import InferenceSamplesConfig
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.noise_mask import torsions_empty
-from cogeneration.dataset.datasets import BaseDataset, LengthSamplingDataset, BatchFeaturizer
+from cogeneration.dataset.datasets import (
+    BaseDataset,
+    BatchFeaturizer,
+    LengthSamplingDataset,
+)
 from cogeneration.dataset.motif_factory import ChainBreak, Motif, Scaffold
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import empty_feats
@@ -52,8 +56,8 @@ class TestBaseDataset:
         assert torch.equal(new_feats[bp.rotmats_1][5:9], feats[bp.rotmats_1][2:6])
         assert torch.equal(new_feats[bp.aatypes_1][5:9], feats[bp.aatypes_1][2:6])
         assert torch.equal(
-            new_feats[bp.torsion_angles_sin_cos_1][5:9],
-            feats[bp.torsion_angles_sin_cos_1][2:6],
+            new_feats[bp.torsions_1][5:9],
+            feats[bp.torsions_1][2:6],
         )
 
         # trans + rots + aatypes masked in scaffold regions
@@ -65,7 +69,7 @@ class TestBaseDataset:
             new_feats[bp.aatypes_1][0:5], torch.ones(5) * MASK_TOKEN_INDEX
         )
         assert torch.equal(
-            new_feats[bp.torsion_angles_sin_cos_1][0:5],
+            new_feats[bp.torsions_1][0:5],
             torsions_empty(num_batch=1, num_res=5, num_angles=7, device="cpu").squeeze(
                 0
             ),

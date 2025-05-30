@@ -4,7 +4,8 @@ Cogeneration is a protein generative model that simultaneously generates protein
 
 This project is based on MultiFlow, but introduces several extensions over the original:
 - support for multimers
-- inpainting (conditional generation)
+- inpainting (conditional generation) given partial structures
+    - MultiFlow supports per-domain conditioning via seperate t (i.e. folding and inverse folding)
 - stochastic paths, for the structure and sequence
 - model architecture changes:
     - support for existing protein language models (e.g. ESM) to get frozen embeddings

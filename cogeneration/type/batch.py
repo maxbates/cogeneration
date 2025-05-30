@@ -17,7 +17,7 @@ class BatchProp(StrEnum):
     aatypes_1 = "aatypes_1"  # (B, N) amino acid sequence, as ints (0-20, 20 for UNK)
     trans_1 = "trans_1"  # (B, N, 3) frame translations
     rotmats_1 = "rotmats_1"  # (B, N, 3, 3) frame rotations
-    torsion_angles_sin_cos_1 = "torsion_angles_sin_cos_1"  # (B, N, 7, 2)
+    torsions_1 = "torsion_angles_sin_cos_1"  # (B, N, 7, 2)
     # structure metadata
     chain_idx = "chain_idx"  # (B, N) chain index (chains are shuffled, 1-indexed)
     res_idx = "res_idx"  # (B, N) residue index (residues are re-numbered contiguously 1-indexed)
@@ -48,6 +48,7 @@ class NoisyBatchProp(StrEnum):
     """
     Corrupted batch property enum.
     "_t" properties @ time == t are data corrupted to time `t`, where t=0 is noise.
+    "_sc" properties are self-conditioned predictions, i.e. predictions at `t`
     """
 
     cat_t = "cat_t"  # (B, 1) tensor, t for amino acids (categoricals)
@@ -55,6 +56,7 @@ class NoisyBatchProp(StrEnum):
     r3_t = "r3_t"  # (B, 1) tensor, t for R3 (translations)
     trans_t = "trans_t"  # (B, N, 3) tensor, translations @ t
     rotmats_t = "rotmats_t"  # (B, N, 3, 3) tensor, rotations @ t
+    torsions_t = "torsions_t"  # (B, N, 7, 2) tensor, torsions @ t
     aatypes_t = "aatypes_t"  # (B, N) tensor, predicted amino acids @ t as ints (0-20)
     trans_sc = "trans_sc"  # (B, N, 3) tensor, self-conditioned pred translations @ t
     aatypes_sc = "aatypes_sc"  # (B, N, 21) tensor, self-conditioned pred sequence @ t, including mask token
@@ -102,7 +104,7 @@ def empty_feats(N: int, task: DataTask = DataTask.hallucination) -> BatchFeature
         BatchProp.aatypes_1: (torch.ones(N) * MASK_TOKEN_INDEX).long(),
         BatchProp.trans_1: torch.zeros(N, 3),
         BatchProp.rotmats_1: torch.eye(3).repeat(N, 1, 1),
-        BatchProp.torsion_angles_sin_cos_1: torch.stack(
+        BatchProp.torsions_1: torch.stack(
             [torch.zeros(N, 7), torch.ones(N, 7)], dim=-1  # sin(0) = 0  # cos(0) = 1
         ),
         BatchProp.chain_idx: torch.ones(N),

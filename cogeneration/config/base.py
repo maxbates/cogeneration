@@ -375,7 +375,8 @@ class ModelConfig(BaseClassConfig):
     esm_combiner: ModelESMCombinerConfig = field(default_factory=ModelESMCombinerConfig)
     ipa: ModelIPAConfig = field(default_factory=ModelIPAConfig)
 
-    # predict torsion angles. Model outputs (B, N, K, 2) depending on K predicted.
+    # Predict torsion angles. Model outputs (B, N, K, 2) depending on K predicted.
+    # These torsions are then filled to (B, N, 7, 2) by interpolant.
     predict_psi_torsions: bool = True  # -> 1 (psi): orients peptide plane & side chain
     predict_all_torsions: bool = True  # -> 7 angles: omega, phi, psi, chi1-chi4
 
