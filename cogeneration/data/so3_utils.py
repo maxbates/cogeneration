@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -510,7 +510,10 @@ def calc_rot_vf(mat_t: torch.Tensor, mat_1: torch.Tensor) -> torch.Tensor:
 
 
 def geodesic_t(
-    t: float, mat: torch.Tensor, base_mat: torch.Tensor, rot_vf=None
+    t: Union[float, torch.Tensor],
+    mat: torch.Tensor,
+    base_mat: torch.Tensor,
+    rot_vf=None,
 ) -> torch.Tensor:
     """
     Computes the geodesic at time t. Specifically, R_t = Exp_{base_mat}(t * Log_{base_mat}(mat)).

@@ -141,7 +141,7 @@ class SamplingTrajectory:
 @dataclass
 class BatchTrueFeatures:
     """
-    Struct for time=1 features of a batch.
+    Struct for time=1 (true/target distribution) features of a batch.
     Used during sampling for conditional generation (e.g. if a domain is fixed, motifs in inpainting)
     """
 
@@ -193,7 +193,7 @@ class Interpolant:
     (1) corrupt batches with noise, generating intermediate samples at some time `t`
     (2) generates samples, interpolating each modality using the learned vector fields over t=[0, 1] from noise to sample.
 
-    Works across 3 modalties: translations and rotations (i.e. backbone frames), and amino acid types (i.e. sequence).
+    Works across multiple domains: translations and rotations (i.e. backbone frames), torsion angles, and amino acid types (i.e. sequence).
 
     (1) Translations
     - in R^3 and are Euclidean
@@ -207,11 +207,18 @@ class Interpolant:
     - Noise is IGSO(3)
     - Supports stochastic paths
     - Supports Euler sampling using geodesic (Riemannian flow matching)
-    (3) Amino acid types
+    (3) Torsion angles
+    - Optional, and only sort of. Not a model input, only an output.
+    - Noise sampled from VonMises distribution
+    - Interpolate in angle space
+    - Supports stochastic paths
+    - Supports Euler sampling
+    (4) Amino acid types
     - are discrete
     - over either uniform distribution (n=20) or with masks (n=21)
     - supports Euler steps using learned rate matrix (discrete flow matching)
     - supports "purity" sampling, i.e. masking by max log probs and re-masking noise
+    - supports stochastic paths using CTMC jump
 
     (Frames a.k.a. Rigids are therefore in SE(3) = R^3 x SO(3))
     torsion angles are not really considered by the interpolant, except when output by the model to generate Rigids.
@@ -477,7 +484,9 @@ class Interpolant:
         if so3_schedule == InterpolantRotationsScheduleEnum.linear:
             so3_t = t
         elif so3_schedule == InterpolantRotationsScheduleEnum.exp:
-            so3_t = 1 - torch.exp(-t * self.cfg.rots.exp_rate)
+            # Normalize schedule anchored at t=0 -> 0 and t=1 -> 1
+            rate = self.cfg.rots.exp_rate
+            so3_t = (1 - torch.exp(-t * rate)) / (1 - math.exp(-rate))
         else:
             raise ValueError(f"Invalid schedule: {so3_schedule}")
 
@@ -493,10 +502,12 @@ class Interpolant:
                 so3_t.squeeze(1),  # (B,)
                 scale=self.cfg.rots.stochastic_noise_intensity,
             )
+
+            # sample IGSO(3) noise
             sigma_t = sigma_t.cpu()  # ensure on cpu for igso3 calculation
-            # multipy rotmats_t by IGSO(3) noise
             intermediate_noise = self.igso3.sample(sigma_t, num_res).to(self._device)
             intermediate_noise = intermediate_noise.reshape(num_batch, num_res, 3, 3)
+
             rotmats_t = torch.einsum(
                 "...ij,...jk->...ik", rotmats_t, intermediate_noise
             )
@@ -805,7 +816,7 @@ class Interpolant:
 
         return noisy_batch
 
-    def rot_sample_kappa(self, t: torch.Tensor):
+    def _rot_sample_kappa(self, t: torch.Tensor):
         if self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.exp:
             return 1 - torch.exp(-t * self.cfg.rots.exp_rate)
         elif self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.linear:
@@ -903,7 +914,7 @@ class Interpolant:
 
         return rotmats_next
 
-    def torsions_euler_step(
+    def _torsions_euler_step(
         self,
         d_t: float,
         t: float,
@@ -1439,7 +1450,7 @@ class Interpolant:
                 d_t=d_t, t=t_1, logits_1=pred_logits_1, aatypes_t=aatypes_t_1
             )
             torsions_t_2 = (
-                self.torsions_euler_step(
+                self._torsions_euler_step(
                     d_t=d_t, t=t_1, torsions_1=pred_torsions_1, torsions_t=torsions_t_1
                 )
                 if pred_torsions_1 is not None
@@ -1574,6 +1585,19 @@ class Interpolant:
         else:
             raise ValueError(f"Unknown task {task}")
 
+        # model_trajectory tracks model outputs
+        model_trajectory = SamplingTrajectory(
+            num_batch=num_batch,
+            num_res=num_res,
+            num_tokens=self.num_tokens,
+        )
+        # protein_trajectory tracks predicted intermediate states integrating from t=0 to t=1
+        protein_trajectory = SamplingTrajectory(
+            num_batch=num_batch,
+            num_res=num_res,
+            num_tokens=self.num_tokens,
+        )
+
         # for inference, all residues under consideration
         res_mask = torch.ones(num_batch, num_res, device=self._device)
         # for inpainting, define `scaffold_mask` for sequence corruption using `1-motif_mask`
@@ -1657,19 +1681,7 @@ class Interpolant:
             else:
                 raise ValueError(f"Unknown task {task}")
 
-        # model_trajectory tracks model outputs
-        model_trajectory = SamplingTrajectory(
-            num_batch=num_batch,
-            num_res=num_res,
-            num_tokens=self.num_tokens,
-        )
-        # protein_trajectory tracks predicted intermediate states integrating from t=0 to t=1
-        protein_trajectory = SamplingTrajectory(
-            num_batch=num_batch,
-            num_res=num_res,
-            num_tokens=self.num_tokens,
-        )
-
+        # save t=0 state
         protein_trajectory.append(
             SamplingStep(
                 structure=Interpolant.frames_to_atom37(
@@ -1706,7 +1718,7 @@ class Interpolant:
                 ) = torch.split(t_nn(t), -1)
             else:
                 if self.cfg.provide_kappa:
-                    batch[nbp.so3_t] = self.rot_sample_kappa(t)
+                    batch[nbp.so3_t] = self._rot_sample_kappa(t)
                 else:
                     batch[nbp.so3_t] = t
                 batch[nbp.r3_t] = t
