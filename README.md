@@ -2,7 +2,11 @@
 
 Cogeneration is a protein generative model that simultaneously generates protein sequences and structures.
 
-This project is based on MultiFlow, but introduces several extensions over the original:
+Proteins are represented as frames, each with a translation and rotation and torsions, and a sequence of amino acids.
+It is based on MultiFlow, which applies flow matching across several domains:
+Translations are interpolated in Euclidean space, rotations are interpolated in SO(3), and the sequence with discrete flow matching.
+
+This project introduces several extensions over MultiFlow:
 - support for multimers
 - inpainting (conditional generation) given partial structures
     - MultiFlow supports per-domain conditioning via seperate t (i.e. folding and inverse folding)
@@ -15,7 +19,111 @@ This project is based on MultiFlow, but introduces several extensions over the o
 - data pipeline to generate or augment training data
 - many improvements to code base: typing, enums, documentation, tests, etc.
 
-### Attribution
+## Project Conventions
+
+### Code Style
+
+- Code is formatted using `black` and `isort`
+- Use `dataclasses` for structs and for classes. Prefer classes to several global functions.
+- Prefer single line comments. Short comments can proceed code on the same line followed by 2 spaces. 
+- Use multiline comments to explain complex logic. Avoid formatting comments with `#` blocks.
+- Use type annotations. Comment shape annotations for tensors.
+- Use kwargs generally, especially if there is more than one argument or the function is imported.
+
+### Tests
+
+- Tests are in `/test`
+- Test by running `pytest`
+- Test directory structure should match the `/cogeneration` directory structure, with `_test.py` suffix.
+
+## Project Structure
+
+`/cogeneration` - the main directory for the project, containing all source code.
+
+`/cogeneration/config/`
+`/cogeneration/config/base.py` - contains the all configuration for the project, specified using Hydra dataclasses and enums. The base class is `Config` and there are many subclasses.
+`/cogeneration/config/curriculum.py` - defines a Curriculum class to serially train the model on different configurations.
+`/cogeneration/config/dict_utils.py` - helpers for working with dicts
+
+`/cogeneration/data`
+`/cogeneration/data/all_atom.py` - mostly from Openfold. Frames / rigids -> atom14 and atom37 representations.
+`/cogeneration/data/const.py` - mostly from Openfold. sequence and structure and aatypes constants.
+`/cogeneration/data/data_transforms.py` - mostly from Openfold. Openfold data pipeline for getting rigid features, angles, etc.
+`/cogeneration/data/folding_validation.py` - `FoldingValidator` class to assess samples, inverse fold with ProteinMPNN, fold with ColabFold (AlphaFold2), and compute metrics
+`/cogeneration/data/interpolant.py` - Large file, work horse for training and sampling. `Interpolant` class for corrupting batches during training (`Interpolant.corrupt_batch()`) and sampling from the model (`Interpolant.sample()`). Many utilities for sampling from the source distributions, and Euler-Maruyama integration across each domain.
+`/cogeneration/data/io.py` - utilities for saving/loading pkl, json.
+`/cogeneration/data/metrics.py` - helpers for computing metrics of samples
+`/cogeneration/data/noise_mask.py` - Utilities for masking and generating noise for each domain
+`/cogeneration/data/protein.py` - mostly from Openfold. `Protein` class for processing PDBs into a `Protein` `Chain`. 
+`/cogeneration/data/residue_constants.py` - mostly from Openfold. Atom types, residue constants, bond lengths, atom14 and atom37 representations and masks, etc.
+`/cogeneration/data/rigid.py` - mostly from Openfold. utilities for interacting with rigids, like centering and aligning.
+`/cogeneration/data/rigid_utils.py` - largely from Openfold. `Rotation` and `Rigid` classes, utilities for working with quaternions.
+`/cogeneration/data/so3_utils.py` - largely from Openfold. SO(3) sampling and interpolation utilities.
+`/cogeneration/data/superimposition.py` - mostly from Openfold. Superimposition and tm_score to compare protein structures.
+`/cogeneration/data/tensor_utils.py` - mostly from Openfold. utilities for working with tensors.
+`/cogeneration/data/trajectory.py` - plotting utilities for sampled trajectories, `save_trajectory()` for writing relevant files.
+
+`/cogeneration/dataset`
+`/cogeneration/dataset/scripts` - scripts for downloading and processing data, mostly PDBs.
+`/cogeneration/dataset/scripts/download_pdb.py` - Download PDB database
+`/cogeneration/dataset/scripts/process_pdb_files.py` - process a set of PDB files into a metadata CSV and pre-processed pkls for each PDB file
+`/cogeneration/dataset/scripts/redesign_structures.py` - use ProteinMPNN to redesign structures in the dataset
+`/cogeneration/dataset/scripts/update_dataset_metadata.py` - update an existing metadata CSV with new metadata
+`/cogeneration/dataset/datasets.py` - `BaseDataset` and child class `PdbDataset` for loading Metadata CSV, redesigned structures, synthetic structures, and creating dataset. `ProcessedFiles` are loaded on the fly in `__get_item__`. `BatchFeaturizer` for generating `BatchFeatures` from a `ProcessedFile`.
+`/cogeneration/dataset/filterer.py` - `DatasetFilterer` class for filtering Metadata
+`/cogeneration/dataset/interaction.py` - `NonResidueInteractions` and `MultimerInteraction` classes for computing atom / backbone interactions and clashes.
+`/cogeneration/dataset/mmcif_parsing.py` - utils for parsing mmCIF files
+`/cogeneration/dataset/motif_factory.py` - `MotifFactory` class for generating motifs and scaffolds, several strategies for picking motif regions.
+`/cogeneration/dataset/process_pdb.py` - parsing PDBs into `ProcessedFile` and `MetadataCSVRow` instances, loading a `ProcessedFile` from file.
+`/cogeneration/dataset/protein_downloader.py` - Dataloader using DDP and `LengthBatcher`
+`/cogeneration/dataset/test_utils.py` - Utilities for tests to construct mock features, datasets, dataloaders
+
+`/cogeneration/datasets` - Directory containing training and test data
+
+`/cogeneration/models`
+`/cogeneration/models/aa_pred.py` - Simple Sequence prediction network using linear layer / MLP
+`/cogeneration/models/edge_feature_net.py` - Simple network for embedding edge features / pair representations. Embed edges using distrogram, plus self-conditioned dist, chain, masks etc.
+`/cogeneration/models/embed.py` - Embedding utilites for positions, time, distrogram
+`/cogeneration/models/esm_combiner.py` - Module which combines initial node and edge embeddings with ESM single and pair embeddings
+`/cogeneration/models/esm_frozen.py` - Frozen ESM model for ESM single and pair embeddings
+`/cogeneration/models/ipa_attention.py` - AttentionIPATrunk module
+`/cogeneration/models/ipa_pytorch.py` - Mostly from Openfold, IPA submodules
+`/cogeneration/models/loss_calculator.py` - class `BatchLossCalculator` which computes losses and serializes them into `TrainingLosses` and `AuxiliaryMetrics`.
+`/cogeneration/models/model.py` - complete Pytorch model
+`/cogeneration/models/module.py` - Lightning Module which defines losses, training + validation + prediction steps
+`/cogeneration/models/node_feature_net.py` - Simple network for initial representation of structure, sequence, masks, positional embeddings, time embeddings.
+`/cogeneration/models/sequence_ipa_net.py` - More complex sequence prediction network using IPA
+
+`/cogeneration/scripts`
+`/cogeneration/scripts/predict.py` - script for inference / sampling, as an `EvalRunner`
+`/cogeneration/scripts/train.py` - script for training the model, as an `Experiment`
+`/cogeneration/scripts/utils.py` - GPU utilities, timing, etc.
+`/cogeneration/scripts/utils_ddp.py` - Helpers for setting up distributed data parallel, Mac-friendly. 
+
+`/cogeneration/type` - enums, type aliases, structs
+`/cogeneration/type/batch.py` - defines enums `BatchProp` for properties from metadata / input structure and sequence, `NoisyBatchProp` for corrupted batch, `PredBatchProp` for model outputs, and util `empty_feats` for generating empty batch
+`/cogeneration/type/dataset.py` - defines enums `MetadataColumn` for columns in Metadata CSV, `RedesignColumn` for redesign metadata, `DatasetProteinColumn` for fields of a `Protein` or `ProcessedFile`, `DatasetTransformColumn` for fields generated by OpenFold transforms
+`/cogeneration/type/embed.py` - embedding types `PositionalEmbeddingMethod`
+`/cogeneration/type/metrics.py` - `MetricName` enum defines sampling metrics calculated, `OutputFileName` defines files written by sampling + metrics
+`/cogeneration/type/str_enum.py` - base class `StrEnum` for enums
+`/cogeneration/type/task.py` - `DataTask` (training task) and  `InferenceTask` (sampling task) enums
+
+`/doc` contains documentation, including some feature specs.
+
+`/test` contains unit tests for the project. All tests are run using `pytest`. The structure roughly matches `/cogeneration` and test files are suffixed with `_test.py`.
+
+### Ignored Directories
+
+There are several directories that should be ignored:
+`.cache`
+`ckpt`
+`/inference_outputs`
+`/lightning_logs`
+`/multiflow_weights`
+`/venv`
+`/wandb`
+
+## Attribution
 
 This project is based on MultiFlow:
 
@@ -28,7 +136,10 @@ This project is based on MultiFlow:
 }
 ```
 
-And uses code from OpenFold:
+This repo uses Openfold, but copies its source in many places.
+This is primarily because OpenFold requires building kernels on install, which requires an Nvidia GPU. 
+The MSA transformer etc. are not necessary for the model in this repo.
+This should simplify install, testing, etc.
 ```
 @article {Ahdritz2022.11.20.517210,
 	author = {Ahdritz, Gustaf and Bouatta, Nazim and Floristean, Christina and Kadyan, Sachin and Xia, Qinghui and Gerecke, William and O{\textquoteright}Donnell, Timothy J and Berenberg, Daniel and Fisk, Ian and Zanichelli, Niccolò and Zhang, Bo and Nowaczynski, Arkadiusz and Wang, Bei and Stepniewska-Dziubinska, Marta M and Zhang, Shang and Ojewole, Adegoke and Guney, Murat Efe and Biderman, Stella and Watkins, Andrew M and Ra, Stephen and Lorenzo, Pablo Ribalta and Nivon, Lucas and Weitzner, Brian and Ban, Yih-En Andrew and Sorger, Peter K and Mostaque, Emad and Zhang, Zhao and Bonneau, Richard and AlQuraishi, Mohammed},
