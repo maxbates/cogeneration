@@ -36,6 +36,7 @@ from cogeneration.data.noise_mask import (
 from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
 from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProp as bp
+from cogeneration.type.batch import ModelPrediction
 from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
 from cogeneration.type.batch import PredBatchProp as pbp
@@ -48,6 +49,12 @@ def to_cpu(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.detach().cpu()
 
 
+def to_cpu_clone(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if x is None:
+        return None
+    return x.detach().clone().cpu()
+
+
 @dataclass
 class SamplingStep:
     """
@@ -56,9 +63,66 @@ class SamplingStep:
     tensors should be detached and moved to CPU.
     """
 
-    structure: torch.Tensor  # (B, N, 37, 3)  i.e. atom37 representation
-    amino_acids: torch.Tensor  # (B, N)
-    logits: Optional[torch.Tensor] = None
+    res_mask: torch.Tensor  # (B, N)
+    trans: torch.Tensor  # (B, N, 3)
+    rotmats: torch.Tensor  # (B, N, 3, 3)
+    aatypes: torch.Tensor  # (B, N)
+    torsions: Optional[torch.Tensor]  # (B, N, 7, 2)
+    logits: Optional[torch.Tensor]  # model output only; (B, N, S) S={20,21}
+
+    @property
+    def structure(self) -> torch.Tensor:
+        """
+        Returns the atom37 representation tensor shape (B, N, 37, 3).
+        """
+        return all_atom.atom37_from_trans_rot(
+            trans=self.trans,
+            rots=self.rotmats,
+            torsions=self.torsions,
+            aatype=self.aatypes,
+            res_mask=self.res_mask,
+            unknown_to_alanine=True,  # show UNK residues as alanine
+        )
+
+    @classmethod
+    def from_values(
+        cls,
+        res_mask: torch.Tensor,
+        trans: torch.Tensor,
+        rotmats: torch.Tensor,
+        aatypes: torch.Tensor,
+        torsions: Optional[torch.Tensor],
+        logits: Optional[torch.Tensor],
+    ):
+        """
+        Safely create a SamplingStep. Handles detach / move to cpu.
+        """
+        return cls(
+            res_mask=to_cpu(res_mask),
+            trans=to_cpu_clone(trans),
+            rotmats=to_cpu_clone(rotmats),
+            aatypes=to_cpu_clone(aatypes),
+            torsions=to_cpu_clone(torsions),
+            logits=to_cpu_clone(logits),
+        )
+
+    @classmethod
+    def from_model_prediction(
+        cls,
+        pred: ModelPrediction,
+        res_mask: torch.Tensor,
+    ) -> "SamplingStep":
+        """
+        Safely create a SamplingStep from a model prediction.
+        """
+        return cls(
+            res_mask=to_cpu(res_mask),
+            trans=to_cpu_clone(pred[pbp.pred_trans]),
+            rotmats=to_cpu_clone(pred[pbp.pred_rotmats]),
+            aatypes=to_cpu_clone(pred[pbp.pred_aatypes]),
+            torsions=to_cpu_clone(pred.get(pbp.pred_torsions, None)),
+            logits=to_cpu_clone(pred[pbp.pred_logits]),
+        )
 
 
 @dataclass
@@ -105,7 +169,7 @@ class SamplingTrajectory:
         Returns amino acid types tensor [num_batch, num_steps, sample_length]
         """
         t = (
-            torch.stack([step.amino_acids for step in self.steps], dim=0)
+            torch.stack([step.aatypes for step in self.steps], dim=0)
             .transpose(0, 1)
             .long()
         )
@@ -1366,16 +1430,9 @@ class Interpolant:
         pred_aatypes_1 = model_out[pbp.pred_aatypes]
         pred_logits_1 = model_out[pbp.pred_logits]
 
-        model_step = SamplingStep(
-            structure=Interpolant.frames_to_atom37(
-                res_mask=res_mask,
-                trans=pred_trans_1,
-                rots=pred_rotmats_1,
-                aatypes=pred_aatypes_1,
-                torsions=pred_torsions_1,
-            ),
-            amino_acids=to_cpu(pred_aatypes_1),
-            logits=to_cpu(pred_logits_1),
+        model_step = SamplingStep.from_model_prediction(
+            pred=model_out,
+            res_mask=res_mask,
         )
 
         # Mask fixed values to prepare for integration and update the batch for next step.
@@ -1473,15 +1530,13 @@ class Interpolant:
         #   The motifs vs structure @ t will have different centers of mass.
         trans_t_2 -= batch_center_of_mass(trans_t_2, mask=res_mask)[:, None]
 
-        protein_step = SamplingStep(
-            structure=Interpolant.frames_to_atom37(
-                res_mask=res_mask,
-                trans=trans_t_2,
-                rots=rotmats_t_2,
-                aatypes=aatypes_t_2,
-                torsions=torsions_t_2,
-            ),
-            amino_acids=to_cpu(aatypes_t_2),
+        protein_step = SamplingStep.from_values(
+            res_mask=res_mask,
+            trans=trans_t_2,
+            rotmats=rotmats_t_2,
+            torsions=torsions_t_2,
+            aatypes=aatypes_t_2,
+            logits=None,  # logits not interpolated
         )
 
         # update batch to t_2
@@ -1683,15 +1738,13 @@ class Interpolant:
 
         # save t=0 state
         protein_trajectory.append(
-            SamplingStep(
-                structure=Interpolant.frames_to_atom37(
-                    res_mask=res_mask,
-                    trans=trans_0,
-                    rots=rotmats_0,
-                    aatypes=aatypes_0,
-                    torsions=torsions_0,
-                ),
-                amino_acids=to_cpu(aatypes_0),
+            SamplingStep.from_values(
+                res_mask=res_mask,
+                trans=trans_0,
+                rotmats=rotmats_0,
+                torsions=torsions_0,
+                aatypes=aatypes_0,
+                logits=None,
             )
         )
 
