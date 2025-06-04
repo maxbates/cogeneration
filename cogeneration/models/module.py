@@ -28,7 +28,7 @@ from cogeneration.data.folding_validation import (
 )
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import mask_blend_2d
-from cogeneration.data.trajectory import SavedTrajectory, save_trajectory
+from cogeneration.data.trajectory_save import SavedTrajectory, save_trajectory
 from cogeneration.models.loss_calculator import (
     AuxiliaryMetrics,
     BatchLossCalculator,
@@ -404,7 +404,7 @@ class FlowModule(LightningModule):
 
         # batch-level aatype metrics
         final_step = protein_traj[-1]
-        generated_aatypes = to_numpy(final_step.amino_acids)
+        generated_aatypes = to_numpy(final_step.aatypes)
         assert generated_aatypes.shape == (num_batch, num_res)
         batch_level_aatype_metrics = metrics.calc_aatype_metrics(generated_aatypes)
 

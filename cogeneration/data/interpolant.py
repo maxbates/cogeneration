@@ -1,8 +1,8 @@
 import copy
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Any, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -17,7 +17,7 @@ from cogeneration.config.base import (
     InterpolantTranslationsNoiseTypeEnum,
     InterpolantTranslationsScheduleEnum,
 )
-from cogeneration.data import all_atom, so3_utils
+from cogeneration.data import so3_utils
 from cogeneration.data.const import MASK_TOKEN_INDEX, NM_TO_ANG_SCALE
 from cogeneration.data.noise_mask import (
     angles_noise,
@@ -33,173 +33,15 @@ from cogeneration.data.noise_mask import (
     uniform_categorical,
     uniform_so3,
 )
+from cogeneration.data.potentials import FKSteeringResampler
 from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
+from cogeneration.data.trajectory import SamplingStep, SamplingTrajectory
 from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProp as bp
-from cogeneration.type.batch import ModelPrediction
 from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
 from cogeneration.type.batch import PredBatchProp as pbp
 from cogeneration.type.task import DataTask, InferenceTask
-
-
-def to_cpu(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    if x is None:
-        return None
-    return x.detach().cpu()
-
-
-def to_cpu_clone(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    if x is None:
-        return None
-    return x.detach().clone().cpu()
-
-
-@dataclass
-class SamplingStep:
-    """
-    A single step in the sampling trajectory.
-
-    tensors should be detached and moved to CPU.
-    """
-
-    res_mask: torch.Tensor  # (B, N)
-    trans: torch.Tensor  # (B, N, 3)
-    rotmats: torch.Tensor  # (B, N, 3, 3)
-    aatypes: torch.Tensor  # (B, N)
-    torsions: Optional[torch.Tensor]  # (B, N, 7, 2)
-    logits: Optional[torch.Tensor]  # model output only; (B, N, S) S={20,21}
-
-    @property
-    def structure(self) -> torch.Tensor:
-        """
-        Returns the atom37 representation tensor shape (B, N, 37, 3).
-        """
-        return all_atom.atom37_from_trans_rot(
-            trans=self.trans,
-            rots=self.rotmats,
-            torsions=self.torsions,
-            aatype=self.aatypes,
-            res_mask=self.res_mask,
-            unknown_to_alanine=True,  # show UNK residues as alanine
-        )
-
-    @classmethod
-    def from_values(
-        cls,
-        res_mask: torch.Tensor,
-        trans: torch.Tensor,
-        rotmats: torch.Tensor,
-        aatypes: torch.Tensor,
-        torsions: Optional[torch.Tensor],
-        logits: Optional[torch.Tensor],
-    ):
-        """
-        Safely create a SamplingStep. Handles detach / move to cpu.
-        """
-        return cls(
-            res_mask=to_cpu(res_mask),
-            trans=to_cpu_clone(trans),
-            rotmats=to_cpu_clone(rotmats),
-            aatypes=to_cpu_clone(aatypes),
-            torsions=to_cpu_clone(torsions),
-            logits=to_cpu_clone(logits),
-        )
-
-    @classmethod
-    def from_model_prediction(
-        cls,
-        pred: ModelPrediction,
-        res_mask: torch.Tensor,
-    ) -> "SamplingStep":
-        """
-        Safely create a SamplingStep from a model prediction.
-        """
-        return cls(
-            res_mask=to_cpu(res_mask),
-            trans=to_cpu_clone(pred[pbp.pred_trans]),
-            rotmats=to_cpu_clone(pred[pbp.pred_rotmats]),
-            aatypes=to_cpu_clone(pred[pbp.pred_aatypes]),
-            torsions=to_cpu_clone(pred.get(pbp.pred_torsions, None)),
-            logits=to_cpu_clone(pred[pbp.pred_logits]),
-        )
-
-
-@dataclass
-class SamplingTrajectory:
-    """
-    A trajectory of inference sampling steps.
-    """
-
-    num_batch: int
-    num_res: int
-    num_tokens: int
-    steps: List[SamplingStep] = field(default_factory=list)
-    check_dimensions: bool = True
-
-    def __len__(self):
-        return len(self.steps)
-
-    def __getitem__(self, index: int) -> SamplingStep:
-        return self.steps[index]
-
-    def append(self, step: SamplingStep):
-        self.steps.append(step)
-
-    @property
-    def num_steps(self):
-        return len(self.steps)
-
-    @property
-    def structure(self) -> torch.Tensor:
-        """
-        Returns structure / backbone tensor [num_batch, num_steps, sample_length, 37, 3]
-        """
-        t = torch.stack([step.structure for step in self.steps], dim=0).transpose(0, 1)
-        if self.check_dimensions:
-            expected_shape = (self.num_batch, self.num_steps, self.num_res, 37, 3)
-            assert (
-                t.shape == expected_shape
-            ), f"Unexpected structure shape {t.shape}, expected {expected_shape}"
-        return t
-
-    @property
-    def amino_acids(self) -> torch.Tensor:
-        """
-        Returns amino acid types tensor [num_batch, num_steps, sample_length]
-        """
-        t = (
-            torch.stack([step.aatypes for step in self.steps], dim=0)
-            .transpose(0, 1)
-            .long()
-        )
-        if self.check_dimensions:
-            expected_shape = (self.num_batch, self.num_steps, self.num_res)
-            assert (
-                t.shape == expected_shape
-            ), f"Unexpected amino_acids shape {t.shape}, expected {expected_shape}"
-        return t
-
-    @property
-    def logits(self) -> Optional[torch.Tensor]:
-        """
-        Returns logits tensor if available [num_batch, num_steps, sample_length, num_tokens]
-        Currently only available for model steps, not protein steps, since we don't flow for logits.
-        """
-        if self.steps[0].logits is None:
-            return None
-        t = torch.stack([step.logits for step in self.steps], dim=0).transpose(0, 1)
-        if self.check_dimensions:
-            expected_shape = (
-                self.num_batch,
-                self.num_steps,
-                self.num_res,
-                self.num_tokens,
-            )
-            assert (
-                t.shape == expected_shape
-            ), f"Unexpected logits shape {t.shape}, expected {expected_shape}"
-        return t
 
 
 @dataclass
@@ -290,6 +132,14 @@ class Interpolant:
 
     def __init__(self, cfg: InterpolantConfig):
         self.cfg = cfg
+
+        self.resampler = FKSteeringResampler(cfg=self.cfg.steering)
+        if self.resampler.enabled:
+            assert (
+                self.cfg.sampling.num_timesteps % self.resampler.cfg.resampling_interval
+                == 0
+            ), f"Number of sampling timesteps ({self.cfg.sampling.num_timesteps}) must be divisible by the steering resampling interval ({self.resampler.cfg.resampling_interval})"
+
         self._igso3 = None
         self._device = None
 
@@ -473,7 +323,7 @@ class Interpolant:
 
         # Find optimal matching between noisy and ground truth structures
         # Return the reordered noisy structures -> ground truth pairing
-        noise_perm, gt_perm = linear_sum_assignment(to_cpu(cost_matrix).numpy())
+        noise_perm, gt_perm = linear_sum_assignment(cost_matrix.detach().cpu().numpy())
         return batch_0[(tuple(gt_perm), tuple(noise_perm))]
 
     def _corrupt_trans(self, trans_1, t, res_mask, diffuse_mask, chain_idx):
@@ -1361,31 +1211,13 @@ class Interpolant:
 
         return aatypes_t
 
-    @staticmethod
-    def frames_to_atom37(
-        res_mask: torch.Tensor,  # (B, N)
-        trans: torch.Tensor,  # (B, N, 3)
-        rots: torch.Tensor,  # (B, N, 3, 3)
-        aatypes: torch.Tensor,  # (B, N, S)
-        torsions: Optional[torch.Tensor],  # (B, N, K, 2)
-    ) -> torch.Tensor:
-        return to_cpu(
-            all_atom.atom37_from_trans_rot(
-                trans=trans,
-                rots=rots,
-                torsions=torsions,
-                aatype=aatypes,
-                res_mask=res_mask,
-                unknown_to_alanine=True,  # show UNK residues as alanine
-            )
-        )
-
     def sample_step(
         self,
         noisy_batch: NoisyFeatures,
         true_feats: BatchTrueFeatures,
         model,
         task: InferenceTask,
+        step_idx: int,
         t_1: float,  # [scalar Tensor]
         t_2: Optional[float],  # [scalar Tensor] None if final step
     ) -> Tuple[NoisyFeatures, SamplingStep, SamplingStep]:
@@ -1430,7 +1262,7 @@ class Interpolant:
         pred_aatypes_1 = model_out[pbp.pred_aatypes]
         pred_logits_1 = model_out[pbp.pred_logits]
 
-        model_step = SamplingStep.from_model_prediction(
+        model_pred = SamplingStep.from_model_prediction(
             pred=model_out,
             res_mask=res_mask,
         )
@@ -1468,6 +1300,16 @@ class Interpolant:
                 pred_torsions_1 = true_feats.torsions
         else:
             raise ValueError(f"Unknown task {task}")
+
+        # Save the modified preditions
+        protein_pred = SamplingStep.from_values(
+            res_mask=res_mask,
+            trans=pred_trans_1,
+            rotmats=pred_rotmats_1,
+            aatypes=pred_aatypes_1,
+            torsions=pred_torsions_1,
+            logits=None,
+        )
 
         # During sampling, update the self-conditioned values and take Euler steps for each domain.
         # On the final step, just use the cleaned up model predictions.
@@ -1530,15 +1372,6 @@ class Interpolant:
         #   The motifs vs structure @ t will have different centers of mass.
         trans_t_2 -= batch_center_of_mass(trans_t_2, mask=res_mask)[:, None]
 
-        protein_step = SamplingStep.from_values(
-            res_mask=res_mask,
-            trans=trans_t_2,
-            rotmats=rotmats_t_2,
-            torsions=torsions_t_2,
-            aatypes=aatypes_t_2,
-            logits=None,  # logits not interpolated
-        )
-
         # update batch to t_2
         noisy_batch[nbp.trans_t] = (
             trans_t_2 if self.cfg.trans.corrupt else true_feats.trans
@@ -1552,7 +1385,24 @@ class Interpolant:
         if torsions_t_2 is not None:
             noisy_batch[nbp.torsions_t] = torsions_t_2
 
-        return noisy_batch, model_step, protein_step
+        # Save protein state after interpolating
+        protein_state = SamplingStep.from_batch(
+            batch=noisy_batch,
+        )
+
+        # Feynman-Kac steering, if enabled.
+        noisy_batch, resample_idx = self.resampler.on_step(
+            step_idx=step_idx,
+            batch=noisy_batch,
+            protein_pred=protein_pred,
+            model_pred=model_pred,
+            protein_state=protein_state,
+        )
+        if resample_idx is not None:
+            model_pred = model_pred.select_batch_idx(resample_idx)
+            protein_state = protein_state.select_batch_idx(resample_idx)
+
+        return noisy_batch, model_pred, protein_state
 
     def sample(
         self,
@@ -1669,12 +1519,13 @@ class Interpolant:
         batch = {
             bp.res_mask: res_mask,
             bp.diffuse_mask: diffuse_mask,
-            bp.motif_mask: motif_mask,
             bp.chain_idx: chain_idx,
             bp.res_idx: res_idx,
             nbp.trans_sc: trans_sc,
             nbp.aatypes_sc: aatypes_sc,
         }
+        if motif_mask is not None:
+            batch[bp.motif_mask] = motif_mask
 
         # Capture t=1 values for translations, rotations, torsions, and aatypes
         # Set to empty/identity values if they are not provided.
@@ -1736,26 +1587,23 @@ class Interpolant:
             else:
                 raise ValueError(f"Unknown task {task}")
 
-        # save t=0 state
-        protein_trajectory.append(
-            SamplingStep.from_values(
-                res_mask=res_mask,
-                trans=trans_0,
-                rotmats=rotmats_0,
-                torsions=torsions_0,
-                aatypes=aatypes_0,
-                logits=None,
-            )
-        )
-
         # Set up initial t=0 values in batch
         batch[nbp.trans_t] = trans_0
         batch[nbp.rotmats_t] = rotmats_0
         batch[nbp.torsions_t] = torsions_0
         batch[nbp.aatypes_t] = aatypes_0
 
+        # Set up Feynman-Kac resampling, which expands each batch member to K particles.
+        # Idempotent if not enabled or number of particles is 1.
+        batch = self.resampler.init_particles(batch=batch)  # (B, ...) -> (B * K, ...)
+        num_batch = batch[bp.res_mask].shape[0]  # may have changed
+
+        # save t=0 state
+        protein_trajectory.append(SamplingStep.from_batch(batch=batch))
+
         # Set-up time steps
         ts = torch.linspace(self.cfg.min_t, 1.0, self.cfg.sampling.num_timesteps)
+        step_idx = 0
 
         # We will integrate in a loop over ts (handling the last step after the loop)
         # t_1 is the current time, t_2 is the next time
@@ -1801,6 +1649,7 @@ class Interpolant:
                 true_feats=true_feats,
                 model=model,
                 task=task,
+                step_idx=step_idx,
                 t_1=t_1,
                 t_2=t_2,
             )
@@ -1810,6 +1659,7 @@ class Interpolant:
 
             # Update t_1 to t_2 for the next step
             t_1 = t_2
+            step_idx += 1
 
         # We only integrated to ts[-1], so need to make a final step
 
@@ -1825,11 +1675,20 @@ class Interpolant:
             true_feats=true_feats,
             model=model,
             task=task,
+            step_idx=step_idx,
             t_1=t_1,
             t_2=None,  # final step
         )
 
         model_trajectory.append(model_step)
         protein_trajectory.append(protein_step)
+
+        # If FK steering is enabled, pick the best particle per sample
+        # TODO - allow passing through all the particles. Ensure each is handled properly.
+        _, best_idx = self.resampler.best_particle_in_batch(batch=batch)
+        if best_idx is not None:
+            # Select the best particle for each sample
+            protein_trajectory = protein_trajectory.select_batch_idx(best_idx)
+            model_trajectory = model_trajectory.select_batch_idx(best_idx)
 
         return protein_trajectory, model_trajectory

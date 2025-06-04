@@ -15,12 +15,8 @@ class TestInterpolantSample:
     """Test suite for Interpolant.sample()."""
 
     def _run_sample(self, cfg: Config, batch, task: InferenceTask):
-        cfg.inference.interpolant.sampling.num_timesteps = (
-            2  # run quickly with few timesteps
-        )
-        cfg.interpolant.sampling.num_timesteps = (
-            4  # ensure don't use training interpolant
-        )
+        # ensure don't use training interpolant, will mess up shapes
+        cfg.interpolant.sampling.num_timesteps = 7
 
         interpolant = Interpolant(cfg.inference.interpolant)
         interpolant.set_device(torch.device("cpu"))
@@ -153,3 +149,36 @@ class TestInterpolantSample:
         assert torch.equal(
             final_aa[motif_sel], orig_aa[motif_sel]
         ), "Motif amino acids should be preserved in inpainting sampling"
+
+    @pytest.mark.parametrize(
+        "task",
+        [
+            InferenceTask.unconditional,
+            InferenceTask.inpainting,
+        ],
+    )
+    def test_sample_fk_steering(
+        self,
+        task,
+        mock_cfg_uninterpolated,
+        mock_pred_unconditional_dataloader,
+        mock_pred_inpainting_dataloader,
+    ):
+        mock_cfg_uninterpolated.inference.interpolant.steering.num_particles = 3
+        cfg = mock_cfg_uninterpolated.interpolate()
+
+        if task == InferenceTask.unconditional:
+            dataloader = mock_pred_unconditional_dataloader
+        elif task == InferenceTask.inpainting:
+            dataloader = mock_pred_inpainting_dataloader
+
+        batch = next(iter(dataloader))
+        num_batch, num_res = batch[bp.res_mask].shape
+
+        protein_traj, model_traj = self._run_sample(cfg=cfg, batch=batch, task=task)
+
+        # particles downselected to one per sample
+        final_state = protein_traj.steps[-1]
+        assert final_state.structure.shape == (num_batch, num_res, 37, 3)
+        final_pred = model_traj.steps[-1]
+        assert final_pred.aatypes.shape == (num_batch, num_res)

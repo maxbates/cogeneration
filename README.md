@@ -54,6 +54,7 @@ This project introduces several extensions over MultiFlow:
 `/cogeneration/data/io.py` - utilities for saving/loading pkl, json.
 `/cogeneration/data/metrics.py` - helpers for computing metrics of samples
 `/cogeneration/data/noise_mask.py` - Utilities for masking and generating noise for each domain
+`/cogeneration/data/potentials.py` - Feynman-Kac Steering. Several `Potential` instances. `FKSTeeringCalculator` stateless class for computing potentials. `FKSteeringResambler` stateful class for initializing particles and resampling during inference.
 `/cogeneration/data/protein.py` - mostly from Openfold. `Protein` class for processing PDBs into a `Protein` `Chain`. 
 `/cogeneration/data/residue_constants.py` - mostly from Openfold. Atom types, residue constants, bond lengths, atom14 and atom37 representations and masks, etc.
 `/cogeneration/data/rigid.py` - mostly from Openfold. utilities for interacting with rigids, like centering and aligning.
@@ -61,7 +62,8 @@ This project introduces several extensions over MultiFlow:
 `/cogeneration/data/so3_utils.py` - largely from Openfold. SO(3) sampling and interpolation utilities.
 `/cogeneration/data/superimposition.py` - mostly from Openfold. Superimposition and tm_score to compare protein structures.
 `/cogeneration/data/tensor_utils.py` - mostly from Openfold. utilities for working with tensors.
-`/cogeneration/data/trajectory.py` - plotting utilities for sampled trajectories, `save_trajectory()` for writing relevant files.
+`/cogeneration/data/trajectory.py` - `SamplingStep` and `SamplingTrajectory` classes for capturing model predictions and protein intermediate states
+`/cogeneration/data/trajectory_save.py` - plotting utilities for sampled trajectories, `save_trajectory()` for writing relevant files.
 
 `/cogeneration/dataset`
 `/cogeneration/dataset/scripts` - scripts for downloading and processing data, mostly PDBs.
