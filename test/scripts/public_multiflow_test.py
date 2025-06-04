@@ -42,7 +42,7 @@ class TestEvalRunner:
 
     # This is a slow test, because it actually samples with real model, many timesteps, and animates.
     # Can run manually.
-    @pytest.mark.skip
+    # @pytest.mark.skip
     def test_public_weights_sampling(self, public_weights_path, tmp_path):
         cfg = Config.public_multiflow()
 
@@ -54,6 +54,8 @@ class TestEvalRunner:
         cfg.inference.interpolant.trans.stochastic_noise_intensity = 0.75
         cfg.inference.interpolant.rots.stochastic_noise_intensity = 0.5
         cfg.inference.interpolant.aatypes.stochastic_noise_intensity = 0.25
+        # FK Steering
+        cfg.inference.interpolant.steering.num_particles = 4
         # set up predict_dir to tmp_path
         cfg.inference.predict_dir = str(tmp_path / "inference")
         # control number of timesteps. e.g. use 1 to debug folding validation / plotting
@@ -105,6 +107,6 @@ class TestEvalRunner:
         # sample
         top_sample_metrics = module.predict_step(batch, batch_idx=0)
 
-        print()
+        print("results:")
         print(cfg.inference.predict_dir)
         print(top_sample_metrics.to_csv(index=False))

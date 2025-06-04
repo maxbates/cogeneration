@@ -1438,10 +1438,10 @@ class Interpolant:
         - special handling for the final timestep
 
         Returns two trajectories:
-        1) protein_trajectory / predicted states - sampled trajectory.
+        1) sample_trajectory / predicted states - sampled trajectory.
             Intermediate steps resulting from integration over vector fields. Fixed values set by mask.
             No logits, just the amino acids (integration with rate matrix yields discrete sequence).
-        2) model_trajectory / clean states - direct model output.
+        2) model_trajectory / clean states - model predictions
             Without masking or added noise. Does not involve integrating. Includes logits.
 
         Note that while sampling operates on backbones, the emitted structures are all-atom (i.e. atom37).
@@ -1496,8 +1496,8 @@ class Interpolant:
             num_res=num_res,
             num_tokens=self.num_tokens,
         )
-        # protein_trajectory tracks predicted intermediate states integrating from t=0 to t=1
-        protein_trajectory = SamplingTrajectory(
+        # sample_trajectory tracks predicted intermediate states integrating from t=0 to t=1
+        sample_trajectory = SamplingTrajectory(
             num_batch=num_batch,
             num_res=num_res,
             num_tokens=self.num_tokens,
@@ -1599,7 +1599,7 @@ class Interpolant:
         num_batch = batch[bp.res_mask].shape[0]  # may have changed
 
         # save t=0 state
-        protein_trajectory.append(SamplingStep.from_batch(batch=batch))
+        sample_trajectory.append(SamplingStep.from_batch(batch=batch))
 
         # Set-up time steps
         ts = torch.linspace(self.cfg.min_t, 1.0, self.cfg.sampling.num_timesteps)
@@ -1655,7 +1655,7 @@ class Interpolant:
             )
 
             model_trajectory.append(model_step)
-            protein_trajectory.append(protein_step)
+            sample_trajectory.append(protein_step)
 
             # Update t_1 to t_2 for the next step
             t_1 = t_2
@@ -1681,14 +1681,14 @@ class Interpolant:
         )
 
         model_trajectory.append(model_step)
-        protein_trajectory.append(protein_step)
+        sample_trajectory.append(protein_step)
 
         # If FK steering is enabled, pick the best particle per sample
         # TODO - allow passing through all the particles. Ensure each is handled properly.
         _, best_idx = self.resampler.best_particle_in_batch(batch=batch)
         if best_idx is not None:
             # Select the best particle for each sample
-            protein_trajectory = protein_trajectory.select_batch_idx(best_idx)
+            sample_trajectory = sample_trajectory.select_batch_idx(best_idx)
             model_trajectory = model_trajectory.select_batch_idx(best_idx)
 
-        return protein_trajectory, model_trajectory
+        return sample_trajectory, model_trajectory

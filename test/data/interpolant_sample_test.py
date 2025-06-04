@@ -75,21 +75,21 @@ class TestInterpolantSample:
                 torsions_1=batch[bp.torsions_1],
             )
 
-        prot_traj, model_traj = interpolant.sample(
+        sample_traj, model_traj = interpolant.sample(
             num_batch=B, num_res=N, model=model, task=task, **kwargs
         )
 
-        assert prot_traj.structure.shape == (B, T + 1, N, 37, 3)
+        assert sample_traj.structure.shape == (B, T + 1, N, 37, 3)
 
-        assert prot_traj.amino_acids.shape == (B, T + 1, N)
-        assert prot_traj.amino_acids.dtype == torch.long
-        assert torch.all(prot_traj.amino_acids >= 0) and torch.all(
-            prot_traj.amino_acids < num_tokens
+        assert sample_traj.amino_acids.shape == (B, T + 1, N)
+        assert sample_traj.amino_acids.dtype == torch.long
+        assert torch.all(sample_traj.amino_acids >= 0) and torch.all(
+            sample_traj.amino_acids < num_tokens
         )
 
         assert model_traj.logits.shape == (B, T, N, num_tokens)
 
-        return prot_traj, model_traj
+        return sample_traj, model_traj
 
     @pytest.mark.parametrize(
         "task",
@@ -175,10 +175,10 @@ class TestInterpolantSample:
         batch = next(iter(dataloader))
         num_batch, num_res = batch[bp.res_mask].shape
 
-        protein_traj, model_traj = self._run_sample(cfg=cfg, batch=batch, task=task)
+        sample_traj, model_traj = self._run_sample(cfg=cfg, batch=batch, task=task)
 
         # particles downselected to one per sample
-        final_state = protein_traj.steps[-1]
+        final_state = sample_traj.steps[-1]
         assert final_state.structure.shape == (num_batch, num_res, 37, 3)
         final_pred = model_traj.steps[-1]
         assert final_pred.aatypes.shape == (num_batch, num_res)

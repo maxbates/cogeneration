@@ -40,8 +40,8 @@ class SavedTrajectory:
 
     sample_pdb_path: str  # OutputFileName.sample_pdb
     sample_pdb_backbone_path: str  # OutputFileName.sample_pdb_backbone
-    traj_path: Optional[str] = None  # OutputFileName.bb_traj_pdb
-    x0_traj_path: Optional[str] = None  # OutputFileName.x0_traj_pdb
+    sample_traj_path: Optional[str] = None  # OutputFileName.sample_traj_pdb
+    model_pred_traj_path: Optional[str] = None  # OutputFileName.model_pred_traj_pdb
     aa_traj_fasta_path: Optional[str] = None  # OutputFileName.aa_traj_fa
     logits_traj_path: Optional[str] = None  # OutputFileName.logits_traj_{gif/mp4}
     traj_panel_path: Optional[str] = None  # OutputFileName.traj_panel_{gif/mp4}
@@ -447,8 +447,8 @@ def plot_structure(
 
 
 def animate_trajectories(
-    prot_structure_traj: npt.NDArray,  # [noisy_T, N, 37, 3]
-    prot_aa_traj: npt.NDArray,  # [noisy_T, N]
+    sample_structure_traj: npt.NDArray,  # [noisy_T, N, 37, 3]
+    sample_aa_traj: npt.NDArray,  # [noisy_T, N]
     model_structure_traj: npt.NDArray,  # [clean_T, N, 37, 3]  (clean_T = noisy_T-1)
     model_aa_traj: npt.NDArray,  # [clean_T, N]
     model_logits_traj: npt.NDArray,  # [clean_T, N, S] (S = 20, 21)
@@ -463,12 +463,12 @@ def animate_trajectories(
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # `model_traj` is one step shorter than `protein_traj`
-    num_timesteps, num_res = prot_structure_traj.shape[:2]
+    # `model_traj` is one step shorter than `sample_traj`
+    num_timesteps, num_res = sample_structure_traj.shape[:2]
     assert model_structure_traj.shape[0] == num_timesteps - 1
 
     # Determine backbone 3D camera limits
-    camera_limits = CameraLimits.from_bb_traj(prot_structure_traj)
+    camera_limits = CameraLimits.from_bb_traj(sample_structure_traj)
 
     # Fig determined ahead of time
     dpi = 100
@@ -503,7 +503,7 @@ def animate_trajectories(
     logits_rects = _init_logits_borders(
         ax_logits_model,
         logits_traj=model_logits_traj,
-        aa_traj=prot_aa_traj,
+        aa_traj=sample_aa_traj,
         motif_mask=motif_mask,
     )
 
@@ -516,7 +516,7 @@ def animate_trajectories(
 
     scat_l = _init_structure_artists(
         ax_structure_prot,
-        positions=prot_structure_traj[0],
+        positions=sample_structure_traj[0],
         diffuse_mask=diffuse_mask,
         limits=camera_limits,
     )
@@ -544,11 +544,11 @@ def animate_trajectories(
         fig.suptitle(f"t = {t:.2f}", fontsize=9, y=0.99)
 
         _update_seq_artists(
-            prot_aa_traj[timestep],
+            sample_aa_traj[timestep],
             rects=seq_rects_l,
             texts=seq_texts_l,
         )
-        _update_structure_artists(prot_structure_traj[timestep], scats=scat_l)
+        _update_structure_artists(sample_structure_traj[timestep], scats=scat_l)
 
         if timestep > 0:
             _update_seq_artists(
@@ -591,14 +591,14 @@ def animate_trajectories(
 def save_trajectory(
     sample_name: Union[int, str],
     sample_atom37: npt.NDArray,  # (N, 37, 3)
-    protein_structure_traj: npt.NDArray,  # (noisy_T, N, 37, 3)
+    sample_structure_traj: npt.NDArray,  # (noisy_T, N, 37, 3)
     model_structure_traj: npt.NDArray,  # (clean_T, N, 37, 3)
     diffuse_mask: npt.NDArray,  # (N,)
     motif_mask: Optional[npt.NDArray],  # (N,)
     chain_idx: npt.NDArray,  # (N,)
     res_idx: npt.NDArray,  # (N,)
     output_dir: str,
-    protein_aa_traj: Optional[npt.NDArray] = None,  # (noisy_T, N)
+    sample_aa_traj: Optional[npt.NDArray] = None,  # (noisy_T, N)
     model_aa_traj: Optional[npt.NDArray] = None,  # (clean_T, N)
     model_logits_traj: Optional[npt.NDArray] = None,  # (clean_T, N, S)
     write_trajectories: bool = True,
@@ -610,15 +610,14 @@ def save_trajectory(
 
     Args:
         sample_atom37: [N, 37, 3] atom37 final sample.
-        protein_structure_traj: [noisy_T, N, 37, 3] atom37 sampled diffusion states.
-            T is number of time steps. First time step is t=eps,
-            i.e. bb_prot_traj[0] is the final sample after reverse diffusion.
+        sample_structure_traj: [noisy_T, N, 37, 3] atom37 sampled diffusion states.
+            T is number of time steps. First time step is t=eps, final step is t=1.
             N is number of residues.
         model_structure_traj: [clean_T, N, 37, 3] atom37 predictions of clean data at each time step.
         diffuse_mask: [N] which residues are diffused.
         motif_mask: [N] (inpainting only) which residues are motifs.
         output_dir: where to save samples.
-        protein_aa_traj: [noisy_T, N] amino acids (0 - S inclusive where S = 20 or 21).
+        sample_aa_traj: [noisy_T, N] amino acids (0 - S inclusive where S = 20 or 21).
         model_aa_traj: [clean_T, N] amino acids (0 - S inclusive where S = 20 or 21).
         model_logits_traj: [clean_T, N, S] logits for each amino acid, from model
         write_trajectories: bool Whether to also write the PDB trajectories
@@ -627,14 +626,14 @@ def save_trajectory(
 
     Returns:
         SavedTrajectory with paths to saved samples:
-            'sample_pdb_path': PDB file of final state of reverse trajectory.
+            sample_pdb_path: PDB file of final structure
+            sample_pdb_backbone_path: PDB of final backbone
         And if `write_trajectories == True`:
-            'traj_path': PDB file os all intermediate diffused states.
-            'x0_traj_path': PDB file of C-alpha x_0 predictions at each state.
-            'aa_traj_fasta_path': Fasta file of amino acid sequence at each state of trajectory.
-            'logits_traj_path': GIF animation of logits trajectory, if provided.
+            sample_traj_path: PDB file os all intermediate states
+            model_pred_traj_path: PDB file of t=1 model predictions at each state
+            aa_traj_fasta_path: Fasta file of amino acid sequence at each state
         And if `write_animations == True`:
-            `traj_panel_path`: GIF animation of the trajectory.
+            traj_panel_path: animation of the trajectory, model and sample side by side.
     """
 
     start_time = time.time()
@@ -652,14 +651,14 @@ def save_trajectory(
         output_dir, OutputFileName.sample_pdb_backbone
     )
 
-    noisy_traj_length, num_res, _, _ = protein_structure_traj.shape
+    noisy_traj_length, num_res, _, _ = sample_structure_traj.shape
     model_traj_length = model_structure_traj.shape[0]
     assert sample_atom37.shape == (num_res, 37, 3)
-    assert protein_structure_traj.shape == (noisy_traj_length, num_res, 37, 3)
+    assert sample_structure_traj.shape == (noisy_traj_length, num_res, 37, 3)
     assert model_structure_traj.shape == (model_traj_length, num_res, 37, 3)
 
-    if protein_aa_traj is not None:
-        assert protein_aa_traj.shape == (noisy_traj_length, num_res)
+    if sample_aa_traj is not None:
+        assert sample_aa_traj.shape == (noisy_traj_length, num_res)
         assert model_aa_traj is not None
         assert model_aa_traj.shape == (model_traj_length, num_res)
 
@@ -672,7 +671,7 @@ def save_trajectory(
         file_path=sample_pdb_path,
         b_factors=b_factors,
         no_indexing=True,
-        aatype=protein_aa_traj[-1] if protein_aa_traj is not None else None,
+        aatype=sample_aa_traj[-1] if sample_aa_traj is not None else None,
         chain_idx=chain_idx,
         res_idx=res_idx,
         backbone_only=False,
@@ -682,7 +681,7 @@ def save_trajectory(
         file_path=sample_pdb_backbone_path,
         b_factors=b_factors,
         no_indexing=True,
-        aatype=protein_aa_traj[-1] if protein_aa_traj is not None else None,
+        aatype=sample_aa_traj[-1] if sample_aa_traj is not None else None,
         chain_idx=chain_idx,
         res_idx=res_idx,
         backbone_only=True,
@@ -694,20 +693,20 @@ def save_trajectory(
             sample_pdb_backbone_path=sample_pdb_backbone_path,
         )
 
-    prot_traj_path = os.path.join(output_dir, OutputFileName.bb_traj_pdb)
-    x0_traj_path = os.path.join(output_dir, OutputFileName.x0_traj_pdb)
-    prot_traj_path = write_prot_to_pdb(
-        protein_structure_traj,
-        file_path=prot_traj_path,
+    sample_traj_path = os.path.join(output_dir, OutputFileName.sample_traj_pdb)
+    model_pred_traj_path = os.path.join(output_dir, OutputFileName.model_pred_traj_pdb)
+    sample_traj_path = write_prot_to_pdb(
+        sample_structure_traj,
+        file_path=sample_traj_path,
         b_factors=b_factors,
         no_indexing=True,
-        aatype=protein_aa_traj,
+        aatype=sample_aa_traj,
         chain_idx=chain_idx,
         res_idx=res_idx,
     )
-    x0_traj_path = write_prot_to_pdb(
+    model_pred_traj_path = write_prot_to_pdb(
         model_structure_traj,
-        file_path=x0_traj_path,
+        file_path=model_pred_traj_path,
         b_factors=b_factors,
         no_indexing=True,
         aatype=model_aa_traj,
@@ -723,25 +722,25 @@ def save_trajectory(
     traj_panel_path = None
 
     # Write amino acids trajectory, if provided.
-    if protein_aa_traj is not None:
+    if sample_aa_traj is not None:
         aa_traj_fasta_path = os.path.join(output_dir, OutputFileName.aa_traj_fa)
-        num_steps = protein_aa_traj.shape[0]
+        num_steps = sample_aa_traj.shape[0]
         with open(aa_traj_fasta_path, "w") as f:
             for i in range(num_steps):
                 f.write(f">step{i}\n")
                 f.write(
-                    "".join([restypes_with_x[aa] for aa in protein_aa_traj[i]]) + "\n"
+                    "".join([restypes_with_x[aa] for aa in sample_aa_traj[i]]) + "\n"
                 )
 
     if (
         write_animations
-        and protein_aa_traj is not None
+        and sample_aa_traj is not None
         and model_aa_traj is not None
         and model_logits_traj is not None
     ):
         traj_panel_path = animate_trajectories(
-            prot_structure_traj=protein_structure_traj,
-            prot_aa_traj=protein_aa_traj,
+            sample_structure_traj=sample_structure_traj,
+            sample_aa_traj=sample_aa_traj,
             model_structure_traj=model_structure_traj,
             model_aa_traj=model_aa_traj,
             model_logits_traj=model_logits_traj,
@@ -755,8 +754,8 @@ def save_trajectory(
     return SavedTrajectory(
         sample_pdb_path=sample_pdb_path,
         sample_pdb_backbone_path=sample_pdb_backbone_path,
-        traj_path=prot_traj_path,
-        x0_traj_path=x0_traj_path,
+        sample_traj_path=sample_traj_path,
+        model_pred_traj_path=model_pred_traj_path,
         aa_traj_fasta_path=aa_traj_fasta_path,
         logits_traj_path=model_logits_traj_path,
         traj_panel_path=traj_panel_path,

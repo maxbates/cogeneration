@@ -378,7 +378,7 @@ class FlowModule(LightningModule):
 
         # Validation can run either unconditional generation, or inpainting
         self.interpolant.set_device(res_mask.device)
-        protein_traj, model_traj = self.interpolant.sample(
+        sample_traj, model_traj = self.interpolant.sample(
             num_batch,
             num_res,
             self.model,
@@ -394,8 +394,8 @@ class FlowModule(LightningModule):
             torsions_1=batch[bp.torsions_1],
         )
 
-        bb_trajs = to_numpy(protein_traj.structure)
-        aa_trajs = to_numpy(protein_traj.amino_acids)
+        bb_trajs = to_numpy(sample_traj.structure)
+        aa_trajs = to_numpy(sample_traj.amino_acids)
 
         model_bb_trajs = to_numpy(model_traj.structure)
         model_aa_trajs = to_numpy(model_traj.amino_acids)
@@ -403,7 +403,7 @@ class FlowModule(LightningModule):
         model_logits_trajs = to_numpy(model_traj.logits)
 
         # batch-level aatype metrics
-        final_step = protein_traj[-1]
+        final_step = sample_traj[-1]
         generated_aatypes = to_numpy(final_step.aatypes)
         assert generated_aatypes.shape == (num_batch, num_res)
         batch_level_aatype_metrics = metrics.calc_aatype_metrics(generated_aatypes)
@@ -429,8 +429,8 @@ class FlowModule(LightningModule):
                     sample_id=sample_id,
                     sample_dir=sample_dir,
                     task=inference_task,
-                    protein_structure_traj=bb_trajs[i],
-                    protein_aa_traj=aa_trajs[i],
+                    sample_structure_traj=bb_trajs[i],
+                    sample_aa_traj=aa_trajs[i],
                     model_structure_traj=model_bb_trajs[i],
                     model_aa_traj=model_aa_trajs[i],
                     model_logits_traj=model_logits_trajs[i],
@@ -610,7 +610,7 @@ class FlowModule(LightningModule):
             raise ValueError(f"Unknown task {task}")
 
         # Sample batch
-        protein_traj, model_traj = interpolant.sample(
+        sample_traj, model_traj = interpolant.sample(
             num_batch=num_batch,
             num_res=sample_length,
             model=self.model,
@@ -629,8 +629,8 @@ class FlowModule(LightningModule):
         model_aa_trajs = to_numpy(model_traj.amino_acids)
         model_logits_trajs = to_numpy(model_traj.logits)
 
-        bb_trajs = to_numpy(protein_traj.structure)
-        aa_trajs = to_numpy(protein_traj.amino_acids)
+        bb_trajs = to_numpy(sample_traj.structure)
+        aa_trajs = to_numpy(sample_traj.amino_acids)
         # (We only emit logits from direct model output - don't simulate logits)
 
         # Check for remaining mask tokens in final step of interpolated trajectory and reset to 0 := alanine
@@ -647,8 +647,8 @@ class FlowModule(LightningModule):
                 sample_id=sample_id,
                 sample_dir=sample_dir,
                 task=task,
-                protein_structure_traj=bb_trajs[i],
-                protein_aa_traj=aa_trajs[i],
+                sample_structure_traj=bb_trajs[i],
+                sample_aa_traj=aa_trajs[i],
                 model_structure_traj=model_bb_trajs[i],
                 model_aa_traj=model_aa_trajs[i],
                 model_logits_traj=model_logits_trajs[i],
@@ -673,8 +673,8 @@ class FlowModule(LightningModule):
         sample_id: Union[int, str],
         sample_dir: str,  # inference output directory for this sample
         task: InferenceTask,
-        protein_structure_traj: npt.NDArray,
-        protein_aa_traj: npt.NDArray,
+        sample_structure_traj: npt.NDArray,
+        sample_aa_traj: npt.NDArray,
         model_structure_traj: npt.NDArray,
         model_aa_traj: npt.NDArray,
         model_logits_traj: npt.NDArray,
@@ -698,17 +698,17 @@ class FlowModule(LightningModule):
         Note that this function expects numpy inputs. Tensors should be detached and converted.
         """
         # Noisy trajectory and model (clean) trajectory may not be the same number of steps.
-        noisy_traj_length, sample_length, _, _ = protein_structure_traj.shape
-        assert protein_structure_traj.shape == (
+        noisy_traj_length, sample_length, _, _ = sample_structure_traj.shape
+        assert sample_structure_traj.shape == (
             noisy_traj_length,
             sample_length,
             37,
             3,
-        ), f"bb_traj shape {protein_structure_traj.shape}"
-        assert protein_aa_traj.shape == (
+        ), f"bb_traj shape {sample_structure_traj.shape}"
+        assert sample_aa_traj.shape == (
             noisy_traj_length,
             sample_length,
-        ), f"aa_traj shape {protein_aa_traj.shape}"
+        ), f"aa_traj shape {sample_aa_traj.shape}"
 
         models_traj_length = model_structure_traj.shape[0]
         assert model_structure_traj.shape == (
@@ -738,15 +738,15 @@ class FlowModule(LightningModule):
         # Save PDBs, trajectories, and a fasta of the final sequence
         saved_trajectory_files = save_trajectory(
             sample_name=sample_id,
-            sample_atom37=protein_structure_traj[-1],
-            protein_structure_traj=protein_structure_traj,
+            sample_atom37=sample_structure_traj[-1],
+            sample_structure_traj=sample_structure_traj,
             model_structure_traj=model_structure_traj,
             diffuse_mask=diffuse_mask,
             motif_mask=motif_mask,
             chain_idx=chain_idx,
             res_idx=res_idx,
             output_dir=sample_dir,
-            protein_aa_traj=protein_aa_traj,
+            sample_aa_traj=sample_aa_traj,
             model_aa_traj=model_aa_traj,
             model_logits_traj=model_logits_traj,
             write_trajectories=write_sample_trajectories,
@@ -760,8 +760,8 @@ class FlowModule(LightningModule):
                 sample_name=sample_id,
                 sample_dir=sample_dir,
                 pred_pdb_path=saved_trajectory_files.sample_pdb_path,
-                pred_bb_positions=protein_structure_traj[-1],
-                pred_aa=protein_aa_traj[-1],
+                pred_bb_positions=sample_structure_traj[-1],
+                pred_aa=sample_aa_traj[-1],
                 diffuse_mask=diffuse_mask,
                 motif_mask=motif_mask,
                 chain_idx=chain_idx,
