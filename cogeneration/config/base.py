@@ -555,7 +555,8 @@ class InterpolantSteeringConfig:
 
     # potentials
     chain_break_scale: float = 1.0
-    chain_break_max_backbone_dist: float = 4.0
+    chain_break_allowed_backbone_dist: float = 4.0  # ideal is ~3.8Å
+    chain_break_maximum_backbone_dist: float = 12.0  # clamp
 
 
 @dataclass

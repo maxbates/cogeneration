@@ -1675,7 +1675,7 @@ class Interpolant:
             true_feats=true_feats,
             model=model,
             task=task,
-            step_idx=step_idx,
+            step_idx=self.cfg.sampling.num_timesteps,  # final step
             t_1=t_1,
             t_2=None,  # final step
         )

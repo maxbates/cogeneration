@@ -1,3 +1,4 @@
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -55,7 +56,7 @@ class Potential(ABC):
     Fow now, does not support computing gradients for guidance.
     """
 
-    scale: float = 1.0  # energy * scale is the final energy
+    scale: float  # compute_energy() * scale is the final energy
 
     @abstractmethod
     def compute_energy(
@@ -72,10 +73,11 @@ class Potential(ABC):
 class ChainBreakPotential(Potential):
     """
     Penalize unnatural backbone chain breaks by checking residue Euclidean distances,
-    but accounting for true chain breaks or non-sequential residues.
+    while accounting for true chain breaks or non-sequential residues.
     """
 
-    max_backbone_dist: float = 4.0
+    allowed_backbone_dist: float  # allowed distance, ideal is 3.8Å
+    maximum_backbone_dist: float  # upper bound
 
     def compute_energy(
         self,
@@ -91,18 +93,25 @@ class ChainBreakPotential(Potential):
         # use protein_pred, e.g. for inpainting after fixing motifs
         trans = protein_pred.trans  # (B, N, 3)
 
+        # dists from one residue to the next
+        dists = torch.linalg.norm(
+            trans[:, :-1, :] - trans[:, 1:, :], dim=-1
+        )  # (B, N-1)
+        # excess penalty is >0Å above allowed distance
+        excess = torch.relu(dists - self.allowed_backbone_dist)
+        # normalize penalties to [0, 1] range
+        span = max(1e-6, self.maximum_backbone_dist - self.allowed_backbone_dist)
+        penalty_pair = excess.clamp(max=span) / span  # (B, N-1)
+
         # continuity masks
         same_chain = chain_idx[:, 1:].eq(chain_idx[:, :-1])
         consecutive = res_idx[:, 1:].eq(res_idx[:, :-1] + 1)
-        need_continuity = same_chain & consecutive  # (B, N-1)
+        need_continuity = same_chain & consecutive
+        penalty_pair = penalty_pair * need_continuity.float()
 
-        # dists from one residue to the next
-        dists = torch.linalg.norm(trans[:, :-1, :] - trans[:, 1:, :], dim=-1)
-        breaks = need_continuity & (dists > self.max_backbone_dist)
-        num_breaks = breaks.sum(dim=1).float()  # (B,)
-
-        # logistic ramp, so even 1 break is penalized heavily
-        energy = 1.0 - torch.exp(-1 * num_breaks)
+        # aggregate and logistic ramp
+        penalty_sum = penalty_pair.sum(dim=1)
+        energy = 1.0 - torch.exp(-1 * penalty_sum)  # in [0, 1]
         return energy
 
 
@@ -137,7 +146,8 @@ class FKSteeringCalculator:
         return [
             ChainBreakPotential(
                 scale=cfg.chain_break_scale,
-                max_backbone_dist=cfg.chain_break_max_backbone_dist,
+                allowed_backbone_dist=cfg.chain_break_allowed_backbone_dist,
+                maximum_backbone_dist=cfg.chain_break_maximum_backbone_dist,
             ),
         ]
 
@@ -181,20 +191,33 @@ class FKSteeringResampler:
 
     def __post_init__(self):
         self.calculator = FKSteeringCalculator(cfg=self.cfg)
+        self._log = logging.getLogger(__name__)
 
         # track energy trajectory for each particle
-        self._energy_trajectory: Optional[torch.Tensor] = None
-
-        # track running total log G
-        self._log_G: Optional[torch.Tensor] = None
+        self._energy_trajectory: Optional[torch.Tensor] = None  # (B * K, 0->T)
+        # track accumulated log G
+        self._log_G: Optional[torch.Tensor] = None  # (B * K,)
+        # track log G delta (difference at previous step)
+        self._log_G_delta: Optional[torch.Tensor] = None  # (B * K,)
 
     @property
     def enabled(self) -> bool:
         return self.cfg.num_particles > 1
 
+    def log_G_score(self) -> torch.Tensor:
+        """
+        log G score is a weighted sum of the absolute energy and the difference from previous step
+        expects `self._log_G` and `self._log_G_delta` to be set to prev/accumulated values.
+        """
+        return (self.cfg.energy_weight_difference * self._log_G_delta) + (
+            self.cfg.energy_weight_absolute * self._log_G
+        )
+
     def init_particles(self, batch: NoisyFeatures) -> NoisyFeatures:
         if not self.enabled:
             return batch
+
+        self._log.debug(f"Init FK Steering with {self.cfg.num_particles} particles")
 
         num_batch, num_res = batch[bp.res_mask].shape  # (B, N)
         num_particles = self.cfg.num_particles  # K
@@ -202,8 +225,9 @@ class FKSteeringResampler:
 
         self._energy_trajectory = torch.empty(
             num_batch * num_particles, 0, device=device
-        )  # (B * K, 0)
-        self._log_G = torch.zeros(num_batch * num_particles, device=device)  # (B * K,)
+        )
+        self._log_G = torch.zeros(num_batch * num_particles, device=device)
+        self._log_G_delta = torch.zeros(num_batch * num_particles, device=device)
 
         batch = {k: _batch_repeat_feat(v, num_particles) for k, v in batch.items()}
 
@@ -260,20 +284,27 @@ class FKSteeringResampler:
             )
         # scale log_G by lambda
         log_G_delta *= self.cfg.fk_lambda
+        # cache log G delta
+        self._log_G_delta = log_G_delta
         # accumulate log G values
         self._log_G += log_G_delta
 
-        # log G is a weighted sum of the absolute energy and the difference from previous step
-        log_G_score = (self.cfg.energy_weight_difference * log_G_delta) + (
-            self.cfg.energy_weight_absolute * self._log_G
-        )
+        # calculate log G score
+        log_G_score = self.log_G_score()
+        logG_mat = log_G_score.view(num_batch, num_particles)  # (B, K)
 
         # softmax-normalize resampling weights per sample
-        logG_mat = log_G_score.view(num_batch, num_particles)  # (B, K)
+        # temperature scale log G; <1 = sharpen, 1 = no effect. TODO cfg
+        tau = 0.5
+        logG_mat = logG_mat / tau
         resampling_weights = (logG_mat - logG_mat.max(dim=1, keepdim=True).values).exp()
         resampling_weights = resampling_weights / resampling_weights.sum(
             dim=1, keepdim=True
         )
+
+        # track metric effective sample size as diagnostic of weight degeneracy
+        # TODO expose ESS and energy trajectory
+        effective_sample_size = 1.0 / (resampling_weights**2).sum(dim=1)
 
         # draw surviving particle indices
         row_idx = [
@@ -285,14 +316,19 @@ class FKSteeringResampler:
             + torch.arange(num_batch, device=device).unsqueeze(1) * num_particles
         ).flatten()
 
+        self._log.debug(f"Step {step_idx} | energy = {energy.tolist()}")
+        self._log.debug(f"Step {step_idx} | ∆G     = {log_G_delta.tolist()}")
+        self._log.debug(f"Step {step_idx} | Log G  = {log_G_score.tolist()}")
+        self._log.debug(f"Step {step_idx} | keep   = {idx.tolist()}")
+        self._log.debug(
+            f"Step {step_idx} | ESS    = {effective_sample_size.mean().item():.2f}"
+        )
+
         # reindex batch + internal state using the sampled indices
         batch = {k: _batch_select_feat(v, idx) for k, v in batch.items()}
         self._energy_trajectory = self._energy_trajectory.index_select(0, idx)
         self._log_G = self._log_G.index_select(0, idx)
-
-        # track metric effective sample size as diagnostic of weight degeneracy
-        # TODO expose ESS and energy trajectory
-        effective_sample_size = 1.0 / (resampling_weights**2).sum(dim=1)
+        self._log_G_delta = self._log_G_delta.index_select(0, idx)
 
         return batch, idx
 
@@ -300,7 +336,7 @@ class FKSteeringResampler:
         self, batch: NoisyFeatures
     ) -> Tuple[NoisyFeatures, Optional[torch.Tensor]]:
         """
-        Pick the best particle per sample in the batch, by accumulated log G values.
+        Pick the best particle per sample in the batch by log G score.
         Converts batch from (B * K, ...) to (B, ...), and returns indices of the best particles.
         """
         if not self.enabled:
@@ -311,7 +347,8 @@ class FKSteeringResampler:
         num_batch = batch_size // num_particles  # B (original batch size)
         device = batch[bp.res_mask].device
 
-        logG_mat = self._log_G.view(num_batch, num_particles)  # (B, K)
+        log_G_score = self.log_G_score()
+        logG_mat = log_G_score.view(num_batch, num_particles)  # (B, K)
         idx_best = logG_mat.argmax(dim=1)  # (B,)
         idx_best += torch.arange(num_batch, device=device) * num_particles  # (B,)
         batch_best = {k: _batch_select_feat(v, idx_best) for k, v in batch.items()}
