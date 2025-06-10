@@ -479,20 +479,28 @@ class FlowModule(LightningModule):
         rotmats_1 = batch.get(bp.rotmats_1, None)
         torsions_1 = batch.get(bp.torsions_1, None)
         aatypes_1 = batch.get(bp.aatypes_1, None)
-        sample_pdb_name = batch.get(bp.pdb_name, [None])[0]
-
+        # Pull out masks
         diffuse_mask = batch[bp.diffuse_mask]
         motif_mask = batch.get(bp.motif_mask, None)
 
-        # Handle single-sample and missing sample_id
+        # Determine `pdb_name` (one per batch, optional)
+        if bp.pdb_name in batch:
+            assert (
+                len(list(set(batch[bp.pdb_name]))) == 1
+            ), f"Multiple sample PDB names found in batch: {batch[bp.pdb_name]}"
+            sample_pdb_name = batch[bp.pdb_name][0]
+        else:
+            sample_pdb_name = f"sample"
+
+        # Determine `sample_id` (unique per row, optional)
         if bp.sample_id in batch:
             sample_ids = batch[bp.sample_id].squeeze().tolist()
+            sample_ids = [sample_ids] if isinstance(sample_ids, int) else sample_ids
         else:
-            sample_ids = [0]
-        sample_ids = [sample_ids] if isinstance(sample_ids, int) else sample_ids
+            sample_ids = list(range(num_batch))
         assert num_batch == len(sample_ids)
 
-        # Task-specific logic for creating output `sample_dirs`
+        # Define `sample_dirs` according to task
         if task == InferenceTask.unconditional:
             sample_dirs = [
                 os.path.join(
@@ -529,6 +537,10 @@ class FlowModule(LightningModule):
         else:
             raise ValueError(f"Unknown task {task}")
 
+        # Ensure directories are unique
+        assert len(sample_dirs) == len(
+            list(set(sample_dirs))
+        ), f"Sample directories are not unique: {sample_dirs}"
         # Create output directories
         for sample_dir in sample_dirs:
             os.makedirs(sample_dir, exist_ok=True)

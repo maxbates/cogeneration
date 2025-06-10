@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+from tensorflow.python.util.tf_export import kwarg_only
 
 from cogeneration.config.base import InterpolantSteeringConfig
 from cogeneration.data.trajectory import SamplingStep
@@ -56,7 +57,7 @@ class Potential(ABC):
     Fow now, does not support computing gradients for guidance.
     """
 
-    scale: float  # compute_energy() * scale is the final energy
+    scale: float = 1.0  # compute_energy() * scale is the final energy
 
     @abstractmethod
     def compute_energy(
@@ -76,8 +77,8 @@ class ChainBreakPotential(Potential):
     while accounting for true chain breaks or non-sequential residues.
     """
 
-    allowed_backbone_dist: float  # allowed distance, ideal is 3.8Å
-    maximum_backbone_dist: float  # upper bound
+    allowed_backbone_dist: float = 4.0  # allowed distance, ideal is 3.8Å
+    maximum_backbone_dist: float = 12.0  # upper bound
 
     def compute_energy(
         self,
