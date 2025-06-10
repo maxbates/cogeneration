@@ -47,8 +47,8 @@ class TestEvalRunner:
         cfg = Config.public_multiflow()
 
         # specify task (note public multiflow not trained to support inpainting)
-        cfg.inference.task = InferenceTask.unconditional
-        # cfg.inference.task = InferenceTask.inpainting
+        # cfg.inference.task = InferenceTask.unconditional
+        cfg.inference.task = InferenceTask.inpainting
         # stochastic paths (NOTE public multiflow not trained to support, but can force)
         cfg.shared.stochastic = True
         cfg.inference.interpolant.trans.stochastic_noise_intensity = 0.75

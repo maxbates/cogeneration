@@ -154,7 +154,7 @@ class MotifFactory:
         segments: List[Segment] = []
         seg_start = 0
         current_is_motif = motif_mask[0]
-        current_chain = bool(chain_idx[0].item())
+        current_chain = int(chain_idx[0].item())
 
         for i in range(1, N):
             is_motif = bool(motif_mask[i].item())

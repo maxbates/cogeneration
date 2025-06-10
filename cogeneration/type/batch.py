@@ -110,14 +110,14 @@ def empty_feats(N: int, task: DataTask = DataTask.hallucination) -> BatchFeature
         BatchProp.chain_idx: torch.ones(N),
         BatchProp.res_idx: torch.arange(1, N + 1),
         BatchProp.res_plddt: torch.full((N,), 100.0),
-        BatchProp.diffuse_mask: torch.ones(N),
-        BatchProp.plddt_mask: torch.ones(N),
+        BatchProp.diffuse_mask: torch.ones(N).int(),
+        BatchProp.plddt_mask: torch.ones(N).int(),
         BatchProp.pdb_name: "",
         BatchProp.csv_idx: torch.tensor([1], dtype=torch.long),
         BatchProp.sample_id: 0,  # inference only but no impact to training / model
     }
 
     if task == DataTask.inpainting:
-        feats[BatchProp.motif_mask] = torch.zeros(N)
+        feats[BatchProp.motif_mask] = torch.zeros(N).int()
 
     return feats

@@ -19,6 +19,7 @@ from cogeneration.config.base import (
 )
 from cogeneration.data import data_transforms, rigid_utils
 from cogeneration.data.const import seq_to_aatype
+from cogeneration.data.noise_mask import mask_blend_2d
 from cogeneration.dataset.filterer import DatasetFilterer
 from cogeneration.dataset.motif_factory import (
     ChainBreak,
@@ -197,10 +198,10 @@ class BatchFeaturizer:
                     new_feats[prop][ns:ne] = feats[prop][os:oe]
 
                 # mark motif
-                new_feats[bp.motif_mask][ns:ne] = 1.0
+                new_feats[bp.motif_mask][ns:ne] = 1
                 # mark diffusable for inpainting with guidance
                 # TODO(inpainting-fixed) mark fixed
-                new_feats[bp.diffuse_mask][ns:ne] = 1.0
+                new_feats[bp.diffuse_mask][ns:ne] = 1
                 # enforce idx
                 new_feats[bp.chain_idx][ns:ne] = current_chain_idx
                 new_feats[bp.res_idx][ns:ne] = torch.arange(
@@ -211,9 +212,9 @@ class BatchFeaturizer:
                 # Scaffolds mostly retain default `empty_feats` values.
 
                 # mark scaffold
-                new_feats[bp.motif_mask][ns:ne] = 0.0
+                new_feats[bp.motif_mask][ns:ne] = 0
                 # ensure marked to be diffused
-                new_feats[bp.diffuse_mask][ns:ne] = 1.0
+                new_feats[bp.diffuse_mask][ns:ne] = 1
                 # enforce idx
                 new_feats[bp.chain_idx][ns:ne] = current_chain_idx
                 new_feats[bp.res_idx][ns:ne] = torch.arange(
@@ -397,8 +398,14 @@ class BatchFeaturizer:
 
         # Centering
         if bp.motif_mask in feats and (feats[bp.motif_mask] == 1).any():
-            # Center the motifs using motif_mask
+            # Center the motifs using motif_mask, and re-zero the scaffolds,
+            # to prevent biasing how scaffolds are placed relative to motifs.
             BatchFeaturizer.recenter_structure(feats, mask=feats[bp.motif_mask])
+            feats[bp.trans_1] = mask_blend_2d(
+                feats[bp.trans_1],
+                torch.zeros_like(feats[bp.trans_1]),
+                mask=feats[bp.motif_mask],
+            )
         else:
             # Center the whole structure
             BatchFeaturizer.recenter_structure(feats)

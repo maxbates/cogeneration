@@ -1211,7 +1211,7 @@ class Interpolant:
 
         return aatypes_t
 
-    def sample_step(
+    def sample_single_step(
         self,
         noisy_batch: NoisyFeatures,
         true_feats: BatchTrueFeatures,
@@ -1279,15 +1279,19 @@ class Interpolant:
                 pred_aatypes_1, true_feats.aatypes, scaffold_mask
             )
 
-            # For inpainting with guidance, set motif structure to t=1
+            # TODO - consider whether we should first align (i.e. rotate)
+            #   the pred structure to known motifs, rather than simply substituting them in.
+            #   I don't think FrameFlow guidance did this, but the twisting variant sort of does?
+
+            # For inpainting with guidance, fix known motifs of predicted structure
             # so that we interpolate toward the known motifs. Also for self-conditioning.
-            pred_trans_1 = mask_blend_2d(pred_trans_1, true_feats.trans, diffuse_mask)
+            pred_trans_1 = mask_blend_2d(pred_trans_1, true_feats.trans, scaffold_mask)
             pred_rotmats_1 = mask_blend_3d(
-                pred_rotmats_1, true_feats.rotmats, diffuse_mask
+                pred_rotmats_1, true_feats.rotmats, scaffold_mask
             )
             if pred_torsions_1 is not None:
                 pred_torsions_1 = mask_blend_3d(
-                    pred_torsions_1, true_feats.torsions, diffuse_mask
+                    pred_torsions_1, true_feats.torsions, scaffold_mask
                 )
         elif task == InferenceTask.forward_folding:
             # scale logits during integration, assumes will `softmax`
@@ -1605,8 +1609,9 @@ class Interpolant:
         ts = torch.linspace(self.cfg.min_t, 1.0, self.cfg.sampling.num_timesteps)
         step_idx = 0
 
-        # We will integrate in a loop over ts (handling the last step after the loop)
-        # t_1 is the current time, t_2 is the next time
+        # We will integrate in a loop over ts, handling the last step after the loop.
+        # t_1 is the current time (handle updating ourselves at end of loop).
+        # t_2 is the next time.
         t_1 = ts[0]
         for t_2 in ts[1:]:
             # Determine time for each domain
@@ -1644,7 +1649,7 @@ class Interpolant:
                     raise ValueError(f"Unknown task {task}")
 
             # Take a single step, updating the batch in place
-            batch, model_step, protein_step = self.sample_step(
+            batch, model_step, sample_step = self.sample_single_step(
                 noisy_batch=batch,
                 true_feats=true_feats,
                 model=model,
@@ -1655,7 +1660,7 @@ class Interpolant:
             )
 
             model_trajectory.append(model_step)
-            sample_trajectory.append(protein_step)
+            sample_trajectory.append(sample_step)
 
             # Update t_1 to t_2 for the next step
             t_1 = t_2
@@ -1670,7 +1675,7 @@ class Interpolant:
         batch[nbp.r3_t] = t
         batch[nbp.cat_t] = t
 
-        batch, model_step, protein_step = self.sample_step(
+        batch, model_step, sample_step = self.sample_single_step(
             noisy_batch=batch,
             true_feats=true_feats,
             model=model,
@@ -1681,14 +1686,14 @@ class Interpolant:
         )
 
         model_trajectory.append(model_step)
-        sample_trajectory.append(protein_step)
+        sample_trajectory.append(sample_step)
 
         # If FK steering is enabled, pick the best particle per sample
         # TODO - allow passing through all the particles. Ensure each is handled properly.
         _, best_idx = self.resampler.best_particle_in_batch(batch=batch)
         if best_idx is not None:
             # Select the best particle for each sample
-            sample_trajectory = sample_trajectory.select_batch_idx(best_idx)
             model_trajectory = model_trajectory.select_batch_idx(best_idx)
+            sample_trajectory = sample_trajectory.select_batch_idx(best_idx)
 
         return sample_trajectory, model_trajectory

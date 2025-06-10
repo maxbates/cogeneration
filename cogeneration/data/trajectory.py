@@ -17,16 +17,16 @@ def detach(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.detach()
 
 
+def clone_detach(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if x is None:
+        return None
+    return x.detach().clone()
+
+
 def to_cpu(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if x is None:
         return None
     return x.detach().cpu()
-
-
-def to_cpu_clone(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    if x is None:
-        return None
-    return x.detach().clone().cpu()
 
 
 @dataclass
@@ -78,8 +78,8 @@ class SamplingStep:
             trans=self.trans[idx],
             rotmats=self.rotmats[idx],
             aatypes=self.aatypes[idx],
-            torsions=None if self.torsions is None else self.torsions[idx],
-            logits=None if self.logits is None else self.logits[idx],
+            torsions=self.torsions[idx] if self.torsions is not None else None,
+            logits=self.logits[idx] if self.logits is not None else None,
         )
 
     @classmethod
@@ -93,15 +93,15 @@ class SamplingStep:
         logits: Optional[torch.Tensor],
     ):
         """
-        Safely create a SamplingStep
+        Safely create a SamplingStep, cloning and detaching tensors.
         """
         return cls(
-            res_mask=detach(res_mask),
-            trans=detach(trans),
-            rotmats=detach(rotmats),
-            aatypes=detach(aatypes),
-            torsions=detach(torsions),
-            logits=detach(logits),
+            res_mask=clone_detach(res_mask),
+            trans=clone_detach(trans),
+            rotmats=clone_detach(rotmats),
+            aatypes=clone_detach(aatypes),
+            torsions=clone_detach(torsions),
+            logits=clone_detach(logits),
         )
 
     @classmethod
