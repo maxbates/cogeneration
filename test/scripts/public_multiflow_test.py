@@ -42,7 +42,7 @@ class TestEvalRunner:
 
     # This is a slow test, because it actually samples with real model, many timesteps, and animates.
     # Can run manually.
-    # @pytest.mark.skip
+    @pytest.mark.skip
     def test_public_weights_sampling(self, public_weights_path, tmp_path):
         cfg = Config.public_multiflow()
 

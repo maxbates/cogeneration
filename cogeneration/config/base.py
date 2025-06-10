@@ -523,6 +523,8 @@ class InterpolantAATypesConfig(BaseClassConfig):
     # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
     # Roughly, 0.5 => 0.2 jumps/residue, 1.0 = > 0.4, 1.5 => 0.6 over 500 timesteps  TODO doublecheck
     stochastic_noise_intensity: float = 0.25
+    # temperature smooths logits softmax()
+    stochastic_temp: float = 1.5
 
 
 class InterpolantTrainTimeSamplingEnum(StrEnum):
@@ -596,6 +598,8 @@ class InterpolantConfig(BaseClassConfig):
     self_condition_prob: float = 0.5  # 0.5 in public MultiFlow
     # kappa allows scaling rotation t exponentially during sampling
     provide_kappa: bool = True
+    # non-stochastic proportion in training, i.e. reverting to flow matching. batch level.
+    stochastic_dropout_prop: float = 0.15
 
     # sub-modules
     rots: InterpolantRotationsConfig = field(default_factory=InterpolantRotationsConfig)
@@ -1278,6 +1282,9 @@ class Config(BaseClassConfig):
         raw_cfg.interpolant.inpainting_unconditional_prop = 0.0
         raw_cfg.interpolant.codesign_forward_fold_prop = 0.0
         raw_cfg.interpolant.codesign_inverse_fold_prop = 0.0
+
+        # always stochastic, if enabled
+        raw_cfg.interpolant.stochastic_dropout_prop = 0.0
 
         # skip animations, they are slow to generate
         raw_cfg.inference.write_animations = False

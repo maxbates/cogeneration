@@ -326,7 +326,15 @@ class Interpolant:
         noise_perm, gt_perm = linear_sum_assignment(cost_matrix.detach().cpu().numpy())
         return batch_0[(tuple(gt_perm), tuple(noise_perm))]
 
-    def _corrupt_trans(self, trans_1, t, res_mask, diffuse_mask, chain_idx):
+    def _corrupt_trans(
+        self,
+        trans_1,
+        t,
+        res_mask,
+        diffuse_mask,
+        chain_idx,
+        stochasticity_scale: float = 1.0,
+    ):
         """
         Corrupt translations from t=1 to t using Gaussian noise.
         """
@@ -360,12 +368,13 @@ class Interpolant:
         if (
             self.cfg.trans.stochastic
             and self.cfg.trans.stochastic_noise_intensity > 0.0
+            and stochasticity_scale > 0.0
         ):
             # guassian noise added is markovian; just sample from gaussian, scaled by sigma_t, and add.
             # sigma_t is ~parabolic (and ~0 at t=0 and t=1) so corrupted sample reflects marginal distribution at t.
             sigma_t = self._compute_sigma_t(
                 t.squeeze(1),  # (B,)
-                scale=self.cfg.trans.stochastic_noise_intensity,
+                scale=self.cfg.trans.stochastic_noise_intensity * stochasticity_scale,
             )
             intermediate_noise = self._trans_noise(chain_idx=chain_idx)  # (B, N, 3)
             intermediate_noise = intermediate_noise * sigma_t[..., None, None]
@@ -379,7 +388,9 @@ class Interpolant:
 
         return trans_t * res_mask[..., None]
 
-    def _corrupt_rotmats(self, rotmats_1, t, res_mask, diffuse_mask):
+    def _corrupt_rotmats(
+        self, rotmats_1, t, res_mask, diffuse_mask, stochasticity_scale: float = 1.0
+    ):
         """
         Corrupt rotations from t=1 to t using IGSO3.
         """
@@ -408,13 +419,17 @@ class Interpolant:
         rotmats_t = so3_utils.geodesic_t(so3_t[..., None], rotmats_1, rotmats_0)
 
         # stochastic paths
-        if self.cfg.rots.stochastic and self.cfg.rots.stochastic_noise_intensity > 0.0:
+        if (
+            self.cfg.rots.stochastic
+            and self.cfg.rots.stochastic_noise_intensity > 0.0
+            and stochasticity_scale > 0.0
+        ):
             # gaussian noise added is markovian; we are sampling intermediate point directly from marginal
             # so we just need to compute sigma_t for variance of IGSO(3) noise.
             # compute noise std deviation (mean is just rotmats_t)
             sigma_t = self._compute_sigma_t(
                 so3_t.squeeze(1),  # (B,)
-                scale=self.cfg.rots.stochastic_noise_intensity,
+                scale=self.cfg.rots.stochastic_noise_intensity * stochasticity_scale,
             )
 
             # sample IGSO(3) noise
@@ -433,7 +448,9 @@ class Interpolant:
         # only corrupt residues in `diffuse_mask`
         return mask_blend_3d(rotmats_t, rotmats_1, diffuse_mask)
 
-    def _corrupt_torsions(self, torsions_1, t, res_mask, diffuse_mask):
+    def _corrupt_torsions(
+        self, torsions_1, t, res_mask, diffuse_mask, stochasticity_scale: float = 1.0
+    ):
         """
         Corrupt torsions from t=1 to t using noise.
         """
@@ -450,10 +467,11 @@ class Interpolant:
         if (
             self.cfg.trans.stochastic
             and self.cfg.trans.stochastic_noise_intensity > 0.0
+            and stochasticity_scale > 0.0
         ):
             sigma_t = self._compute_sigma_t(
                 t.squeeze(1),  # (B,)
-                scale=self.cfg.trans.stochastic_noise_intensity,
+                scale=self.cfg.trans.stochastic_noise_intensity * stochasticity_scale,
             )
             angles_t += angles_noise(sigma=sigma_t, num_samples=num_res, num_angles=7)
 
@@ -468,7 +486,9 @@ class Interpolant:
 
         return torsions_t * res_mask[..., None, None]
 
-    def _corrupt_aatypes(self, aatypes_1, t, res_mask, diffuse_mask):
+    def _corrupt_aatypes(
+        self, aatypes_1, t, res_mask, diffuse_mask, stochasticity_scale: float = 1.0
+    ):
         """
         Corrupt AA residues from t=1 to t, using masking or uniform sampling.
 
@@ -490,10 +510,11 @@ class Interpolant:
         if (
             self.cfg.aatypes.stochastic
             and self.cfg.aatypes.stochastic_noise_intensity > 0.0
+            and stochasticity_scale > 0.0
         ):
             sigma_t = self._compute_sigma_t(
                 t.squeeze(1),  # (B,)
-                scale=self.cfg.aatypes.stochastic_noise_intensity,
+                scale=self.cfg.aatypes.stochastic_noise_intensity * stochasticity_scale,
             ).unsqueeze(
                 1
             )  # (B, 1)
@@ -627,7 +648,11 @@ class Interpolant:
         noisy_batch[nbp.r3_t] = r3_t  # [B, 1]
         noisy_batch[nbp.cat_t] = cat_t  # [B, 1]
 
-    def corrupt_batch(self, batch: BatchFeatures, task: DataTask) -> NoisyFeatures:
+    def corrupt_batch(
+        self,
+        batch: BatchFeatures,
+        task: DataTask,
+    ) -> NoisyFeatures:
         """
         Corrupt `t=1` data into a noisy batch at sampled `t`.
 
@@ -668,6 +693,17 @@ class Interpolant:
         #   Though values at t=1 effectively won't be corrupted.
         scaffold_mask = (1 - motif_mask) if motif_mask is not None else diffuse_mask
 
+        # Stochastic dropout, if enabled, disables stochasticity for some proportion of batches.
+        # It is at the batch level, rather than sample level, largely out of expedience
+        # (sigma_t == 0 does not imply no noise is added), but could be changed to sample level.
+        if (
+            self.cfg.stochastic_dropout_prop > 0.0
+            and torch.rand(1).item() < self.cfg.stochastic_dropout_prop
+        ):
+            stochasticity_scale = 0.0
+        else:
+            stochasticity_scale = 1.0
+
         # Apply corruptions
 
         if self.cfg.trans.corrupt:
@@ -677,6 +713,7 @@ class Interpolant:
                 res_mask=res_mask,
                 diffuse_mask=diffuse_mask,
                 chain_idx=chain_idx,
+                stochasticity_scale=stochasticity_scale,
             )
         else:
             trans_t = trans_1
@@ -690,6 +727,7 @@ class Interpolant:
                 t=so3_t,
                 res_mask=res_mask,
                 diffuse_mask=diffuse_mask,
+                stochasticity_scale=stochasticity_scale,
             )
         else:
             rotmats_t = rotmats_1
@@ -704,6 +742,7 @@ class Interpolant:
                 t=r3_t,
                 res_mask=res_mask,
                 diffuse_mask=diffuse_mask,
+                stochasticity_scale=stochasticity_scale,
             )
         else:
             torsions_t = torsions_1
@@ -717,6 +756,7 @@ class Interpolant:
                 t=cat_t,
                 res_mask=res_mask,
                 diffuse_mask=scaffold_mask,
+                stochasticity_scale=stochasticity_scale,
             )
         else:
             aatypes_t = aatypes_1
@@ -768,6 +808,7 @@ class Interpolant:
         trans_1: torch.Tensor,  # (B, N, 3)
         trans_t: torch.Tensor,  # (B, N, 3)
         chain_idx: torch.Tensor,  # (B, N)
+        stochasticity_scale: float = 1.0,
     ) -> torch.Tensor:
         trans_vf = self._trans_vector_field(t, trans_1, trans_t)
         trans_next = trans_t + trans_vf * d_t
@@ -775,6 +816,7 @@ class Interpolant:
         if (
             self.cfg.trans.stochastic
             and self.cfg.trans.stochastic_noise_intensity > 0.0
+            and stochasticity_scale > 0.0
         ):
             # Sample from either Gaussian or Harmonic prior (zero‐mean, correct covariance)
             # For harmonic noise, each Brownian increment has covariance J^{-1} (the harmonic prior) instead of identity.
@@ -783,7 +825,7 @@ class Interpolant:
             )  # (B, N, 3) in Angstroms
             sigma_t = self._compute_sigma_t(
                 torch.ones(trans_1.shape[0]) * t,  # (B)
-                scale=self.cfg.trans.stochastic_noise_intensity,
+                scale=self.cfg.trans.stochastic_noise_intensity * stochasticity_scale,
             )
             sigma_t = sigma_t.to(trans_next.device)
             trans_next += base_noise * math.sqrt(d_t) * sigma_t[..., None, None]
@@ -796,6 +838,7 @@ class Interpolant:
         t: float,
         rotmats_1: torch.Tensor,  # (B, N, 3, 3)
         rotmats_t: torch.Tensor,  # (B, N, 3, 3)
+        stochasticity_scale: float = 1.0,
     ) -> torch.Tensor:
         if self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.linear:
             scaling = 1 / (1 - t)
@@ -806,7 +849,11 @@ class Interpolant:
 
         rotmats_next = so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)
 
-        if self.cfg.rots.stochastic and self.cfg.rots.stochastic_noise_intensity > 0.0:
+        if (
+            self.cfg.rots.stochastic
+            and self.cfg.rots.stochastic_noise_intensity > 0.0
+            and stochasticity_scale > 0.0
+        ):
             # Brownian increment: σ(t) · √dt with σ(t)=intensity·√(t(1–t))
             # Sample IGSO(3) noise with a time-independent sigma_t, scaled by sqrt(dt)
             # Add IGSO(3) noise to stay on SO(3).
@@ -814,7 +861,7 @@ class Interpolant:
 
             sigma_t = self._compute_sigma_t(
                 torch.ones(num_batch) * t,  # (B)
-                scale=self.cfg.rots.stochastic_noise_intensity,
+                scale=self.cfg.rots.stochastic_noise_intensity * stochasticity_scale,
             ) * math.sqrt(
                 d_t
             )  # (B,)
@@ -834,6 +881,7 @@ class Interpolant:
         t: float,
         torsions_1: torch.Tensor,  # (B, N, 7, 2)
         torsions_t: torch.Tensor,  # (B, N, K, 2)
+        stochasticity_scale: float = 1.0,
     ) -> torch.Tensor:  # (B, N, 7, 2)
         """
         Perform an Euler step in angle space to update torsion angles.
@@ -860,10 +908,11 @@ class Interpolant:
         if (
             self.cfg.trans.stochastic
             and self.cfg.trans.stochastic_noise_intensity > 0.0
+            and stochasticity_scale > 0.0
         ):
             sigma_t = self._compute_sigma_t(
                 torch.full((B,), t, device=angles_next.device),
-                scale=self.cfg.trans.stochastic_noise_intensity,
+                scale=self.cfg.trans.stochastic_noise_intensity * stochasticity_scale,
             ) * math.sqrt(d_t)
             # add sampled noisy angles
             angles_next += angles_noise(sigma=sigma_t, num_samples=N, num_angles=K)
@@ -1103,6 +1152,7 @@ class Interpolant:
         t: float,  # t in [0,1]
         logits_1: torch.Tensor,  # (B, N, S)
         aatypes_t: torch.Tensor,  # (B, N)
+        stochasticity_scale: float = 1.0,
     ) -> torch.Tensor:
         """
         Stochastic CTMC jump for aatypes.
@@ -1123,8 +1173,9 @@ class Interpolant:
         device = logits_1.device
 
         # logits -> probabilities
-        stochastic_temp = 1.5  # TODO(cfg) support cfg for `stochastic_temp`
-        prob_rows = F.softmax(logits_1 / stochastic_temp, dim=-1)  # (B, N, S)
+        prob_rows = F.softmax(
+            logits_1 / self.cfg.aatypes.stochastic_temp, dim=-1
+        )  # (B, N, S)
         prob_rows = prob_rows.clamp(min=1e-8)  # avoid zeros
 
         # Build rate matrix (positive exits, negative stays)
@@ -1138,7 +1189,7 @@ class Interpolant:
         # Multiplying the whole rate matrix by the same value preserves valid rate matrix.
         sigma_t = self._compute_sigma_t(
             torch.ones(aatypes_t.shape[0], device=device) * t,
-            scale=self.cfg.aatypes.stochastic_noise_intensity,
+            scale=self.cfg.aatypes.stochastic_noise_intensity * stochasticity_scale,
         )
         step_rates = step_rates * sigma_t[..., None, None]  # (B, N, S)
 
@@ -1171,9 +1222,10 @@ class Interpolant:
     def _aatypes_euler_step(
         self,
         d_t: float,
-        t: float,  # t in [0,1]   TODO - move to tensor to match other domains
+        t: float,  # t in [0,1]
         logits_1: torch.Tensor,  # (B, N, S) unscaled probabilities, S={20, 21}
         aatypes_t: torch.Tensor,  # (B, N) current amino acid types
+        stochasticity_scale: float = 1.0,
     ):
         """
         Perform an Euler step to update amino acid types based on the provided logits and interpolation settings.
@@ -1205,9 +1257,19 @@ class Interpolant:
                 f"Unknown aatypes interpolant type {self.cfg.aatypes.interpolant_type}"
             )
 
-        if self.cfg.aatypes.stochastic:
+        if (
+            self.cfg.aatypes.stochastic
+            and self.cfg.aatypes.stochastic_noise_intensity > 0.0
+            and stochasticity_scale > 0.0
+        ):
             # Additional stochastic CTMC jump step
-            aatypes_t = self._aatype_jump_step(d_t, t, logits_1, aatypes_t)
+            aatypes_t = self._aatype_jump_step(
+                d_t,
+                t=t,
+                logits_1=logits_1,
+                aatypes_t=aatypes_t,
+                stochasticity_scale=stochasticity_scale,
+            )
 
         return aatypes_t
 
@@ -1220,6 +1282,7 @@ class Interpolant:
         step_idx: int,
         t_1: float,  # [scalar Tensor]
         t_2: Optional[float],  # [scalar Tensor] None if final step
+        stochasticity_scale: float = 1.0,
     ) -> Tuple[NoisyFeatures, SamplingStep, SamplingStep]:
         """
         Perform a single step of sampling, integrating from `t_1` toward `t_2`.
@@ -1345,16 +1408,29 @@ class Interpolant:
                 trans_1=pred_trans_1,
                 trans_t=trans_t_1,
                 chain_idx=chain_idx,
+                stochasticity_scale=stochasticity_scale,
             )
             rotmats_t_2 = self._rots_euler_step(
-                d_t=d_t, t=t_1, rotmats_1=pred_rotmats_1, rotmats_t=rotmats_t_1
+                d_t=d_t,
+                t=t_1,
+                rotmats_1=pred_rotmats_1,
+                rotmats_t=rotmats_t_1,
+                stochasticity_scale=stochasticity_scale,
             )
             aatypes_t_2 = self._aatypes_euler_step(
-                d_t=d_t, t=t_1, logits_1=pred_logits_1, aatypes_t=aatypes_t_1
+                d_t=d_t,
+                t=t_1,
+                logits_1=pred_logits_1,
+                aatypes_t=aatypes_t_1,
+                stochasticity_scale=stochasticity_scale,
             )
             torsions_t_2 = (
                 self._torsions_euler_step(
-                    d_t=d_t, t=t_1, torsions_1=pred_torsions_1, torsions_t=torsions_t_1
+                    d_t=d_t,
+                    t=t_1,
+                    torsions_1=pred_torsions_1,
+                    torsions_t=torsions_t_1,
+                    stochasticity_scale=stochasticity_scale,
                 )
                 if pred_torsions_1 is not None
                 else None
@@ -1428,6 +1504,9 @@ class Interpolant:
         aatypes_1: Optional[torch.Tensor] = None,
         # t_nn is model/function that generates explicit time steps (r3, so3, cat) given t
         t_nn: Union[Callable[[torch.Tensor], torch.Tensor], Any] = None,
+        # scale euler step stochasticity, 0 to disable for this `sample()`.
+        # stochasticity must be enabled in cfg, this only scales it per domain
+        stochasticity_scale: float = 1.0,
     ) -> Tuple[SamplingTrajectory, SamplingTrajectory]:
         """
         Generate samples by interpolating towards model predictions.
@@ -1657,6 +1736,7 @@ class Interpolant:
                 step_idx=step_idx,
                 t_1=t_1,
                 t_2=t_2,
+                stochasticity_scale=stochasticity_scale,
             )
 
             model_trajectory.append(model_step)
@@ -1683,6 +1763,7 @@ class Interpolant:
             step_idx=self.cfg.sampling.num_timesteps,  # final step
             t_1=t_1,
             t_2=None,  # final step
+            stochasticity_scale=stochasticity_scale,
         )
 
         model_trajectory.append(model_step)
