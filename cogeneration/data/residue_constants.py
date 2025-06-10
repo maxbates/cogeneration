@@ -570,58 +570,194 @@ atom_types = [
 atom_order = {atom_type: i for i, atom_type in enumerate(atom_types)}
 atom_type_num = len(atom_types)  # := 37.
 
-# Set of metal atom types. Not used for modeling.
+# Set of metal atom types. Not used for modeling, but for checking interactions in raw structure.
 metal_types = {
+    # alkali metals
+    "LI",
     "NA",
     "K",
+    "RB",
+    "CS",
+    # alkaline-earth metals
     "MG",
     "CA",
+    "SR",
+    "BA",
+    # 1st-row transition metals
+    "V",
+    "CR",
     "MN",
     "FE",
     "CO",
     "NI",
     "CU",
     "ZN",
+    # 2nd-/3rd-row transition & post-transition
+    "AG",
     "CD",
     "MO",
-    "HG",
-    "PB",
+    "W",
     "PT",
     "AU",
+    "HG",
+    "PB",
+    "AL",
+    "RE",
+    # lanthanides often used for phasing / NMR
+    "LA",
+    "CE",
+    "EU",
+    "GD",
+    "TB",
+    "YB",
+    "LU",
 }
 
-# Set of common solution atom types, mostly to filter them away.
-solutions = {
-    # water forms
-    "HOH",  # standard PDB water
-    "WAT",  # occasionally used
-    "DOD",  # deuterated water
-    # common cryo‑protectants / solvents
-    "GOL",  # glycerol
-    "EDO",  # ethylene glycol
-    "MPD",  # 2‑methyl‑2,4‑pentanediol
-    "PEG",  # polyethylene glycol fragments
-    "PG4",  # propylene glycol
-    "DMS",  # DMSO (dimethyl sulfoxide)
-    "EOH",  # ethanol
-    "IPA",  # isopropanol
-    # buffer components / small ions
-    "SO4",  # sulfate
-    "PO4",  # phosphate
-    "ACT",  # acetate
-    "FMT",  # formate
-    "ACN",  # acetonitrile
-    "BME",  # β‑mercaptoethanol
-    "MES",  # MES buffer
-    "HEP",  # HEPES buffer (sometimes “HEP”)
+# Set of solutions and other ligands to exclude.
+# Names annotated by ChatGPT so may have errors.
+ligands_excluded = {
+    # Water & aqueous solvent forms
+    "HOH",  # Water
+    "WAT",  # Water (alt code)
+    "DOD",  # Deuterated water (D2O)
+    # Buffers & small organic acids
+    "144",  # Tris(hydroxymethyl)methyl-ammonium
+    "ACT",  # Acetate
+    "ACE",  # Acetyl / acetate cap
+    "ACY",  # Acetyl group
+    "AAE",  # Acetoacetate
     "ADA",  # ADA buffer
-    "ACE",  # acetate (sometimes ACE or ACT)
-    # common precipitants/crystallants
-    "TAR",  # tartaric acid
-    "TRS",  # Tris
-    "CIT",  # citrate
-    "MOP",  # MOPS
-    "CAP",  # caprylate
+    "ACN",  # Acetonitrile
+    "CIT",  # Citrate
+    "MES",  # MES buffer
+    "TRS",  # Tris base
+    "MOP",  # MOPS buffer
+    "HEP",  # HEPES fragment
+    "CAP",  # Caprylate (octanoate)
+    "BTB",  # Bis-tris propane
+    "BCN",  # Bicine buffer
+    "BCT",  # Bicarbonate
+    "BME",  # β-Mercaptoethanol
+    "FMT",  # Formate
+    "DEP",  # Diethyl-phosphate
+    "OXA",  # Oxalate
+    "TAR",  # Tartrate
+    "PEP",  # Phosphoenol-pyruvate
+    "EEE",  # Triethylamine
+    "IMD",  # Imidazole
+    "SIN",  # Sinapic acid
+    # Simple ions & small inorganics
+    "CL",  # Chloride
+    "IOD",  # Iodide
+    "NA",  # Sodium ion
+    "SR",  # Strontium ion
+    "CM",  # Curium ion
+    "NH4",  # Ammonium
+    "NH2",  # Amide anion
+    "NHE",  # Ethanol-ammonium
+    "N",  # Dinitrogen
+    "BO3",  # Borate
+    "CO3",  # Carbonate
+    "NO3",  # Nitrate
+    "PO4",  # Phosphate
+    "SO4",  # Sulfate
+    "SCN",  # Thiocyanate
+    "O4B",  # Peroxoborate
+    "CMO",  # Carbon monoxide
+    # Alcohols, polyols & PEG-type cryo-protectants
+    "EOH",  # Ethanol
+    "IPA",  # Isopropanol
+    "MOH",  # Methanol
+    "DMS",  # Dimethyl sulfoxide
+    "DIO",  # 1,4-Dioxane
+    "EDO",  # Ethylene glycol
+    "EGL",  # Ethylene glycol (synonym)
+    "GOL",  # Glycerol
+    "MPD",  # 2-Methyl-2,4-pentanediol
+    "MEG",  # Mono-ethylene glycol
+    "1PE",  # Penta-ethylene glycol
+    "15P",  # Polyethylene glycol (≈34 units)
+    "2F2",  # Dimethyl ether
+    "PE3",  # Tri-ethylene glycol
+    "PE4",  # Tetra-ethylene glycol
+    "P6G",  # Hexa-ethylene glycol
+    "PEG",  # Polyethylene glycol (generic)
+    "PEO",  # Polyethylene oxide
+    "PG0",  # Short PEG fragment
+    "PG4",  # Propylene glycol
+    "PGE",  # PEG derivative
+    "PGR",  # PEG-ribose adduct
+    "EPE",  # PEG-phenyl ether
+    "ETF",  # PEG-formate adduct
+    "FW5",  # PEG variant
+    "GTT",  # Glutathione disulfide (polyol part)
+    # Detergents, lipids & fatty acids
+    "MYR",  # Myristate
+    "PLM",  # Palmitate
+    "STE",  # Stearate
+    "OLA",  # Oleate
+    "OLC",  # Oleoyl/linoleoyl derivative
+    "LDA",  # Laurate
+    "OMB",  # n-Octyl-β-D-maltoside
+    "OME",  # n-Octyl-β-D-glucoside
+    "C8E",  # Octyl-ethylene-oxide detergent
+    "MB3",  # Decyl-maltoside
+    "CLR",  # Cholate-like lipid
+    "CXS",  # Cyclohexyl-maltoside
+    "CAD",  # Caprylate derivative
+    "CAQ",  # Caprate derivative
+    "BU1",  # 1,4-Butanediol
+    "OHE",  # Ethanolamine
+    # Amino-acid-like & phosphorylated residues
+    "ABA",  # 4-Aminobutyric acid
+    "SAR",  # Sarcosine
+    "SEP",  # O-Phosphoserine
+    "TPO",  # O-Phosphothreonine
+    "MSE",  # Selenomethionine
+    "SPD",  # Spermidine
+    "SPM",  # Spermine
+    "HED",  # 2-Hydroxyethyl-dimethyl-amine
+    "URE",  # Urea
+    "GSH",  # Glutathione
+    "IHP",  # Inositol hexakisphosphate
+    "IHS",  # Inositol heptasulfate
+    "IPH",  # Inositol pentakisphosphate
+    # Drug-like / inhibitors / miscellaneous organics
+    "BEN",  # Benzamidine
+    "BDN",  # Biotin amide
+    "BTC",  # Benzene-1,3,5-tricarboxylate
+    "FLC",  # Fluconazole
+    "FCY",  # 5-Fluorocytosine
+    "DOX",  # Doxycycline
+    "CPT",  # Camptothecin
+    "POP",  # Pyrophosphate analog
+    "POL",  # Triphosphate analog
+    "PVO",  # Pyrvinium oxide
+    "STU",  # Staurosporine
+    "SEO",  # Flavin selenoxide
+    "DN",  # Deoxy-nucleotide analog
+    "FJO",  # Custom inhibitor
+    "D10",  # Heavy-atom derivative
+    "GYF",  # Glycerol-fructose adduct
+    "CBM",  # Cellobiose monomer
+    "CCN",  # Cyanocobalamin fragment
+    "MLA",  # Malonyl-CoA analog
+    "MLI",  # Malonate
+    "MRD",  # (R)-2-Methyl-2,4-pentanediol
+    "STO",  # Stearoyl-oleoyl glycerol
+    "TBU",  # tert-Butanol
+    "TME",  # Trimethylamine N-oxide
+    "ETP",  # Ethanethiol phosphate analog
+    # Place-holders / unknowns
+    "UNK",  # Unknown residue
+    "UNL",  # Unknown ligand
+    "UNX",  # Unknown atom type
+    "UPL",  # Unknown polymer
+    "9JE",  # Uncharacterised fragment
+    "7PE",  # Large PEG ether
+    "7N5",  # 2-Ketohexanoic acid
+    "2JC",  # N-Ethylglycine
+    "3SY",  # Bis(hydroxymethyl)propane-1,3-diol
 }
 
 # A compact atom encoding with 14 columns

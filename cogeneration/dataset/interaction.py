@@ -12,8 +12,8 @@ from scipy.spatial.distance import cdist
 from cogeneration.data.protein import chain_str_to_int
 from cogeneration.data.residue_constants import (
     atom_order,
+    ligands_excluded,
     metal_types,
-    solutions,
     unk_restype_index,
 )
 from cogeneration.type.dataset import ChainFeatures
@@ -454,7 +454,7 @@ class NonResidueInteractions:
         for chain in structure.get_chains():
             for res in chain:
                 # count water / solution atoms
-                if res.get_resname().strip() in solutions:
+                if res.get_resname().strip() in ligands_excluded:
                     count += 1
 
         return count
@@ -487,7 +487,7 @@ class NonResidueInteractions:
         for chain_id, chain in struct_chains.items():
             for res_idx, res in enumerate(chain):
                 # drop water / solution atoms
-                if filter_solution and res.get_resname().strip() in solutions:
+                if filter_solution and res.get_resname().strip() in ligands_excluded:
                     continue
 
                 # allow residues to fall through, in case getting atoms for entire structure,
