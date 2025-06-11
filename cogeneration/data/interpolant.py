@@ -463,15 +463,15 @@ class Interpolant:
         t_broadcast = t.view(num_batch, 1, 1)  # (B, 1, 1)
         angles_t = (1.0 - t_broadcast) * angles_0 + t_broadcast * angles_1
 
-        # HACK piggy back on trans.stochastic for stochastic torsions
         if (
-            self.cfg.trans.stochastic
-            and self.cfg.trans.stochastic_noise_intensity > 0.0
+            self.cfg.torsions.stochastic
+            and self.cfg.torsions.stochastic_noise_intensity > 0.0
             and stochasticity_scale > 0.0
         ):
             sigma_t = self._compute_sigma_t(
                 t.squeeze(1),  # (B,)
-                scale=self.cfg.trans.stochastic_noise_intensity * stochasticity_scale,
+                scale=self.cfg.torsions.stochastic_noise_intensity
+                * stochasticity_scale,
             )
             angles_t += angles_noise(sigma=sigma_t, num_samples=num_res, num_angles=7)
 
@@ -735,8 +735,7 @@ class Interpolant:
             raise ValueError("NaN in rotmats_t during corruption")
         noisy_batch[nbp.rotmats_t] = rotmats_t
 
-        # HACK piggy back on trans.corrupt for torsions
-        if self.cfg.trans.corrupt:
+        if self.cfg.torsions.corrupt:
             torsions_t = self._corrupt_torsions(
                 torsions_1,
                 t=r3_t,
@@ -904,15 +903,15 @@ class Interpolant:
         angles_vf = (angles_1 - angles_t) / (1 - t)
         angles_next = angles_t + angles_vf * d_t
 
-        # HACK piggyback on `trans.stochastic`
         if (
-            self.cfg.trans.stochastic
-            and self.cfg.trans.stochastic_noise_intensity > 0.0
+            self.cfg.torsions.stochastic
+            and self.cfg.torsions.stochastic_noise_intensity > 0.0
             and stochasticity_scale > 0.0
         ):
             sigma_t = self._compute_sigma_t(
                 torch.full((B,), t, device=angles_next.device),
-                scale=self.cfg.trans.stochastic_noise_intensity * stochasticity_scale,
+                scale=self.cfg.torsions.stochastic_noise_intensity
+                * stochasticity_scale,
             ) * math.sqrt(d_t)
             # add sampled noisy angles
             angles_next += angles_noise(sigma=sigma_t, num_samples=N, num_angles=K)

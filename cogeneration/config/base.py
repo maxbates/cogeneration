@@ -476,6 +476,22 @@ class InterpolantTranslationsConfig(BaseClassConfig):
     stochastic_noise_intensity: float = 1.0  # `g` in FoldFlow SO3SFM
 
 
+@dataclass
+class InterpolantTorsionsConfig(BaseClassConfig):
+    """
+    Interpolant for torsion angles.
+    """
+
+    # corrupt torsions (unless forward folding)
+    corrupt: bool = (
+        "${ternary:${equals: ${inference.task}, 'forward_folding'}, False, True}"
+    )
+    # stochastic paths
+    stochastic: bool = "${shared.stochastic}"
+    # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
+    stochastic_noise_intensity: float = 1.0
+
+
 class InterpolantAATypesScheduleEnum(StrEnum):
     linear = "linear"
     exp = "exp"  # TODO re-introduce, 'exp' not used in public MultiFlow code
@@ -607,6 +623,9 @@ class InterpolantConfig(BaseClassConfig):
     rots: InterpolantRotationsConfig = field(default_factory=InterpolantRotationsConfig)
     trans: InterpolantTranslationsConfig = field(
         default_factory=InterpolantTranslationsConfig
+    )
+    torsions: InterpolantTorsionsConfig = field(
+        default_factory=InterpolantTorsionsConfig
     )
     aatypes: InterpolantAATypesConfig = field(default_factory=InterpolantAATypesConfig)
     sampling: InterpolantSamplingConfig = field(

@@ -63,7 +63,7 @@ class NodeFeatureNet(nn.Module):
         res_index: torch.Tensor,  # (B, N)
         aatypes: torch.Tensor,  # (B, N)
         aatypes_sc: torch.Tensor,  # (B, N, aatype_pred_num_tokens)
-        torsions_t: torch.Tensor,  # (B, N, 7, 2) or None
+        torsions_t: torch.Tensor,  # (B, N, 7, 2)
     ):
         pos_emb = get_index_embedding(
             res_index,
@@ -96,9 +96,6 @@ class NodeFeatureNet(nn.Module):
             )
 
         if self.cfg.embed_torsions:
-            assert (
-                torsions_t is not None
-            ), "Torsions tensor must be provided if embedding torsions."
             input_feats.append(
                 self.torsion_embedding(
                     torsions_t.flatten(-2)  # (B, N, 7, 2) -> (B, N, 14)
