@@ -196,6 +196,8 @@ class ModelNodeFeaturesConfig(BaseClassConfig):
     embed_chain: bool = True
     # embed_aatype: whether to embed amino acid type
     embed_aatype: bool = True
+    # embed_torsions: whether to embed torsion angles
+    embed_torsions: bool = True
     # use_mlp: whether to use MLP for embedding, otherwise linear layer
     use_mlp: bool = True
 
@@ -1324,6 +1326,7 @@ class Config(BaseClassConfig):
         raw_cfg.model.predict_all_torsions = False
         # positional embeddings
         raw_cfg.model.node_features.embed_chain = False
+        raw_cfg.model.node_features.embed_torsions = False
         raw_cfg.model.edge_features.embed_chain = False
         raw_cfg.model.hyper_params.pos_embed_max_len = 2056
         raw_cfg.model.hyper_params.pos_embed_method = (

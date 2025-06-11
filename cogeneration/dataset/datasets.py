@@ -309,7 +309,7 @@ class BatchFeaturizer:
             bp.aatypes_1: aatypes_1,
             bp.trans_1: trans_1,
             bp.rotmats_1: rotmats_1,
-            bp.torsions_1: chain_feats[dtc.torsion_angles_sin_cos],
+            bp.torsions_1: chain_feats[dtc.torsion_angles_sin_cos].float(),
             bp.chain_idx: chain_idx,
             bp.res_idx: res_idx,
             bp.res_plddt: res_plddt,

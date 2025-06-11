@@ -15,6 +15,8 @@ from cogeneration.type.batch import PredBatchProp as pbp
 """
 TODO(model) Additional losses to consider:
 
+- side chain interactions / clashes / vdw
+
 - translation vector field loss 
     instead of just translation coordinates
 
@@ -266,8 +268,11 @@ class BatchLossCalculator:
         """
         Torsion loss computes cosine distance using `1 - cos`, if torsions are predicted.
         (use 1-cos because smooth, no wrap around issues, simpler than atan2.)
+
+        The model may predict all 7 torsions, or a subset (e.g. only 1 [psi] angle).
+        The loss is calculated by taking the appropriate subset of the ground truth torsions.
         """
-        pred_torsions = self.pred[pbp.pred_torsions]  # (B, N, K, 2)  K={1,5,7}
+        pred_torsions = self.pred[pbp.pred_torsions]  # (B, N, K, 2)  K={1,7}
 
         if pred_torsions is None:
             return torch.zeros(
@@ -283,12 +288,21 @@ class BatchLossCalculator:
         if K < 7:
             gt_torsions = gt_torsions[..., 2 : 2 + K, :]
 
+        # TODO - mask angles according to sequence
+        #   but, which sequence? the real one? the predicted one?
+
         # dot product of unit vectors = cosine of angle difference
         cos_delta = (gt_torsions * pred_torsions).sum(-1)  # (B, N, K)
         # 1 - delta -> 0 when they match, up to 2 if they are opposite
         loss_per_angle = 1.0 - cos_delta  # (B, N, K)
-        # average per residues
-        loss_per_residue = loss_per_angle.mean(dim=-1)  # (B, N)
+
+        # unit-circle norm penalty, scaled smaller than angle loss
+        norm_diff = pred_torsions.norm(dim=-1) - 1.0  # (B, N, K)
+        loss_norm = norm_diff.abs()
+        loss_norm = loss_norm * 0.05
+
+        # average per residue
+        loss_per_residue = (loss_per_angle + loss_norm).mean(dim=-1)  # (B, N)
 
         loss = (loss_per_residue * self.loss_mask).sum(-1) / (
             self.loss_denom_num_res + 1e-10

@@ -87,6 +87,7 @@ class FlowModel(nn.Module):
         cat_t = batch[nbp.cat_t]
         trans_t = batch[nbp.trans_t]
         rotmats_t = batch[nbp.rotmats_t]
+        torsions_t = batch[nbp.torsions_t]
         aatypes_t = batch[nbp.aatypes_t].long()
         trans_sc = batch[nbp.trans_sc]
         aatypes_sc = batch[nbp.aatypes_sc]
@@ -104,6 +105,7 @@ class FlowModel(nn.Module):
             res_index=res_index,
             aatypes=aatypes_t,
             aatypes_sc=aatypes_sc,
+            torsions_t=torsions_t,
         )
         init_edge_embed = self.edge_feature_net(
             node_embed=init_node_embed,

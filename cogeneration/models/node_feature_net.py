@@ -15,7 +15,8 @@ class NodeFeatureNet(nn.Module):
         self.cfg = cfg
 
         # input embedding size
-        embed_size = self.cfg.c_pos_emb + self.cfg.c_timestep_emb * 2 + 1
+        embed_size = self.cfg.c_pos_emb + 1 + self.cfg.c_timestep_emb * 2
+
         if self.cfg.embed_aatype:
             # Always support 21 (20 AA + UNK)
             num_embeddings = 21
@@ -23,7 +24,12 @@ class NodeFeatureNet(nn.Module):
             embed_size += (
                 self.cfg.c_s + self.cfg.c_timestep_emb + self.cfg.aatype_pred_num_tokens
             )
+
         if self.cfg.embed_chain:
+            embed_size += self.cfg.c_pos_emb
+
+        if self.cfg.embed_torsions:
+            self.torsion_embedding = nn.Linear(14, self.cfg.c_pos_emb)
             embed_size += self.cfg.c_pos_emb
 
         if self.cfg.use_mlp:
@@ -57,6 +63,7 @@ class NodeFeatureNet(nn.Module):
         res_index: torch.Tensor,  # (B, N)
         aatypes: torch.Tensor,  # (B, N)
         aatypes_sc: torch.Tensor,  # (B, N, aatype_pred_num_tokens)
+        torsions_t: torch.Tensor,  # (B, N, 7, 2) or None
     ):
         pos_emb = get_index_embedding(
             res_index,
@@ -72,10 +79,12 @@ class NodeFeatureNet(nn.Module):
             self.embed_t(so3_t, res_mask),  # (B, N, c_timestep_emb)
             self.embed_t(r3_t, res_mask),  # (B, N, c_timestep_emb)
         ]
+
         if self.cfg.embed_aatype:
             input_feats.append(self.aatype_embedding(aatypes))
             input_feats.append(self.embed_t(cat_t, res_mask))
             input_feats.append(aatypes_sc)
+
         if self.cfg.embed_chain:
             input_feats.append(
                 get_index_embedding(
@@ -85,4 +94,15 @@ class NodeFeatureNet(nn.Module):
                     pos_embed_method=self.cfg.pos_embed_method,
                 )  # (B, N, c_pos_emb)
             )
+
+        if self.cfg.embed_torsions:
+            assert (
+                torsions_t is not None
+            ), "Torsions tensor must be provided if embedding torsions."
+            input_feats.append(
+                self.torsion_embedding(
+                    torsions_t.flatten(-2)  # (B, N, 7, 2) -> (B, N, 14)
+                )
+            )  # (B, N, c_pos_emb)
+
         return self.linear(torch.cat(input_feats, dim=-1))
