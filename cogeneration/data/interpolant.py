@@ -41,6 +41,7 @@ from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
 from cogeneration.type.batch import PredBatchProp as pbp
+from cogeneration.type.structure import StructureExperimentalMethod
 from cogeneration.type.task import DataTask, InferenceTask
 
 
@@ -1506,6 +1507,7 @@ class Interpolant:
         # scale euler step stochasticity, 0 to disable for this `sample()`.
         # stochasticity must be enabled in cfg, this only scales it per domain
         stochasticity_scale: float = 1.0,
+        structure_method: StructureExperimentalMethod = StructureExperimentalMethod.XRAY_DIFFRACTION,
     ) -> Tuple[SamplingTrajectory, SamplingTrajectory]:
         """
         Generate samples by interpolating towards model predictions.
@@ -1603,6 +1605,9 @@ class Interpolant:
             bp.diffuse_mask: diffuse_mask,
             bp.chain_idx: chain_idx,
             bp.res_idx: res_idx,
+            bp.structure_method: StructureExperimentalMethod.to_tensor(structure_method)
+            .to(self._device)
+            .expand(num_batch, 1),
             nbp.trans_sc: trans_sc,
             nbp.aatypes_sc: aatypes_sc,
         }

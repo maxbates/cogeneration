@@ -32,6 +32,7 @@ from cogeneration.type.dataset import ChainFeatures
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.dataset import MetadataCSVRow
+from cogeneration.type.structure import StructureExperimentalMethod
 
 
 class MetadataUpdater:
@@ -146,6 +147,8 @@ class MetadataUpdater:
                 )
             return _chain_independent_trimmed
 
+        # chains / lengths
+
         if mc.num_all_chains not in row_metadata:
             structure = get_pdb_structure()
             row_updates[mc.num_all_chains] = len(structure.get_chains())
@@ -163,6 +166,8 @@ class MetadataUpdater:
                 struct_feats, modeled_only=True
             )
 
+        # modeled sequence lengths
+
         if mc.moduled_num_res not in row_metadata:
             row_updates[mc.moduled_num_res] = len(raw_processed_file[dpc.modeled_idx])
 
@@ -174,6 +179,17 @@ class MetadataUpdater:
             _chain_independent_trimmed = get_chain_independent_trimmed()
             row_updates[mc.modeled_indep_seq_len] = len(
                 _chain_independent_trimmed[dpc.aatype]
+            )
+
+        # structure metadata as enum
+        if mc.structure_method in row_metadata:
+            row_updates[mc.structure_method] = StructureExperimentalMethod.from_value(
+                row_metadata[mc.structure_method]
+            )
+        else:
+            structure = get_pdb_structure()
+            row_updates[mc.structure_method] = (
+                StructureExperimentalMethod.from_structure(structure=structure)
             )
 
         # plddts

@@ -3,6 +3,7 @@ from torch import nn
 
 from cogeneration.config.base import ModelNodeFeaturesConfig
 from cogeneration.models.embed import get_index_embedding, get_time_embedding
+from cogeneration.type.structure import StructureExperimentalMethod
 
 
 class NodeFeatureNet(nn.Module):
@@ -14,7 +15,7 @@ class NodeFeatureNet(nn.Module):
         super(NodeFeatureNet, self).__init__()
         self.cfg = cfg
 
-        # input embedding size
+        # input embedding size is function of what we optionally embed
         embed_size = self.cfg.c_pos_emb + 1 + self.cfg.c_timestep_emb * 2
 
         if self.cfg.embed_aatype:
@@ -30,6 +31,13 @@ class NodeFeatureNet(nn.Module):
 
         if self.cfg.embed_torsions:
             self.torsion_embedding = nn.Linear(14, self.cfg.c_pos_emb)
+            embed_size += self.cfg.c_pos_emb
+
+        if self.cfg.embed_structural_method:
+            num_methods = len(StructureExperimentalMethod)
+            self.structural_method_embedding = nn.Embedding(
+                num_methods, self.cfg.c_pos_emb
+            )
             embed_size += self.cfg.c_pos_emb
 
         if self.cfg.use_mlp:
@@ -64,6 +72,7 @@ class NodeFeatureNet(nn.Module):
         aatypes: torch.Tensor,  # (B, N)
         aatypes_sc: torch.Tensor,  # (B, N, aatype_pred_num_tokens)
         torsions_t: torch.Tensor,  # (B, N, 7, 2)
+        structure_method: torch.Tensor,  # (B, 1)
     ):
         pos_emb = get_index_embedding(
             res_index,
@@ -100,6 +109,13 @@ class NodeFeatureNet(nn.Module):
                 self.torsion_embedding(
                     torsions_t.flatten(-2)  # (B, N, 7, 2) -> (B, N, 14)
                 )
+            )  # (B, N, c_pos_emb)
+
+        if self.cfg.embed_structural_method:
+            B, N = res_mask.shape
+            method_feature = structure_method.expand(-1, N).long()  # (B, N)
+            input_feats.append(
+                self.structural_method_embedding(method_feature)
             )  # (B, N, c_pos_emb)
 
         return self.linear(torch.cat(input_feats, dim=-1))

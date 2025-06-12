@@ -42,6 +42,7 @@ from cogeneration.type.dataset import (
     ProcessedFile,
     RedesignColumn,
 )
+from cogeneration.type.structure import StructureExperimentalMethod
 from cogeneration.type.task import DataTask
 
 
@@ -233,6 +234,7 @@ class BatchFeaturizer:
     @staticmethod
     def batch_features_from_processed_file(
         processed_file: ProcessedFile,
+        csv_row: MetadataCSVRow,
         cfg: DatasetConfig,
         processed_file_path: str,
     ) -> BatchFeatures:
@@ -295,8 +297,24 @@ class BatchFeaturizer:
         res_idx = torch.tensor(processed_file[dpc.residue_index])
         chain_idx = torch.tensor(processed_file[dpc.chain_index])
 
-        # Mask low pLDDT residues
-        res_plddt = torch.tensor(processed_file[dpc.b_factors][:, 1])
+        # Extract method and b factors / pLDDTs (depending on the method)
+        bfactors = torch.tensor(processed_file[dpc.b_factors][:, 1])
+        method = StructureExperimentalMethod.from_value(
+            csv_row.get(
+                mc.structure_method, StructureExperimentalMethod.XRAY_DIFFRACTION
+            )
+        )
+        method_feature = StructureExperimentalMethod.to_tensor(method)
+        is_experimental = StructureExperimentalMethod.is_experimental(method)
+        if is_experimental:
+            res_bfactors = bfactors
+            # pLDDT 100.0 for true structures
+            res_plddt = torch.full_like(bfactors, fill_value=100.0)
+        else:
+            res_bfactors = torch.zeros_like(bfactors)
+            res_plddt = bfactors
+
+        # mask low pLDDT residues for synthetic data
         plddt_mask = torch.ones_like(res_mask)
         if cfg.add_plddt_mask:
             plddt_mask = (res_plddt > cfg.min_plddt_threshold).int()
@@ -312,9 +330,13 @@ class BatchFeaturizer:
             bp.torsions_1: chain_feats[dtc.torsion_angles_sin_cos].float(),
             bp.chain_idx: chain_idx,
             bp.res_idx: res_idx,
+            bp.res_bfactor: res_bfactors,
             bp.res_plddt: res_plddt,
+            bp.structure_method: method_feature,
             bp.diffuse_mask: diffuse_mask,
             bp.plddt_mask: plddt_mask,
+            # Pass through relevant data from CSV
+            bp.pdb_name: csv_row.get(mc.pdb_name, ""),
         }
 
         return feats
@@ -350,12 +372,10 @@ class BatchFeaturizer:
         # Construct feats from processed_file.
         feats = BatchFeaturizer.batch_features_from_processed_file(
             processed_file=processed_file,
+            csv_row=csv_row,
             cfg=self.cfg,
             processed_file_path=csv_row[mc.processed_path],
         )
-
-        # Pass through relevant data from CSV
-        feats[bp.pdb_name] = csv_row[mc.pdb_name]
 
         # Update `diffuse_mask` and `motif_mask` depending on task
         if self.task == DataTask.hallucination:
@@ -826,6 +846,7 @@ class LengthSamplingDataset(Dataset):
             bp.diffuse_mask: torch.ones(num_res),
             bp.res_idx: res_idx,
             bp.chain_idx: chain_idx,
+            bp.structure_method: StructureExperimentalMethod.default_tensor_feat(),
         }
 
 

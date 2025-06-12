@@ -7,15 +7,17 @@ It is based on MultiFlow, which applies flow matching across several domains:
 Translations are interpolated in Euclidean space, rotations are interpolated in SO(3), and the sequence with discrete flow matching.
 
 This project introduces several extensions over MultiFlow:
-- support for multimers
-- inpainting (conditional generation) given partial structures
-    - MultiFlow supports per-domain conditioning via seperate t (i.e. folding and inverse folding)
-- stochastic paths, for the structure and sequence
-- model architecture changes:
-    - support for existing protein language models (e.g. ESM) to get frozen embeddings
-    - options to use a deeper sequence prediction network
-    - side chain prediction for more accurate side chain placement
-    - additional losses (e.g. for atomic interactions, clashes)
+- inpainting (conditional generation) given partial sequences / structures
+  - MultiFlow supports per-domain conditioning via seperate t (i.e. folding and inverse folding)
+- multimers support, enabling binder design
+- stochastic paths, for the structure and sequence, enabling e.g. conformation sampling and sequence redesign
+- Feynman-Kac steering for sequential monte-carlo sampling guided by potentials, defined only at inference time
+- support for existing protein language models (e.g. ESM) to get frozen embeddings
+  - particularly for sequence-conditioned tasks like inpainting
+- Improved sequence prediction / inverse folding, using a deeper sequence prediction network
+- torsion angle prediction for more accurate side chain placement
+- B-factor prediction, improving model understanding of flexible regions, and embedding structure experimental method
+- additional losses (e.g. for atomic interactions, clashes)
 - data pipeline to generate or augment training data
 - many improvements to code base: typing, enums, documentation, tests, etc.
 
@@ -84,6 +86,7 @@ This project introduces several extensions over MultiFlow:
 
 `/cogeneration/models`
 `/cogeneration/models/aa_pred.py` - Simple Sequence prediction network using linear layer / MLP
+`/cogeneration/models/bfactors.py` - Module for predicting B-factors
 `/cogeneration/models/edge_feature_net.py` - Simple network for embedding edge features / pair representations. Embed edges using distrogram, plus self-conditioned dist, chain, masks etc.
 `/cogeneration/models/embed.py` - Embedding utilites for positions, time, distrogram
 `/cogeneration/models/esm_combiner.py` - Module which combines initial node and edge embeddings with ESM single and pair embeddings
@@ -108,6 +111,7 @@ This project introduces several extensions over MultiFlow:
 `/cogeneration/type/embed.py` - embedding types `PositionalEmbeddingMethod`
 `/cogeneration/type/metrics.py` - `MetricName` enum defines sampling metrics calculated, `OutputFileName` defines files written by sampling + metrics
 `/cogeneration/type/str_enum.py` - base class `StrEnum` for enums
+`/cogeneration/type/structure.py` - `StructureExperimentalMethod` enum and parsing PDB for experimental method
 `/cogeneration/type/task.py` - `DataTask` (training task) and  `InferenceTask` (sampling task) enums
 
 `/doc` contains documentation, including some feature specs.
@@ -160,8 +164,8 @@ And benefits from the following works:
 
 FoldFlow-2: https://github.com/DreamFold/FoldFlow
 FrameFlow: https://github.com/microsoft/protein-frame-flow
+Boltz: https://github.com/jwohlwend/boltz
 ESM: https://github.com/facebookresearch/esm
 RFDiffusion: https://github.com/RosettaCommons/RFdiffusion
-Boltz: https://github.com/jwohlwend/boltz
 ProteinMPNN: https://github.com/dauparas/ProteinMPNN
 AlphaFold2: https://github.com/google-deepmind/alphafold

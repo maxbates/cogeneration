@@ -113,6 +113,10 @@ def safe_process_pdb(
     max_combined_length: int = 8192,
 ) -> Tuple[Optional[MetadataCSVRow], Optional[str]]:
     try:
+        # if greater than 7 MB, skip
+        if os.stat(raw_pdb_path).st_size > 7 * 1024 * 1024:
+            return None, f"{raw_pdb_path} | Skipped: file size > 5 MB"
+
         metadata, _ = process_pdb_with_metadata(
             pdb_file_path=raw_pdb_path,
             write_dir=write_dir,

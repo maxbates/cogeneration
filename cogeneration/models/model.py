@@ -2,9 +2,9 @@ from torch import nn
 
 from cogeneration.config.base import ModelConfig, ModelSequencePredictionEnum
 from cogeneration.data.const import rigids_ang_to_nm, rigids_nm_to_ang
-from cogeneration.data.noise_mask import fill_torsions
 from cogeneration.data.rigid import create_rigid
 from cogeneration.models.aa_pred import AminoAcidNOOPNet, AminoAcidPredictionNet
+from cogeneration.models.bfactors import BFactorModule
 from cogeneration.models.edge_feature_net import EdgeFeatureNet
 from cogeneration.models.esm_combiner import ESMCombinerNetwork
 from cogeneration.models.ipa_attention import AttentionIPATrunk
@@ -65,6 +65,10 @@ class FlowModel(nn.Module):
             predict_all_torsions=self.cfg.predict_all_torsions,
         )
 
+        # B-factor prediction
+        if self.cfg.bfactor.enabled:
+            self.bfactor_net = BFactorModule(cfg=cfg.bfactor)
+
     def forward(self, batch: NoisyFeatures) -> ModelPrediction:
         res_mask = batch[bp.res_mask]
         node_mask = res_mask
@@ -91,6 +95,7 @@ class FlowModel(nn.Module):
         aatypes_t = batch[nbp.aatypes_t].long()
         trans_sc = batch[nbp.trans_sc]
         aatypes_sc = batch[nbp.aatypes_sc]
+        structure_method = batch[bp.structure_method]
 
         init_rigids_ang = create_rigid(rots=rotmats_t, trans=trans_t)
 
@@ -106,6 +111,7 @@ class FlowModel(nn.Module):
             aatypes=aatypes_t,
             aatypes_sc=aatypes_sc,
             torsions_t=torsions_t,
+            structure_method=structure_method,
         )
         init_edge_embed = self.edge_feature_net(
             node_embed=init_node_embed,
@@ -145,6 +151,14 @@ class FlowModel(nn.Module):
         pred_trans = pred_rigids_ang.get_trans()
         pred_rotmats = pred_rigids_ang.get_rots().get_rot_mats()
 
+        # B-factor prediction
+        pred_bfactor = None
+        if self.cfg.bfactor.enabled:
+            pred_bfactor = self.bfactor_net(node_embed=node_embed)
+
+        # pLDDT prediction
+        # TODO new module, property, loss, logging, etc.
+
         # Sequence prediction
         pred_logits, pred_aatypes = self.aa_pred_net(
             node_embed=node_embed,
@@ -165,6 +179,7 @@ class FlowModel(nn.Module):
             pbp.pred_torsions: pred_torsions,
             pbp.pred_logits: pred_logits,
             pbp.pred_aatypes: pred_aatypes,
+            pbp.pred_bfactor: pred_bfactor,
             # other model outputs
             pbp.node_embed: node_embed,
             pbp.edge_embed: edge_embed,

@@ -35,6 +35,7 @@ class TestMotifFactory:
         )
         pdb_batch_features = BatchFeaturizer.batch_features_from_processed_file(
             processed_file=processed_pdb,
+            csv_row={},
             cfg=DatasetConfig(),
             processed_file_path=str(example_pdb_path),
         )

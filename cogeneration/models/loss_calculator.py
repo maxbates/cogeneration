@@ -40,6 +40,7 @@ class AuxiliaryMetrics:
     batch_torsions_loss: torch.Tensor
     batch_multimer_interface_loss: torch.Tensor
     batch_multimer_clash_loss: torch.Tensor
+    batch_bfactor_loss: torch.Tensor
     train_loss: torch.Tensor
     rots_vf_loss: torch.Tensor
     trans_loss: torch.Tensor
@@ -48,6 +49,7 @@ class AuxiliaryMetrics:
     torsions_loss: torch.Tensor
     multimer_interface_loss: torch.Tensor
     multimer_clash_loss: torch.Tensor
+    bfactor_loss: torch.Tensor
     loss_denom_num_res: torch.Tensor
     examples_per_step: torch.Tensor
     res_length: torch.Tensor
@@ -62,6 +64,7 @@ class TrainingLosses:
     torsions_loss: torch.Tensor
     auxiliary_loss: torch.Tensor
     aatypes_loss: torch.Tensor
+    bfactor_loss: torch.Tensor  # optional, may not be present
     train_loss: torch.Tensor  # aggregated loss
 
     def items(self):
@@ -462,6 +465,36 @@ class BatchLossCalculator:
 
         return clash_rate * multi_chain_mask.float()
 
+    def loss_bfactor(self) -> torch.Tensor:
+        """
+        Cross-entropy loss on b-factor histograms, adapted from Boltz.
+        b-factor prediction is optional, and invalid when all b-factors are zero
+        (e.g. as in synthetic examples).
+        """
+        pred = self.pred.get(pbp.pred_bfactor, None)  # (B, N, num_bins)
+        if pred is None or bp.res_bfactor not in self.batch:
+            return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+
+        gt = self.batch[bp.res_bfactor]  # (B, N)
+        bins = pred.shape[-1]
+        boundaries = torch.linspace(0.0, 100.0, bins - 1, device=gt.device)
+
+        # discretise ground-truth b-factors
+        bin_idx = (gt.unsqueeze(-1) > boundaries).sum(-1).long()  # (B, N)
+        target = torch.nn.functional.one_hot(bin_idx, num_classes=bins).float()
+
+        # mask out synthetic examples (all-zero b-factors) + padding
+        valid_mask = (gt > 1e-5) & self.loss_mask  # (B, N)
+        if not valid_mask.any():
+            return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+
+        # cross-entropy
+        logp = torch.nn.functional.log_softmax(pred.float(), dim=-1)
+        ce = -(target * logp).sum(-1)  # (B, N)
+        loss = (ce * valid_mask.float()).sum(-1) / (valid_mask.sum(-1).float() + 1e-5)
+
+        return loss
+
     def calculate(self) -> Tuple[TrainingLosses, AuxiliaryMetrics]:
         """Calculate losses for the batch."""
         loss_trans = self.loss_trans()
@@ -472,6 +505,7 @@ class BatchLossCalculator:
         loss_pairwise_dist = self.loss_pairwise_dist()
         loss_multimer_interface = self.loss_multimer_interface()
         loss_multimer_clash = self.loss_multimer_clash()
+        loss_bfactor = self.loss_bfactor()
 
         # scale losses by cfg weights
         loss_trans = loss_trans * self.train_cfg.translation_loss_weight
@@ -488,6 +522,7 @@ class BatchLossCalculator:
         loss_multimer_clash = (
             loss_multimer_clash * self.train_cfg.aux_loss_use_multimer_clash
         )
+        loss_bfactor = loss_bfactor * self.train_cfg.aux_bfactor_loss_weight
 
         # auxiliary loss
         loss_auxiliary = (
@@ -495,6 +530,7 @@ class BatchLossCalculator:
             + loss_pairwise_dist
             + loss_multimer_clash
             + loss_multimer_interface
+            + loss_bfactor
         )
         loss_auxiliary *= self.train_cfg.aux_loss_weight
 
@@ -522,6 +558,7 @@ class BatchLossCalculator:
             batch_torsions_loss=loss_torsions,
             batch_multimer_interface_loss=loss_multimer_interface,
             batch_multimer_clash_loss=loss_multimer_clash,
+            batch_bfactor_loss=loss_bfactor,
             train_loss=self.normalize_loss(loss_total),
             rots_vf_loss=self.normalize_loss(loss_rot_vf),
             trans_loss=self.normalize_loss(loss_trans),
@@ -530,6 +567,7 @@ class BatchLossCalculator:
             torsions_loss=self.normalize_loss(loss_torsions),
             multimer_interface_loss=self.normalize_loss(loss_multimer_interface),
             multimer_clash_loss=self.normalize_loss(loss_multimer_clash),
+            bfactor_loss=self.normalize_loss(loss_bfactor),
             loss_denom_num_res=self.loss_denom_num_res,
             examples_per_step=torch.tensor(self.num_batch),
             res_length=torch.mean(torch.sum(self.batch[bp.res_mask], dim=-1).float()),
@@ -541,6 +579,7 @@ class BatchLossCalculator:
             torsions_loss=loss_torsions,
             auxiliary_loss=loss_auxiliary,
             aatypes_loss=loss_aatypes_ce,
+            bfactor_loss=loss_bfactor,
             train_loss=loss_total,
         )
 

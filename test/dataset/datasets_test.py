@@ -9,11 +9,34 @@ from cogeneration.dataset.datasets import (
     LengthSamplingDataset,
 )
 from cogeneration.dataset.motif_factory import ChainBreak, Motif, Scaffold
+from cogeneration.dataset.test_utils import create_pdb_batch
+from cogeneration.type.batch import METADATA_BATCH_PROPS
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import empty_feats
+from cogeneration.type.task import DataTask
 
 
 class TestBaseDataset:
+    def test_pdb_batch(self, mock_cfg):
+        # use inpainting so motif_mask is present
+        mock_cfg.data.task = DataTask.inpainting
+        batch = create_pdb_batch(cfg=mock_cfg)
+
+        assert batch is not None
+        for batch_prop in bp:
+            if batch_prop in METADATA_BATCH_PROPS:
+                continue
+
+            # all batch properties should be present
+            assert (
+                batch_prop in batch
+            ), f"Batch property {batch_prop} not found in batch"
+
+            # non-metadata properties should be tensors
+            assert isinstance(
+                batch[batch_prop], torch.Tensor
+            ), f"Batch property {batch_prop} should be a tensor"
+
     def test_segment_features_preserves_motif_and_masks_scaffold(self):
         """
         Test that BaseDataset.segment_features correctly preserves features in motif regions

@@ -13,6 +13,7 @@ from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
+from cogeneration.type.structure import StructureExperimentalMethod
 from cogeneration.type.task import DataTask
 
 
@@ -27,13 +28,16 @@ def mock_feats(
 
     # N residue protein, random frames
     feats[bp.res_mask] = torch.ones(N).int()
+    feats[bp.diffuse_mask] = torch.ones(N).int()
+
     feats[bp.aatypes_1] = torch.randint(0, 20, (N,))  # may contain UNK (20)
     feats[bp.trans_1] = torch.rand(N, 3) * 10.0
     feats[bp.rotmats_1] = uniform_so3(1, N, device=torch.device("cpu")).squeeze(0)
     feats[bp.torsions_1] = torch.rand(N, 7, 2)
-    feats[bp.res_plddt] = torch.floor(torch.rand(N) + 0.5)
-    feats[bp.plddt_mask] = feats[bp.res_plddt] > 0.6
-    feats[bp.diffuse_mask] = torch.ones(N).int()
+    feats[bp.res_bfactor] = (torch.rand(N) * 50.0).float()
+    feats[bp.structure_method] = StructureExperimentalMethod.default_tensor_feat()
+    feats[bp.res_plddt] = ((torch.rand(N) + 0.3) * 100.0).clamp(0, 100).float()
+    feats[bp.plddt_mask] = feats[bp.res_bfactor] > 60.0
 
     if task == DataTask.inpainting:
         # set a motif_mask where some middle portion of the protein is scaffolded

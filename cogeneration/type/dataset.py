@@ -52,7 +52,7 @@ class MetadataColumn(StrEnum):
 
     # structure metadata if provided
     resolution = "resolution"
-    structure_method = "structure_method"
+    structure_method = "structure_method"  # StructureExperimentalMethod enum
 
     # (new, multimer-only) interactions / clashes
     # chain-chain interactions: "<chain_a>:<chain_b>:<num_bb_res_xing_a>:<num_bb_res_xing_b>,...."

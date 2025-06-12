@@ -15,6 +15,7 @@ from cogeneration.dataset.process_pdb import (
 from cogeneration.type.dataset import DatasetProteinColumn
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.dataset import MetadataColumn as mc
+from cogeneration.type.structure import StructureExperimentalMethod
 from cogeneration.type.task import DataTask
 
 # https://www2.rcsb.org/structure/2QLW
@@ -75,6 +76,10 @@ class TestProcessPDBFiles:
         assert metadata[mc.oligomeric_detail] == "dimeric"
         assert metadata[mc.quaternary_category] == "homomer"
         assert metadata[mc.helix_percent] > 0.1
+        assert (
+            metadata[mc.structure_method]
+            == StructureExperimentalMethod.XRAY_DIFFRACTION
+        )
 
         # modeled sequence includes non-AA residues (i.e. 20 = unknown)
         assert len(pkl[dpc.aatype]) == metadata[mc.seq_len]

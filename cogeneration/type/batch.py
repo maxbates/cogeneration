@@ -4,6 +4,7 @@ import torch
 
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.type.str_enum import StrEnum
+from cogeneration.type.structure import StructureExperimentalMethod
 from cogeneration.type.task import DataTask
 
 
@@ -21,13 +22,17 @@ class BatchProp(StrEnum):
     # structure metadata
     chain_idx = "chain_idx"  # (B, N) chain index (chains are shuffled, 1-indexed)
     res_idx = "res_idx"  # (B, N) residue index (residues are re-numbered contiguously 1-indexed)
-    res_plddt = "res_plddt"  # (B, N) aka b-factors
+    res_bfactor = "res_bfactor"  # (B, N) Ca temp b-factors, iff from experimental method, else 0.0
+    res_plddt = (
+        "res_plddt"  # (B, N) pLDDT scores, iff from predicted structure, else 100.0
+    )
+    structure_method = "structure_method"  # (B, 1) StructureExperimentalMethod
     # masks
     res_mask = "res_mask"  # (B, N) residues under consideration (uses `dpc.bb_mask`)
     diffuse_mask = "diffuse_mask"  # (B, N) hallucination mask, residue positions that are corrupted/sampled
     motif_mask = "motif_mask"  # (B, N) [inpainting only] mask for fixed motif residue
     plddt_mask = (
-        "plddt_mask"  # (B, N) pLDDT mask, residue positions above pLDDT threshold
+        "plddt_mask"  # (B, N) pLDDT mask for synthetic structures, 1 if >= threshold
     )
     # metadata
     pdb_name = "pdb_name"  # (B) source PDB id string/int
@@ -36,7 +41,7 @@ class BatchProp(StrEnum):
     sample_id = "sample_id"  # (B) [inference only] sample id
 
 
-# datum level metadata, i.e. `(B)` rather than `(B, N)`
+# datum level metadata, i.e. `(B)` rather than `(B, N)`, and non-tensors
 METADATA_BATCH_PROPS = [
     BatchProp.pdb_name,
     BatchProp.csv_idx,
@@ -70,6 +75,7 @@ class PredBatchProp(StrEnum):
     pred_trans = "pred_trans"  # (B, N, 3)
     pred_rotmats = "pred_rotmats"  # (B, N, 3, 3)
     pred_torsions = "pred_torsions"  # Optional (B, N, K, 2), K=1 (psi) or K=7 (all)
+    pred_bfactor = "pred_bfactor"  # (B, N, num_bins)
     pred_logits = "pred_logits"  # (B, N, S) where S=21 if masking else S=20
     pred_aatypes = "pred_aatypes"  # (B, N)
 
@@ -109,11 +115,13 @@ def empty_feats(N: int, task: DataTask = DataTask.hallucination) -> BatchFeature
         ),
         BatchProp.chain_idx: torch.ones(N),
         BatchProp.res_idx: torch.arange(1, N + 1),
+        BatchProp.res_bfactor: torch.full((N,), 0.0),
         BatchProp.res_plddt: torch.full((N,), 100.0),
         BatchProp.diffuse_mask: torch.ones(N).int(),
         BatchProp.plddt_mask: torch.ones(N).int(),
         BatchProp.pdb_name: "",
         BatchProp.csv_idx: torch.tensor([1], dtype=torch.long),
+        BatchProp.structure_method: StructureExperimentalMethod.default_tensor_feat(),
         BatchProp.sample_id: 0,  # inference only but no impact to training / model
     }
 

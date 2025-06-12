@@ -24,6 +24,7 @@ from cogeneration.type.dataset import OLIGOMERIC_PREFIXES, ChainFeatures
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.dataset import MetadataCSVRow, ProcessedFile
+from cogeneration.type.structure import StructureExperimentalMethod
 
 
 class DataError(Exception):
@@ -405,6 +406,12 @@ def _process_pdb(
             metadata[mc.pdb_name] = pdb_name
             metadata[mc.raw_path] = pdb_file_path
 
+            # structure metadata
+            metadata[mc.resolution] = structure.header.get("resolution")
+            metadata[mc.structure_method] = StructureExperimentalMethod.from_structure(
+                structure=structure
+            )
+
             # Track total sequence length
             metadata[mc.seq_len] = len(complex_feats[dpc.aatype])
 
@@ -462,10 +469,6 @@ def _process_pdb(
                 pdb_rg = md.compute_rg(traj)
             except Exception as e:
                 raise DataError(f"Mdtraj failed with error {e}")
-
-            # structure metadata
-            metadata[mc.resolution] = structure.header.get("resolution")
-            metadata[mc.structure_method] = structure.header.get("structure_method")
 
             # use denom `metadata[dc.modeled_seq_len]` to match public MultiFlow
             # though if use chain-independent filtering, values almost certainly higher.

@@ -198,6 +198,8 @@ class ModelNodeFeaturesConfig(BaseClassConfig):
     embed_aatype: bool = True
     # embed_torsions: whether to embed torsion angles
     embed_torsions: bool = True
+    # embed_structural_method: whether to embed structure experimental method
+    embed_structural_method: bool = True
     # use_mlp: whether to use MLP for embedding, otherwise linear layer
     use_mlp: bool = True
 
@@ -366,6 +368,20 @@ class ModelSequencePredictionEnum(StrEnum):
 
 
 @dataclass
+class ModelBFactorConfig(BaseClassConfig):
+    """
+    B-factor prediction configuration.
+    """
+
+    enabled: bool = True
+
+    # c_s: node embedding size (input)
+    c_s: int = "${model.hyper_params.node_embed_size}"
+    # num_bins: number of bins
+    num_bins: int = 64
+
+
+@dataclass
 class ModelConfig(BaseClassConfig):
     hyper_params: ModelHyperParamsConfig = field(default_factory=ModelHyperParamsConfig)
     node_features: ModelNodeFeaturesConfig = field(
@@ -376,6 +392,7 @@ class ModelConfig(BaseClassConfig):
     )
     esm_combiner: ModelESMCombinerConfig = field(default_factory=ModelESMCombinerConfig)
     ipa: ModelIPAConfig = field(default_factory=ModelIPAConfig)
+    bfactor: ModelBFactorConfig = field(default_factory=ModelBFactorConfig)
 
     # Predict torsion angles. Model outputs (B, N, K, 2) depending on K predicted.
     # These torsions are then filled to (B, N, 7, 2) by interpolant.
@@ -827,8 +844,8 @@ class DatasetConfig(BaseClassConfig):
     max_cache_size: int = 100_000
     cache_num_res: int = 0  # min size to enable caching
     # plddt [0, 100]. Minimum threshold, per residue, masked if below and add_plddt_mask=True
-    add_plddt_mask: bool = True
-    min_plddt_threshold: float = 0.0
+    add_plddt_mask: bool = False
+    min_plddt_threshold: float = 60.0
     # trim chains independently to modeled positions
     # removes non-residues between chains, more important for multimers
     modeled_trim_method: DatasetTrimMethod = DatasetTrimMethod.chains_independently
@@ -894,7 +911,8 @@ class DatasetConfig(BaseClassConfig):
 
 @dataclass
 class ExperimentTrainingConfig(BaseClassConfig):
-    mask_plddt: bool = True
+    # mask losses to using pLDDT mask
+    mask_plddt: bool = False
     # position scaling (prior to MSE)
     bb_atom_scale: float = 0.1
     trans_scale: float = 0.1
@@ -916,6 +934,8 @@ class ExperimentTrainingConfig(BaseClassConfig):
     # multimers
     aux_loss_use_multimer_interface: bool = True
     aux_loss_use_multimer_clash: bool = True
+    # b factors
+    aux_bfactor_loss_weight: float = 1e-3
 
 
 @dataclass
@@ -1318,7 +1338,7 @@ class Config(BaseClassConfig):
         Returns a config that maintains compatibility with Public MultiFlow weights + better aligned with its defaults.
         Requires running `interpolate()`, to allow for further modification.
         """
-        raw_cfg = cls()
+        raw_cfg: Config = cls()
 
         # Default to unconditional generation
         raw_cfg.data.task = DataTask.hallucination
@@ -1329,6 +1349,9 @@ class Config(BaseClassConfig):
         raw_cfg.model.hyper_params = ModelHyperParamsConfig.public_multiflow()
         # disable ESM combiner
         raw_cfg.model.esm_combiner.enabled = False
+        raw_cfg.model.node_features.embed_structural_method = False
+        # disable b-factor prediction
+        raw_cfg.model.bfactor.enabled = False
         # Use simple aa_pred_net from public MultiFlow
         raw_cfg.model.sequence_pred_type = ModelSequencePredictionEnum.aa_pred
         # stochastic paths not part of public MultiFlow
