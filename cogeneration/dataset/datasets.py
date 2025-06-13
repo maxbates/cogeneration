@@ -604,7 +604,7 @@ class BaseDataset(Dataset):
         # values like pLDDT assigned by the tool that generated them.
         # Also, presumably the synthetic data is generated from already-filtered structures/sequences.
 
-        # TODO support augmenting dataset:
+        # TODO(dataset) support augmenting dataset:
         #   multimers: chain selections
         #     based on MetadataColumn.chain_interactions
         #   too long: crop to target length
@@ -632,8 +632,10 @@ class BaseDataset(Dataset):
         return self.cfg.modeled_trim_method.to_dataset_column()
 
     def _create_split(self, data_csv: DatasetDataFrame):
-        # Training or validation specific logic.
-        # TODO actually split - this isn't really splitting... it's ~ all the samples in both cases
+        """
+        Training or validation specific logic to set up metadata
+        Not really splitting, assumes train / val already split.
+        """
         if self.is_training:
             self.csv = data_csv
             self._log.info(f"Training: {len(self.csv)} examples")

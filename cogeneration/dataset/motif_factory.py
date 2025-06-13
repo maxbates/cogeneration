@@ -59,7 +59,7 @@ class MotifFactory:
     def segments_from_contigmap(self, contigmap: str) -> List[Segment]:
         # Parse a contigmap like "5-15/A1-20/20/0 A39-50" into a list of segment objects.
 
-        # TODO - require input `feats` and ground positions in feats
+        # TODO(inpainting) - require input `feats` and ground positions in feats
         #   motif should not require a chain. It's start / end should refer to feat indices.
         #   Just use flattened chains in `feats` as positions. Map the contigmap to those positions.
         #   Note, requires `chain_idx` and chains specified in `contigmap` to be aligned...

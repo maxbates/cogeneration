@@ -123,7 +123,7 @@ def safe_process_pdb(
             max_combined_length=max_combined_length,
         )
 
-        # TODO - clean up file when errors are encountered?
+        # TODO(dataset) - clean up file when errors are encountered?
         if delete_original:
             os.remove(raw_pdb_path)
 

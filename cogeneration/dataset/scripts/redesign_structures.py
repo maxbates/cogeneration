@@ -156,7 +156,7 @@ class BestRedesign:
         return cls(
             example=redesign.metadata[mc.pdb_name],
             wildtype_seq=redesign.wildtype_seq,
-            wildtype_rmsd=0.0,  # TODO - refold WT
+            wildtype_rmsd=0.0,  # TODO(validation) - refold WT
             best_seq=redesign.sequence,
             best_rmsd=redesign.rmsd,
         )
@@ -191,7 +191,7 @@ class SequenceRedesigner:
         work_dir = self.args.output_dir / "redesigns" / metadata_row[mc.pdb_name]
         work_dir.mkdir(parents=True, exist_ok=True)
 
-        # TODO write fasta for original sequence, fold it, calculate RMSD to original structure
+        # TODO(validation) write fasta for original sequence, fold it, calculate RMSD to original structure
 
         # Redesign the structure using inverse folding
         redesign_fasta_path = self.validator.inverse_fold_structure(
@@ -344,7 +344,7 @@ class SequenceRedesigner:
 def main() -> None:
     args = Args.parse_args()
 
-    # TODO support hydra to get config
+    # TODO(cfg) support hydra to get config
     validator = FoldingValidator(
         cfg=FoldingConfig(
             seq_per_sample=args.seqs_per_sample,

@@ -2,7 +2,7 @@
 Script to update dataset metadata CSV with new columns.
 To be run on an ad-hoc basis if certain fields are required.
 
-TODO consider deprecating? Or improve how kept in sync with `process_pdb.py`
+TODO(dataset) consider deprecating this file? Or improve how kept in sync with `process_pdb.py`
 """
 
 import argparse
@@ -286,7 +286,7 @@ class Args:
 
 def main(args: Args) -> None:
     # Check paths
-    # TODO enable moving original and writing updated to original path
+    # TODO(dataset) enable moving original and writing updated to original path
     assert args.metadata_csv_path.startswith("/"), "Metadata CSV path must be absolute."
     if args.metadata_csv_path == args.updated_csv_path:
         raise ValueError("Input and output paths must be different.")

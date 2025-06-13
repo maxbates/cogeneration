@@ -11,11 +11,11 @@ from cogeneration.data.trajectory import SamplingStep
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyFeatures
 
-# TODO reconsider what states to provide to compute_energy().
+# TODO(fksteering) reconsider what states to provide to compute_energy().
 #   model output for sure...
 #   Current protein state vs. modified protein prediction...
 
-# TODO additional potentials, e.g.:
+# TODO(fksteering) additional potentials, e.g.:
 #   - van der waals clashes and interactions
 #   - run ProteinMPNN on to predict the sequence to bias towards designable sequences
 
@@ -295,7 +295,8 @@ class FKSteeringResampler:
         logG_mat = log_G_score.view(num_batch, num_particles)  # (B, K)
 
         # softmax-normalize resampling weights per sample
-        # temperature scale log G; <1 = sharpen, 1 = no effect. TODO cfg
+        # temperature scale log G; <1 = sharpen, 1 = no effect.
+        # TODO(cfg) fksteering temp scale
         tau = 0.5
         logG_mat = logG_mat / tau
         resampling_weights = (logG_mat - logG_mat.max(dim=1, keepdim=True).values).exp()
@@ -304,7 +305,7 @@ class FKSteeringResampler:
         )
 
         # track metric effective sample size as diagnostic of weight degeneracy
-        # TODO expose ESS and energy trajectory
+        # TODO(metrics) expose ESS and energy trajectory
         effective_sample_size = 1.0 / (resampling_weights**2).sum(dim=1)
 
         # draw surviving particle indices

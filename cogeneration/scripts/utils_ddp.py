@@ -16,15 +16,15 @@ def setup_ddp(
 
     Required for distributed data loaders.
 
-    TODO - properly use from env / set up Pytorch Lightning DDP environment variables
+    TODO(train) - properly use from env / set up Pytorch Lightning DDP environment variables
     """
 
     # Initialize the process group for distributed training
     # These environment variables are required for PyTorch DDP / by Lightning
-    # TODO - consider specifying externally, e.g. for real distributed training, if want to support outside lightning.
+    # TODO(train) - consider specifying externally, e.g. for real distributed training, if want to support outside lightning.
     os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "127.0.0.1")
     os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "29500")
-    # TODO - validate config-specified devices are available, esp when consider folding devices
+    # TODO(train) - validate config-specified devices are available, esp when consider folding devices
     os.environ["WORLD_SIZE"] = world_size
     os.environ["NODE_RANK"] = rank
 
@@ -38,7 +38,7 @@ def setup_ddp(
         # Lightning does not support DDP with MPS accelerator, i.e. on a Mac
         # However, DataLoaders use DDP, so we need to initialize it
         if trainer_strategy == "auto":
-            # TODO - ensure each thread has its own rank / device if multiple threads
+            # TODO(train) - ensure each thread has its own rank / device if multiple threads
             local_rank = int(rank)
             world_size = int(world_size)
 

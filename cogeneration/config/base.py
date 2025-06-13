@@ -128,7 +128,7 @@ class ModelHyperParamsConfig(BaseClassConfig):
     """
     Shared model hyperparameters.
 
-    TODO register each factory as hydra config groups?
+    TODO(cfg) register each factory as hydra config groups?
     https://hydra.cc/docs/tutorials/structured_config/defaults/
     """
 
@@ -271,7 +271,7 @@ class ModelESMCombinerConfig(BaseClassConfig):
     # which ESM model size to use
     esm_model_key: ModelESMKey = ModelESMKey.esm2_t30_150M_UR50D
     # representation enriched using attention blocks
-    # TODO support folding blocks instead
+    # TODO(model) support folding blocks instead
     double_attention_pair_trunk: ModelESMDoubleAttentionPairConfig = field(
         default_factory=ModelESMDoubleAttentionPairConfig
     )
@@ -450,7 +450,7 @@ class InterpolantRotationsConfig(BaseClassConfig):
     )
     exp_rate: float = 10
     # stochastic paths
-    # TODO consider min_t for stochastic rotations, so field can settle before injecting noise.
+    # TODO(stochastic) consider min_t for stochastic rotations, so field can settle before injecting noise.
     stochastic: bool = "${shared.stochastic}"
     # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
     # Roughly, 0.5 => 11°, 1.0 => 23°, 2.0 => 34° over 500 timesteps
@@ -491,8 +491,6 @@ class InterpolantTranslationsConfig(BaseClassConfig):
     sample_schedule: InterpolantTranslationsScheduleEnum = (
         "${ternary:${equals: ${shared.stochastic}, True}, 'vpsde', 'linear'}"
     )
-    # sample_temp: sampling temperature
-    sample_temp: float = 1.0  # TODO - drop or check FrameDiff for usage
     # vpsde_bmin: variance-preserving SDE minimum
     vpsde_bmin: float = 0.1
     # vpsde_bmax: variance-preserving SDE maximum
@@ -528,7 +526,9 @@ class InterpolantTorsionsConfig(BaseClassConfig):
 
 class InterpolantAATypesScheduleEnum(StrEnum):
     linear = "linear"
-    exp = "exp"  # TODO re-introduce, 'exp' not used in public MultiFlow code
+    exp = (
+        "exp"  # TODO(interpolant) re-introduce, 'exp' not used in public MultiFlow code
+    )
 
 
 class InterpolantAATypesInterpolantTypeEnum(StrEnum):
@@ -542,7 +542,7 @@ class InterpolantAATypesConfig(BaseClassConfig):
     Interpolant for amino acids.
 
     Note that there are two interpolants: one for training and one for inference
-    TODO reconsider ternary use to differentiate training and inference interpolants
+    TODO(cfg) reconsider ternary use to differentiate training and inference interpolants
         or, consider a subclass which handles default arguments accordingly
     """
 
@@ -573,7 +573,7 @@ class InterpolantAATypesConfig(BaseClassConfig):
     # stochastic CTMC
     stochastic: bool = "${shared.stochastic}"
     # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
-    # Roughly, 0.5 => 0.2 jumps/residue, 1.0 = > 0.4, 1.5 => 0.6 over 500 timesteps  TODO doublecheck
+    # Roughly, 0.5 => 0.2 jumps/residue, 1.0 = > 0.4, 1.5 => 0.6 over 500 timesteps
     stochastic_noise_intensity: float = 0.25
     # temperature smooths logits softmax()
     stochastic_temp: float = 1.5
@@ -850,7 +850,7 @@ class DatasetConfig(BaseClassConfig):
 
     use PDBPost2021() for test dataset
 
-    # TODO - support scope and swissprot datasets
+    # TODO(dataset) - support scope and swissprot datasets
     # MultiFlow public config lists: `pdb`, `pdb_mixed`, `pdb_post2021`, `scope`, `scope_mixed`, `swissprot`
     """
 
@@ -867,8 +867,6 @@ class DatasetConfig(BaseClassConfig):
     # removes non-residues between chains, more important for multimers
     modeled_trim_method: DatasetTrimMethod = DatasetTrimMethod.chains_independently
     # add gaussian noise to atom positions
-    # TODO cfg to only add noise if t below some threshold (requires moving out of dataset)
-    # TODO ensure noise added each time accessed and not cached
     noise_atom_positions_angstroms: float = 0.1
 
     # debug/test, take first N rows of metadata_csv
@@ -1002,7 +1000,7 @@ class ExperimentTrainerConfig(BaseClassConfig):
     # logging
     log_every_n_steps: int = 1
 
-    # TODO put somewhere else, invalid argument to Trainer()
+    # TODO(cfg) put somewhere else, invalid argument to Trainer()
     # local_tensorboard_logdir: str = "./tensorboard_logs"
 
     def __post_init__(self):
@@ -1041,7 +1039,7 @@ class ExperimentConfig(BaseClassConfig):
     seed: int = "${shared.seed}"
     # debug True for local tensorboard logger, False to enable W&B, saving outputs etc
     debug: bool = False
-    # num GPU devices TODO support more than one, esp for GPUs
+    # num GPU devices TODO(train) support more than one, esp for GPUs
     num_devices: int = 1
     # checkpoint path, parent directory expected to contain `config.yaml`
     warm_start_ckpt: Optional[str] = None
@@ -1051,7 +1049,7 @@ class ExperimentConfig(BaseClassConfig):
     raw_state_dict_reload: Optional[str] = None
     # pytorch Trainer profiler, "simple", "advanced", None
     profiler: Optional[str] = None
-    # enable torch.compile(), requires no graph breaks TODO make it work
+    # enable torch.compile(), requires no graph breaks TODO(model) working torch.compile
     torch_compile: bool = False
     # save a `final.ckpt` when training is complete, defaults to symlink sentinel
     save_final_ckpt: bool = True
@@ -1257,7 +1255,7 @@ class Config(BaseClassConfig):
         # Special handling for public Multiflow checkpoints.
         # If we got a config from MultiFlow, we need to map to our new module names.
         # We'll map, and save a new checkpoint, and then load that checkpoint.
-        # TODO move to separate function
+        # TODO(cfg) move to separate function
         if is_multiflow:
             ckpt = torch.load(
                 ckpt_path, map_location=torch.device("cpu"), weights_only=False
@@ -1283,7 +1281,7 @@ class Config(BaseClassConfig):
                 new_state_dict[key] = value
 
             # Save new checkpoint
-            # TODO - clean it up, esp in tests
+            # TODO(test) - clean ckpt after running, esp in tests
             os.makedirs(ckpt_dir, exist_ok=True)
             ckpt["state_dict"] = new_state_dict
             torch.save(ckpt, ckpt_path)

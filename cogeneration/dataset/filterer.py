@@ -124,7 +124,7 @@ class DatasetFilterer:
     @_log_filter("pLDDT filter")
     def _plddt_filter(self, df: MetadataDataFrame) -> MetadataDataFrame:
         # not used in the public multiflow codebase
-        # TODO - pull out pLDDTs from structure, not available in current CSV
+        # TODO(dataset) - pull out pLDDTs from structure, not available in current CSV
         # return data_csv[
         #     dc.num_confident_plddt
         #     > self.dataset_cfg.filter.min_num_confident_plddt

@@ -315,7 +315,7 @@ class MultimerInteractions:
             )
 
             # All-atom interactions
-            # Too slow, disabled  TODO re-enable
+            # Too slow, disabled
             # all_interactions.extend(
             #     MultimerInteractions.find_chain_interactions(
             #         complex_feats=complex_feats,

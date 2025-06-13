@@ -324,7 +324,6 @@ def chunk_layer(
     orig_batch_dims = tuple([max(s) for s in zip(*initial_dims)])
 
     def _prep_inputs(t):
-        # TODO: make this more memory efficient. This sucks
         if not low_mem:
             if not sum(t.shape[:no_batch_dims]) == no_batch_dims:
                 t = t.expand(orig_batch_dims + t.shape[no_batch_dims:])

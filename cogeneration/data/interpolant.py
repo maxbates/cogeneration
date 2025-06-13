@@ -1342,7 +1342,7 @@ class Interpolant:
                 pred_aatypes_1, true_feats.aatypes, scaffold_mask
             )
 
-            # TODO - consider whether we should first align (i.e. rotate)
+            # TODO(inpainting) - consider whether we should first align (i.e. rotate)
             #   the pred structure to known motifs, rather than simply substituting them in.
             #   I don't think FrameFlow guidance did this, but the twisting variant sort of does?
 
@@ -1774,7 +1774,7 @@ class Interpolant:
         sample_trajectory.append(sample_step)
 
         # If FK steering is enabled, pick the best particle per sample
-        # TODO - allow passing through all the particles. Ensure each is handled properly.
+        # TODO(fksteering) - allow passing through all the particles. Ensure each is handled properly.
         _, best_idx = self.resampler.best_particle_in_batch(batch=batch)
         if best_idx is not None:
             # Select the best particle for each sample

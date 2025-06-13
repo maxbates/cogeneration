@@ -140,7 +140,6 @@ class FlowModule(LightningModule):
             return tensor
 
         # if we are on MPS, convert all tensors to float32
-        # TODO - check the device itself, not the config (but should match)
         if self.cfg.experiment.trainer.accelerator == "mps":
             batch = apply_to_collection(batch, torch.Tensor, convert_to_float32)
 

@@ -57,7 +57,7 @@ def mock_feats(
         feats[bp.chain_idx][chain_break:] = 2
         feats[bp.res_idx][chain_break:] = feats[bp.res_idx][chain_break:] - chain_break
 
-    # inference-only feats  # TODO remove, dedicated mock function
+    # inference-only feats  # TODO(mock) remove, dedicated mock function
     feats[bp.sample_id] = f"test_{idx}"
 
     return feats

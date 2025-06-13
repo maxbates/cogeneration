@@ -46,7 +46,7 @@ def batch_align_structures(
     """
     Center and align structures to reference structures
     If no mask is provided, structures are centered at origin, otherwise pass `center=True` to center
-    TODO set `center=True` by default so get similar behavior as when no mask is provided
+    TODO(dataset) set `center=True` by default so get similar behavior as when no mask is provided
     """
     if pos_1.shape != pos_2.shape:
         raise ValueError("pos_1 and pos_2 must have the same shape.")

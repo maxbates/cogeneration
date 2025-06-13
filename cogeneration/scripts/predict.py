@@ -115,7 +115,7 @@ class EvalRunner:
         ):
             # We want to use the input cfg inference settings for the pdb dataset,
             # not what was in the ckpt config
-            # TODO - actually read the config, rather than using constructor to get new instance
+            # TODO(dataset) - actually read the config, rather than using constructor to get new instance
             pdb_test_cfg = self.cfg.dataset.PDBPost2021()
 
             # The dataset will behave differently depending on the task

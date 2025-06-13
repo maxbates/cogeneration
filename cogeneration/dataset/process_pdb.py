@@ -53,7 +53,7 @@ def get_uncompressed_pdb_path(
     """
     Uncompress a PDB file if it is compressed, returns path and whether it is a temp path
 
-    TODO consider moving to context handler to close file more easily.
+    TODO(dataset) consider moving to context handler to close file more easily.
     """
     is_compressed = file_path.endswith(".ent.gz")
 

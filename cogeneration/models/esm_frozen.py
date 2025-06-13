@@ -131,7 +131,7 @@ class SequenceData:
         seq = aatypes + 1
         seq = conv_table[seq]
         # set non-residue positions to <pad> to ignore (<unk> rarely observed so less stable)
-        # TODO - ideally differentiate non-canonical residues from non-residues (e.g. metal ion)
+        # TODO(model) - ideally differentiate non-canonical residues from non-residues (e.g. metal ion)
         #   So that residues in the chain are set to X. We don't differentiate in res_mask.
         seq = seq.masked_fill(~res_mask.bool(), pad)
 

@@ -450,7 +450,7 @@ class FoldingValidator:
                     }
                 )
 
-            # TODO - calculate diversity using FoldSeek, see MultiFlow.
+            # TODO(metric) - calculate diversity using FoldSeek, see MultiFlow.
 
         elif task == InferenceTask.forward_folding:
             metrics_csv_path = os.path.join(
@@ -570,8 +570,7 @@ class FoldingValidator:
         Run ColabFold AF2 folding on a fasta file
         Returns a DataFrame describing the outputs, where `header` column is the sequence name.
 
-        TODO make this static. It should delegate to a AlphaFold2Runner class, that can be mocked.
-        TODO - rename columns, include more information (e.g. all the pLDDTs)
+        TODO(tools) make this static. It should delegate to a AlphaFold2Runner class, that can be mocked.
         """
         assert self.device_id is not None, "Device ID must be set for AF2 folding"
         assert (
@@ -589,7 +588,7 @@ class FoldingValidator:
         os.makedirs(output_dir, exist_ok=True)
 
         # NOTE - public MultiFlow only runs model 4, but may want to consider running others.
-        # TODO - pass device
+        # TODO(tools) - pass device
 
         af2_args = [
             str(self.cfg.colabfold_path),
@@ -641,8 +640,6 @@ class FoldingValidator:
             with open(af2_json_path, "r") as f:
                 fold_metrics = json.load(f)
 
-            # TODO - include other metrics from AlphaFold
-
             all_fold_metrics.append(
                 {
                     MetricName.header: header,
@@ -666,7 +663,7 @@ class FoldingValidator:
         Run ProteinMPNN inverse folding on a PDB file
         Returns a fasta with reasonably named sequences
 
-        TODO make this static. It should delegate to a ProteinMPNNRunner class, that can be mocked.
+        TODO(tools) make this static. It should delegate to a ProteinMPNNRunner class, that can be mocked.
         """
         assert device_id is not None, "Device ID must be set for PMPNN folding"
         assert os.path.exists(
@@ -706,7 +703,7 @@ class FoldingValidator:
         #     )
 
         # Run ProteinMPNN Inverse Folding
-        # TODO pass device
+        # TODO(tools) pass device
 
         pmpnn_args = [
             "python3",

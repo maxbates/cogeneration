@@ -54,7 +54,7 @@ def get_index_embedding(
     """
     Creates positional embeddings from prespecified indices using the specified method.
 
-    TODO - consider adding chain gaps to res_idx, which currently is 1-indexed per chain.
+    TODO(model) - consider adding chain gaps to res_idx, which currently is 1-indexed per chain.
        Currently we embed chain_idx separately, but could be worth comparing approaches.
 
     Args:

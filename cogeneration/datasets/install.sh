@@ -1,7 +1,7 @@
 # download datasets from multiflow
 # https://zenodo.org/records/10714631?token=eyJhbGciOiJIUzUxMiJ9
 
-# TODO - support downloading scope metadata
+# TODO(dataset) - support downloading other metadata, e.g. Scope already processed
 # https://github.com/microsoft/protein-frame-flow/blob/20293ab04994a5bfe97f2d8cf8603a0b63af0609/metadata/scope_metadata.csv
 
 # Ensure we are in the directory containing this file

@@ -14,7 +14,7 @@ def get_available_device(device_limit: int) -> List[Union[int, str]]:
 
     # support being on a Mac, which doesn't have a GPU that GPUtil picks up
     # Lightning also only supports 1 device for MPS
-    # TODO - validate and check explicitly for MPS devices
+    # TODO(train) - validate and check explicitly for MPS devices
     if len(device_ids) == 0:
         device_ids = [0]
 
