@@ -418,14 +418,18 @@ class BatchFeaturizer:
 
         # Centering
         if bp.motif_mask in feats and (feats[bp.motif_mask] == 1).any():
-            # Center the motifs using motif_mask, and re-zero the scaffolds,
+            # Center the motifs using motif_mask,
             # to prevent biasing how scaffolds are placed relative to motifs.
             BatchFeaturizer.recenter_structure(feats, mask=feats[bp.motif_mask])
-            feats[bp.trans_1] = mask_blend_2d(
-                feats[bp.trans_1],
-                torch.zeros_like(feats[bp.trans_1]),
-                mask=feats[bp.motif_mask],
-            )
+
+            # For training, we need the scaffolds positions for losses.
+            # For eval, zero out the segmented scaffolds after re-centering.
+            if not self.is_training:
+                feats[bp.trans_1] = mask_blend_2d(
+                    feats[bp.trans_1],
+                    torch.zeros_like(feats[bp.trans_1]),
+                    mask=feats[bp.motif_mask],
+                )
         else:
             # Center the whole structure
             BatchFeaturizer.recenter_structure(feats)

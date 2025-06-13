@@ -930,29 +930,34 @@ class DatasetConfig(BaseClassConfig):
 class ExperimentTrainingConfig(BaseClassConfig):
     # mask losses to using pLDDT mask
     mask_plddt: bool = False
-    # position scaling (prior to MSE)
+    # position scaling (~ ang -> nm) (prior to MSE)
     bb_atom_scale: float = 0.1
     trans_scale: float = 0.1
     # losses scaling normalized up to t
     t_normalize_clip: float = 0.9
     # structure
     translation_loss_weight: float = 2.0
-    rotation_loss_weights: float = 1.0
-    torsion_loss_weight: float = 0.25
+    rotation_loss_weight: float = 1.0
+    torsion_loss_weight: float = 0.2
     # aatypes
-    aatypes_loss_weight: float = 1  # default 0.0 in multiflow
+    aatypes_loss_weight: float = 1.0  # default 0.0 in multiflow
     aatypes_loss_mean_or_sum: str = "mean"
     aatypes_loss_use_likelihood_weighting: bool = True
-    # Auxiliary losses: clashes, bb pairwise distances
-    aux_loss_weight: float = 1  # default 0.0 in multiflow
+
+    # Auxiliary losses
+    aux_loss_weight: float = 1.0  # default 0.0 in multiflow
     aux_loss_t_pass: float = 0.5  # minimum t for aux loss
-    aux_loss_use_atom_loss: bool = True  # num atoms dep on angles modeled
-    aux_loss_use_pair_loss: bool = True
-    # multimers
-    aux_loss_use_multimer_interface: bool = True
-    aux_loss_use_multimer_clash: bool = True
-    # b factors / confidence
+    # atom positions, num atoms dep on angles modeled (0=3, 1=5, 7=14)
+    aux_bb_atom_loss_weight: float = 0.25
+    # backbone pairwise distances
+    aux_bb_pair_loss_weight: float = 0.25
+    # multimer interchain contacts
+    aux_multimer_interface_loss_weight: float = 0.25
+    # multimer interchain clashes
+    aux_multimer_clash_loss_weight: float = 0.05
+    # b factors (if provided in experimental structure)
     aux_bfactor_loss_weight: float = 1e-3
+    # pLDDT confidence (comparing pred to GT structure)
     aux_plddt_loss_weight: float = 1e-3
 
 
