@@ -41,6 +41,7 @@ class AuxiliaryMetrics:
     batch_multimer_interface_loss: torch.Tensor
     batch_multimer_clash_loss: torch.Tensor
     batch_bfactor_loss: torch.Tensor
+    batch_plddt_loss: torch.Tensor
     train_loss: torch.Tensor
     rots_vf_loss: torch.Tensor
     trans_loss: torch.Tensor
@@ -50,6 +51,7 @@ class AuxiliaryMetrics:
     multimer_interface_loss: torch.Tensor
     multimer_clash_loss: torch.Tensor
     bfactor_loss: torch.Tensor
+    plddt_loss: torch.Tensor
     loss_denom_num_res: torch.Tensor
     examples_per_step: torch.Tensor
     res_length: torch.Tensor
@@ -61,10 +63,11 @@ class TrainingLosses:
 
     trans_loss: torch.Tensor
     rots_vf_loss: torch.Tensor
-    torsions_loss: torch.Tensor
+    torsions_loss: torch.Tensor  # optional
     auxiliary_loss: torch.Tensor
     aatypes_loss: torch.Tensor
-    bfactor_loss: torch.Tensor  # optional, may not be present
+    bfactor_loss: torch.Tensor  # optional
+    plddt_loss: torch.Tensor  # optional
     train_loss: torch.Tensor  # aggregated loss
 
     def items(self):
@@ -352,7 +355,9 @@ class BatchLossCalculator:
 
         return bb_atom_loss
 
-    def loss_pairwise_dist(self, proximity_threshold_ang: float = 6.0) -> torch.Tensor:
+    def loss_bb_pairwise_dist(
+        self, proximity_threshold_ang: float = 6.0
+    ) -> torch.Tensor:
         # Pairwise distance loss
         num_batch = self.num_batch
         num_res = self.num_res
@@ -471,27 +476,114 @@ class BatchLossCalculator:
         b-factor prediction is optional, and invalid when all b-factors are zero
         (e.g. as in synthetic examples).
         """
-        pred = self.pred.get(pbp.pred_bfactor, None)  # (B, N, num_bins)
-        if pred is None or bp.res_bfactor not in self.batch:
+        pred_logits = self.pred.get(pbp.pred_bfactor, None)  # (B, N, num_bins)
+        if pred_logits is None or bp.res_bfactor not in self.batch:
             return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
 
-        gt = self.batch[bp.res_bfactor]  # (B, N)
-        bins = pred.shape[-1]
-        boundaries = torch.linspace(0.0, 100.0, bins - 1, device=gt.device)
+        bins = pred_logits.shape[-1]
+        gt_bfactor = self.batch[bp.res_bfactor]  # (B, N)
+        boundaries = torch.linspace(0.0, 100.0, bins - 1, device=gt_bfactor.device)
 
         # discretise ground-truth b-factors
-        bin_idx = (gt.unsqueeze(-1) > boundaries).sum(-1).long()  # (B, N)
-        target = torch.nn.functional.one_hot(bin_idx, num_classes=bins).float()
+        bin_idx = (gt_bfactor.unsqueeze(-1) > boundaries).sum(-1).long()  # (B, N)
+        target_logits = torch.nn.functional.one_hot(bin_idx, num_classes=bins).float()
 
         # mask out synthetic examples (all-zero b-factors) + padding
-        valid_mask = (gt > 1e-5) & self.loss_mask  # (B, N)
+        valid_mask = (gt_bfactor > 1e-5) & self.loss_mask  # (B, N)
         if not valid_mask.any():
             return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
 
         # cross-entropy
-        logp = torch.nn.functional.log_softmax(pred.float(), dim=-1)
-        ce = -(target * logp).sum(-1)  # (B, N)
+        logp = torch.nn.functional.log_softmax(pred_logits.float(), dim=-1)
+        ce = -(target_logits * logp).sum(-1)  # (B, N)
         loss = (ce * valid_mask.float()).sum(-1) / (valid_mask.sum(-1).float() + 1e-5)
+
+        return loss
+
+    @staticmethod
+    def _lddt_per_residue(
+        pred_dists: torch.Tensor,  # (B, N, N)
+        true_dists: torch.Tensor,  # (B, N, N)
+        pair_mask: torch.Tensor,  # (B, N, N) pairs to consider
+        dist_cutoff: float = 15.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute per-residue target lDDT, returning score and a validity mask (i.e. a valid neighbor exists)
+        """
+        # pairs that are "local neighbours" in the reference structure
+        neighbors = (true_dists < dist_cutoff) & pair_mask  # (B, N, N)
+
+        # diff in distance between pred and true for every pair
+        diff = (pred_dists - true_dists).abs().unsqueeze(-1)  # (B, N, N, 1)
+
+        # four tolerance levels, as defined by lDDT
+        cuts = torch.tensor(
+            [0.5, 1.0, 2.0, 4.0], device=diff.device, dtype=diff.dtype
+        ).view(1, 1, 1, 4)
+
+        # pass/fail at each tolerance
+        in_proximity = (diff < cuts) & neighbors.unsqueeze(-1)  # (B, N, N, 4)
+
+        # per-residue counts
+        in_proximity_counts = in_proximity.float().sum((2, 3))  # (B, N)
+        pair_count = neighbors.float().sum(2)  # (B, N)
+
+        score = in_proximity_counts / (pair_count.clamp_min(1.0) * 4.0)  # (B, N)
+        valid = (pair_count > 0).float()  # (B, N)
+
+        return score, valid
+
+    def loss_plddt(self, dist_cutoff: float = 15.0) -> torch.Tensor:
+        """
+        Cross-entropy on per-token lDDT bins (pLDDT).
+        Uses current predicted coords vs. ground-truth coords to recompute lDDT.
+        """
+        plddt_logits = self.pred.get(pbp.pred_lddt, None)  # (B, N, num_bins)
+        if plddt_logits is None:
+            return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+
+        num_bins = plddt_logits.shape[-1]
+
+        # gather Ca coordinates (B, N, 3) to compute pairwise distances (B, N, N)
+        pred_trans = self.pred[pbp.pred_trans]
+        true_trans = self.gt.trans_1
+        pred_dists = torch.cdist(pred_trans, pred_trans)
+        true_dists = torch.cdist(true_trans, true_trans)
+
+        # mask: only consider resolved residues and exclude self-pairs
+        pair_mask = self.loss_mask.unsqueeze(2) & self.loss_mask.unsqueeze(
+            1
+        )  # (B, N, N)
+        # remove self
+        eye = torch.eye(
+            pred_dists.size(1), device=pred_dists.device, dtype=torch.bool
+        ).unsqueeze(
+            0
+        )  # (1, N, N)
+        pair_mask &= ~eye
+
+        # lDDT score and mask (for which residues have lDDT neighbors)
+        target_lddt_score, lddt_mask = self._lddt_per_residue(
+            pred_dists, true_dists, pair_mask, dist_cutoff
+        )  # (B,N), (B,N)
+        # discretise into bins
+        target_lddt_bins = torch.clamp(
+            (target_lddt_score * num_bins).long(), max=num_bins - 1
+        )
+        target_logits = torch.nn.functional.one_hot(
+            target_lddt_bins, num_classes=num_bins
+        ).float()
+
+        # cross-entropy of bin logits
+        logp = torch.nn.functional.log_softmax(
+            plddt_logits.float(), dim=-1
+        )  # (B, N, num_bins)
+        ce = -(target_logits * logp).sum(-1)  # (B, N)
+        # mask & average
+        loss = (ce * self.loss_mask.float() * lddt_mask).sum(-1) / (
+            (self.loss_mask.float() * lddt_mask).sum(-1) + 1e-5
+        )  # (B,)
+        loss = torch.nan_to_num(loss, nan=0.0)
 
         return loss
 
@@ -502,27 +594,29 @@ class BatchLossCalculator:
         loss_torsions = self.loss_torsions()
         loss_aatypes_ce = self.loss_aatypes_ce()
         loss_atom_positions = self.loss_atom_positions(n_bb_atoms=self.n_atoms_modeled)
-        loss_pairwise_dist = self.loss_pairwise_dist()
+        loss_pairwise_dist = self.loss_bb_pairwise_dist()
         loss_multimer_interface = self.loss_multimer_interface()
         loss_multimer_clash = self.loss_multimer_clash()
         loss_bfactor = self.loss_bfactor()
+        loss_plddt = self.loss_plddt()
 
         # scale losses by cfg weights
         loss_trans = loss_trans * self.train_cfg.translation_loss_weight
-        loss_rot_vf = loss_rot_vf * self.train_cfg.rotation_loss_weights
+        loss_rot_vf = loss_rot_vf * self.train_cfg.rotation_loss_weight
         loss_torsions = loss_torsions * self.train_cfg.torsion_loss_weight
         loss_aatypes_ce = loss_aatypes_ce * self.train_cfg.aatypes_loss_weight
         loss_atom_positions = (
-            loss_atom_positions * self.train_cfg.aux_loss_use_atom_loss
+            loss_atom_positions * self.train_cfg.aux_bb_atom_loss_weight
         )
-        loss_pairwise_dist = loss_pairwise_dist * self.train_cfg.aux_loss_use_pair_loss
+        loss_pairwise_dist = loss_pairwise_dist * self.train_cfg.aux_bb_pair_loss_weight
         loss_multimer_interface = (
-            loss_multimer_interface * self.train_cfg.aux_loss_use_multimer_interface
+            loss_multimer_interface * self.train_cfg.aux_multimer_interface_loss_weight
         )
         loss_multimer_clash = (
-            loss_multimer_clash * self.train_cfg.aux_loss_use_multimer_clash
+            loss_multimer_clash * self.train_cfg.aux_multimer_clash_loss_weight
         )
         loss_bfactor = loss_bfactor * self.train_cfg.aux_bfactor_loss_weight
+        loss_plddt = loss_plddt * self.train_cfg.aux_plddt_loss_weight
 
         # auxiliary loss
         loss_auxiliary = (
@@ -531,6 +625,7 @@ class BatchLossCalculator:
             + loss_multimer_clash
             + loss_multimer_interface
             + loss_bfactor
+            + loss_plddt
         )
         loss_auxiliary *= self.train_cfg.aux_loss_weight
 
@@ -559,6 +654,7 @@ class BatchLossCalculator:
             batch_multimer_interface_loss=loss_multimer_interface,
             batch_multimer_clash_loss=loss_multimer_clash,
             batch_bfactor_loss=loss_bfactor,
+            batch_plddt_loss=loss_plddt,
             train_loss=self.normalize_loss(loss_total),
             rots_vf_loss=self.normalize_loss(loss_rot_vf),
             trans_loss=self.normalize_loss(loss_trans),
@@ -568,6 +664,7 @@ class BatchLossCalculator:
             multimer_interface_loss=self.normalize_loss(loss_multimer_interface),
             multimer_clash_loss=self.normalize_loss(loss_multimer_clash),
             bfactor_loss=self.normalize_loss(loss_bfactor),
+            plddt_loss=self.normalize_loss(loss_plddt),
             loss_denom_num_res=self.loss_denom_num_res,
             examples_per_step=torch.tensor(self.num_batch),
             res_length=torch.mean(torch.sum(self.batch[bp.res_mask], dim=-1).float()),
@@ -580,6 +677,7 @@ class BatchLossCalculator:
             auxiliary_loss=loss_auxiliary,
             aatypes_loss=loss_aatypes_ce,
             bfactor_loss=loss_bfactor,
+            plddt_loss=loss_plddt,
             train_loss=loss_total,
         )
 

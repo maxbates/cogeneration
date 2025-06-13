@@ -5,6 +5,7 @@ from cogeneration.data.const import rigids_ang_to_nm, rigids_nm_to_ang
 from cogeneration.data.rigid import create_rigid
 from cogeneration.models.aa_pred import AminoAcidNOOPNet, AminoAcidPredictionNet
 from cogeneration.models.bfactors import BFactorModule
+from cogeneration.models.confidence import PLDDTModule
 from cogeneration.models.edge_feature_net import EdgeFeatureNet
 from cogeneration.models.esm_combiner import ESMCombinerNetwork
 from cogeneration.models.ipa_attention import AttentionIPATrunk
@@ -65,9 +66,11 @@ class FlowModel(nn.Module):
             predict_all_torsions=self.cfg.predict_all_torsions,
         )
 
-        # B-factor prediction
+        # B-factor / confidence prediction
         if self.cfg.bfactor.enabled:
             self.bfactor_net = BFactorModule(cfg=cfg.bfactor)
+        if self.cfg.plddt.enabled:
+            self.plddt_net = PLDDTModule(cfg=cfg.plddt)
 
     def forward(self, batch: NoisyFeatures) -> ModelPrediction:
         res_mask = batch[bp.res_mask]
@@ -157,7 +160,9 @@ class FlowModel(nn.Module):
             pred_bfactor = self.bfactor_net(node_embed=node_embed)
 
         # pLDDT prediction
-        # TODO new module, property, loss, logging, etc.
+        pred_lddt = None
+        if self.cfg.plddt.enabled:
+            pred_lddt = self.plddt_net(node_embed=node_embed)
 
         # Sequence prediction
         pred_logits, pred_aatypes = self.aa_pred_net(
@@ -180,6 +185,7 @@ class FlowModel(nn.Module):
             pbp.pred_logits: pred_logits,
             pbp.pred_aatypes: pred_aatypes,
             pbp.pred_bfactor: pred_bfactor,
+            pbp.pred_lddt: pred_lddt,
             # other model outputs
             pbp.node_embed: node_embed,
             pbp.edge_embed: edge_embed,

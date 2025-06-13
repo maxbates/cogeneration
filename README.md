@@ -16,10 +16,11 @@ This project introduces several extensions over MultiFlow:
   - particularly for sequence-conditioned tasks like inpainting
 - Improved sequence prediction / inverse folding, using a deeper sequence prediction network
 - torsion angle prediction for more accurate side chain placement
-- B-factor prediction, improving model understanding of flexible regions, and embedding structure experimental method
+- B-factor and pLDDT prediction, improving model understanding of flexible regions, and embedding structure experimental method
 - additional losses (e.g. for atomic interactions, clashes)
 - data pipeline to generate or augment training data
 - many improvements to code base: typing, enums, documentation, tests, etc.
+- new features and modules are optional - reverse compatible with MultiFlow
 
 ## Project Conventions
 

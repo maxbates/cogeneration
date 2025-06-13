@@ -382,6 +382,20 @@ class ModelBFactorConfig(BaseClassConfig):
 
 
 @dataclass
+class ModelPLDDTConfig(BaseClassConfig):
+    """
+    pLDDT prediction configuration.
+    """
+
+    enabled: bool = True
+
+    # c_s: node embedding size (input)
+    c_s: int = "${model.hyper_params.node_embed_size}"
+    # num_bins: number of bins
+    num_bins: int = 50  # mirror AF convention
+
+
+@dataclass
 class ModelConfig(BaseClassConfig):
     hyper_params: ModelHyperParamsConfig = field(default_factory=ModelHyperParamsConfig)
     node_features: ModelNodeFeaturesConfig = field(
@@ -392,7 +406,10 @@ class ModelConfig(BaseClassConfig):
     )
     esm_combiner: ModelESMCombinerConfig = field(default_factory=ModelESMCombinerConfig)
     ipa: ModelIPAConfig = field(default_factory=ModelIPAConfig)
+
+    # B-factors, confidence (pLDDT)
     bfactor: ModelBFactorConfig = field(default_factory=ModelBFactorConfig)
+    plddt: ModelPLDDTConfig = field(default_factory=ModelPLDDTConfig)
 
     # Predict torsion angles. Model outputs (B, N, K, 2) depending on K predicted.
     # These torsions are then filled to (B, N, 7, 2) by interpolant.
@@ -934,8 +951,9 @@ class ExperimentTrainingConfig(BaseClassConfig):
     # multimers
     aux_loss_use_multimer_interface: bool = True
     aux_loss_use_multimer_clash: bool = True
-    # b factors
+    # b factors / confidence
     aux_bfactor_loss_weight: float = 1e-3
+    aux_plddt_loss_weight: float = 1e-3
 
 
 @dataclass
@@ -1349,9 +1367,10 @@ class Config(BaseClassConfig):
         raw_cfg.model.hyper_params = ModelHyperParamsConfig.public_multiflow()
         # disable ESM combiner
         raw_cfg.model.esm_combiner.enabled = False
+        # disable method embedding, b-factor, confidence prediction
         raw_cfg.model.node_features.embed_structural_method = False
-        # disable b-factor prediction
         raw_cfg.model.bfactor.enabled = False
+        raw_cfg.model.plddt.enabled = False
         # Use simple aa_pred_net from public MultiFlow
         raw_cfg.model.sequence_pred_type = ModelSequencePredictionEnum.aa_pred
         # stochastic paths not part of public MultiFlow

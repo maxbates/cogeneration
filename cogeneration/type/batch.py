@@ -75,7 +75,8 @@ class PredBatchProp(StrEnum):
     pred_trans = "pred_trans"  # (B, N, 3)
     pred_rotmats = "pred_rotmats"  # (B, N, 3, 3)
     pred_torsions = "pred_torsions"  # Optional (B, N, K, 2), K=1 (psi) or K=7 (all)
-    pred_bfactor = "pred_bfactor"  # (B, N, num_bins)
+    pred_bfactor = "pred_bfactor"  # (B, N, num_bins) b-factor logits
+    pred_lddt = "pred_lddt"  # (B, N, num_bins) pLDDT logits
     pred_logits = "pred_logits"  # (B, N, S) where S=21 if masking else S=20
     pred_aatypes = "pred_aatypes"  # (B, N)
 
