@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from cogeneration.data import residue_constants as rc
+from cogeneration.data.residue_constants import chi_angles_mask, restypes_with_x
 from cogeneration.data.rigid_utils import Rigid, Rotation
 from cogeneration.data.tensor_utils import batched_gather, tensor_tree_map, tree_map
 
@@ -1132,3 +1133,44 @@ def random_crop_to_size(
     protein["seq_length"] = protein["seq_length"].new_tensor(num_res_crop_size)
 
     return protein
+
+
+# Torsion angle masks
+
+# amino acid -> torsion angle mask lookup table
+TORSION_MASK_LUT = torch.cat(
+    [
+        # phi, psi, omega are always present
+        torch.ones(len(restypes_with_x), 3, dtype=torch.bool),
+        # chi angles set using `chi_angles_mask`, 0 for UNK := 20
+        torch.nn.functional.pad(
+            torch.as_tensor(chi_angles_mask, dtype=torch.bool), (0, 0, 0, 1)
+        ),
+    ],
+    dim=-1,
+)  # (21, 7)
+
+
+def torsion_mask_from_sequence(seq: torch.Tensor) -> torch.Tensor:
+    """
+    Args:
+        seq: (N,) or (B, N) torch.Tensor integer residues
+
+    Returns:
+        (N, 7, 2) or (B, N, 7, 2) boolean tensor: mask for [φ, ψ, ω, χ1, χ2, χ3, χ4].
+    """
+    mask = TORSION_MASK_LUT[seq]  # broadcasted (B?, N, 7)
+    return mask[..., None].expand(*mask.shape, 2)  # (B?, N, 7, 2)
+
+
+def common_torsion_mask(seq1: torch.Tensor, seq2: torch.Tensor) -> torch.Tensor:
+    """
+    Union of torsion masks for two shape-compatible sequences (N,) or (B, N).
+
+    Returns:
+        (N, 7, 2) or (B, N, 7, 2) boolean mask, 1 where *both* sequences
+        can define the corresponding torsion angle.
+    """
+    mask1 = torsion_mask_from_sequence(seq1)
+    mask2 = torsion_mask_from_sequence(seq2)
+    return mask1 & mask2

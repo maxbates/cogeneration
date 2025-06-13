@@ -938,7 +938,7 @@ class ExperimentTrainingConfig(BaseClassConfig):
     # structure
     translation_loss_weight: float = 2.0
     rotation_loss_weight: float = 1.0
-    torsion_loss_weight: float = 0.2
+    torsion_loss_weight: float = 0.1
     # aatypes
     aatypes_loss_weight: float = 1.0  # default 0.0 in multiflow
     aatypes_loss_mean_or_sum: str = "mean"

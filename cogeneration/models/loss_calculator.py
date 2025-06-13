@@ -6,6 +6,7 @@ import torch
 
 from cogeneration.config.base import Config
 from cogeneration.data import all_atom, so3_utils
+from cogeneration.data.data_transforms import common_torsion_mask
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import ModelPrediction
 from cogeneration.type.batch import NoisyBatchProp as nbp
@@ -287,28 +288,41 @@ class BatchLossCalculator:
                 dtype=torch.float32,
             )
 
+        # Only consider torsions valid in both GT and pred sequences.
+        # Note may have effect of rarely predicting x3 and x4 angles,
+        # if model predicted sequence rarely == GT sequence for large residues.
+        torsion_mask = common_torsion_mask(
+            seq1=self.gt.aatypes_1,
+            seq2=self.pred[pbp.pred_aatypes],
+        )
+
+        # handle predicting torsion subset
         # ground‑truth psi torsion: (B, N, 7, 2) -> (B, N, K, 2)
         K = pred_torsions.shape[2]
         assert K in (1, 5, 7)
         gt_torsions = self.batch[bp.torsions_1]
         if K < 7:
             gt_torsions = gt_torsions[..., 2 : 2 + K, :]
+            torsion_mask = torsion_mask[..., 2 : 2 + K, :]
 
-        # TODO - mask angles according to sequence
-        #   but, which sequence? the real one? the predicted one?
+        angle_mask = torsion_mask[..., 0].float()  # (B, N, K)
+
+        # first, norm penalty to keep magnitude ~1
+        norm_diff = pred_torsions.norm(dim=-1) - 1.0  # (B, N, K)
+        loss_norm = norm_diff.abs()
+        # scaled smaller than angle loss
+        loss_norm = loss_norm * 0.05 * angle_mask  # (B, N, K)
 
         # dot product of unit vectors = cosine of angle difference
         cos_delta = (gt_torsions * pred_torsions).sum(-1)  # (B, N, K)
         # 1 - delta -> 0 when they match, up to 2 if they are opposite
-        loss_per_angle = 1.0 - cos_delta  # (B, N, K)
-
-        # unit-circle norm penalty, scaled smaller than angle loss
-        norm_diff = pred_torsions.norm(dim=-1) - 1.0  # (B, N, K)
-        loss_norm = norm_diff.abs()
-        loss_norm = loss_norm * 0.05
+        loss_per_angle = (1.0 - cos_delta) * angle_mask  # (B, N, K)
 
         # average per residue
-        loss_per_residue = (loss_per_angle + loss_norm).mean(dim=-1)  # (B, N)
+        angle_cnt = angle_mask.sum(-1)  # (B, N)
+        loss_per_residue = (loss_per_angle + loss_norm).sum(dim=-1) / (
+            angle_cnt + 1e-10
+        )  # (B, N)
 
         loss = (loss_per_residue * self.loss_mask).sum(-1) / (
             self.loss_denom_num_res + 1e-10
