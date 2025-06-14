@@ -63,7 +63,9 @@ class MetadataColumn(StrEnum):
     num_backbone_res_interacting = "num_backbone_res_interacting"
     # atomic interactions across chains
     # num_atom_interactions = "num_atom_interactions"
-    # clashes across chains
+    # serialized all chain clashes: "<chain_a>:<chain_b>:<num_bb_clashes>,..."
+    chain_clashes = "chain_clashes"
+    # clashes across chains exceeding clash threshold
     num_chains_clashing = "num_chains_clashing"
 
     # (new) Non-residue chains + interactions

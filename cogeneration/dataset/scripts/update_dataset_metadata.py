@@ -227,6 +227,7 @@ class MetadataUpdater:
             mc.chain_interactions not in row_metadata
             or mc.num_backbone_interactions not in row_metadata
             or mc.num_backbone_res_interacting not in row_metadata
+            or mc.chain_clashes not in row_metadata
             or mc.num_chains_clashing not in row_metadata
         ):
             interactions = MultimerInteractions.from_chain_feats(

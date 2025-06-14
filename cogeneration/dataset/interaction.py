@@ -101,6 +101,11 @@ class ChainClash:
     def percent_residues_clash(self) -> float:
         return len(self.residue_pairs) / self.chain_num_res
 
+    @property
+    def is_clash(self) -> bool:
+        # check if clash meets criteria, i.e. percent of residues exceeds threshold
+        return self.percent_residues_clash >= FRAC_RES_FOR_CLASH
+
 
 @dataclass
 class MultimerInteractions:
@@ -192,12 +197,12 @@ class MultimerInteractions:
 
         return interactions
 
-    @property
-    def chain_clashes(self) -> List[ChainClash]:
-        """Determine ChainClashes between chains"""
-        # aggregate clash interactions per chain interaction
+    def potential_chain_clashes(self, backbone_only: bool = True) -> List[ChainClash]:
+        """Determine potential ChainClashes between chains. Check `ChainClash.is_clash`"""
         potential_clashes = {}
         for interaction in self.interactions:
+            if backbone_only and not interaction.is_backbone:
+                continue
             if interaction.is_clash:
                 key = (interaction.chain_id, interaction.other_id)
                 if key not in potential_clashes:
@@ -212,17 +217,11 @@ class MultimerInteractions:
                         chain_num_res=chain_atoms.shape[0],
                         residue_pairs=set(),
                     )
-                potential_clashes[key].num_clashes += 1
                 potential_clashes[key].residue_pairs.add(
                     (interaction.chain_res_index, interaction.other_res_index)
                 )
 
-        # return a ChainClash if exceeds thresholds
-        return [
-            potential
-            for potential in list(potential_clashes.values())
-            if potential.percent_residues_clash >= FRAC_RES_FOR_CLASH
-        ]
+        return list(potential_clashes.values())
 
     @property
     def unique_backbone_interactions(self) -> List[Interaction]:
@@ -341,8 +340,13 @@ class MultimerInteractions:
         metadata[mc.num_backbone_res_interacting] = len(self.backbone_res_interacting)
         # metadata[dc.num_atom_interactions] = len(self.atom_interactions)
 
+        potential_clashes = self.potential_chain_clashes(backbone_only=True)
+        metadata[mc.chain_clashes] = ",".join(
+            f"{chain_clash.chain_id}:{chain_clash.other_id}:{len(chain_clash.residue_pairs)}"
+            for chain_clash in potential_clashes
+        )
         metadata[mc.num_chains_clashing] = len(
-            set(clash.chain_id for clash in self.chain_clashes)
+            set(clash.chain_id for clash in potential_clashes if clash.is_clash)
         )
 
 
