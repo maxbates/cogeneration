@@ -32,7 +32,10 @@ from cogeneration.type.dataset import ChainFeatures
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.dataset import MetadataCSVRow
-from cogeneration.type.structure import StructureExperimentalMethod
+from cogeneration.type.structure import (
+    StructureExperimentalMethod,
+    extract_structure_date,
+)
 
 
 class MetadataUpdater:
@@ -181,7 +184,15 @@ class MetadataUpdater:
                 _chain_independent_trimmed[dpc.aatype]
             )
 
-        # structure metadata as enum, ensure in `row_updates`
+        # structure metadata like date, resolution
+        if mc.date not in row_metadata:
+            structure = get_pdb_structure()
+            row_updates[mc.date] = extract_structure_date(structure=structure)
+        if mc.resolution not in row_metadata:
+            structure = get_pdb_structure()
+            row_updates[mc.resolution] = structure.header.get("resolution", None)
+
+        # structure method enum, ensure in `row_updates` for future steps
         if mc.structure_method in row_metadata:
             row_updates[mc.structure_method] = StructureExperimentalMethod.from_value(
                 row_metadata[mc.structure_method]

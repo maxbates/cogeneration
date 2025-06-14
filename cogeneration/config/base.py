@@ -704,11 +704,16 @@ class DatasetFilterConfig(BaseClassConfig):
     max_num_res: int = 384
     min_num_res: int = 60
     max_coil_percent: float = 0.667  # 0.5 in public MultiFlow
+    # radius of gyration quantile
     rog_quantile: float = 0.96
     # minimum percent of known and modelable residues in the structure of total sequence.
-    max_percent_residues_unknown: float = 0.333  # 0.5 in public MultiFlow
+    max_percent_residues_unknown: float = 0.5  # 0.5 in public MultiFlow
     # pLDDT filter for synthetic structures
     min_plddt: float = 0.7
+    # PDB date filter, converted to `pd.datetime`
+    min_date: Optional[str] = None
+    max_date: Optional[str] = None
+    # oligmers / multimers
     oligomeric: Optional[List[str]] = field(
         default_factory=lambda: [
             "monomer",

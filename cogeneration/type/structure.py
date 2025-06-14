@@ -1,9 +1,45 @@
-from typing import Any, Mapping, Set
+import datetime as dt
+from typing import Any, Mapping, Optional, Set
 
 import torch
 from Bio.PDB.Structure import Structure
 
 from cogeneration.type.str_enum import StrEnum
+
+
+def extract_structure_date(structure: Structure) -> Optional[dt.date]:
+    """
+    Extract the date of structure deposition from the Biopython Structure header.
+    """
+    header: Mapping[str, str] = getattr(structure, "header", {})
+
+    for key in (
+        "deposition_date",  # normalised datetime.date
+        "deposition_date_original",  # raw string (older Biopython)
+        "release_date",  # mmCIF key
+    ):
+        date_val = header.get(key)
+        if isinstance(date_val, dt.date):
+            return date_val
+        if isinstance(date_val, str):
+            try:
+                return dt.datetime.strptime(date_val.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                pass  # keep trying
+
+    # fallback to HEADER, line format: cols 50-59 => DD-MON-YY (e.g. 12-APR-89)
+    header_line = next(
+        (l for l in header.get("raw_header_lines", []) if l.startswith("HEADER")),
+        None,
+    )
+    if header_line:
+        raw = header_line[50:59].strip()
+        try:
+            return dt.datetime.strptime(raw, "%d-%b-%y").date()
+        except ValueError:
+            pass
+
+    return None
 
 
 class StructureExperimentalMethod(StrEnum):

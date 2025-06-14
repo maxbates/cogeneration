@@ -51,6 +51,7 @@ class MetadataColumn(StrEnum):
     radius_gyration = "radius_gyration"
 
     # structure metadata if provided
+    date = "date"  # date of structure deposition
     resolution = "resolution"
     structure_method = "structure_method"  # StructureExperimentalMethod enum
 

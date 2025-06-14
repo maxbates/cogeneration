@@ -24,7 +24,10 @@ from cogeneration.type.dataset import OLIGOMERIC_PREFIXES, ChainFeatures
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.dataset import MetadataCSVRow, ProcessedFile
-from cogeneration.type.structure import StructureExperimentalMethod
+from cogeneration.type.structure import (
+    StructureExperimentalMethod,
+    extract_structure_date,
+)
 
 
 class DataError(Exception):
@@ -408,6 +411,7 @@ def _process_pdb(
 
             # structure metadata
             metadata[mc.resolution] = structure.header.get("resolution")
+            metadata[mc.date] = extract_structure_date(structure=structure)
             metadata[mc.structure_method] = StructureExperimentalMethod.from_structure(
                 structure=structure
             )

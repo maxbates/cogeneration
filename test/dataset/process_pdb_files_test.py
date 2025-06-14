@@ -1,3 +1,4 @@
+import datetime as dt
 from pathlib import Path
 
 import numpy as np
@@ -66,6 +67,13 @@ class TestProcessPDBFiles:
         # print(pdb_path)
 
         # check metadata
+        assert metadata[mc.resolution] == 1.6
+        assert metadata[mc.date] == dt.date(2007, 7, 13)
+        assert (
+            metadata[mc.structure_method]
+            == StructureExperimentalMethod.XRAY_DIFFRACTION
+        )
+        # check structure
         assert metadata[mc.num_chains] == 2
         # 2x 100 residues with known aa types
         assert metadata[mc.moduled_num_res] == 200
@@ -76,10 +84,6 @@ class TestProcessPDBFiles:
         assert metadata[mc.oligomeric_detail] == "dimeric"
         assert metadata[mc.quaternary_category] == "homomer"
         assert metadata[mc.helix_percent] > 0.1
-        assert (
-            metadata[mc.structure_method]
-            == StructureExperimentalMethod.XRAY_DIFFRACTION
-        )
 
         # modeled sequence includes non-AA residues (i.e. 20 = unknown)
         assert len(pkl[dpc.aatype]) == metadata[mc.seq_len]

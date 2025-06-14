@@ -132,11 +132,38 @@ class DatasetFilterer:
             self._log.warning("No pLDDT column found, skipping pLDDT filter")
             return df
 
+    @_log_filter("date filter")
+    def _date_filter(self, df: MetadataDataFrame) -> MetadataDataFrame:
+        if not mc.date in df.columns:
+            self._log.warning("No date column found, skipping date filter")
+            return df
+        if self.cfg.min_date is None and self.cfg.max_date is None:
+            return df
+
+        if self.cfg.min_date is not None:
+            min_date = pd.to_datetime(self.cfg.min_date, errors="coerce")
+            if min_date is pd.NaT:
+                self._log.warning(f"Invalid min_date: {self.cfg.min_date}")
+                return df
+            datetime_col = df[mc.date].apply(pd.to_datetime, errors="coerce")
+            df = df[datetime_col >= min_date]
+
+        if self.cfg.max_date is not None:
+            max_date = pd.to_datetime(self.cfg.max_date, errors="coerce")
+            if max_date is pd.NaT:
+                self._log.warning(f"Invalid max_date: {self.cfg.max_date}")
+                return df
+            datetime_col = df[mc.date].apply(pd.to_datetime, errors="coerce")
+            df = df[datetime_col <= max_date]
+
+        return df
+
     def filter_metadata(self, raw_csv: MetadataDataFrame) -> MetadataDataFrame:
         """
         Filter a metadata CSV according to DatasetConfig.
         """
         df = raw_csv.copy()
+        df = self._date_filter(df)
         df = self._oligomeric_filter(df)
         df = self._num_chains_filter(df)
         df = self._length_filter(df)
