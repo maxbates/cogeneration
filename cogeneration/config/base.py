@@ -707,6 +707,8 @@ class DatasetFilterConfig(BaseClassConfig):
     rog_quantile: float = 0.96
     # minimum percent of known and modelable residues in the structure of total sequence.
     max_percent_residues_unknown: float = 0.333  # 0.5 in public MultiFlow
+    # pLDDT filter for synthetic structures
+    min_plddt: float = 0.7
     oligomeric: Optional[List[str]] = field(
         default_factory=lambda: [
             "monomer",
@@ -744,6 +746,7 @@ class DatasetFilterConfig(BaseClassConfig):
             max_coil_percent=1,
             rog_quantile=1,
             max_percent_residues_unknown=0.75,
+            min_plddt=0.4,
             oligomeric=None,
             num_chains=None,
         )

@@ -181,7 +181,7 @@ class MetadataUpdater:
                 _chain_independent_trimmed[dpc.aatype]
             )
 
-        # structure metadata as enum
+        # structure metadata as enum, ensure in `row_updates`
         if mc.structure_method in row_metadata:
             row_updates[mc.structure_method] = StructureExperimentalMethod.from_value(
                 row_metadata[mc.structure_method]
@@ -192,17 +192,24 @@ class MetadataUpdater:
                 StructureExperimentalMethod.from_structure(structure=structure)
             )
 
-        # plddts
-        if mc.mean_plddt_all_atom not in row_metadata:
-            _chain_independent_trimmed = get_chain_independent_trimmed()
-            row_updates[mc.mean_plddt_all_atom] = _chain_independent_trimmed[
-                dpc.b_factors
-            ].mean()
-        if mc.mean_plddt_modeled_bb not in row_metadata:
-            _chain_independent_trimmed = get_chain_independent_trimmed()
-            row_updates[mc.mean_plddt_modeled_bb] = _chain_independent_trimmed[
-                dpc.b_factors
-            ][:, :3][_chain_independent_trimmed[dpc.modeled_idx]].mean()
+        # plddts, using b-factors if synthetic otherwise 100.0
+        if (
+            mc.mean_plddt_all_atom not in row_metadata
+            or mc.mean_plddt_modeled_bb not in row_metadata
+        ):
+            if StructureExperimentalMethod.is_experimental(
+                row_updates[mc.structure_method]
+            ):
+                row_updates[mc.mean_plddt_all_atom] = 100.0
+                row_updates[mc.mean_plddt_modeled_bb] = 100.0
+            else:
+                _chain_independent_trimmed = get_chain_independent_trimmed()
+                row_updates[mc.mean_plddt_all_atom] = _chain_independent_trimmed[
+                    dpc.b_factors
+                ].mean()
+                row_updates[mc.mean_plddt_modeled_bb] = _chain_independent_trimmed[
+                    dpc.b_factors
+                ][:, :3][_chain_independent_trimmed[dpc.modeled_idx]].mean()
 
         # interactions / clashes
         if (

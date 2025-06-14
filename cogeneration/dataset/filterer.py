@@ -123,13 +123,14 @@ class DatasetFilterer:
 
     @_log_filter("pLDDT filter")
     def _plddt_filter(self, df: MetadataDataFrame) -> MetadataDataFrame:
-        # not used in the public multiflow codebase
-        # TODO(dataset) - pull out pLDDTs from structure, not available in current CSV
-        # return data_csv[
-        #     dc.num_confident_plddt
-        #     > self.dataset_cfg.filter.min_num_confident_plddt
-        # ]
-        return df
+        # not used in the public multiflow codebase; only applies to synthetic structures
+        if mc.mean_plddt_modeled_bb in df.columns:
+            return df[df[mc.mean_plddt_modeled_bb] > self.cfg.min_plddt]
+        elif mc.mean_plddt_all_atom in df.columns:
+            return df[df[mc.mean_plddt_all_atom] > self.cfg.min_plddt]
+        else:
+            self._log.warning("No pLDDT column found, skipping pLDDT filter")
+            return df
 
     def filter_metadata(self, raw_csv: MetadataDataFrame) -> MetadataDataFrame:
         """
