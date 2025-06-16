@@ -2,8 +2,9 @@ import pytest
 import torch
 from esm.pretrained import esm2_t6_8M_UR50D
 
+from cogeneration.config.base import ModelESMKey
 from cogeneration.data.residue_constants import restypes, restypes_with_x
-from cogeneration.models.esm_frozen import SequenceData
+from cogeneration.models.esm_frozen import FrozenEsmModel, SequenceData
 
 
 @pytest.fixture(scope="module")
@@ -58,3 +59,39 @@ class TestSequenceData:
             ]
         )
         assert torch.equal(seq_data_masked.aa_sequence, expected)
+
+
+class TestFrozenEsmModel:
+    @pytest.mark.parametrize("batch, length", [(1, 12), (2, 8)])
+    @pytest.mark.parametrize("get_attn_map", [True, False])
+    @pytest.mark.parametrize(
+        "model_key", [ModelESMKey.esm2_t6_8M_UR50D, ModelESMKey.DUMMY]
+    )
+    def test_forward_pass(self, model_key, get_attn_map, batch, length):
+        # load a real model (8M) from the registry
+        model = FrozenEsmModel(model_key, use_esm_attn_map=get_attn_map, caching=False)
+
+        # dummy AF2-style inputs
+        aatypes = torch.randint(0, 21, (batch, length))  # residue indices
+        chain_idx = torch.ones_like(aatypes)  # single-chain
+        res_mask = torch.ones_like(aatypes, dtype=torch.bool)  # all valid
+
+        token_reps, pair_reps = model(aatypes, chain_idx, res_mask)
+
+        # token-level reps: (B, L, nLayers+1, embed_dim)
+        assert token_reps.shape == (
+            batch,
+            length,
+            model.num_layers + 1,
+            model.embed_dim,
+        )
+
+        if get_attn_map:
+            # pair-level reps: (B, L, L, nLayers * nHeads)
+            assert pair_reps is not None
+            assert pair_reps.shape == (
+                batch,
+                length,
+                length,
+                model.num_layers * model.num_heads,
+            )
