@@ -88,6 +88,7 @@ class DoubleAttentionPairBlock(nn.Module):
 class ESMCombinerNetwork(nn.Module):
     """
     Runs ESM model and combines single and pair representations with node and edge embeddings.
+    If cfg.only_single, only generates single rep and enriches node embeddings.
     Optionally also runs a trunk of DoubleAttentionPairBlocks to enrich edge embeddings.
     """
 
@@ -95,7 +96,10 @@ class ESMCombinerNetwork(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        self.esm = FrozenEsmModel(model_key=cfg.esm_model_key, use_esm_attn_map=True)
+        self.esm = FrozenEsmModel(
+            model_key=cfg.esm_model_key,
+            use_esm_attn_map=not self.cfg.only_single,
+        )
 
         # learn a scalar mix over all single layers
         self.esm_single_combine = nn.Parameter(torch.zeros(self.esm.num_layers + 1))
@@ -106,28 +110,27 @@ class ESMCombinerNetwork(nn.Module):
             out_dim=self.cfg.esm_proj_single_dim,
             hidden_dim=self.cfg.mlp_proj_hidden_dim,
         )
-
-        # pair reps come out flattened layers*heads (B, N, N, layers*heads) -> (B, N, N, edge_dim)
-        self.pair_proj = _mlp(
-            in_dim=self.esm.num_layers * self.esm.num_heads,
-            out_dim=self.cfg.esm_proj_pair_dim,
-            hidden_dim=self.cfg.mlp_proj_hidden_dim,
-        )
-
-        # LayerNorm after combine
         self.single_layer_norm = nn.LayerNorm(self.cfg.node_embed_size)
-        self.pair_layer_norm = nn.LayerNorm(self.cfg.edge_embed_size)
 
-        # DoubleAttentionPairBlock trunk
-        if self.cfg.double_attention_pair_trunk.num_blocks > 0:
-            self.double_attention_pair_trunk = nn.ModuleList(
-                [
-                    DoubleAttentionPairBlock(self.cfg.double_attention_pair_trunk)
-                    for _ in range(self.cfg.double_attention_pair_trunk.num_blocks)
-                ]
+        if not self.cfg.only_single:
+            # pair reps come out flattened layers*heads (B, N, N, layers*heads) -> (B, N, N, edge_dim)
+            self.pair_proj = _mlp(
+                in_dim=self.esm.num_layers * self.esm.num_heads,
+                out_dim=self.cfg.esm_proj_pair_dim,
+                hidden_dim=self.cfg.mlp_proj_hidden_dim,
             )
+            self.pair_layer_norm = nn.LayerNorm(self.cfg.edge_embed_size)
 
-            self.trunk_pair_layer_norm = nn.LayerNorm(self.cfg.edge_embed_size)
+            # DoubleAttentionPairBlock trunk
+            if self.cfg.double_attention_pair_trunk.num_blocks > 0:
+                self.double_attention_pair_trunk = nn.ModuleList(
+                    [
+                        DoubleAttentionPairBlock(self.cfg.double_attention_pair_trunk)
+                        for _ in range(self.cfg.double_attention_pair_trunk.num_blocks)
+                    ]
+                )
+
+                self.trunk_pair_layer_norm = nn.LayerNorm(self.cfg.edge_embed_size)
 
     def forward(
         self,
@@ -144,23 +147,33 @@ class ESMCombinerNetwork(nn.Module):
             chain_index=chain_index,
             res_mask=res_mask,
         )
+
         esm_single = esm_single.detach()  # (B, N, nLayers, node_dim)
-        esm_pair = esm_pair.detach()  # (B, N, N, nLayers*nHeads)
 
         # flatten `esm_single` using weighted sum `esm_single_combine`
         weights = self.esm_single_combine.softmax(0)
         w = weights.view(1, 1, -1, 1)  # (1, 1, nLayers+1, 1)
         esm_single = (w * esm_single).sum(dim=2)  # (B, N, node_dim)
 
-        # project weighted single and flattened pair representations
+        # project weighted single representations
         esm_single = self.seq_proj(esm_single)  # (B, N, node_dim)
-        esm_pair = self.pair_proj(esm_pair)  # (B, N, N, edge_dim)
 
         # combine + LayerNorm
         node_embed = 0.5 * (esm_single + init_node_embed)  # (B, N, node_dim)
-        edge_embed = 0.5 * (esm_pair + init_edge_embed)  # (B, N, N, edge_dim)
         node_embed = self.single_layer_norm(node_embed)
-        edge_embed = self.pair_layer_norm(edge_embed)
+
+        # If generated, process pair representations, otherwise use initial edge embeddings
+        if self.cfg.only_single:
+            edge_embed = init_edge_embed
+        else:
+            esm_pair = esm_pair.detach()  # (B, N, N, nLayers*nHeads)
+
+            # project weighted single and flattened pair representations
+            esm_pair = self.pair_proj(esm_pair)  # (B, N, N, edge_dim)
+
+            # combine + LayerNorm
+            edge_embed = 0.5 * (esm_pair + init_edge_embed)  # (B, N, N, edge_dim)
+            edge_embed = self.pair_layer_norm(edge_embed)
 
         # TODO(model) - support ESMFold style folding blocks instead.
         #    Note requires `openfold` install for Triangle Updates.
@@ -176,8 +189,8 @@ class ESMCombinerNetwork(nn.Module):
             edge_embed = self.trunk_pair_layer_norm(edge_embed)  # (B, N, N, edge_dim)
 
         # mask
-        edge_mask = res_mask[:, None] * res_mask[:, :, None]
         node_embed = node_embed * res_mask[..., None]
+        edge_mask = res_mask[:, None] * res_mask[:, :, None]
         edge_embed = edge_embed * edge_mask[..., None]
 
         return node_embed, edge_embed
