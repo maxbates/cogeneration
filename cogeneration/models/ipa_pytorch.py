@@ -16,7 +16,7 @@ from scipy.stats import truncnorm
 from cogeneration.config.base import ModelIPAConfig
 from cogeneration.data import all_atom
 from cogeneration.data.rigid_utils import Rigid
-from cogeneration.data.tensor_utils import permute_final_dims, flatten_final_dims
+from cogeneration.data.tensor_utils import flatten_final_dims, permute_final_dims
 
 
 def ipa_point_weights_init_(weights):
@@ -118,7 +118,7 @@ class Linear(nn.Linear):
         bias: bool = True,
         init: str = "default",
         init_fn: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
-            precision=None,
+        precision=None,
     ):
         """
         Args:

@@ -1,13 +1,12 @@
-from __future__ import annotations
-
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 from torch import nn
 
-from cogeneration.config.base import (
-    ModelESMCombinerConfig,
-    ModelESMDoubleAttentionPairConfig,
+from cogeneration.config.base import ModelESMCombinerConfig
+from cogeneration.models.double_attention_pair import (
+    DoubleAttentionPairBlock,
+    DoubleAttentionPairTrunk,
 )
 from cogeneration.models.esm_frozen import FrozenEsmModel
 
@@ -19,70 +18,6 @@ def _mlp(in_dim: int, out_dim: int, hidden_dim: int) -> nn.Module:
         nn.GELU(),
         nn.Linear(hidden_dim, out_dim),
     )
-
-
-class DoubleAttentionPairBlock(nn.Module):
-    """
-    Rough but O(N^2) substitute triangle‐attention.
-
-    Uses a two‐step “gather & redistribute” over all pair edges:
-    - Gather global context via a softmax‐weighted sum of `fP` and value projection `gP`
-    - Redistribute that context back to each edge via a separate softmax on `hP`
-    - Applies a channel‐wise FiLM (scale + shift) conditioned on the timestep
-
-    Differs from standard self‐attention:
-    - operates on the flattened edge map, not on feature tokens
-    - mimics two‐hop (i -> k -> j) triangle interactions rather than dot‑product between queries/keys
-    - complexity is O(N^2 * D^2) (where D << C) versus O(N^3 * C) for triangle attention
-    """
-
-    def __init__(self, cfg: ModelESMDoubleAttentionPairConfig):
-        super().__init__()
-        self.cfg = cfg
-
-        assert cfg.edge_embed_size % cfg.bottleneck_scale == 0
-        bottleneck_dim = self.cfg.edge_embed_size // cfg.bottleneck_scale
-
-        self.gather_proj = nn.Linear(self.cfg.edge_embed_size, bottleneck_dim)
-        self.value_proj = nn.Linear(self.cfg.edge_embed_size, bottleneck_dim)
-        self.distribute_proj = nn.Linear(self.cfg.edge_embed_size, bottleneck_dim)
-        self.output_proj = nn.Linear(bottleneck_dim, self.cfg.edge_embed_size)
-
-        self.time_mlp = nn.Sequential(
-            nn.Linear(1, self.cfg.time_mlp_hidden_dim),  # embed scalar t
-            nn.GELU(),
-            nn.Linear(
-                self.cfg.time_mlp_hidden_dim, self.cfg.edge_embed_size * 2
-            ),  # scale+shift
-        )
-
-    def forward(self, edge_embed: torch.Tensor, r3_t: torch.Tensor) -> torch.Tensor:
-        B, N, _, edge_dim = edge_embed.shape
-
-        # flatten (B, N, N, edge_dim) → (B, N*N, edge_dim)
-        P = edge_embed.view(B, N * N, edge_dim)
-
-        # compute gather weights and values
-        fP = self.gather_proj(P)  # (B, N*N, bottleneck_dim)
-        gP = self.value_proj(P)  # (B, N*N, bottleneck_dim)
-        weights = torch.softmax(fP, dim=1)  # norm over all edges
-        # aggregate global context
-        # (B, bottleneck_dim, N*N) @ (B, N*N, bottleneck_dim) -> (B, bottleneck_dim, bottleneck_dim)
-        V = weights.transpose(1, 2) @ gP
-
-        # compute distribute scores and redistribute context
-        hP = self.distribute_proj(P)  # (B, N*N, bottleneck_dim)
-        scores = torch.softmax(hP, dim=2)  # norm over context dims
-        O = scores @ V  # (B, N*N, bottleneck_dim)
-        O = self.output_proj(O).view(B, N, N, edge_dim)
-
-        # Feature-wise Linear Modulation (FiLM) using timestep embedding
-        t_emb = self.time_mlp(r3_t.view(B, 1))  # (B, 2*C)
-        scale, shift = t_emb.chunk(2, dim=-1)
-        O = O * (1 + scale.unsqueeze(1).unsqueeze(1)) + shift.unsqueeze(1).unsqueeze(1)
-
-        # residual update
-        return edge_embed + O
 
 
 class ESMCombinerNetwork(nn.Module):
@@ -121,16 +56,12 @@ class ESMCombinerNetwork(nn.Module):
             )
             self.pair_layer_norm = nn.LayerNorm(self.cfg.edge_embed_size)
 
-            # DoubleAttentionPairBlock trunk
-            if self.cfg.double_attention_pair_trunk.num_blocks > 0:
-                self.double_attention_pair_trunk = nn.ModuleList(
-                    [
-                        DoubleAttentionPairBlock(self.cfg.double_attention_pair_trunk)
-                        for _ in range(self.cfg.double_attention_pair_trunk.num_blocks)
-                    ]
-                )
-
-                self.trunk_pair_layer_norm = nn.LayerNorm(self.cfg.edge_embed_size)
+            # DoubleAttentionPairBlock trunk; may not be active (if num_blocks==0)
+            self.double_attention_pair_trunk = DoubleAttentionPairTrunk(
+                cfg=self.cfg.double_attention_pair_trunk,
+                final_layer_norm=False,
+            )
+            self.trunk_pair_layer_norm = nn.LayerNorm(self.cfg.edge_embed_size)
 
     def forward(
         self,
@@ -141,6 +72,8 @@ class ESMCombinerNetwork(nn.Module):
         res_mask: torch.Tensor,  # (B, N)
         r3_t: torch.Tensor,  # (B, 1)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        edge_mask = res_mask[:, None] * res_mask[:, :, None]
+
         # get ESM single and pair representations
         esm_single, esm_pair = self.esm(
             aatypes=aatypes_t,
@@ -175,14 +108,12 @@ class ESMCombinerNetwork(nn.Module):
             edge_embed = 0.5 * (esm_pair + init_edge_embed)  # (B, N, N, edge_dim)
             edge_embed = self.pair_layer_norm(edge_embed)
 
-        # TODO(model) - support ESMFold style folding blocks instead.
-        #    Note requires `openfold` install for Triangle Updates.
-        #    Can install as local package, but brings in large dependency we've avoided so far.
-        #    May wish to add in RelativePosition embedding for folding blocks.
-        # TODO(model) - alternatively, `trifast` https://github.com/latkins/trifast
-        if self.cfg.double_attention_pair_trunk.num_blocks > 0:
-            for block in self.double_attention_pair_trunk:
-                edge_embed = block(edge_embed=edge_embed, r3_t=r3_t)
+        if self.double_attention_pair_trunk.enabled:
+            edge_embed = self.double_attention_pair_trunk(
+                edge_embed=edge_embed,
+                edge_mask=edge_mask,
+                r3_t=r3_t,
+            )
 
             # add back in initial representation after trunk + norm
             edge_embed = 0.5 * (edge_embed + init_edge_embed)  # (B, N, N, edge_dim)
@@ -190,7 +121,6 @@ class ESMCombinerNetwork(nn.Module):
 
         # mask
         node_embed = node_embed * res_mask[..., None]
-        edge_mask = res_mask[:, None] * res_mask[:, :, None]
         edge_embed = edge_embed * edge_mask[..., None]
 
         return node_embed, edge_embed

@@ -102,6 +102,12 @@ class BaseClassConfig:
             other=other_cfg.asdict(),
         )
 
+    def clone(self: GenericConfig, interpolate: bool = True) -> GenericConfig:
+        """
+        Clone the config, returning a new instance of the same class.
+        """
+        return self.merge_dict(other={}, interpolate=interpolate)
+
 
 @dataclass
 class SharedConfig(BaseClassConfig):
@@ -222,22 +228,32 @@ class ModelEdgeFeaturesConfig(BaseClassConfig):
     embed_diffuse_mask: bool = True
 
 
-class ModelESMKey(StrEnum):
-    """Keys for ESM model selection."""
-
-    esm2_t6_8M_UR50D = "esm2_t6_8M_UR50D"
-    esm2_t12_35M_UR50D = "esm2_t12_35M_UR50D"
-    esm2_t30_150M_UR50D = "esm2_t30_150M_UR50D"
-    esm2_t33_650M_UR50D = "esm2_t33_650M_UR50D"
-    esm2_t36_3B_UR50D = "esm2_t36_3B_UR50D"
-    esm2_t48_15B_UR50D = "esm2_t48_15B_UR50D"
-    DUMMY = "dummy"  # dummy model for testing
+class AttentionType(StrEnum):
+    NONE = "none"  # identity
+    PAIR_BIAS = "pair_bias"  # AttentionPairBias (node only)
+    DOUBLE_AXIS = "double_axis"  # DoubleAxisAttentionModule (edge only)
+    PAIRFORMER = "pairformer"  # PairformerModule (node + edge)
+    PAIRFORMER_NO_SEQ = "pairformer_no_seq"  # PairformerNoSeqModule (edge only)
+    IPA = "ipa"  # Invariant Point Attention Trunk (node + edge, frames skipped here)
 
 
 @dataclass
-class ModelESMDoubleAttentionPairConfig(BaseClassConfig):
+class ModelAttentionPairBiasConfig(BaseClassConfig):
+    """Config for a stack of AttentionPairBias layers."""
+
+    node_dim: int = "${model.hyper_params.node_embed_size}"
+    edge_dim: int = "${model.hyper_params.edge_embed_size}"
+    num_heads: int = 4
+    compute_pair_bias: bool = True
+
+    # trunk
+    num_layers: int = 4
+
+
+@dataclass
+class ModelDoubleAttentionPairConfig(BaseClassConfig):
     """
-    Config for DoubleAttentionPairBlock.
+    Config for DoubleAttentionPairBlock and trunk
     """
 
     # number of blocks in series, 0 to disable
@@ -246,35 +262,27 @@ class ModelESMDoubleAttentionPairConfig(BaseClassConfig):
     edge_embed_size: int = "${model.hyper_params.edge_embed_size}"
     # reduced dim D for gather/distribute
     bottleneck_scale: int = 4  # -> 1/N of edge_embed_size
-    # hidden dim for time conditioning MLP
+    # hidden dim for time conditioning MLP, i.e. Feature-wise Linear Modulation (FiLM)
+    use_film: bool = True  # enable time conditioning, requires r3_t
     time_mlp_hidden_dim: int = "${model.hyper_params.timestep_embed_size}"
 
 
 @dataclass
-class ModelESMCombinerConfig(BaseClassConfig):
-    """
-    Enable ESM and combine simple + ESM / single + pair representations.
-    """
-
-    # Whether ESM is enabled. If so, representations will be combined.
-    enabled: bool = True
-    # only get single rep, which can use speed up e.g. using flash attention
-    only_single: bool = False
-    # which ESM model size to use
-    esm_model_key: ModelESMKey = ModelESMKey.esm2_t30_150M_UR50D
-    # representation enriched using attention blocks
-    # TODO(model) support folding blocks instead
-    double_attention_pair_trunk: ModelESMDoubleAttentionPairConfig = field(
-        default_factory=ModelESMDoubleAttentionPairConfig
+class ModelPairformerConfig(BaseClassConfig):
+    node_dim: int = "${model.hyper_params.node_embed_size}"  # aka token_s
+    edge_dim: int = "${model.hyper_params.edge_embed_size}"  # aka token_z
+    dropout: float = 0.1
+    attention_pair_bias: ModelAttentionPairBiasConfig = field(
+        default_factory=ModelAttentionPairBiasConfig
     )
-    # dims coming from simple node/edge networks
-    node_embed_size: int = "${model.hyper_params.node_embed_size}"
-    edge_embed_size: int = "${model.hyper_params.edge_embed_size}"
-    # ESM outputs projection size
-    esm_proj_single_dim: int = "${model.hyper_params.node_embed_size}"
-    esm_proj_pair_dim: int = "${model.hyper_params.edge_embed_size}"
-    # hidden size inside the tiny MLP used for projection
-    mlp_proj_hidden_dim: int = "${model.hyper_params.node_embed_size}"
+    pairwise_head_width: int = 32
+    pairwise_num_heads: int = 4
+    post_layer_norm: bool = False
+    chunk_size_tri_attn: int = 512  # chunking/tiling for large sequences
+    use_kernels: bool = True  # cuEquiv if available  # TODO(attn) automatic
+    checkpointing: bool = False  # torch.utils.checkpoint on every layer
+    # trunk
+    num_layers: int = 8
 
 
 @dataclass
@@ -301,6 +309,45 @@ class ModelIPAConfig(BaseClassConfig):
     transformer_dropout: float = 0.2
 
 
+class ModelESMKey(StrEnum):
+    """Keys for ESM model selection."""
+
+    esm2_t6_8M_UR50D = "esm2_t6_8M_UR50D"
+    esm2_t12_35M_UR50D = "esm2_t12_35M_UR50D"
+    esm2_t30_150M_UR50D = "esm2_t30_150M_UR50D"
+    esm2_t33_650M_UR50D = "esm2_t33_650M_UR50D"
+    esm2_t36_3B_UR50D = "esm2_t36_3B_UR50D"
+    esm2_t48_15B_UR50D = "esm2_t48_15B_UR50D"
+    DUMMY = "dummy"  # dummy model for testing
+
+
+@dataclass
+class ModelESMCombinerConfig(BaseClassConfig):
+    """
+    Enable ESM and combine simple + ESM / single + pair representations.
+    """
+
+    # Whether ESM is enabled. If so, representations will be combined.
+    enabled: bool = True
+    # only get single rep, which can use speed up e.g. using flash attention
+    only_single: bool = False
+    # which ESM model size to use
+    esm_model_key: ModelESMKey = ModelESMKey.esm2_t30_150M_UR50D
+    # representation enriched using attention blocks
+    # TODO(attn) support folding blocks instead
+    double_attention_pair_trunk: ModelDoubleAttentionPairConfig = field(
+        default_factory=ModelDoubleAttentionPairConfig
+    )
+    # dims coming from simple node/edge networks
+    node_embed_size: int = "${model.hyper_params.node_embed_size}"
+    edge_embed_size: int = "${model.hyper_params.edge_embed_size}"
+    # ESM outputs projection size
+    esm_proj_single_dim: int = "${model.hyper_params.node_embed_size}"
+    esm_proj_pair_dim: int = "${model.hyper_params.edge_embed_size}"
+    # hidden size inside the tiny MLP used for projection
+    mlp_proj_hidden_dim: int = "${model.hyper_params.node_embed_size}"
+
+
 @dataclass
 class ModelAAPredConfig(BaseClassConfig):
     """
@@ -316,7 +363,7 @@ class ModelAAPredConfig(BaseClassConfig):
 @dataclass
 class ModelSequenceIPANetConfig(BaseClassConfig):
     """
-    IPA style transformer, predicting logits instead of backbone update.
+    IPA style transformer, for predicting logits without backbone update.
 
     Public MultiFlow code uses minimal AAPred linear network.
     The public MultiFlow config alludes to a `sequence_net` not in code, with fields:

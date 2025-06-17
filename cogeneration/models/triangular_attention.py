@@ -17,15 +17,18 @@
 
 import math
 from functools import partial, partialmethod
-from typing import Callable, Optional, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
-from cuequivariance_torch.primitives.triangle import triangle_attention
 import torch
 import torch.nn as nn
+from cuequivariance_torch.primitives.triangle import triangle_attention
 
-
-from cogeneration.data.tensor_utils import permute_final_dims, flatten_final_dims, chunk_layer
-from cogeneration.models.ipa_pytorch import Linear, LayerNorm
+from cogeneration.data.tensor_utils import (
+    chunk_layer,
+    flatten_final_dims,
+    permute_final_dims,
+)
+from cogeneration.models.ipa_pytorch import LayerNorm, Linear
 
 
 @torch.jit.ignore
@@ -77,6 +80,7 @@ class Attention(nn.Module):
     """
     Standard multi-head attention using AlphaFold's default layer
     initialization. Allows multiple bias vectors.
+
     Allows `forward(use_kernels)` to use cuEquivariance triangle attn kernel
     """
 
@@ -236,7 +240,6 @@ class Attention(nn.Module):
         o = self._wrap_up(o, q_x)
 
         return o
-
 
 
 class TriangleAttention(nn.Module):

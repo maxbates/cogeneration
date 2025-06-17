@@ -43,13 +43,13 @@ def kernel_triangular_mult(
 class TriangleMultiplicationOutgoing(nn.Module):
     """TriangleMultiplicationOutgoing."""
 
-    def __init__(self, dim: int = 128) -> None:
+    def __init__(self, dim: int) -> None:
         """Initialize the TriangularUpdate module.
 
         Parameters
         ----------
         dim: int
-            The dimension of the input, default 128
+            The dimension of the input
 
         """
         super().__init__()

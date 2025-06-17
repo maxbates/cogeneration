@@ -9,7 +9,6 @@ from cogeneration.data.rigid_utils import Rigid
 from cogeneration.models.aa_pred import BaseSequencePredictionNet
 from cogeneration.models.ipa_attention import AttentionIPATrunk
 
-
 # TODO variant using e.g. triangle attention.
 #   cheaper than IPA, since no bb updates.
 

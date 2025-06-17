@@ -6,7 +6,13 @@ import torch.nn as nn
 from cogeneration.config.base import ModelIPAConfig
 from cogeneration.data.rigid_utils import Rigid
 from cogeneration.models import ipa_pytorch
-from cogeneration.models.ipa_pytorch import TorsionAngles
+from cogeneration.models.ipa_pytorch import (
+    BackboneUpdate,
+    EdgeTransition,
+    Linear,
+    StructureModuleTransition,
+    TorsionAngles,
+)
 
 
 class AttentionIPATrunk(nn.Module):
@@ -64,15 +70,13 @@ class AttentionIPATrunk(nn.Module):
                 num_layers=self.cfg.seq_tfmr_num_layers,
                 enable_nested_tensor=False,
             )
-            self.trunk[f"post_tfmr_{b}"] = ipa_pytorch.Linear(
-                tfmr_in, self.cfg.c_s, init="final"
-            )
-            self.trunk[f"node_transition_{b}"] = ipa_pytorch.StructureModuleTransition(
+            self.trunk[f"post_tfmr_{b}"] = Linear(tfmr_in, self.cfg.c_s, init="final")
+            self.trunk[f"node_transition_{b}"] = StructureModuleTransition(
                 c=self.cfg.c_s
             )
 
             if self.perform_backbone_update:
-                self.trunk[f"bb_update_{b}"] = ipa_pytorch.BackboneUpdate(
+                self.trunk[f"bb_update_{b}"] = BackboneUpdate(
                     self.cfg.c_s,
                     use_rot_updates=True,
                 )
@@ -80,7 +84,7 @@ class AttentionIPATrunk(nn.Module):
             # No edge update on the last block, unless specified.
             if b < self.cfg.num_blocks - 1 or self.perform_final_edge_update:
                 edge_in = self.cfg.c_z
-                self.trunk[f"edge_transition_{b}"] = ipa_pytorch.EdgeTransition(
+                self.trunk[f"edge_transition_{b}"] = EdgeTransition(
                     node_embed_size=self.cfg.c_s,
                     edge_embed_in=edge_in,
                     edge_embed_out=self.cfg.c_z,

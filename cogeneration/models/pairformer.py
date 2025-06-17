@@ -1,21 +1,38 @@
 # Adapted from Boltz-2
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
+import torch.utils.checkpoint as _ckpt
 from torch import Tensor, nn
 
-
+from cogeneration.config.base import ModelPairformerConfig
 from cogeneration.models.attention_pair_bias import AttentionPairBias
 from cogeneration.models.dropout import get_dropout_mask
 from cogeneration.models.transition import Transition
-from cogeneration.models.triangular_attention import TriangleAttentionStartingNode, \
-    TriangleAttentionEndingNode
-from cogeneration.models.triangular_mult import TriangleMultiplicationOutgoing, \
-    TriangleMultiplicationIncoming
+from cogeneration.models.triangular_attention import (
+    TriangleAttentionEndingNode,
+    TriangleAttentionStartingNode,
+)
+from cogeneration.models.triangular_mult import (
+    TriangleMultiplicationIncoming,
+    TriangleMultiplicationOutgoing,
+)
 
 # chunking constant
 CHUNK_SIZE_THRESHOLD = 384
+
+
+def _get_chunk_size(is_training: bool, edge_embed: torch.Tensor) -> Optional[int]:
+    if not is_training:
+        if edge_embed.shape[1] > CHUNK_SIZE_THRESHOLD:
+            chunk_size_tri_attn = 128
+        else:
+            chunk_size_tri_attn = 512
+    else:
+        chunk_size_tri_attn = None
+
+    return chunk_size_tri_attn
 
 
 class PairformerLayer(nn.Module):
@@ -23,178 +40,98 @@ class PairformerLayer(nn.Module):
 
     def __init__(
         self,
-        token_s: int,
-        token_z: int,
-        num_heads: int = 16,
-        dropout: float = 0.25,
-        pairwise_head_width: int = 32,
-        pairwise_num_heads: int = 4,
-        post_layer_norm: bool = False,
-    ) -> None:
+        cfg: ModelPairformerConfig,
+    ):
         super().__init__()
-        self.token_z = token_z
-        self.dropout = dropout
-        self.num_heads = num_heads
-        self.post_layer_norm = post_layer_norm
+        self.cfg = cfg
 
-        self.pre_norm_s = nn.LayerNorm(token_s)
-        self.attention = AttentionPairBias(token_s, token_z, num_heads)
+        self.pre_norm_s = nn.LayerNorm(self.cfg.node_dim)
+        self.attention = AttentionPairBias(
+            cfg=self.cfg.attention_pair_bias,
+        )
 
-        self.tri_mul_out = TriangleMultiplicationOutgoing(token_z)
-        self.tri_mul_in = TriangleMultiplicationIncoming(token_z)
+        self.tri_mul_out = TriangleMultiplicationOutgoing(dim=self.cfg.edge_dim)
+        self.tri_mul_in = TriangleMultiplicationIncoming(dim=self.cfg.edge_dim)
 
         self.tri_att_start = TriangleAttentionStartingNode(
-            token_z, pairwise_head_width, pairwise_num_heads, inf=1e9
+            c_in=self.cfg.edge_dim,
+            c_hidden=self.cfg.pairwise_head_width,
+            no_heads=self.cfg.pairwise_num_heads,
+            inf=1e9,
         )
         self.tri_att_end = TriangleAttentionEndingNode(
-            token_z, pairwise_head_width, pairwise_num_heads, inf=1e9
+            c_in=self.cfg.edge_dim,
+            c_hidden=self.cfg.pairwise_head_width,
+            no_heads=self.cfg.pairwise_num_heads,
+            inf=1e9,
         )
 
-        self.transition_s = Transition(token_s, token_s * 4)
-        self.transition_z = Transition(token_z, token_z * 4)
+        self.node_transition = Transition(
+            dim=self.cfg.node_dim, hidden=self.cfg.node_dim * 4
+        )
+        self.edge_transition = Transition(
+            dim=self.cfg.edge_dim, hidden=self.cfg.edge_dim * 4
+        )
 
-        self.s_post_norm = (
-            nn.LayerNorm(token_s) if self.post_layer_norm else nn.Identity()
+        self.node_post_norm = (
+            nn.LayerNorm(self.cfg.node_dim)
+            if self.cfg.post_layer_norm
+            else nn.Identity()
         )
 
     def forward(
         self,
-        s: Tensor,
-        z: Tensor,
-        mask: Tensor,
-        pair_mask: Tensor,
+        node_embed: Tensor,  # (B, N, node_dim)
+        edge_embed: Tensor,  # (B, N, N, edge_dim)
+        node_mask: Tensor,  # (B, N)
+        edge_mask: Tensor,  # (B, N, N)
+        # TODO(attn) - automatic chunk / kernel selection
         chunk_size_tri_attn: Optional[int] = None,
         use_kernels: bool = False,
         use_cuequiv_mul: bool = False,
         use_cuequiv_attn: bool = False,
     ) -> tuple[Tensor, Tensor]:
         # Compute pairwise stack
-        dropout = get_dropout_mask(self.dropout, z, self.training)
-        z = z + dropout * self.tri_mul_out(
-            z, mask=pair_mask, use_kernels=use_cuequiv_mul or use_kernels
+        dropout = get_dropout_mask(self.cfg.dropout, edge_embed, self.training)
+        edge_embed = edge_embed + dropout * self.tri_mul_out(
+            x=edge_embed, mask=edge_mask, use_kernels=use_cuequiv_mul or use_kernels
         )
 
-        dropout = get_dropout_mask(self.dropout, z, self.training)
-        z = z + dropout * self.tri_mul_in(
-            z, mask=pair_mask, use_kernels=use_cuequiv_mul or use_kernels
+        dropout = get_dropout_mask(self.cfg.dropout, edge_embed, self.training)
+        edge_embed = edge_embed + dropout * self.tri_mul_in(
+            x=edge_embed, mask=edge_mask, use_kernels=use_cuequiv_mul or use_kernels
         )
 
-        dropout = get_dropout_mask(self.dropout, z, self.training)
-        z = z + dropout * self.tri_att_start(
-            z,
-            mask=pair_mask,
+        dropout = get_dropout_mask(self.cfg.dropout, edge_embed, self.training)
+        edge_embed = edge_embed + dropout * self.tri_att_start(
+            x=edge_embed,
+            mask=edge_mask,
             chunk_size=chunk_size_tri_attn,
             use_kernels=use_cuequiv_attn or use_kernels,
         )
 
-        dropout = get_dropout_mask(self.dropout, z, self.training, columnwise=True)
-        z = z + dropout * self.tri_att_end(
-            z,
-            mask=pair_mask,
+        dropout = get_dropout_mask(
+            self.cfg.dropout, edge_embed, self.training, columnwise=True
+        )
+        edge_embed = edge_embed + dropout * self.tri_att_end(
+            x=edge_embed,
+            mask=edge_mask,
             chunk_size=chunk_size_tri_attn,
             use_kernels=use_cuequiv_attn or use_kernels,
         )
 
-        z = z + self.transition_z(z)
+        edge_embed = edge_embed + self.edge_transition(edge_embed)
 
         # Compute sequence stack
         with torch.autocast("cuda", enabled=False):
-            s_normed = self.pre_norm_s(s.float())
-            s = s.float() + self.attention(
-                s=s_normed, z=z.float(), mask=mask.float(), k_in=s_normed
+            s_normed = self.pre_norm_s(node_embed.float())
+            node_embed = node_embed.float() + self.attention(
+                s=s_normed, z=edge_embed.float(), mask=node_mask.float(), k_in=s_normed
             )
-            s = s + self.transition_s(s)
-            s = self.s_post_norm(s)
+            node_embed = node_embed + self.node_transition(node_embed)
+            node_embed = self.node_post_norm(node_embed)
 
-        return s, z
-
-
-class PairformerModule(nn.Module):
-    """Pairformer module."""
-
-    def __init__(
-        self,
-        token_s: int,
-        token_z: int,
-        num_blocks: int,
-        num_heads: int = 16,
-        dropout: float = 0.25,
-        pairwise_head_width: int = 32,
-        pairwise_num_heads: int = 4,
-        post_layer_norm: bool = False,
-        activation_checkpointing: bool = False,
-        **kwargs,
-    ) -> None:
-        super().__init__()
-        self.token_z = token_z
-        self.num_blocks = num_blocks
-        self.dropout = dropout
-        self.num_heads = num_heads
-        self.post_layer_norm = post_layer_norm
-        self.activation_checkpointing = activation_checkpointing
-
-        self.layers = nn.ModuleList()
-        for _ in range(num_blocks):
-            self.layers.append(
-                PairformerLayer(
-                    token_s,
-                    token_z,
-                    num_heads,
-                    dropout,
-                    pairwise_head_width,
-                    pairwise_num_heads,
-                    post_layer_norm,
-                ),
-            )
-
-    def forward(
-        self,
-        s: Tensor,
-        z: Tensor,
-        mask: Tensor,
-        pair_mask: Tensor,
-        use_kernels: bool = False,
-    ) -> tuple[Tensor, Tensor]:
-        """Perform the forward pass.
-
-        Parameters
-        ----------
-        s : Tensor
-            The sequence stack.
-        z : Tensor
-            The pairwise stack.
-        mask : Tensor
-            The mask.
-        pair_mask : Tensor
-            The pairwise mask.
-        use_kernels : bool
-            Whether to use kernels.
-
-        """
-        if not self.training:
-            if z.shape[1] > CHUNK_SIZE_THRESHOLD:
-                chunk_size_tri_attn = 128
-            else:
-                chunk_size_tri_attn = 512
-        else:
-            chunk_size_tri_attn = None
-
-        for layer in self.layers:
-            if self.activation_checkpointing and self.training:
-                s, z = torch.utils.checkpoint.checkpoint(
-                    layer,
-                    s,
-                    z,
-                    mask,
-                    pair_mask,
-                    chunk_size_tri_attn,
-                    use_kernels=use_kernels,
-                )
-            else:
-                s, z = layer(
-                    s, z, mask, pair_mask, chunk_size_tri_attn, use_kernels=use_kernels
-                )
-        return s, z
+        return node_embed, edge_embed
 
 
 class PairformerNoSeqLayer(nn.Module):
@@ -202,130 +139,159 @@ class PairformerNoSeqLayer(nn.Module):
 
     def __init__(
         self,
-        token_z: int,
-        dropout: float = 0.25,
-        pairwise_head_width: int = 32,
-        pairwise_num_heads: int = 4,
-        post_layer_norm: bool = False,
-    ) -> None:
+        cfg: ModelPairformerConfig,
+    ):
         super().__init__()
-        self.token_z = token_z
-        self.dropout = dropout
-        self.post_layer_norm = post_layer_norm
+        self.cfg = cfg
 
-        self.tri_mul_out = TriangleMultiplicationOutgoing(token_z)
-        self.tri_mul_in = TriangleMultiplicationIncoming(token_z)
+        self.tri_mul_out = TriangleMultiplicationOutgoing(dim=self.cfg.edge_dim)
+        self.tri_mul_in = TriangleMultiplicationIncoming(dim=self.cfg.edge_dim)
 
         self.tri_att_start = TriangleAttentionStartingNode(
-            token_z, pairwise_head_width, pairwise_num_heads, inf=1e9
+            c_in=self.cfg.edge_dim,
+            c_hidden=self.cfg.pairwise_head_width,
+            no_heads=self.cfg.pairwise_num_heads,
+            inf=1e9,
         )
         self.tri_att_end = TriangleAttentionEndingNode(
-            token_z, pairwise_head_width, pairwise_num_heads, inf=1e9
+            c_in=self.cfg.edge_dim,
+            c_hidden=self.cfg.pairwise_head_width,
+            no_heads=self.cfg.pairwise_num_heads,
+            inf=1e9,
         )
 
-        self.transition_z = Transition(token_z, token_z * 4)
+        self.transition_z = Transition(
+            dim=self.cfg.edge_dim, hidden=self.cfg.edge_dim * 4
+        )
 
     def forward(
         self,
-        z: Tensor,
-        pair_mask: Tensor,
+        edge_embed: Tensor,
+        edge_mask: Tensor,
         chunk_size_tri_attn: Optional[int] = None,
         use_kernels: bool = False,
         use_cuequiv_mul: bool = False,
         use_cuequiv_attn: bool = False,
     ) -> Tensor:
         # Compute pairwise stack
-        dropout = get_dropout_mask(self.dropout, z, self.training)
-        z = z + dropout * self.tri_mul_out(
-            z, mask=pair_mask, use_kernels=use_cuequiv_mul or use_kernels
+        dropout = get_dropout_mask(self.cfg.dropout, edge_embed, self.training)
+        edge_embed = edge_embed + dropout * self.tri_mul_out(
+            x=edge_embed, mask=edge_mask, use_kernels=use_cuequiv_mul or use_kernels
         )
 
-        dropout = get_dropout_mask(self.dropout, z, self.training)
-        z = z + dropout * self.tri_mul_in(
-            z, mask=pair_mask, use_kernels=use_cuequiv_mul or use_kernels
+        dropout = get_dropout_mask(self.cfg.dropout, edge_embed, self.training)
+        edge_embed = edge_embed + dropout * self.tri_mul_in(
+            x=edge_embed, mask=edge_mask, use_kernels=use_cuequiv_mul or use_kernels
         )
 
-        dropout = get_dropout_mask(self.dropout, z, self.training)
-        z = z + dropout * self.tri_att_start(
-            z,
-            mask=pair_mask,
+        dropout = get_dropout_mask(self.cfg.dropout, edge_embed, self.training)
+        edge_embed = edge_embed + dropout * self.tri_att_start(
+            x=edge_embed,
+            mask=edge_mask,
             chunk_size=chunk_size_tri_attn,
             use_kernels=use_cuequiv_attn or use_kernels,
         )
 
-        dropout = get_dropout_mask(self.dropout, z, self.training, columnwise=True)
-        z = z + dropout * self.tri_att_end(
-            z,
-            mask=pair_mask,
+        dropout = get_dropout_mask(self.cfg.dropout, edge_embed, self.training)
+        edge_embed = edge_embed + dropout * self.tri_att_end(
+            x=edge_embed,
+            mask=edge_mask,
             chunk_size=chunk_size_tri_attn,
             use_kernels=use_cuequiv_attn or use_kernels,
         )
 
-        z = z + self.transition_z(z)
-        return z
+        edge_embed = edge_embed + self.transition_z(edge_embed)
+        return edge_embed
 
 
-class PairformerNoSeqModule(nn.Module):
-    """Pairformer module without sequence track."""
+class PairformerModule(nn.Module):
+    """Pairformer module."""
 
     def __init__(
         self,
-        token_z: int,
-        num_blocks: int,
-        dropout: float = 0.25,
-        pairwise_head_width: int = 32,
-        pairwise_num_heads: int = 4,
-        post_layer_norm: bool = False,
-        activation_checkpointing: bool = False,
-        **kwargs,
-    ) -> None:
+        cfg: ModelPairformerConfig,
+    ):
         super().__init__()
-        self.token_z = token_z
-        self.num_blocks = num_blocks
-        self.dropout = dropout
-        self.post_layer_norm = post_layer_norm
-        self.activation_checkpointing = activation_checkpointing
+        self.cfg = cfg
 
-        self.layers = nn.ModuleList()
-        for i in range(num_blocks):
-            self.layers.append(
-                PairformerNoSeqLayer(
-                    token_z,
-                    dropout,
-                    pairwise_head_width,
-                    pairwise_num_heads,
-                    post_layer_norm,
-                ),
-            )
+        self.layers = nn.ModuleList(
+            [PairformerLayer(self.cfg) for _ in range(self.cfg.num_layers)]
+        )
 
     def forward(
         self,
-        z: Tensor,
-        pair_mask: Tensor,
+        node_embed: Tensor,
+        edge_embed: Tensor,
+        node_mask: Tensor,
+        edge_mask: Tensor,
+        # TODO(attn) - automatic chunk / kernel selection
         use_kernels: bool = False,
-    ) -> Tensor:
-        if not self.training:
-            if z.shape[1] > CHUNK_SIZE_THRESHOLD:
-                chunk_size_tri_attn = 128
-            else:
-                chunk_size_tri_attn = 512
-        else:
-            chunk_size_tri_attn = None
+    ) -> Tuple[Tensor, Tensor]:
+        chunk_size_tri_attn = _get_chunk_size(
+            is_training=self.training, edge_embed=edge_embed
+        )
 
         for layer in self.layers:
-            if self.activation_checkpointing and self.training:
-                z = torch.utils.checkpoint.checkpoint(
+            if self.cfg.checkpointing and self.training:
+                node_embed, edge_embed = torch.utils.checkpoint.checkpoint(
                     layer,
-                    z,
-                    pair_mask,
-                    chunk_size_tri_attn,
+                    node_embed=node_embed,
+                    edge_embed=edge_embed,
+                    node_mask=node_mask,
+                    edge_mask=edge_mask,
+                    chunk_size_tri_attn=chunk_size_tri_attn,
                     use_kernels=use_kernels,
                 )
             else:
-                z = layer(
-                    z,
-                    pair_mask,
-                    chunk_size_tri_attn,
+                node_embed, edge_embed = layer(
+                    node_embed=node_embed,
+                    edge_embed=edge_embed,
+                    node_mask=node_mask,
+                    edge_mask=edge_mask,
+                    chunk_size_tri_attn=chunk_size_tri_attn,
                     use_kernels=use_kernels,
                 )
-        return z
+
+        return node_embed, edge_embed
+
+
+class PairformerNoSeqModule(nn.Module):
+    """Stack of edge‑only Pairformer layers."""
+
+    def __init__(self, cfg: ModelPairformerConfig):
+        super().__init__()
+        self.cfg = cfg
+
+        self.layers = nn.ModuleList(
+            [PairformerNoSeqLayer(cfg) for _ in range(cfg.num_layers)]
+        )
+
+    def forward(
+        self,
+        edge_embed: Tensor,
+        edge_mask: Tensor,
+        # TODO(attn) - automatic chunk / kernel selection
+        use_kernels: bool = False,
+    ) -> torch.Tensor:
+        chunk_size_tri_attn = _get_chunk_size(
+            is_training=self.training, edge_embed=edge_embed
+        )
+
+        for layer in self.layers:
+            if self.cfg.checkpointing and self.training:
+                edge_embed = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    edge_embed=edge_embed,
+                    edge_mask=edge_mask,
+                    chunk_size_tri_attn=chunk_size_tri_attn,
+                    use_kernels=use_kernels,
+                )
+            else:
+                edge_embed = layer(
+                    edge_embed=edge_embed,
+                    edge_mask=edge_mask,
+                    chunk_size_tri_attn=chunk_size_tri_attn,
+                    use_kernels=use_kernels,
+                )
+
+        return edge_embed

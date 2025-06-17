@@ -55,33 +55,59 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
 - Pre-work
   - [x] update to python 3.2
 
-- New Modules
+- Add New Modules
   - [ ] Adopt FAPLM package to replace fair-esm
     - see branch `faplm`
-  - [ ] Adapt triangle attention from Boltz2 to project
+  - [x] Adapt triangle attention from Boltz2 to project
     - has some dependencies to work through
-  - [ ] Adapt `Pairformer` from Boltz2 to project
+  - [x] Adapt `Pairformer` from Boltz2 to project
     - has some dependencies to work through
   - ? FoldingBlocks from ESM3
     - is there any advantage to them over optimized blocks?
+  
+- Migrate new modules
+  - [x] variable names consistent
+  - [x] each major module has its own config
 
-- Speed up Modules
-  - [ ] FlashIPA / cuEquivariance wrapper
-  - [ ] env setup helper, e.g. set `CUQUI_ENABLE_BF16` etc.
+- [x] switch Attention block switch to create desired attention block
+  - [x] Base class / switch class with single interface
+  - [ ] easy way to pass config, update with number of layers, etc.
+    - may need to define default shared configs, and override?
+    - Don't want to re-define each one where may be used
+  - [x] implement `enabled` prop
+  - [x] be consistent which trunks have layer norm. 
+    - Maybe we just have a trunk factory that creates N blocks, given a factory function to make a block
+
+- Integrate new switch module
+  - [ ] Before IPA trunk
+  - [ ] in ESMCombiner
+  - [ ] in SequenceIPANet instead of IPA
+  
+- Speed up IPA
+  - [ ] FlashIPA
 
 - Support backlog
-  - expose `is_training` for dropout mask, or different values for training / inference
+  - [x] expose `training` / use pytorch prop for dropout mask, or different values for training / inference
+  - [ ] cuEquivariance env setup helper, e.g. set `CUQUI_ENABLE_BF16` etc.
 
 - Config
   - [ ] shared config `kernel` instead of only `local` option
     - Or, detect what is available and use helper throughout -- probably want explicit option
   - [x] `ESMCombiner` pair representation is optional, to enable flash attention
   - [ ] Enum to define block type for rep enrichment, shared default cfg for each 
-    - `IPA`, `Pairformer`, `DoublePairAttention`
-  
+    - `IPA`, `Pairformer`, `DoublePairAttention` 
+  - [ ] better group attention mechanism configs
+  - [ ] add more attn parameters to model hyper param config, e.g. num heads
+  - [ ] update `tiny` hyperparam config where appropriate
 
 - Tests
   - [ ] test model pass for each model configuration 
 
+- Clean up Modules
+  - [ ] Break up `models/` directory
+
 - [ ] `setup.py` optional dependencies in `[cuda]` extras
   - [ ] improve `torch` and `cuequivariance` install
+  - [ ] `pip install flash-attn --no-build-isolation`
+  
+- address TODO(attn)
