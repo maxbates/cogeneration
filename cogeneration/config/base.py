@@ -162,16 +162,6 @@ class ModelHyperParamsConfig(BaseClassConfig):
             pos_embed_max_len=2056,  # idk
         )
 
-    @classmethod
-    def esm2_150m(cls):
-        """Factory for configuration compatible with ESM-2 150M"""
-        return cls(
-            node_embed_size=640,
-            edge_embed_size=256,
-            pos_embed_size=128,
-            timestep_embed_size=128,
-        )
-
 
 @dataclass
 class ModelNodeFeaturesConfig(BaseClassConfig):

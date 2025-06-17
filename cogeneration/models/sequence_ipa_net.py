@@ -9,20 +9,16 @@ from cogeneration.data.rigid_utils import Rigid
 from cogeneration.models.aa_pred import BaseSequencePredictionNet
 from cogeneration.models.ipa_attention import AttentionIPATrunk
 
-# TODO(model) - consider a backwards predictor too, see Discrete Flow Matching
-#   as an alternative to purity sampling
-#   in practice, this will predict masks, but allow for "correction"
 
-# consider more interesting proability paths than just masking
-#   e.g. could you corrupt ranking by an independent language model’s perplexities
-#   (requires that LM can predict perplexities for partially masked sequences)
+# TODO variant using e.g. triangle attention.
+#   cheaper than IPA, since no bb updates.
 
 
 class SequenceIPANet(BaseSequencePredictionNet):
     """
     IPA-Attention style transformer to predict amino acid token logits.
 
-    Based very heavily on AttentionIPATrunk, except does not update backbone.
+    Uses ~ AttentionIPATrunk, except does not update backbone.
 
     Because the backbone is not updated, only the node and edge representations,
     and these representations have already gone through several IPA blocks,
