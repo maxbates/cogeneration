@@ -369,7 +369,7 @@ class TestFlowModule:
         cfg = Config.test_uninterpolated(tmp_path=tmp_path / "test").interpolate()
         assert cfg.model.esm_combiner.enabled, "ESM must be enabled"
         cfg, ckpt_path = mock_checkpoint(cfg=cfg)
-        ckpt = torch.load(ckpt_path)
+        ckpt = torch.load(ckpt_path, weights_only=False)
         assert any(
             "esm_combiner" in k for k in ckpt["state_dict"].keys()
         ), "ESM combiner not in checkpoint"

@@ -1268,7 +1268,9 @@ class Config(BaseClassConfig):
         # TODO(cfg) move to separate function
         if is_multiflow:
             ckpt = torch.load(
-                ckpt_path, map_location=torch.device("cpu"), weights_only=False
+                ckpt_path,
+                map_location=torch.device("cpu"),
+                weights_only=False,
             )
 
             # Define new checkpoint directory

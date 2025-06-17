@@ -1159,7 +1159,8 @@ def torsion_mask_from_sequence(seq: torch.Tensor) -> torch.Tensor:
     Returns:
         (N, 7, 2) or (B, N, 7, 2) boolean tensor: mask for [φ, ψ, ω, χ1, χ2, χ3, χ4].
     """
-    mask = TORSION_MASK_LUT[seq]  # broadcasted (B?, N, 7)
+    lut = TORSION_MASK_LUT.to(seq.device)
+    mask = lut[seq]  # broadcasted (B?, N, 7)
     return mask[..., None].expand(*mask.shape, 2)  # (B?, N, 7, 2)
 
 
