@@ -16,16 +16,7 @@ from scipy.stats import truncnorm
 from cogeneration.config.base import ModelIPAConfig
 from cogeneration.data import all_atom
 from cogeneration.data.rigid_utils import Rigid
-
-
-def permute_final_dims(tensor: torch.Tensor, inds: List[int]):
-    zero_index = -1 * len(inds)
-    first_inds = list(range(len(tensor.shape[:zero_index])))
-    return tensor.permute(first_inds + [zero_index + i for i in inds])
-
-
-def flatten_final_dims(t: torch.Tensor, no_dims: int):
-    return t.reshape(t.shape[:-no_dims] + (-1,))
+from cogeneration.data.tensor_utils import permute_final_dims, flatten_final_dims
 
 
 def ipa_point_weights_init_(weights):
@@ -127,6 +118,7 @@ class Linear(nn.Linear):
         bias: bool = True,
         init: str = "default",
         init_fn: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
+            precision=None,
     ):
         """
         Args:
@@ -139,7 +131,7 @@ class Linear(nn.Linear):
             init:
                 The initializer to use. Choose from:
 
-                "default": LeCun fan-in truncated normal initialization
+                "default" or "lecun": LeCun fan-in truncated normal initialization
                 "relu": He initialization w/ truncated normal distribution
                 "glorot": Fan-average Glorot uniform initialization
                 "gating": Weights=0, Bias=1
@@ -162,6 +154,8 @@ class Linear(nn.Linear):
         else:
             if init == "default":
                 lecun_normal_init_(self.weight)
+            elif init == "lecun":
+                lecun_normal_init_(self.weight)
             elif init == "relu":
                 he_normal_init_(self.weight)
             elif init == "glorot":
@@ -177,6 +171,63 @@ class Linear(nn.Linear):
                 final_init_(self.weight)
             else:
                 raise ValueError("Invalid init string.")
+
+        self.precision = precision
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        d = input.dtype
+        if self.precision is not None:
+            with torch.autocast("cuda", enabled=False):
+                bias = (
+                    self.bias.to(dtype=self.precision)
+                    if self.bias is not None
+                    else None
+                )
+                return nn.functional.linear(
+                    input.to(dtype=self.precision),
+                    self.weight.to(dtype=self.precision),
+                    bias,
+                ).to(dtype=d)
+
+        if d is torch.bfloat16:
+            with torch.autocast("cuda", enabled=False):
+                bias = self.bias.to(dtype=d) if self.bias is not None else None
+                return nn.functional.linear(input, self.weight.to(dtype=d), bias)
+
+        return nn.functional.linear(input, self.weight, self.bias)
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, c_in, eps=1e-5):
+        super(LayerNorm, self).__init__()
+
+        self.c_in = (c_in,)
+        self.eps = eps
+
+        self.weight = nn.Parameter(torch.ones(c_in))
+        self.bias = nn.Parameter(torch.zeros(c_in))
+
+    def forward(self, x):
+        d = x.dtype
+        if d is torch.bfloat16:
+            with torch.autocast("cuda", enabled=False):
+                out = nn.functional.layer_norm(
+                    x,
+                    self.c_in,
+                    self.weight.to(dtype=d),
+                    self.bias.to(dtype=d),
+                    self.eps,
+                )
+        else:
+            out = nn.functional.layer_norm(
+                x,
+                self.c_in,
+                self.weight,
+                self.bias,
+                self.eps,
+            )
+
+        return out
 
 
 class StructureModuleTransition(nn.Module):

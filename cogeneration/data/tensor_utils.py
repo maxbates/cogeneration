@@ -288,6 +288,8 @@ def chunk_layer(
     chunk_size: int,
     no_batch_dims: int,
     low_mem: bool = False,
+    _out: Any = None,
+    _add_into_out: bool = False,
 ) -> Any:
     """
     Implements the "chunking" procedure described in section 1.11.8.
@@ -333,6 +335,10 @@ def chunk_layer(
         return t
 
     prepped_inputs = tensor_tree_map(_prep_inputs, inputs)
+    prepped_outputs = None
+    if _out is not None:
+        reshape_fn = lambda t: t.view([-1] + list(t.shape[no_batch_dims:]))
+        prepped_outputs = tensor_tree_map(reshape_fn, _out)
 
     flat_batch_dim = 1
     for d in orig_batch_dims:
@@ -341,7 +347,7 @@ def chunk_layer(
     no_chunks = flat_batch_dim // chunk_size + (flat_batch_dim % chunk_size != 0)
 
     i = 0
-    out = None
+    out = prepped_outputs
     for _ in range(no_chunks):
         # Chunk the input
         if not low_mem:
@@ -373,14 +379,23 @@ def chunk_layer(
                     if type(v) is dict:
                         assign(v, d2[k])
                     else:
-                        v[i : i + chunk_size] = d2[k]
+                        if _add_into_out:
+                            v[i : i + chunk_size] += d2[k]
+                        else:
+                            v[i : i + chunk_size] = d2[k]
 
             assign(out, output_chunk)
         elif out_type is tuple:
             for x1, x2 in zip(out, output_chunk):
-                x1[i : i + chunk_size] = x2
+                if _add_into_out:
+                    x1[i : i + chunk_size] += x2
+                else:
+                    x1[i : i + chunk_size] = x2
         elif out_type is torch.Tensor:
-            out[i : i + chunk_size] = output_chunk
+            if _add_into_out:
+                out[i : i + chunk_size] += output_chunk
+            else:
+                out[i : i + chunk_size] = output_chunk
         else:
             raise ValueError("Not supported")
 

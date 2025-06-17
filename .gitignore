@@ -1,3 +1,4 @@
+__pycache__
 .idea
 .cache
 ckpt
@@ -9,3 +10,4 @@ inference_outputs
 multiflow_weights
 multiflow_weights_mapped
 boltz
+*.egg-info

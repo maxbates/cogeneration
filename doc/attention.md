@@ -52,6 +52,9 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
 
 ## Implementation
 
+- Pre-work
+  - [x] update to python 3.2
+
 - New Modules
   - [ ] Adopt FAPLM package to replace fair-esm
     - see branch `faplm`
@@ -66,9 +69,12 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
   - [ ] FlashIPA / cuEquivariance wrapper
   - [ ] env setup helper, e.g. set `CUQUI_ENABLE_BF16` etc.
 
+- Support backlog
+  - expose `is_training` for dropout mask, or different values for training / inference
+
 - Config
   - [ ] shared config `kernel` instead of only `local` option
-    - Or, detect what is available and use helper throughout
+    - Or, detect what is available and use helper throughout -- probably want explicit option
   - [x] `ESMCombiner` pair representation is optional, to enable flash attention
   - [ ] Enum to define block type for rep enrichment, shared default cfg for each 
     - `IPA`, `Pairformer`, `DoublePairAttention`
@@ -78,3 +84,4 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
   - [ ] test model pass for each model configuration 
 
 - [ ] `setup.py` optional dependencies in `[cuda]` extras
+  - [ ] improve `torch` and `cuequivariance` install
