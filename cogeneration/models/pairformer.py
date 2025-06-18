@@ -214,9 +214,10 @@ class PairformerModule(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        self.layers = nn.ModuleList(
-            [PairformerLayer(self.cfg) for _ in range(self.cfg.num_layers)]
-        )
+        if self.cfg.num_layers > 0:
+            self.layers = nn.ModuleList(
+                [PairformerLayer(self.cfg) for _ in range(self.cfg.num_layers)]
+            )
 
     def forward(
         self,
@@ -227,6 +228,9 @@ class PairformerModule(nn.Module):
         # TODO(attn) - automatic chunk / kernel selection
         use_kernels: bool = False,
     ) -> Tuple[Tensor, Tensor]:
+        if self.cfg.num_layers < 1:
+            return node_embed, edge_embed
+
         chunk_size_tri_attn = _get_chunk_size(
             is_training=self.training, edge_embed=edge_embed
         )
@@ -262,9 +266,10 @@ class PairformerNoSeqModule(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        self.layers = nn.ModuleList(
-            [PairformerNoSeqLayer(cfg) for _ in range(cfg.num_layers)]
-        )
+        if self.cfg.num_layers > 0:
+            self.layers = nn.ModuleList(
+                [PairformerNoSeqLayer(cfg) for _ in range(cfg.num_layers)]
+            )
 
     def forward(
         self,
@@ -273,6 +278,9 @@ class PairformerNoSeqModule(nn.Module):
         # TODO(attn) - automatic chunk / kernel selection
         use_kernels: bool = False,
     ) -> torch.Tensor:
+        if self.cfg.num_layers < 1:
+            return edge_embed
+
         chunk_size_tri_attn = _get_chunk_size(
             is_training=self.training, edge_embed=edge_embed
         )

@@ -138,6 +138,7 @@ class ModelHyperParamsConfig(BaseClassConfig):
     https://hydra.cc/docs/tutorials/structured_config/defaults/
     """
 
+    # dimensions
     node_embed_size: int = 256
     edge_embed_size: int = 128
     aa_num_tokens: int = 21  # number of amino acid types (if masking), 21 = mask/UNK
@@ -145,6 +146,10 @@ class ModelHyperParamsConfig(BaseClassConfig):
     pos_embed_method: PositionalEmbeddingMethod = PositionalEmbeddingMethod.rotary
     pos_embed_max_len: int = 2048
     timestep_embed_size: int = 128
+    # layers
+    trunk_num_layers: int = 8  # 0 to disable
+    ipa_num_layers: int = 6  # > 1
+    seq_trunk_num_layers: int = 4  # 0 to disable
 
     @classmethod
     def tiny(cls):
@@ -154,6 +159,10 @@ class ModelHyperParamsConfig(BaseClassConfig):
             edge_embed_size=4,
             pos_embed_size=4,
             timestep_embed_size=4,
+            # small attention networks
+            trunk_num_layers=1,
+            ipa_num_layers=1,
+            seq_trunk_num_layers=1,
         )
 
     @classmethod
@@ -166,6 +175,10 @@ class ModelHyperParamsConfig(BaseClassConfig):
             timestep_embed_size=128,
             pos_embed_method=PositionalEmbeddingMethod.sine_cosine,
             pos_embed_max_len=2056,  # idk
+            # only IPA trunk
+            trunk_num_layers=0,
+            ipa_num_layers=8,
+            seq_trunk_num_layers=0,
         )
 
 
@@ -228,26 +241,16 @@ class ModelEdgeFeaturesConfig(BaseClassConfig):
     embed_diffuse_mask: bool = True
 
 
-class AttentionType(StrEnum):
-    NONE = "none"  # identity
-    PAIR_BIAS = "pair_bias"  # AttentionPairBias (node only)
-    DOUBLE_AXIS = "double_axis"  # DoubleAxisAttentionModule (edge only)
-    PAIRFORMER = "pairformer"  # PairformerModule (node + edge)
-    PAIRFORMER_NO_SEQ = "pairformer_no_seq"  # PairformerNoSeqModule (edge only)
-    IPA = "ipa"  # Invariant Point Attention Trunk (node + edge, frames skipped here)
-
-
 @dataclass
 class ModelAttentionPairBiasConfig(BaseClassConfig):
     """Config for a stack of AttentionPairBias layers."""
 
+    # number of blocks in series, 0 to disable
+    num_layers: int = "${model.hyper_params.trunk_num_layers}"
     node_dim: int = "${model.hyper_params.node_embed_size}"
     edge_dim: int = "${model.hyper_params.edge_embed_size}"
     num_heads: int = 4
     compute_pair_bias: bool = True
-
-    # trunk
-    num_layers: int = 4
 
 
 @dataclass
@@ -257,7 +260,7 @@ class ModelDoubleAttentionPairConfig(BaseClassConfig):
     """
 
     # number of blocks in series, 0 to disable
-    num_blocks: int = 4
+    num_layers: int = "${model.hyper_params.trunk_num_layers}"
     # input dim
     edge_embed_size: int = "${model.hyper_params.edge_embed_size}"
     # reduced dim D for gather/distribute
@@ -269,6 +272,8 @@ class ModelDoubleAttentionPairConfig(BaseClassConfig):
 
 @dataclass
 class ModelPairformerConfig(BaseClassConfig):
+    # number of blocks, 0 to disable
+    num_layers: int = "${model.hyper_params.trunk_num_layers}"
     node_dim: int = "${model.hyper_params.node_embed_size}"  # aka token_s
     edge_dim: int = "${model.hyper_params.edge_embed_size}"  # aka token_z
     dropout: float = 0.1
@@ -281,8 +286,6 @@ class ModelPairformerConfig(BaseClassConfig):
     chunk_size_tri_attn: int = 512  # chunking/tiling for large sequences
     use_kernels: bool = True  # cuEquiv if available  # TODO(attn) automatic
     checkpointing: bool = False  # torch.utils.checkpoint on every layer
-    # trunk
-    num_layers: int = 8
 
 
 @dataclass
@@ -302,11 +305,52 @@ class ModelIPAConfig(BaseClassConfig):
     no_qk_points: int = 8
     no_v_points: int = 12
     # Attention trunk parameters
-    num_blocks: int = 8
+    num_layers: int = "${model.hyper_params.ipa_num_layers}"
     dropout: float = 0.0
     seq_tfmr_num_heads: int = 4
     seq_tfmr_num_layers: int = 4
     transformer_dropout: float = 0.2
+
+
+class AttentionType(StrEnum):
+    NONE = "none"  # identity
+    PAIR_BIAS = "pair_bias"  # AttentionPairBias (node only)
+    DOUBLE = "double"  # DoubleAttentionPairBlock (edge only)
+    PAIRFORMER = "pairformer"  # PairformerModule (node + edge)
+    PAIRFORMER_NO_SEQ = "pairformer_no_seq"  # PairformerNoSeqModule (edge only)
+    IPA = "ipa"  # Invariant Point Attention Trunk (node + edge, frames skipped here)
+
+
+@dataclass
+class ModelAttentionConfig(BaseClassConfig):
+    """Gather all default attention configurations"""
+
+    pair_bias: ModelAttentionPairBiasConfig = field(
+        default_factory=ModelAttentionPairBiasConfig
+    )
+    double_attention_pair: ModelDoubleAttentionPairConfig = field(
+        default_factory=ModelDoubleAttentionPairConfig
+    )
+    pairformer: ModelPairformerConfig = field(default_factory=ModelPairformerConfig)
+    ipa: ModelIPAConfig = field(default_factory=ModelIPAConfig)
+
+
+@dataclass
+class ModelAttentionTrunkConfig(BaseClassConfig):
+    """
+    Configuration for attention trunks. Note more than 1 trunk.
+    """
+
+    attn_type: AttentionType = AttentionType.PAIRFORMER
+    num_layers: int = 4
+    node_dim: int = "${model.hyper_params.node_embed_size}"
+    edge_dim: int = "${model.hyper_params.edge_embed_size}"
+    pre_add_init_embed: bool = False
+    pre_node_layer_norm: bool = False
+    pre_edge_layer_norm: bool = False
+    post_add_init_embed: bool = False
+    post_node_layer_norm: bool = False
+    post_edge_layer_norm: bool = False
 
 
 class ModelESMKey(StrEnum):
@@ -346,6 +390,14 @@ class ModelESMCombinerConfig(BaseClassConfig):
     esm_proj_pair_dim: int = "${model.hyper_params.edge_embed_size}"
     # hidden size inside the tiny MLP used for projection
     mlp_proj_hidden_dim: int = "${model.hyper_params.node_embed_size}"
+
+
+class ModelSequencePredictionEnum(StrEnum):
+    NOOP = "noop"  # simply emit aatypes
+    aa_pred = "aa_pred"  # Simple MLP as in public MultiFlow
+    sequence_ipa_net = (
+        "sequence_ipa_net"  # transformer architecture  # TODO(attn) remove
+    )
 
 
 @dataclass
@@ -393,17 +445,12 @@ class ModelSequenceIPANetConfig(BaseClassConfig):
     use_init_embed: bool = True
     # IPA parameters
     # We use fewer blocks, because no backbone updates are performed
+    # TODO(attn) remove
     ipa: ModelIPAConfig = field(
         default_factory=lambda: ModelIPAConfig(
-            num_blocks=2,
+            num_layers=2,
         )
     )
-
-
-class ModelSequencePredictionEnum(StrEnum):
-    NOOP = "noop"  # simply emit aatypes
-    aa_pred = "aa_pred"  # public MultiFlow. Simple MLP.
-    sequence_ipa_net = "sequence_ipa_net"  # IPA transformer architecture
 
 
 @dataclass
@@ -444,6 +491,17 @@ class ModelConfig(BaseClassConfig):
         default_factory=ModelEdgeFeaturesConfig
     )
     esm_combiner: ModelESMCombinerConfig = field(default_factory=ModelESMCombinerConfig)
+    attention: ModelAttentionConfig = field(default_factory=ModelAttentionConfig)
+    trunk: ModelAttentionTrunkConfig = field(
+        default_factory=lambda: ModelAttentionTrunkConfig(
+            attn_type=AttentionType.PAIRFORMER,
+            num_layers="${model.hyper_params.trunk_num_layers}",
+            # add back time + position information after trunk before IPA, per FoldFlow-2.
+            post_add_init_embed="${ternary:${greater_than: ${model.hyper_params.trunk_num_layers}, 0}, True, False}",
+            post_node_layer_norm="${ternary:${greater_than: ${model.hyper_params.trunk_num_layers}, 0}, True, False}",
+            post_edge_layer_norm="${ternary:${greater_than: ${model.hyper_params.trunk_num_layers}, 0}, True, False}",
+        )
+    )
     ipa: ModelIPAConfig = field(default_factory=ModelIPAConfig)
 
     # B-factors, confidence (pLDDT)
@@ -454,6 +512,16 @@ class ModelConfig(BaseClassConfig):
     # These torsions are then filled to (B, N, 7, 2) by interpolant.
     predict_psi_torsions: bool = True  # -> 1 (psi): orients peptide plane & side chain
     predict_all_torsions: bool = True  # -> 7 angles: omega, phi, psi, chi1-chi4
+
+    seq_trunk: ModelAttentionTrunkConfig = field(
+        default_factory=lambda: ModelAttentionTrunkConfig(
+            attn_type=AttentionType.PAIRFORMER,
+            num_layers="${model.hyper_params.seq_trunk_num_layers}",
+            # assume helpful to pass though of time / positional embeddings.
+            # skip layer norm and just run trunk.
+            pre_add_init_embed="${ternary:${greater_than: ${model.hyper_params.seq_trunk_num_layers}, 0}, True, False}",
+        )
+    )
 
     # sequence prediction, default is simple aa_pred matching MultiFlow
     sequence_pred_type: ModelSequencePredictionEnum = (
@@ -1354,9 +1422,7 @@ class Config(BaseClassConfig):
         raw_cfg.model.edge_features.feat_dim = 8
         # and smaller transformers
         raw_cfg.model.ipa.no_heads = 2
-        raw_cfg.model.ipa.num_blocks = 2
         raw_cfg.model.sequence_ipa_net.ipa.no_heads = 2
-        raw_cfg.model.sequence_ipa_net.ipa.num_blocks = 1
 
         # filter to small PDBs for faster model + sampling
         raw_cfg.dataset.debug_head_samples = 1000

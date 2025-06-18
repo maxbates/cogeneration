@@ -21,6 +21,11 @@ OmegaConf.register_new_resolver(
     lambda x, y: x == y,
     replace=True,
 )
+OmegaConf.register_new_resolver(
+    "greater_than",
+    lambda x, y: x > y,
+    replace=True,
+)
 
 # now timestamp (used in Public Multiflow, needed to load ckpt)
 OmegaConf.register_new_resolver(

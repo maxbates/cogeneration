@@ -71,34 +71,39 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
 
 - [x] switch Attention block switch to create desired attention block
   - [x] Base class / switch class with single interface
-  - [ ] easy way to pass config, update with number of layers, etc.
-    - may need to define default shared configs, and override?
-    - Don't want to re-define each one where may be used
   - [x] implement `enabled` prop
   - [x] be consistent which trunks have layer norm. 
     - Maybe we just have a trunk factory that creates N blocks, given a factory function to make a block
 
-- Integrate new switch module
-  - [ ] Before IPA trunk
-  - [ ] in ESMCombiner
-  - [ ] in SequenceIPANet instead of IPA
+
+- Integrate new trunk switch module
+  - [ ] after ESMCombiner, before IPA trunk
+  - [ ] before SequenceIPANet
+    - [ ]  drop this module + config etc., use existing aa pred net MLP
   
 - Speed up IPA
-  - [ ] FlashIPA
+  - [ ] FlashIPA import 
+  - [ ] wrapper to patch IPA?
 
 - Support backlog
   - [x] expose `training` / use pytorch prop for dropout mask, or different values for training / inference
   - [ ] cuEquivariance env setup helper, e.g. set `CUQUI_ENABLE_BF16` etc.
 
 - Config
+  - [x] easy way to pass config, update with number of layers, etc.
+    - may need to define default shared configs, and override?
+    - Don't want to re-define each one where may be used
+  - [x] ensure generic way to specify node_dim and edge_dim
+  - [x] let's define a single `model.attention` with subconfig for each attention type
+  - [x] then define 2 trunks, pre IPA and pre AA pred, each which takes a type + num layers
+  - [x] better group attention mechanism configs
+  - [ ] add more attn parameters to model hyper param config, e.g. num heads
   - [ ] shared config `kernel` instead of only `local` option
     - Or, detect what is available and use helper throughout -- probably want explicit option
   - [x] `ESMCombiner` pair representation is optional, to enable flash attention
-  - [ ] Enum to define block type for rep enrichment, shared default cfg for each 
-    - `IPA`, `Pairformer`, `DoublePairAttention` 
-  - [ ] better group attention mechanism configs
-  - [ ] add more attn parameters to model hyper param config, e.g. num heads
-  - [ ] update `tiny` hyperparam config where appropriate
+  - [x] Enum to define block type for rep enrichment, shared default cfg for each 
+    - `IPA`, `Pairformer`, `DoublePairAttention`
+  - [x] update `tiny` hyperparam config where appropriate
 
 - Tests
   - [ ] test model pass for each model configuration 

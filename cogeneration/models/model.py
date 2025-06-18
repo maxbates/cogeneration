@@ -138,6 +138,9 @@ class FlowModel(nn.Module):
         else:
             node_embed, edge_embed = init_node_embed, init_edge_embed
 
+        # TODO(attn) pairformer trunk. Remove from ESM combiner?
+        #   add back init_edge_embed after trunk
+
         # IPA trunk - note works in nm scale, not angstroms
         node_embed, edge_embed, pred_rigids_nm, pred_torsions = (
             self.attention_ipa_trunk(

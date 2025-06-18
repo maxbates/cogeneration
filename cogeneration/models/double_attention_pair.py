@@ -95,7 +95,7 @@ class DoubleAttentionPairTrunk(nn.Module):
     """
 
     def __init__(
-        self, cfg: ModelDoubleAttentionPairConfig, final_layer_norm: bool
+        self, cfg: ModelDoubleAttentionPairConfig, final_layer_norm: bool = False
     ) -> None:
         super().__init__()
         self.cfg = cfg
@@ -103,7 +103,7 @@ class DoubleAttentionPairTrunk(nn.Module):
 
         if self.enabled:
             self.blocks = nn.ModuleList(
-                [DoubleAttentionPairBlock(cfg) for _ in range(cfg.num_blocks)]
+                [DoubleAttentionPairBlock(cfg) for _ in range(cfg.num_layers)]
             )
 
             if final_layer_norm:
@@ -114,7 +114,7 @@ class DoubleAttentionPairTrunk(nn.Module):
 
     @property
     def enabled(self):
-        return self.cfg.num_blocks > 0
+        return self.cfg.num_layers > 0
 
     def forward(
         self,

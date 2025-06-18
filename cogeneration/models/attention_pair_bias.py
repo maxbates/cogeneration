@@ -111,7 +111,9 @@ class AttentionPairBias(nn.Module):
 class AttentionPairBiasTrunk(nn.Module):
     """Stacked Attention-Pair-Bias layers acting on node embeddings."""
 
-    def __init__(self, cfg: ModelAttentionPairBiasConfig, final_layer_norm=False):
+    def __init__(
+        self, cfg: ModelAttentionPairBiasConfig, final_layer_norm: bool = False
+    ):
         super().__init__()
         self.cfg = cfg
         self.final_layer_norm = final_layer_norm
