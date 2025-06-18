@@ -6,7 +6,7 @@ from einops.layers.torch import Rearrange
 from torch import Tensor, nn
 
 from cogeneration.config.base import ModelAttentionPairBiasConfig
-from cogeneration.models.ipa_pytorch import Linear
+from cogeneration.models.attention.ipa_pytorch import Linear
 
 
 class AttentionPairBias(nn.Module):

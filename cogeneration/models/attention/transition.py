@@ -4,7 +4,7 @@ from typing import Optional
 
 from torch import Tensor, nn
 
-from cogeneration.models.ipa_pytorch import LayerNorm, Linear
+from cogeneration.models.attention.ipa_pytorch import LayerNorm, Linear
 
 
 class Transition(nn.Module):

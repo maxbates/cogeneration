@@ -4,12 +4,12 @@ from cogeneration.config.base import ModelConfig, ModelSequencePredictionEnum
 from cogeneration.data.const import rigids_ang_to_nm, rigids_nm_to_ang
 from cogeneration.data.rigid import create_rigid
 from cogeneration.models.aa_pred import AminoAcidNOOPNet, AminoAcidPredictionNet
-from cogeneration.models.attention_trunk import AttentionTrunk
+from cogeneration.models.attention.attention_trunk import AttentionTrunk
+from cogeneration.models.attention.ipa_attention import AttentionIPATrunk
 from cogeneration.models.bfactors import BFactorModule
 from cogeneration.models.confidence import PLDDTModule
 from cogeneration.models.edge_feature_net import EdgeFeatureNet
 from cogeneration.models.esm_combiner import ESMCombinerNetwork
-from cogeneration.models.ipa_attention import AttentionIPATrunk
 from cogeneration.models.node_feature_net import NodeFeatureNet
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import ModelPrediction

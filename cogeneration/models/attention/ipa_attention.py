@@ -5,8 +5,8 @@ import torch.nn as nn
 
 from cogeneration.config.base import ModelIPAConfig
 from cogeneration.data.rigid_utils import Rigid
-from cogeneration.models import ipa_pytorch
-from cogeneration.models.ipa_pytorch import (
+from cogeneration.models.attention import ipa_pytorch
+from cogeneration.models.attention.ipa_pytorch import (
     BackboneUpdate,
     EdgeTransition,
     Linear,

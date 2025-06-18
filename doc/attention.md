@@ -110,7 +110,7 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
   - [x] test model pass for each model configuration 
 
 - Clean up Modules
-  - [ ] Break up `models/` directory
+  - [x] Break up `models/` directory
 
 - [ ] `setup.py` optional dependencies in `[cuda]` extras
   - [ ] improve `torch` and `cuequivariance` install

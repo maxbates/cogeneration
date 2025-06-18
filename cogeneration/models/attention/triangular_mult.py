@@ -5,7 +5,7 @@ import torch
 from cuequivariance_torch.primitives.triangle import triangle_multiplicative_update
 from torch import Tensor, nn
 
-from cogeneration.models.ipa_pytorch import LayerNorm, Linear
+from cogeneration.models.attention.ipa_pytorch import LayerNorm, Linear
 
 
 @torch.compiler.disable

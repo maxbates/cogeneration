@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -13,10 +13,13 @@ from cogeneration.config.base import (
     ModelPairformerConfig,
 )
 from cogeneration.data.rigid import Rigid
-from cogeneration.models.attention_pair_bias import AttentionPairBiasTrunk
-from cogeneration.models.double_attention_pair import DoubleAttentionPairTrunk
-from cogeneration.models.ipa_attention import AttentionIPATrunk
-from cogeneration.models.pairformer import PairformerModule, PairformerNoSeqModule
+from cogeneration.models.attention.attention_pair_bias import AttentionPairBiasTrunk
+from cogeneration.models.attention.double_attention_pair import DoubleAttentionPairTrunk
+from cogeneration.models.attention.ipa_attention import AttentionIPATrunk
+from cogeneration.models.attention.pairformer import (
+    PairformerModule,
+    PairformerNoSeqModule,
+)
 
 
 class AttentionTrunk(nn.Module):

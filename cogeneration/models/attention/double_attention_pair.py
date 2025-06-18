@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from cogeneration.config.base import ModelDoubleAttentionPairConfig
-from cogeneration.models.ipa_pytorch import Linear
+from cogeneration.models.attention.ipa_pytorch import Linear
 
 
 class DoubleAttentionPairBlock(nn.Module):

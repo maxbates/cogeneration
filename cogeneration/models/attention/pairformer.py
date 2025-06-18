@@ -7,14 +7,14 @@ import torch.utils.checkpoint as _ckpt
 from torch import Tensor, nn
 
 from cogeneration.config.base import ModelPairformerConfig
-from cogeneration.models.attention_pair_bias import AttentionPairBias
-from cogeneration.models.dropout import get_dropout_mask
-from cogeneration.models.transition import Transition
-from cogeneration.models.triangular_attention import (
+from cogeneration.models.attention.attention_pair_bias import AttentionPairBias
+from cogeneration.models.attention.dropout import get_dropout_mask
+from cogeneration.models.attention.transition import Transition
+from cogeneration.models.attention.triangular_attention import (
     TriangleAttentionEndingNode,
     TriangleAttentionStartingNode,
 )
-from cogeneration.models.triangular_mult import (
+from cogeneration.models.attention.triangular_mult import (
     TriangleMultiplicationIncoming,
     TriangleMultiplicationOutgoing,
 )

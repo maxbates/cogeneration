@@ -17,7 +17,7 @@
 
 import math
 from functools import partial, partialmethod
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -28,7 +28,7 @@ from cogeneration.data.tensor_utils import (
     flatten_final_dims,
     permute_final_dims,
 )
-from cogeneration.models.ipa_pytorch import LayerNorm, Linear
+from cogeneration.models.attention.ipa_pytorch import LayerNorm, Linear
 
 
 @torch.jit.ignore
