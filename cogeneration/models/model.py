@@ -4,13 +4,13 @@ from cogeneration.config.base import ModelConfig, ModelSequencePredictionEnum
 from cogeneration.data.const import rigids_ang_to_nm, rigids_nm_to_ang
 from cogeneration.data.rigid import create_rigid
 from cogeneration.models.aa_pred import AminoAcidNOOPNet, AminoAcidPredictionNet
+from cogeneration.models.attention_trunk import AttentionTrunk
 from cogeneration.models.bfactors import BFactorModule
 from cogeneration.models.confidence import PLDDTModule
 from cogeneration.models.edge_feature_net import EdgeFeatureNet
 from cogeneration.models.esm_combiner import ESMCombinerNetwork
 from cogeneration.models.ipa_attention import AttentionIPATrunk
 from cogeneration.models.node_feature_net import NodeFeatureNet
-from cogeneration.models.sequence_ipa_net import SequenceIPANet
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import ModelPrediction
 from cogeneration.type.batch import NoisyBatchProp as nbp
@@ -36,32 +36,25 @@ class FlowModel(nn.Module):
         super(FlowModel, self).__init__()
         self.cfg = cfg
 
+        # Input + conditioning embedding
         self.node_feature_net = NodeFeatureNet(cfg.node_features)
         self.edge_feature_net = EdgeFeatureNet(cfg.edge_features)
-
-        # sequence prediction sub-module
-        if self.cfg.sequence_pred_type == ModelSequencePredictionEnum.NOOP:
-            self.aa_pred_net = AminoAcidNOOPNet(cfg.aa_pred)
-        elif self.cfg.sequence_pred_type == ModelSequencePredictionEnum.aa_pred:
-            self.aa_pred_net = AminoAcidPredictionNet(cfg.aa_pred)
-        elif (
-            self.cfg.sequence_pred_type == ModelSequencePredictionEnum.sequence_ipa_net
-        ):
-            self.aa_pred_net = SequenceIPANet(cfg.sequence_ipa_net)
-        else:
-            raise ValueError(
-                f"Invalid sequence prediction type: {self.cfg.sequence_pred_type}"
-            )
 
         # ESM + combiner
         if self.cfg.esm_combiner.enabled:
             self.esm_combiner = ESMCombinerNetwork(cfg=self.cfg.esm_combiner)
 
+        # Attention Trunk
+        if self.cfg.trunk.enabled:
+            self.trunk = AttentionTrunk(
+                cfg=self.cfg.trunk,
+                attn_cfg=self.cfg.attention,
+            )
+
         # IPA trunk
-        # Whether we perform final edge update depends on if used by aa_pred_net
-        self.attention_ipa_trunk = AttentionIPATrunk(
+        self.ipa_trunk = AttentionIPATrunk(
             cfg=cfg.ipa,
-            perform_final_edge_update=self.aa_pred_net.uses_edge_embed,
+            perform_final_edge_update=self.cfg.seq_trunk.enabled,
             predict_psi_torsions=self.cfg.predict_psi_torsions,
             predict_all_torsions=self.cfg.predict_all_torsions,
         )
@@ -71,6 +64,23 @@ class FlowModel(nn.Module):
             self.bfactor_net = BFactorModule(cfg=cfg.bfactor)
         if self.cfg.plddt.enabled:
             self.plddt_net = PLDDTModule(cfg=cfg.plddt)
+
+        # Seq trunk
+        if self.cfg.seq_trunk.enabled:
+            self.seq_trunk = AttentionTrunk(
+                cfg=self.cfg.seq_trunk,
+                attn_cfg=self.cfg.attention,
+            )
+
+        # Seq prediction
+        if self.cfg.sequence_pred_type == ModelSequencePredictionEnum.NOOP:
+            self.aa_pred_net = AminoAcidNOOPNet(cfg.aa_pred)
+        elif self.cfg.sequence_pred_type == ModelSequencePredictionEnum.aa_pred:
+            self.aa_pred_net = AminoAcidPredictionNet(cfg.aa_pred)
+        else:
+            raise ValueError(
+                f"Invalid sequence prediction type: {self.cfg.sequence_pred_type}"
+            )
 
     def forward(self, batch: NoisyFeatures) -> ModelPrediction:
         res_mask = batch[bp.res_mask]
@@ -101,6 +111,7 @@ class FlowModel(nn.Module):
         structure_method = batch[bp.structure_method]
 
         init_rigids_ang = create_rigid(rots=rotmats_t, trans=trans_t)
+        init_rigids_nm = rigids_ang_to_nm(init_rigids_ang)
 
         # Initial node and edge embeddings
         init_node_embed = self.node_feature_net(
@@ -133,24 +144,31 @@ class FlowModel(nn.Module):
                 aatypes_t=aatypes_t,
                 chain_index=chain_index,
                 res_mask=res_mask,
-                r3_t=r3_t,
             )
         else:
             node_embed, edge_embed = init_node_embed, init_edge_embed
 
-        # TODO(attn) pairformer trunk. Remove from ESM combiner?
-        #   add back init_edge_embed after trunk
-
-        # IPA trunk - note works in nm scale, not angstroms
-        node_embed, edge_embed, pred_rigids_nm, pred_torsions = (
-            self.attention_ipa_trunk(
+        # Trunk
+        if self.cfg.trunk.enabled:
+            node_embed, edge_embed = self.trunk(
+                init_node_embed=init_node_embed,
+                init_edge_embed=init_edge_embed,
                 node_embed=node_embed,
                 edge_embed=edge_embed,
                 node_mask=node_mask,
                 edge_mask=edge_mask,
-                diffuse_mask=diffuse_mask,
-                curr_rigids_nm=rigids_ang_to_nm(init_rigids_ang),
+                rigid=init_rigids_nm,
+                r3_t=r3_t,
             )
+
+        # IPA trunk - note works in nm scale, not angstroms
+        node_embed, edge_embed, pred_rigids_nm, pred_torsions = self.ipa_trunk(
+            node_embed=node_embed,
+            edge_embed=edge_embed,
+            node_mask=node_mask,
+            edge_mask=edge_mask,
+            diffuse_mask=diffuse_mask,
+            curr_rigids_nm=init_rigids_nm,
         )
         # Convert rigid back to angstroms
         pred_rigids_ang = rigids_nm_to_ang(pred_rigids_nm)
@@ -166,6 +184,19 @@ class FlowModel(nn.Module):
         pred_lddt = None
         if self.cfg.plddt.enabled:
             pred_lddt = self.plddt_net(node_embed=node_embed)
+
+        # Seq trunk
+        if self.cfg.seq_trunk.enabled:
+            node_embed, edge_embed = self.seq_trunk(
+                init_node_embed=init_node_embed,
+                init_edge_embed=init_edge_embed,
+                node_embed=node_embed,
+                edge_embed=edge_embed,
+                node_mask=node_mask,
+                edge_mask=edge_mask,
+                rigid=pred_rigids_nm,
+                r3_t=r3_t,
+            )
 
         # Sequence prediction
         pred_logits, pred_aatypes = self.aa_pred_net(

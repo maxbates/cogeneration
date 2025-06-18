@@ -13,7 +13,7 @@ class TestCurriculum:
         cfg1 = Config.test_uninterpolated(tmp_path=tmp_path / "step1")
         cfg1.shared.id = "step1"
         cfg2 = Config.test_uninterpolated(tmp_path=tmp_path / "step2")
-        cfg2.model.sequence_ipa_net.use_init_embed = False
+        cfg2.model.trunk.num_layers = 69
         cfg2.shared.id = "step2"
 
         # Ensure init raises an error if models are not equivalent

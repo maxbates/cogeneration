@@ -77,9 +77,10 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
 
 
 - Integrate new trunk switch module
-  - [ ] after ESMCombiner, before IPA trunk
-  - [ ] before SequenceIPANet
-    - [ ]  drop this module + config etc., use existing aa pred net MLP
+  - [x] after ESMCombiner, before IPA trunk
+    - [x] drop attention trunk from ESMCombiner
+  - [x] before SequenceIPANet
+    - [x]  drop this module + config etc., use existing aa pred net MLP
   
 - Speed up IPA
   - [ ] FlashIPA import 
@@ -106,7 +107,7 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
   - [x] update `tiny` hyperparam config where appropriate
 
 - Tests
-  - [ ] test model pass for each model configuration 
+  - [x] test model pass for each model configuration 
 
 - Clean up Modules
   - [ ] Break up `models/` directory
@@ -116,3 +117,4 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
   - [ ] `pip install flash-attn --no-build-isolation`
   
 - address TODO(attn)
+- update README code layout

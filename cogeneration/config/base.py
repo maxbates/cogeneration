@@ -352,6 +352,13 @@ class ModelAttentionTrunkConfig(BaseClassConfig):
     post_node_layer_norm: bool = False
     post_edge_layer_norm: bool = False
 
+    @property
+    def enabled(self):
+        assert isinstance(
+            self.num_layers, int
+        ), "enabled property requires interpolated"
+        return self.num_layers > 0 and self.attn_type is not AttentionType.NONE
+
 
 class ModelESMKey(StrEnum):
     """Keys for ESM model selection."""
@@ -395,62 +402,20 @@ class ModelESMCombinerConfig(BaseClassConfig):
 class ModelSequencePredictionEnum(StrEnum):
     NOOP = "noop"  # simply emit aatypes
     aa_pred = "aa_pred"  # Simple MLP as in public MultiFlow
-    sequence_ipa_net = (
-        "sequence_ipa_net"  # transformer architecture  # TODO(attn) remove
-    )
 
 
 @dataclass
 class ModelAAPredConfig(BaseClassConfig):
     """
-    Amino acid prediction configuration using simple linear layers.
+    Amino acid prediction configuration using MLP.
+
+    The public MultiFlow config alludes to a `sequence_net` not in code using IPA.
     """
 
     # c_s: node embedding size (input)
     c_s: int = "${model.hyper_params.node_embed_size}"
     # aatype_pred_num_tokens: number of amino acid types => logits / rate-matrix shape
     aatype_pred_num_tokens: int = "${model.hyper_params.aa_num_tokens}"
-
-
-@dataclass
-class ModelSequenceIPANetConfig(BaseClassConfig):
-    """
-    IPA style transformer, for predicting logits without backbone update.
-
-    Public MultiFlow code uses minimal AAPred linear network.
-    The public MultiFlow config alludes to a `sequence_net` not in code, with fields:
-
-    'model:sequence_net:init_edge_embed',
-    'model:sequence_net:init_node_embed',
-    'model:sequence_net:ipa:c_hidden',
-    'model:sequence_net:ipa:c_s',
-    'model:sequence_net:ipa:c_z',
-    'model:sequence_net:ipa:dropout',
-    'model:sequence_net:ipa:no_heads',
-    'model:sequence_net:ipa:no_qk_points',
-    'model:sequence_net:ipa:no_v_points',
-    'model:sequence_net:num_layers',
-    'model:sequence_net:use_init_embed',
-    'model:sequence_net:use_init_rigid',
-    'model:sequence_net:use_local_attention',
-    'model:use_sequence_net',
-    """
-
-    # aatype_pred_num_tokens: number of amino acid types => logits / rate-matrix shape
-    aatype_pred_num_tokens: int = "${model.hyper_params.aa_num_tokens}"
-    # c_s: internal embedding size for ReLU
-    c_s: int = "${model.hyper_params.node_embed_size}"
-    # add initial node + edge embeddings to post-IPA trunk embeddings
-    # FoldFlow-2 claimed this was important to pass through time + positional embeddings to logit prediction
-    use_init_embed: bool = True
-    # IPA parameters
-    # We use fewer blocks, because no backbone updates are performed
-    # TODO(attn) remove
-    ipa: ModelIPAConfig = field(
-        default_factory=lambda: ModelIPAConfig(
-            num_layers=2,
-        )
-    )
 
 
 @dataclass
@@ -517,20 +482,19 @@ class ModelConfig(BaseClassConfig):
         default_factory=lambda: ModelAttentionTrunkConfig(
             attn_type=AttentionType.PAIRFORMER,
             num_layers="${model.hyper_params.seq_trunk_num_layers}",
-            # assume helpful to pass though of time / positional embeddings.
-            # skip layer norm and just run trunk.
+            # assume helpful to merge back in of time / positional embeddings, per FoldFlow-2.
             pre_add_init_embed="${ternary:${greater_than: ${model.hyper_params.seq_trunk_num_layers}, 0}, True, False}",
+            # skip layer norm and just run trunk.
+            pre_node_layer_norm=False,
+            pre_edge_layer_norm=False,
         )
     )
 
     # sequence prediction, default is simple aa_pred matching MultiFlow
     sequence_pred_type: ModelSequencePredictionEnum = (
-        ModelSequencePredictionEnum.sequence_ipa_net
+        ModelSequencePredictionEnum.aa_pred
     )
     aa_pred: ModelAAPredConfig = field(default_factory=ModelAAPredConfig)
-    sequence_ipa_net: ModelSequenceIPANetConfig = field(
-        default_factory=ModelSequenceIPANetConfig
-    )
 
 
 class InterpolantRotationsScheduleEnum(StrEnum):
@@ -1389,7 +1353,7 @@ class Config(BaseClassConfig):
             state_dict = ckpt["state_dict"]
             new_state_dict = OrderedDict()
             replacements = {
-                "model.trunk.": "model.attention_ipa_trunk.trunk.",
+                "model.trunk.": "model.ipa_trunk.trunk.",
                 "model.aatype_pred_net.": "model.aa_pred_net.aatype_pred_net.",
             }
             for key, value in state_dict.items():
@@ -1422,7 +1386,6 @@ class Config(BaseClassConfig):
         raw_cfg.model.edge_features.feat_dim = 8
         # and smaller transformers
         raw_cfg.model.ipa.no_heads = 2
-        raw_cfg.model.sequence_ipa_net.ipa.no_heads = 2
 
         # filter to small PDBs for faster model + sampling
         raw_cfg.dataset.debug_head_samples = 1000

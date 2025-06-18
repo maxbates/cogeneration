@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from cogeneration.config.base import ModelSequencePredictionEnum
+from cogeneration.config.base import AttentionType, ModelSequencePredictionEnum
 from cogeneration.dataset.test_utils import MockDataloader
 from cogeneration.models.model import FlowModel
 
@@ -39,9 +39,14 @@ class TestFlowModel:
             output = model(batch)
             assert output is not None
 
-    def test_model_sequence_ipa_net(self, mock_cfg, pdb_noisy_batch):
-        mock_cfg.model.sequence_pred_type = ModelSequencePredictionEnum.sequence_ipa_net
-        model = FlowModel(mock_cfg.model)
+    @pytest.mark.parametrize("attn_type", list(AttentionType))
+    def test_forward_attention_types(
+        self, mock_cfg_uninterpolated, attn_type, pdb_noisy_batch
+    ):
+        mock_cfg_uninterpolated.model.trunk.attn_type = attn_type
+        cfg = mock_cfg_uninterpolated.interpolate()
+
+        model = FlowModel(cfg.model)
         output = model(pdb_noisy_batch)
         assert output is not None
 

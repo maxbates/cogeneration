@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from cogeneration.config.base import (
     AttentionType,
+    ModelAttentionConfig,
     ModelAttentionPairBiasConfig,
     ModelAttentionTrunkConfig,
     ModelDoubleAttentionPairConfig,
@@ -29,12 +30,7 @@ class AttentionTrunk(nn.Module):
     def __init__(
         self,
         cfg: ModelAttentionTrunkConfig,
-        attn_cfg: Union[
-            ModelAttentionPairBiasConfig,
-            ModelDoubleAttentionPairConfig,
-            ModelPairformerConfig,
-            ModelIPAConfig,
-        ],
+        attn_cfg: ModelAttentionConfig,
     ) -> None:
         super().__init__()
         self.cfg = cfg
@@ -54,7 +50,7 @@ class AttentionTrunk(nn.Module):
             self.trunk = None
 
         elif self.cfg.attn_type == AttentionType.PAIR_BIAS:
-            attn_cfg: ModelAttentionPairBiasConfig = attn_cfg.merge_dict(
+            attn_cfg: ModelAttentionPairBiasConfig = attn_cfg.pair_bias.merge_dict(
                 {
                     "num_layers": self.cfg.num_layers,
                 }
@@ -63,16 +59,18 @@ class AttentionTrunk(nn.Module):
             self.trunk = AttentionPairBiasTrunk(cfg=attn_cfg)
 
         elif self.cfg.attn_type is AttentionType.DOUBLE:
-            attn_cfg: ModelDoubleAttentionPairConfig = attn_cfg.merge_dict(
-                {
-                    "num_layers": self.cfg.num_layers,
-                }
+            attn_cfg: ModelDoubleAttentionPairConfig = (
+                attn_cfg.double_attention_pair.merge_dict(
+                    {
+                        "num_layers": self.cfg.num_layers,
+                    }
+                )
             )
 
             self.trunk = DoubleAttentionPairTrunk(cfg=attn_cfg)
 
         elif self.cfg.attn_type is AttentionType.PAIRFORMER:
-            attn_cfg: ModelPairformerConfig = attn_cfg.merge_dict(
+            attn_cfg: ModelPairformerConfig = attn_cfg.pairformer.merge_dict(
                 {
                     "num_layers": self.cfg.num_layers,
                 }
@@ -81,7 +79,7 @@ class AttentionTrunk(nn.Module):
             self.trunk = PairformerModule(cfg=attn_cfg)
 
         elif self.cfg.attn_type is AttentionType.PAIRFORMER_NO_SEQ:
-            attn_cfg: ModelPairformerConfig = attn_cfg.merge_dict(
+            attn_cfg: ModelPairformerConfig = attn_cfg.pairformer.merge_dict(
                 {
                     "num_layers": self.cfg.num_layers,
                 }
@@ -90,16 +88,18 @@ class AttentionTrunk(nn.Module):
             self.trunk = PairformerNoSeqModule(cfg=attn_cfg)
 
         elif self.cfg.attn_type is AttentionType.IPA:
-            attn_cfg: ModelIPAConfig = attn_cfg.merge_dict(
+            attn_cfg: ModelIPAConfig = attn_cfg.ipa.merge_dict(
                 {
                     "num_layers": self.cfg.num_layers,
                 }
             )
 
-            # Don't support backbone updates in this wrapper - call separately for bb + torsions
+            # Don't support backbone updates in this wrapper - call separately for bb + torsions.
+            # Assumes for representation enrichment, so enables final edge update.
             self.trunk = AttentionIPATrunk(
                 cfg=attn_cfg,
                 perform_backbone_update=False,
+                perform_final_edge_update=True,
                 predict_psi_torsions=False,
                 predict_all_torsions=False,
             )
@@ -115,13 +115,13 @@ class AttentionTrunk(nn.Module):
     def forward(
         self,
         init_node_embed: torch.Tensor,
-        init_edge_embed: Optional[torch.Tensor],
+        init_edge_embed: torch.Tensor,
         node_embed: torch.Tensor,  # (B, N, node_dim)
-        edge_embed: Optional[torch.Tensor],  # (B, N, N, edge_dim)
-        node_mask: Optional[torch.Tensor],  # (B, N)
-        edge_mask: Optional[torch.Tensor],  # (B, N, N)
-        rigid: Optional[Rigid] = None,  # frames (IPA only)
-        r3_t: Optional[torch.Tensor] = None,  # time, for time conditioning
+        edge_embed: torch.Tensor,  # (B, N, N, edge_dim)
+        node_mask: torch.Tensor,  # (B, N)
+        edge_mask: torch.Tensor,  # (B, N, N)
+        rigid: Optional[Rigid],  # nm scale frames (only used by IPA)
+        r3_t: Optional[torch.Tensor],  # time, if time conditioning used
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # pre trunk
 
@@ -176,7 +176,8 @@ class AttentionTrunk(nn.Module):
                 edge_embed=edge_embed,
                 node_mask=node_mask,
                 edge_mask=edge_mask,
-                rigid=rigid,
+                diffuse_mask=node_mask,
+                curr_rigids_nm=rigid,
             )
 
         else:

@@ -4,10 +4,6 @@ import torch
 from torch import nn
 
 from cogeneration.config.base import ModelESMCombinerConfig
-from cogeneration.models.double_attention_pair import (
-    DoubleAttentionPairBlock,
-    DoubleAttentionPairTrunk,
-)
 from cogeneration.models.esm_frozen import FrozenEsmModel
 
 
@@ -24,7 +20,6 @@ class ESMCombinerNetwork(nn.Module):
     """
     Runs ESM model and combines single and pair representations with node and edge embeddings.
     If cfg.only_single, only generates single rep and enriches node embeddings.
-    Optionally also runs a trunk of DoubleAttentionPairBlocks to enrich edge embeddings.
     """
 
     def __init__(self, cfg: ModelESMCombinerConfig):
@@ -56,13 +51,6 @@ class ESMCombinerNetwork(nn.Module):
             )
             self.pair_layer_norm = nn.LayerNorm(self.cfg.edge_embed_size)
 
-            # DoubleAttentionPairBlock trunk; may not be active (if num_blocks==0)
-            self.double_attention_pair_trunk = DoubleAttentionPairTrunk(
-                cfg=self.cfg.double_attention_pair_trunk,
-                final_layer_norm=False,
-            )
-            self.trunk_pair_layer_norm = nn.LayerNorm(self.cfg.edge_embed_size)
-
     def forward(
         self,
         init_node_embed: torch.Tensor,  # (B, N, node_dim)
@@ -70,7 +58,6 @@ class ESMCombinerNetwork(nn.Module):
         aatypes_t: torch.Tensor,  # (B, N)
         chain_index: torch.Tensor,  # (B, N)
         res_mask: torch.Tensor,  # (B, N)
-        r3_t: torch.Tensor,  # (B, 1)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         edge_mask = res_mask[:, None] * res_mask[:, :, None]
 
@@ -107,17 +94,6 @@ class ESMCombinerNetwork(nn.Module):
             # combine + LayerNorm
             edge_embed = 0.5 * (esm_pair + init_edge_embed)  # (B, N, N, edge_dim)
             edge_embed = self.pair_layer_norm(edge_embed)
-
-        if self.double_attention_pair_trunk.enabled:
-            edge_embed = self.double_attention_pair_trunk(
-                edge_embed=edge_embed,
-                edge_mask=edge_mask,
-                r3_t=r3_t,
-            )
-
-            # add back in initial representation after trunk + norm
-            edge_embed = 0.5 * (edge_embed + init_edge_embed)  # (B, N, N, edge_dim)
-            edge_embed = self.trunk_pair_layer_norm(edge_embed)  # (B, N, N, edge_dim)
 
         # mask
         node_embed = node_embed * res_mask[..., None]

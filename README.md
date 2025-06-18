@@ -98,7 +98,6 @@ This project introduces several extensions over MultiFlow:
 `/cogeneration/models/model.py` - complete Pytorch model
 `/cogeneration/models/module.py` - Lightning Module which defines losses, training + validation + prediction steps
 `/cogeneration/models/node_feature_net.py` - Simple network for initial representation of structure, sequence, masks, positional embeddings, time embeddings.
-`/cogeneration/models/sequence_ipa_net.py` - More complex sequence prediction network using IPA
 
 `/cogeneration/scripts`
 `/cogeneration/scripts/predict.py` - script for inference / sampling, as an `EvalRunner`
