@@ -11,7 +11,7 @@ class DoubleAttentionPairBlock(nn.Module):
     """
     Rough but O(N^2) substitute triangle‐attention. Does not consider node features.
 
-    Uses a two‐step “gather & redistribute” over all pair edges:
+    Uses a two‐step "gather & redistribute" over all pair edges:
     - Gather global context via a softmax‐weighted sum of `fP` and value projection `gP`
     - Redistribute that context back to each edge via a separate softmax on `hP`
     - Optionally, applies a channel‐wise FiLM (scale + shift) conditioned on the timestep
@@ -95,15 +95,19 @@ class DoubleAttentionPairTrunk(nn.Module):
     """
 
     def __init__(
-        self, cfg: ModelDoubleAttentionPairConfig, final_layer_norm: bool = False
+        self,
+        cfg: ModelDoubleAttentionPairConfig,
+        final_layer_norm: bool = False,
+        num_layers: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.cfg = cfg
         self.final_layer_norm = final_layer_norm
+        self.num_layers = num_layers if num_layers is not None else cfg.num_layers
 
         if self.enabled:
             self.blocks = nn.ModuleList(
-                [DoubleAttentionPairBlock(cfg) for _ in range(cfg.num_layers)]
+                [DoubleAttentionPairBlock(cfg) for _ in range(self.num_layers)]
             )
 
             if final_layer_norm:
@@ -114,7 +118,7 @@ class DoubleAttentionPairTrunk(nn.Module):
 
     @property
     def enabled(self):
-        return self.cfg.num_layers > 0
+        return self.num_layers > 0
 
     def forward(
         self,

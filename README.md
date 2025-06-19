@@ -98,8 +98,8 @@ This project introduces several extensions over MultiFlow:
 `/cogeneration/models/attention/ipa_pytorch.py` - Mostly from Openfold, IPA submodules
 `/cogeneration/models/attention/pairformer.py` - Adapted from Boltz, Pairformer block / module, and `NoSeq` variant.
 `/cogeneration/models/attention/transition.py` - MLP transition module
-`/cogeneration/models/attention/triangle_attention.py`  - Adapted from Boltz, triangle attention 
-`/cogeneration/models/attention/triangle_mult.py` - Adapted from Boltz, triangle attention 
+`/cogeneration/models/attention/trianglar_attention.py`  - Adapted from Boltz, triangle attention 
+`/cogeneration/models/attention/trianglar_mult.py` - Adapted from Boltz, triangle attention 
 `/cogeneration/models/aa_pred.py` - Simple Sequence prediction network using linear layer / MLP
 `/cogeneration/models/bfactors.py` - Module for predicting B-factors
 `/cogeneration/models/confidence.py` - Module for predicting pLDDT (potentially PAE, PTM in the future?)

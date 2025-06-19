@@ -6,11 +6,7 @@ import torch.nn as nn
 from cogeneration.config.base import (
     AttentionType,
     ModelAttentionConfig,
-    ModelAttentionPairBiasConfig,
     ModelAttentionTrunkConfig,
-    ModelDoubleAttentionPairConfig,
-    ModelIPAConfig,
-    ModelPairformerConfig,
 )
 from cogeneration.data.rigid import Rigid
 from cogeneration.models.attention.attention_pair_bias import AttentionPairBiasTrunk
@@ -44,67 +40,46 @@ class AttentionTrunk(nn.Module):
         if self.cfg.pre_edge_layer_norm:
             self.pre_edge_ln = nn.LayerNorm(self.cfg.edge_dim)
 
-        # TODO(attn) - consider making num_layers an argument to each module
-        #   rather than requiring it be in the config, to avoid the `merge_dict`.
-
         # trunk
+        # Each attention module accepts num_layers/num_blocks as an optional argument, overriding its cfg
 
         if self.cfg.num_layers < 1 or self.cfg.attn_type is AttentionType.NONE:
             self.trunk = None
 
         elif self.cfg.attn_type == AttentionType.PAIR_BIAS:
-            attn_cfg: ModelAttentionPairBiasConfig = attn_cfg.pair_bias.merge_dict(
-                {
-                    "num_layers": self.cfg.num_layers,
-                }
+            self.trunk = AttentionPairBiasTrunk(
+                cfg=attn_cfg.pair_bias,
+                num_layers=self.cfg.num_layers,
             )
-
-            self.trunk = AttentionPairBiasTrunk(cfg=attn_cfg)
 
         elif self.cfg.attn_type is AttentionType.DOUBLE:
-            attn_cfg: ModelDoubleAttentionPairConfig = (
-                attn_cfg.double_attention_pair.merge_dict(
-                    {
-                        "num_layers": self.cfg.num_layers,
-                    }
-                )
+            self.trunk = DoubleAttentionPairTrunk(
+                cfg=attn_cfg.double_attention_pair,
+                num_layers=self.cfg.num_layers,
             )
-
-            self.trunk = DoubleAttentionPairTrunk(cfg=attn_cfg)
 
         elif self.cfg.attn_type is AttentionType.PAIRFORMER:
-            attn_cfg: ModelPairformerConfig = attn_cfg.pairformer.merge_dict(
-                {
-                    "num_layers": self.cfg.num_layers,
-                }
+            self.trunk = PairformerModule(
+                cfg=attn_cfg.pairformer,
+                num_layers=self.cfg.num_layers,
             )
-
-            self.trunk = PairformerModule(cfg=attn_cfg)
 
         elif self.cfg.attn_type is AttentionType.PAIRFORMER_NO_SEQ:
-            attn_cfg: ModelPairformerConfig = attn_cfg.pairformer.merge_dict(
-                {
-                    "num_layers": self.cfg.num_layers,
-                }
+            self.trunk = PairformerNoSeqModule(
+                cfg=attn_cfg.pairformer,
+                num_layers=self.cfg.num_layers,
             )
-
-            self.trunk = PairformerNoSeqModule(cfg=attn_cfg)
 
         elif self.cfg.attn_type is AttentionType.IPA:
-            attn_cfg: ModelIPAConfig = attn_cfg.ipa.merge_dict(
-                {
-                    "num_blocks": self.cfg.num_layers,
-                }
-            )
-
             # Don't support backbone updates in this wrapper - call separately for bb + torsions.
             # Assumes for representation enrichment, so enables final edge update.
             self.trunk = AttentionIPATrunk(
-                cfg=attn_cfg,
+                cfg=attn_cfg.ipa,
                 perform_backbone_update=False,
                 perform_final_edge_update=True,
                 predict_psi_torsions=False,
                 predict_all_torsions=False,
+                num_blocks=self.cfg.num_layers,
             )
         else:
             raise ValueError(f"unknown attention kind: {self.cfg.attn_type}")

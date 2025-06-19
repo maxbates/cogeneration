@@ -104,23 +104,26 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
 
 - Clean up Modules
   - [x] Break up `models/` directory
-  
-- Support backlog
-  - [ ] pull `num_layers` out of config, per trunk, into an (override?) argument
-      - avoid patching config per trunk
-      - [ ] consider add more attn parameters to model hyper param config, e.g. num heads
-  - [x] expose `training` / use pytorch prop for dropout mask, or different values for training / inference
-  - [ ] cuEquivariance env setup helper, e.g. set `CUQUI_ENABLE_BF16` etc.
-  
-- [ ] shared config `kernel` instead of only `local` option
+
+- [x] shared config `kernel` instead of only `local` option
     - Or, detect what is available and use helper throughout -- probably want explicit option
-  - [ ] consistent `use_kernels` vs `kernel` config
+  - [x] consistent `use_kernels` vs `kernel` config
+
+- Support backlog
+  - [x] pull `num_layers` out of config, per trunk, into an (override?) argument
+      - avoid patching config per trunk
+  - [ ] consider add more attn parameters to model hyper param config, e.g. num heads
+  - [x] expose `training` / use pytorch prop for dropout mask, or different values for training / inference
+  - [x] cuEquivariance env setup helper, e.g. set `CUQUI_ENABLE_BF16` etc. if kernels enabled
+  - [x] use bf16 where appropriate
 
 - [ ] `setup.py` optional dependencies in `[cuda]` extras
   - [ ] improve `torch`
   - [ ] `cuequivariance` install
   - [ ] install flash-ipa
   - [ ] `pip install flash-attn --no-build-isolation`
+
+- [ ] test CUDA kernels work, install works
 
 - [ ] address TODO(attn)
 

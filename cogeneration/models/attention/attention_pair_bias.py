@@ -1,6 +1,8 @@
 # Adapted from Boltz-2
 
 
+from typing import Optional
+
 import torch
 from einops.layers.torch import Rearrange
 from torch import Tensor, nn
@@ -112,14 +114,18 @@ class AttentionPairBiasTrunk(nn.Module):
     """Stacked Attention-Pair-Bias layers acting on node embeddings."""
 
     def __init__(
-        self, cfg: ModelAttentionPairBiasConfig, final_layer_norm: bool = False
+        self,
+        cfg: ModelAttentionPairBiasConfig,
+        final_layer_norm: bool = False,
+        num_layers: Optional[int] = None,
     ):
         super().__init__()
         self.cfg = cfg
         self.final_layer_norm = final_layer_norm
+        self.num_layers = num_layers if num_layers is not None else cfg.num_layers
 
         self.layers = nn.ModuleList(
-            [AttentionPairBias(cfg) for _ in range(cfg.num_layers)]
+            [AttentionPairBias(cfg) for _ in range(self.num_layers)]
         )
 
         if final_layer_norm:
@@ -133,6 +139,10 @@ class AttentionPairBiasTrunk(nn.Module):
         node_mask: torch.Tensor,  # (B, N) or None
     ) -> torch.Tensor:
         """Apply the stack; pair features are read-only."""
+
+        if self.num_layers < 1:
+            return node_embed
+
         for layer in self.layers:
             node_embed = layer(
                 node_embed=node_embed,

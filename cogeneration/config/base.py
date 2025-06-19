@@ -38,7 +38,7 @@ https://github.com/omry/omegaconf/issues/422
 PATH_PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
 PATH_PUBLIC_WEIGHTS = PATH_PROJECT_ROOT / "multiflow_weights"
 
-GenericConfig = TypeVar("GenericConfig", bound="BaseConfig")
+GenericConfig = TypeVar("GenericConfig", bound="BaseClassConfig")
 
 
 @dataclass
@@ -122,6 +122,10 @@ class SharedConfig(BaseClassConfig):
     )
     # `local` to train locally on a Mac. use `mps` not `gpu` with `ddp`, etc.
     local: bool = True
+    # enable CUDA optimized kernels (cuEquivariance, Flash Attention, etc.)
+    kernels: bool = field(default_factory=lambda: torch.cuda.is_available())
+    # enable bf16 precision for CUDA kernels when available
+    kernels_bf16: bool = field(default_factory=lambda: torch.cuda.is_available())
     # randomness / stochastic paths
     stochastic: bool = True
     # project root path
@@ -285,7 +289,7 @@ class ModelPairformerConfig(BaseClassConfig):
     pairwise_num_heads: int = 4
     post_layer_norm: bool = False
     chunk_size_tri_attn: int = 512  # chunking/tiling for large sequences
-    use_kernels: bool = True  # cuEquiv if available  # TODO(attn) automatic
+    use_kernels: bool = "${shared.kernels}"
     checkpointing: bool = False  # torch.utils.checkpoint on every layer
 
 
@@ -312,7 +316,7 @@ class ModelIPAConfig(BaseClassConfig):
     seq_tfmr_num_layers: int = 4
     transformer_dropout: float = 0.2
     # FlashIPA
-    use_flash_attn: bool = False  # TODO(attn) automatic
+    use_flash_attn: bool = "${shared.kernels}"
     z_factor_rank: int = 0
 
 
@@ -1386,6 +1390,7 @@ class Config(BaseClassConfig):
 
         # set to local mode, impacting accelerator etc.
         raw_cfg.shared.local = True
+        raw_cfg.shared.kernels = False
 
         # default to tiny model for faster model evaluations
         raw_cfg.model.hyper_params = ModelHyperParamsConfig.tiny()

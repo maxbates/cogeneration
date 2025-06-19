@@ -43,6 +43,7 @@ class AttentionIPATrunk(nn.Module):
         perform_backbone_update: bool = True,
         predict_psi_torsions: bool = True,
         predict_all_torsions: bool = True,
+        num_blocks: Optional[int] = None,
     ):
         super(AttentionIPATrunk, self).__init__()
         self.cfg = cfg
@@ -50,9 +51,10 @@ class AttentionIPATrunk(nn.Module):
         self.perform_backbone_update = perform_backbone_update
         self.predict_psi_torsions = predict_psi_torsions
         self.predict_all_torsions = predict_all_torsions
+        self.num_blocks = num_blocks if num_blocks is not None else cfg.num_blocks
 
         self.trunk = nn.ModuleDict()
-        for b in range(self.cfg.num_blocks):
+        for b in range(self.num_blocks):
             self.trunk[f"ipa_{b}"] = MaybeFlashIPA(self.cfg)
             self.trunk[f"ipa_ln_{b}"] = nn.LayerNorm(self.cfg.c_s)
 
@@ -82,7 +84,7 @@ class AttentionIPATrunk(nn.Module):
                 )
 
             # No edge update on the last block, unless specified.
-            if b < self.cfg.num_blocks - 1 or self.perform_final_edge_update:
+            if b < self.num_blocks - 1 or self.perform_final_edge_update:
                 edge_in = self.cfg.c_z
                 self.trunk[f"edge_transition_{b}"] = EdgeTransition(
                     node_embed_size=self.cfg.c_s,
@@ -119,7 +121,7 @@ class AttentionIPATrunk(nn.Module):
         node_embed = node_embed * node_mask[..., None]
         edge_embed = edge_embed * edge_mask[..., None]
 
-        for b in range(self.cfg.num_blocks):
+        for b in range(self.num_blocks):
             ipa_embed = self.trunk[f"ipa_{b}"](
                 s=node_embed,  # s = single repr
                 z=edge_embed,  # z = pair repr
@@ -147,7 +149,7 @@ class AttentionIPATrunk(nn.Module):
                     rigid_update, update_mask
                 )
 
-            if b < self.cfg.num_blocks - 1 or self.perform_final_edge_update:
+            if b < self.num_blocks - 1 or self.perform_final_edge_update:
                 edge_embed = self.trunk[f"edge_transition_{b}"](node_embed, edge_embed)
                 edge_embed *= edge_mask[..., None]
 

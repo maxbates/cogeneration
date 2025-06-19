@@ -32,7 +32,7 @@ def setup_ddp(
         # Pytorch doesn't support all the ops we need on MPS, ensure fallback enabled
         # Can't seem to enable it here, so need to set it in the environment
         assert (
-            os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] == "1"
+            os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1"
         ), "MPS fallback not enabled and not all ops supported on MPS. Set `PYTORCH_ENABLE_MPS_FALLBACK=1` in environment."
 
         # Lightning does not support DDP with MPS accelerator, i.e. on a Mac

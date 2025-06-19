@@ -11,9 +11,8 @@ black==24.10.0
 certifi==2024.8.30
 charset-normalizer==3.3.2
 click==8.1.7
-cuequivariance_torch>=0.5.0
-# cuequivariance_ops_cu12>=0.5.0  # TODO(attn) in setup.py
-# cuequivariance_ops_torch_cu12>=0.5.0  # TODO(attn) in setup.py
+cuequivariance-torch>=0.5.0
+cuequivariance-ops-torch-cu12>=0.5.0  # TODO(attn) in setup.py
 dm-tree==0.1.8
 docker-pycreds==0.4.0
 einops==0.8.1

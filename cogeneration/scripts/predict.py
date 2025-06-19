@@ -12,7 +12,11 @@ from pytorch_lightning.utilities.model_summary import ModelSummary
 from cogeneration.config.base import Config
 from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingDataset
 from cogeneration.models.module import FlowModule
-from cogeneration.scripts.utils import get_available_device, print_timing
+from cogeneration.scripts.utils import (
+    get_available_device,
+    print_timing,
+    setup_cuequivariance_env,
+)
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
 from cogeneration.type.task import InferenceTask
 from cogeneration.util.log import rank_zero_logger
@@ -53,6 +57,13 @@ class EvalRunner:
             ckpt_path = merged_ckpt_path
 
         local_rank = DDPInfo.from_env().local_rank
+
+        # Setup for cuEquivariance
+        setup_cuequivariance_env(
+            kernels_enabled=cfg.shared.kernels,
+            enable_bf16=cfg.shared.kernels_bf16
+            and (cfg.experiment.trainer.precision == "bf16"),
+        )
 
         # Ensure DDP is set up for scenarios were pytorch lightning doesn't handle it
         # (e.g. debugging on Mac laptop)

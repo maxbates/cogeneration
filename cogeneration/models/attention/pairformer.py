@@ -85,7 +85,6 @@ class PairformerLayer(nn.Module):
         edge_embed: Tensor,  # (B, N, N, edge_dim)
         node_mask: Tensor,  # (B, N)
         edge_mask: Tensor,  # (B, N, N)
-        # TODO(attn) - automatic chunk / kernel selection
         chunk_size_tri_attn: Optional[int] = None,
         use_kernels: bool = False,
         use_cuequiv_mul: bool = False,
@@ -213,13 +212,16 @@ class PairformerModule(nn.Module):
     def __init__(
         self,
         cfg: ModelPairformerConfig,
+        num_layers: Optional[int] = None,
     ):
         super().__init__()
         self.cfg = cfg
+        # Allow overriding num_layers from config
+        self.num_layers = num_layers if num_layers is not None else self.cfg.num_layers
 
-        if self.cfg.num_layers > 0:
+        if self.num_layers > 0:
             self.layers = nn.ModuleList(
-                [PairformerLayer(self.cfg) for _ in range(self.cfg.num_layers)]
+                [PairformerLayer(self.cfg) for _ in range(self.num_layers)]
             )
 
     def forward(
@@ -228,10 +230,8 @@ class PairformerModule(nn.Module):
         edge_embed: Tensor,
         node_mask: Tensor,
         edge_mask: Tensor,
-        # TODO(attn) - automatic chunk / kernel selection
-        use_kernels: bool = False,
     ) -> Tuple[Tensor, Tensor]:
-        if self.cfg.num_layers < 1:
+        if self.num_layers < 1:
             return node_embed, edge_embed
 
         chunk_size_tri_attn = _get_chunk_size(
@@ -247,7 +247,7 @@ class PairformerModule(nn.Module):
                     node_mask=node_mask,
                     edge_mask=edge_mask,
                     chunk_size_tri_attn=chunk_size_tri_attn,
-                    use_kernels=use_kernels,
+                    use_kernels=self.cfg.use_kernels,
                 )
             else:
                 node_embed, edge_embed = layer(
@@ -256,7 +256,7 @@ class PairformerModule(nn.Module):
                     node_mask=node_mask,
                     edge_mask=edge_mask,
                     chunk_size_tri_attn=chunk_size_tri_attn,
-                    use_kernels=use_kernels,
+                    use_kernels=self.cfg.use_kernels,
                 )
 
         return node_embed, edge_embed
@@ -265,23 +265,23 @@ class PairformerModule(nn.Module):
 class PairformerNoSeqModule(nn.Module):
     """Stack of edge‑only Pairformer layers."""
 
-    def __init__(self, cfg: ModelPairformerConfig):
+    def __init__(self, cfg: ModelPairformerConfig, num_layers: Optional[int] = None):
         super().__init__()
         self.cfg = cfg
+        # Allow overriding num_layers from config
+        self.num_layers = num_layers if num_layers is not None else cfg.num_layers
 
-        if self.cfg.num_layers > 0:
+        if self.num_layers > 0:
             self.layers = nn.ModuleList(
-                [PairformerNoSeqLayer(cfg) for _ in range(cfg.num_layers)]
+                [PairformerNoSeqLayer(cfg) for _ in range(self.num_layers)]
             )
 
     def forward(
         self,
         edge_embed: Tensor,
         edge_mask: Tensor,
-        # TODO(attn) - automatic chunk / kernel selection
-        use_kernels: bool = False,
     ) -> torch.Tensor:
-        if self.cfg.num_layers < 1:
+        if self.num_layers < 1:
             return edge_embed
 
         chunk_size_tri_attn = _get_chunk_size(
@@ -295,14 +295,14 @@ class PairformerNoSeqModule(nn.Module):
                     edge_embed=edge_embed,
                     edge_mask=edge_mask,
                     chunk_size_tri_attn=chunk_size_tri_attn,
-                    use_kernels=use_kernels,
+                    use_kernels=self.cfg.use_kernels,
                 )
             else:
                 edge_embed = layer(
                     edge_embed=edge_embed,
                     edge_mask=edge_mask,
                     chunk_size_tri_attn=chunk_size_tri_attn,
-                    use_kernels=use_kernels,
+                    use_kernels=self.cfg.use_kernels,
                 )
 
         return edge_embed

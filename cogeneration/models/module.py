@@ -132,16 +132,42 @@ class FlowModule(LightningModule):
         )
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
-        """MPS doesn't support float64, so convert to float64 tensors to float32."""
+        """
+        MPS doesn't support float64, so convert to float64 tensors to float32.
+        Also handle optimal precision for CUDA kernels.
+        """
 
         def convert_to_float32(tensor):
             if tensor.dtype == torch.float64:
                 return tensor.to(torch.float32)
             return tensor
 
-        # if we are on MPS, convert all tensors to float32
+        def convert_to_optimal_precision(tensor):
+            """Convert to optimal precision for kernels if enabled."""
+            if tensor.dtype == torch.float64:
+                return tensor.to(torch.float32)
+            # If using bf16 and kernels are enabled, keep float32 for stability
+            # The attention modules will handle the bf16 conversion internally
+            elif (
+                tensor.dtype == torch.float32
+                and self.cfg.shared.kernels
+                and self.cfg.experiment.trainer.precision == "bf16"
+            ):
+                # Keep as float32, let the kernel-enabled modules handle bf16 conversion
+                return tensor
+            return tensor
+
+        # MPS: convert all tensors to float32
         if self.cfg.experiment.trainer.accelerator == "mps":
             batch = apply_to_collection(batch, torch.Tensor, convert_to_float32)
+
+        # CUDA + kernels: optimize precision
+        elif (
+            self.cfg.shared.kernels and self.cfg.experiment.trainer.accelerator == "gpu"
+        ):
+            batch = apply_to_collection(
+                batch, torch.Tensor, convert_to_optimal_precision
+            )
 
         return super().transfer_batch_to_device(batch, device, dataloader_idx)
 
@@ -153,7 +179,7 @@ class FlowModule(LightningModule):
         epochs_done = getattr(self.trainer, "current_epoch", 0)
         epochs_total = getattr(self.trainer, "max_epochs", -1)
 
-        # if total is missing or zero, we’re just starting fresh
+        # if total is missing or zero, we're just starting fresh
         if epochs_total < 0:
             self._log.info(
                 f"Module {module_id}: starting fresh, will run {epochs_total or 'unspecified'} epochs"
