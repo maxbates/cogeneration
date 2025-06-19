@@ -1,6 +1,7 @@
 import datetime
 import itertools
 import os
+import re
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -292,7 +293,7 @@ class ModelPairformerConfig(BaseClassConfig):
 class ModelIPAConfig(BaseClassConfig):
     """
     Invariant Point Attention configuration.
-    Keys match ported OpenFold's IPA module.
+    Keys match ported OpenFold's IPA module, and FlashIPA config
     """
 
     # IPA parameters
@@ -305,11 +306,14 @@ class ModelIPAConfig(BaseClassConfig):
     no_qk_points: int = 8
     no_v_points: int = 12
     # Attention trunk parameters
-    num_layers: int = "${model.hyper_params.ipa_num_layers}"
+    num_blocks: int = "${model.hyper_params.ipa_num_layers}"
     dropout: float = 0.0
     seq_tfmr_num_heads: int = 4
     seq_tfmr_num_layers: int = 4
     transformer_dropout: float = 0.2
+    # FlashIPA
+    use_flash_attn: bool = False  # TODO(attn) automatic
+    z_factor_rank: int = 0
 
 
 class AttentionType(StrEnum):
@@ -1352,13 +1356,16 @@ class Config(BaseClassConfig):
             # Assumes that these modules are active in the network, i.e. network shape is the same as MultiFlow.
             state_dict = ckpt["state_dict"]
             new_state_dict = OrderedDict()
-            replacements = {
+            renames = {
                 "model.trunk.": "model.ipa_trunk.trunk.",
                 "model.aatype_pred_net.": "model.aa_pred_net.aatype_pred_net.",
             }
+            # MaybeFlashIPA proxy requires `impl` after `ipa_#`
+            ipa_impl_pattern = re.compile(r"(model\.ipa_trunk\.trunk\.ipa_\d+)(\.)")
             for key, value in state_dict.items():
-                for old, new in replacements.items():
+                for old, new in renames.items():
                     key = key.replace(old, new)
+                key = ipa_impl_pattern.sub(r"\1.impl\2", key)
                 new_state_dict[key] = value
 
             # Save new checkpoint

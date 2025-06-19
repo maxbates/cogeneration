@@ -12,14 +12,15 @@ certifi==2024.8.30
 charset-normalizer==3.3.2
 click==8.1.7
 cuequivariance_torch>=0.5.0
-# cuequivariance_ops_cu12>=0.5.0  # TODO(deps) in setup.py
-# cuequivariance_ops_torch_cu12>=0.5.0  # TODO(deps) in setup.py
+# cuequivariance_ops_cu12>=0.5.0  # TODO(attn) in setup.py
+# cuequivariance_ops_torch_cu12>=0.5.0  # TODO(attn) in setup.py
 dm-tree==0.1.8
 docker-pycreds==0.4.0
 einops==0.8.1
 exceptiongroup==1.2.2
 fair-esm==2.0.0
 filelock==3.16.1
+# pip install git+https://github.com/flagshippioneering/flash_ipa.git  # TODO(attn) flash--ipa
 frozenlist==1.4.1
 fsspec==2024.9.0
 gitdb==4.0.11

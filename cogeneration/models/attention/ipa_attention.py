@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from cogeneration.config.base import ModelIPAConfig
 from cogeneration.data.rigid_utils import Rigid
-from cogeneration.models.attention import ipa_pytorch
+from cogeneration.models.attention.ipa_flash import MaybeFlashIPA
 from cogeneration.models.attention.ipa_pytorch import (
     BackboneUpdate,
     EdgeTransition,
@@ -52,8 +52,8 @@ class AttentionIPATrunk(nn.Module):
         self.predict_all_torsions = predict_all_torsions
 
         self.trunk = nn.ModuleDict()
-        for b in range(self.cfg.num_layers):
-            self.trunk[f"ipa_{b}"] = ipa_pytorch.InvariantPointAttention(self.cfg)
+        for b in range(self.cfg.num_blocks):
+            self.trunk[f"ipa_{b}"] = MaybeFlashIPA(self.cfg)
             self.trunk[f"ipa_ln_{b}"] = nn.LayerNorm(self.cfg.c_s)
 
             tfmr_in = self.cfg.c_s
@@ -82,7 +82,7 @@ class AttentionIPATrunk(nn.Module):
                 )
 
             # No edge update on the last block, unless specified.
-            if b < self.cfg.num_layers - 1 or self.perform_final_edge_update:
+            if b < self.cfg.num_blocks - 1 or self.perform_final_edge_update:
                 edge_in = self.cfg.c_z
                 self.trunk[f"edge_transition_{b}"] = EdgeTransition(
                     node_embed_size=self.cfg.c_s,
@@ -119,12 +119,12 @@ class AttentionIPATrunk(nn.Module):
         node_embed = node_embed * node_mask[..., None]
         edge_embed = edge_embed * edge_mask[..., None]
 
-        for b in range(self.cfg.num_layers):
+        for b in range(self.cfg.num_blocks):
             ipa_embed = self.trunk[f"ipa_{b}"](
-                node_embed,  # s = single repr
-                edge_embed,  # z = pair repr
-                curr_rigids_nm,  # r = rigid
-                node_mask,
+                s=node_embed,  # s = single repr
+                z=edge_embed,  # z = pair repr
+                r=curr_rigids_nm,  # r = rigid
+                mask=node_mask,
             )
             ipa_embed *= node_mask[..., None]
             node_embed = self.trunk[f"ipa_ln_{b}"](node_embed + ipa_embed)
@@ -147,7 +147,7 @@ class AttentionIPATrunk(nn.Module):
                     rigid_update, update_mask
                 )
 
-            if b < self.cfg.num_layers - 1 or self.perform_final_edge_update:
+            if b < self.cfg.num_blocks - 1 or self.perform_final_edge_update:
                 edge_embed = self.trunk[f"edge_transition_{b}"](node_embed, edge_embed)
                 edge_embed *= edge_mask[..., None]
 

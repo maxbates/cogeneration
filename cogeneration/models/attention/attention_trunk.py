@@ -93,7 +93,7 @@ class AttentionTrunk(nn.Module):
         elif self.cfg.attn_type is AttentionType.IPA:
             attn_cfg: ModelIPAConfig = attn_cfg.ipa.merge_dict(
                 {
-                    "num_layers": self.cfg.num_layers,
+                    "num_blocks": self.cfg.num_layers,
                 }
             )
 

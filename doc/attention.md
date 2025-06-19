@@ -81,14 +81,6 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
     - [x] drop attention trunk from ESMCombiner
   - [x] before SequenceIPANet
     - [x]  drop this module + config etc., use existing aa pred net MLP
-  
-- Speed up IPA
-  - [ ] FlashIPA import 
-  - [ ] wrapper to patch IPA?
-
-- Support backlog
-  - [x] expose `training` / use pytorch prop for dropout mask, or different values for training / inference
-  - [ ] cuEquivariance env setup helper, e.g. set `CUQUI_ENABLE_BF16` etc.
 
 - Config
   - [x] easy way to pass config, update with number of layers, etc.
@@ -98,13 +90,25 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
   - [x] let's define a single `model.attention` with subconfig for each attention type
   - [x] then define 2 trunks, pre IPA and pre AA pred, each which takes a type + num layers
   - [x] better group attention mechanism configs
-  - [ ] add more attn parameters to model hyper param config, e.g. num heads
-  - [ ] shared config `kernel` instead of only `local` option
-    - Or, detect what is available and use helper throughout -- probably want explicit option
   - [x] `ESMCombiner` pair representation is optional, to enable flash attention
   - [x] Enum to define block type for rep enrichment, shared default cfg for each 
     - `IPA`, `Pairformer`, `DoublePairAttention`
   - [x] update `tiny` hyperparam config where appropriate
+  
+- Speed up IPA
+  - [x] FlashIPA import 
+  - [x] wrapper to patch IPA?
+
+- Support backlog
+  - [ ] pull `num_layers` out of config, per trunk, into an (override?) argument
+      - avoid patching config per trunk
+      - [ ] consider add more attn parameters to model hyper param config, e.g. num heads
+  - [x] expose `training` / use pytorch prop for dropout mask, or different values for training / inference
+  - [ ] cuEquivariance env setup helper, e.g. set `CUQUI_ENABLE_BF16` etc.
+  
+- [ ] shared config `kernel` instead of only `local` option
+    - Or, detect what is available and use helper throughout -- probably want explicit option
+  - [ ] consistent `use_kernels` vs `kernel` config
 
 - Tests
   - [x] test model pass for each model configuration 
@@ -113,8 +117,11 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
   - [x] Break up `models/` directory
 
 - [ ] `setup.py` optional dependencies in `[cuda]` extras
-  - [ ] improve `torch` and `cuequivariance` install
+  - [ ] improve `torch`
+  - [ ] `cuequivariance` install
+  - [ ] install flash-ipa
   - [ ] `pip install flash-attn --no-build-isolation`
   
 - address TODO(attn)
+
 - update README code layout
