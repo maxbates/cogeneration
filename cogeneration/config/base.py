@@ -1216,14 +1216,20 @@ class InferenceConfig(BaseClassConfig):
 
 
 @dataclass
-class FoldingConfig(BaseClassConfig):
-    seq_per_sample: int = 8
-    folding_model: str = "af2"  # "af2" only at the moment, maybe "esm" in the future
-    # dedicated device for folding. decrement other devices by 1 if True
-    own_device: bool = False
+class ProteinMPNNRunnerConfig(BaseClassConfig):
+    """Configuration for ProteinMPNN runner."""
+
     # Assume ProteinMPNN to be a sibling to project root, installed separately
     pmpnn_path: Path = PATH_PROJECT_ROOT.parent / "ProteinMPNN"
     pmpnn_seed: int = "${shared.seed}"
+    seq_per_sample: int = 8
+
+
+@dataclass
+class FoldingConfig(BaseClassConfig):
+    folding_model: str = "af2"  # "af2" only at the moment, maybe "esm" in the future
+    # dedicated device for folding. decrement other devices by 1 if True
+    own_device: bool = False
     pt_hub_dir: Path = PATH_PROJECT_ROOT / "cache" / "torch"
     # uses LocalColabFold for folding locally
     # https://github.com/YoshitakaMo/localcolabfold
@@ -1231,6 +1237,10 @@ class FoldingConfig(BaseClassConfig):
     # installation: https://bcrf.biochem.wisc.edu/2023/04/27/alphafold2-on-macintosh-m1/
     colabfold_path: Path = (
         PATH_PROJECT_ROOT.parent / "localcolabfold/colabfold-conda/bin/colabfold_batch"
+    )
+    # ProteinMPNN configuration
+    protein_mpnn: ProteinMPNNRunnerConfig = field(
+        default_factory=ProteinMPNNRunnerConfig
     )
 
 

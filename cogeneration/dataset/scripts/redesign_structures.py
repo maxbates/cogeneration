@@ -27,7 +27,7 @@ import numpy.typing as npt
 import pandas as pd
 from tqdm.auto import tqdm
 
-from cogeneration.config.base import FoldingConfig
+from cogeneration.config.base import FoldingConfig, ProteinMPNNRunnerConfig
 from cogeneration.data.folding_validation import FoldingValidator
 from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.dataset.process_pdb import process_pdb_file, read_processed_file
@@ -347,8 +347,10 @@ def main() -> None:
     # TODO(cfg) support hydra to get config
     validator = FoldingValidator(
         cfg=FoldingConfig(
-            seq_per_sample=args.seqs_per_sample,
-            pmpnn_seed=args.pmpnn_seed,
+            protein_mpnn=ProteinMPNNRunnerConfig(
+                seq_per_sample=args.seqs_per_sample,
+                pmpnn_seed=args.pmpnn_seed,
+            )
         )
     )
 

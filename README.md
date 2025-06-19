@@ -61,6 +61,7 @@ This project introduces several extensions over MultiFlow:
 `/cogeneration/data/metrics.py` - helpers for computing metrics of samples
 `/cogeneration/data/noise_mask.py` - Utilities for masking and generating noise for each domain
 `/cogeneration/data/potentials.py` - Feynman-Kac Steering. Several `Potential` instances. `FKSTeeringCalculator` stateless class for computing potentials. `FKSteeringResambler` stateful class for initializing particles and resampling during inference.
+`cogeneration/data/protein_mpnn_runner.py` - `ProteinMPNNRunner` to run ProteinMPNN
 `/cogeneration/data/protein.py` - mostly from Openfold. `Protein` class for processing PDBs into a `Protein` `Chain`. 
 `/cogeneration/data/residue_constants.py` - mostly from Openfold. Atom types, residue constants, bond lengths, atom14 and atom37 representations and masks, etc.
 `/cogeneration/data/rigid.py` - mostly from Openfold. utilities for interacting with rigids, like centering and aligning.

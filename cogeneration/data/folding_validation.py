@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
@@ -19,6 +20,7 @@ from cogeneration.data.const import CA_IDX, aatype_to_seq
 from cogeneration.data.io import write_numpy_json
 from cogeneration.data.metrics import calc_ca_ca_metrics, calc_mdtraj_metrics
 from cogeneration.data.protein import write_prot_to_pdb
+from cogeneration.data.protein_mpnn_runner import ProteinMPNNRunner
 from cogeneration.data.residue_constants import restype_order_with_x, restypes_with_x
 from cogeneration.data.superimposition import superimpose
 from cogeneration.dataset.process_pdb import get_uncompressed_pdb_path, process_pdb_file
@@ -59,6 +61,8 @@ class FoldingValidator:
 
     def __post_init__(self):
         self.log = logging.getLogger(__name__)
+        # Initialize ProteinMPNN runner once to avoid repeated instantiation
+        self.protein_mpnn_runner = ProteinMPNNRunner(self.cfg.protein_mpnn)
 
     def set_device_id(self, device_id: int):
         self.device_id = device_id
@@ -533,6 +537,7 @@ class FoldingValidator:
         diffuse_mask: Optional[npt.NDArray],
         output_dir: str,
         num_sequences: Optional[int] = None,
+        seed: Optional[int] = None,
     ) -> str:
         """
         Generates and returns a fasta of inverse folded sequences using ProteinMPNN.
@@ -543,27 +548,25 @@ class FoldingValidator:
         #    since some of the metrics check for sequence conservation of motifs.
         # assert diffuse_mask is None or (diffuse_mask == 1.0).all()
 
-        if num_sequences is None:
-            num_sequences = self.cfg.seq_per_sample
-
         assert os.path.exists(
             pdb_input_path
         ), f"PDB path {pdb_input_path} does not exist"
 
         uncompressed_pdb_path, is_temp_file = get_uncompressed_pdb_path(pdb_input_path)
 
-        modified_fasta_path = self._run_protein_mpnn(
-            input_pdb_path=uncompressed_pdb_path,
-            output_dir=output_dir,
-            num_sequences=num_sequences,
-            seed=self.cfg.pmpnn_seed,
+        # Run ProteinMPNN
+        fasta_path = self.protein_mpnn_runner.run(
+            pdb_path=Path(uncompressed_pdb_path),
+            output_dir=Path(output_dir),
             device_id=self.device_id,
+            num_sequences=num_sequences,
+            seed=seed,
         )
 
         if is_temp_file:
             os.remove(uncompressed_pdb_path)
 
-        return modified_fasta_path
+        return str(fasta_path)
 
     def _run_alphafold2(self, fasta_path: str, output_dir: str) -> pd.DataFrame:
         """
@@ -599,7 +602,7 @@ class FoldingValidator:
             "--num-models",
             "1",
             "--random-seed",
-            str(self.cfg.pmpnn_seed),
+            str(self.cfg.protein_mpnn.pmpnn_seed),
             "--model-order",
             "4",
             "--num-recycle",
@@ -650,106 +653,6 @@ class FoldingValidator:
             )
 
         return pd.DataFrame(all_fold_metrics)
-
-    def _run_protein_mpnn(
-        self,
-        input_pdb_path: str,
-        output_dir: str,
-        num_sequences: int,
-        seed: int,
-        device_id: int,
-    ) -> str:
-        """
-        Run ProteinMPNN inverse folding on a PDB file
-        Returns a fasta with reasonably named sequences
-
-        TODO(tools) make this static. It should delegate to a ProteinMPNNRunner class, that can be mocked.
-        """
-        assert device_id is not None, "Device ID must be set for PMPNN folding"
-        assert os.path.exists(
-            self.cfg.pmpnn_path
-        ), f"PMPNN path {self.cfg.pmpnn_path} does not exist"
-
-        os.makedirs(output_dir, exist_ok=True)
-
-        # ProteinMPNN takes a PDB as input, and writes a fasta as output, per PDB.
-        # The output `.fa` file has the same basename as the input `.pdb` file.
-
-        # Prep, copy the input structure to the directory where Protein MPNN needs it
-        pdb_file_name = os.path.basename(input_pdb_path)
-        pdb_name = pdb_file_name.split(".")[0]
-        output_pdb_path = os.path.join(output_dir, pdb_file_name)
-        shutil.copy(input_pdb_path, output_pdb_path)
-
-        # Create a directory `seqs`, as required by the PMPNN code, into which we write each sequence as a file.
-        seqs_dir = os.path.join(output_dir, "seqs")
-        os.makedirs(seqs_dir, exist_ok=True)
-
-        # `parse_multiple_chains` takes directory of PDBs, but assume we are working with one
-        # process = subprocess.Popen(
-        #     [
-        #         "python3",
-        #         os.path.join(
-        #             self.cfg.pmpnn_path, "helper_scripts/parse_multiple_chains.py"
-        #         ),
-        #         f"--input_path={input_pdb_path}",
-        #         f"--output_path={output_dir}",
-        #     ]
-        # )
-        # code = process.wait()
-        # if code != 0:
-        #     raise RuntimeError(
-        #         f"ProteinMPNN parse_multiple_chains.py failed with code {code}"
-        #     )
-
-        # Run ProteinMPNN Inverse Folding
-        # TODO(tools) pass device
-
-        pmpnn_args = [
-            "python3",
-            os.path.join(self.cfg.pmpnn_path, "protein_mpnn_run.py"),
-            "--out_folder",
-            output_dir,
-            "--pdb_path",
-            output_pdb_path,
-            "--num_seq_per_target",
-            str(num_sequences),
-            "--sampling_temp",
-            "0.1",
-            "--seed",
-            str(seed),
-            "--batch_size",
-            "1",
-        ]
-        process = subprocess.Popen(
-            pmpnn_args, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
-        )
-        code = process.wait()
-        if code != 0:
-            raise RuntimeError(
-                f"ProteinMPNN run.py failed with code {code}. Args: {' '.join(pmpnn_args)}"
-            )
-
-        # Rename the entries into a new file.
-        mpnn_fasta_path = os.path.join(
-            output_dir,
-            "seqs",
-            pdb_name + ".fa",
-        )
-        modified_fasta_path = mpnn_fasta_path.replace(".fa", "_modified.fasta")
-        fasta_records = SeqIO.parse(mpnn_fasta_path, "fasta")
-        with open(modified_fasta_path, "w") as f:
-            for i, record in enumerate(fasta_records):
-                # Skip the first, which is the input.
-                if i == 0:
-                    continue
-                # record names are like `T=0.1, sample=1, score=0.4789, global_score=0.4789, seq_recovery=0.2188`
-                # but drop and we'll compute ourselves.
-                f.write(f">{pdb_name}_pmpnn_seq_{i}\n")
-                # replace chain breaks ProteinMPNN serializes with "/" -> ":" for AF2 compatibility
-                f.write(str(record.seq).replace("/", ":") + "\n")
-
-        return modified_fasta_path
 
     @staticmethod
     def calc_backbone_rmsd(

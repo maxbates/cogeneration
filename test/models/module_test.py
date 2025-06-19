@@ -155,7 +155,7 @@ class TestFlowModule:
         mock_folding_validation(
             batch=batch,
             cfg=mock_cfg,
-            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+            n_inverse_folds=mock_cfg.folding.protein_mpnn.seq_per_sample,
         )
 
         predictions = module.predict_step(batch, 0)
@@ -194,7 +194,7 @@ class TestFlowModule:
         mock_folding_validation(
             batch=batch,
             cfg=mock_cfg,
-            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+            n_inverse_folds=mock_cfg.folding.protein_mpnn.seq_per_sample,
         )
 
         # just check that it works
@@ -211,7 +211,7 @@ class TestFlowModule:
         mock_folding_validation(
             batch=batch,
             cfg=mock_cfg,
-            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+            n_inverse_folds=mock_cfg.folding.protein_mpnn.seq_per_sample,
         )
 
         # just test that it works
@@ -232,7 +232,7 @@ class TestFlowModule:
         mock_folding_validation(
             batch=batch,
             cfg=mock_cfg,
-            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+            n_inverse_folds=mock_cfg.folding.protein_mpnn.seq_per_sample,
         )
 
         # just test that it works
@@ -256,7 +256,7 @@ class TestFlowModule:
         mock_folding_validation(
             batch=batch,
             cfg=mock_cfg,
-            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+            n_inverse_folds=mock_cfg.folding.protein_mpnn.seq_per_sample,
         )
 
         # just test that it works
@@ -277,7 +277,7 @@ class TestFlowModule:
         mock_folding_validation(
             batch=batch,
             cfg=mock_cfg,
-            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+            n_inverse_folds=mock_cfg.folding.protein_mpnn.seq_per_sample,
         )
 
         # just test that it works
@@ -306,7 +306,7 @@ class TestFlowModule:
         mock_folding_validation(
             batch=batch,
             cfg=mock_cfg,
-            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+            n_inverse_folds=mock_cfg.folding.protein_mpnn.seq_per_sample,
         )
 
         # just test that it works
@@ -347,7 +347,7 @@ class TestFlowModule:
         mock_folding_validation(
             batch=batch,
             cfg=mock_cfg,
-            n_inverse_folds=mock_cfg.folding.seq_per_sample,
+            n_inverse_folds=mock_cfg.folding.protein_mpnn.seq_per_sample,
         )
 
         # just test that it works

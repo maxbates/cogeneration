@@ -143,7 +143,7 @@ class FoldingValidationMockValue:
 @pytest.fixture
 def mock_folding_validation(tmp_path):
     with patch(
-        "cogeneration.data.folding_validation.FoldingValidator._run_protein_mpnn"
+        "cogeneration.data.protein_mpnn_runner.ProteinMPNNRunner.run"
     ) as mock_run_protein_mpnn, patch(
         "cogeneration.data.folding_validation.FoldingValidator._run_alphafold2"
     ) as mock_run_alphafold2:

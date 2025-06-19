@@ -37,7 +37,7 @@ class TestEvalRunner:
         mock_folding_validation(
             batch=pred_batch,
             cfg=cfg,
-            n_inverse_folds=cfg.folding.seq_per_sample,  # prediction
+            n_inverse_folds=cfg.folding.protein_mpnn.seq_per_sample,  # prediction
         )
 
         # run sampling
