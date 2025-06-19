@@ -99,6 +99,12 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
   - [x] FlashIPA import 
   - [x] wrapper to patch IPA?
 
+- Tests
+  - [x] test model pass for each model configuration 
+
+- Clean up Modules
+  - [x] Break up `models/` directory
+  
 - Support backlog
   - [ ] pull `num_layers` out of config, per trunk, into an (override?) argument
       - avoid patching config per trunk
@@ -110,18 +116,12 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
     - Or, detect what is available and use helper throughout -- probably want explicit option
   - [ ] consistent `use_kernels` vs `kernel` config
 
-- Tests
-  - [x] test model pass for each model configuration 
-
-- Clean up Modules
-  - [x] Break up `models/` directory
-
 - [ ] `setup.py` optional dependencies in `[cuda]` extras
   - [ ] improve `torch`
   - [ ] `cuequivariance` install
   - [ ] install flash-ipa
   - [ ] `pip install flash-attn --no-build-isolation`
-  
-- address TODO(attn)
 
-- update README code layout
+- [ ] address TODO(attn)
+
+- [x] update README code layout

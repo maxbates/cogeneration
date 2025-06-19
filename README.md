@@ -19,8 +19,10 @@ This project introduces several extensions over MultiFlow:
 - B-factor and pLDDT prediction, improving model understanding of flexible regions, and embedding structure experimental method
 - additional losses (e.g. for atomic interactions, clashes)
 - data pipeline to generate or augment training data
+- Adds a trunk with choice of attention mechanisms, e.g. IPA, Pairformer (triangle attention)
+- CUDA optimizations, e.g. Flash Attention, Flash IPA, cuEquivariant triangle attention
 - many improvements to code base: typing, enums, documentation, tests, etc.
-- new features and modules are optional - reverse compatible with MultiFlow
+- these new features and modules are optional - easily reverse compatible with MultiFlow, and public Multiflow weights
 
 ## Project Conventions
 
@@ -37,7 +39,7 @@ This project introduces several extensions over MultiFlow:
 
 - Tests are in `/test`
 - Test by running `pytest`
-- Test directory structure should match the `/cogeneration` directory structure, with `_test.py` suffix.
+- Test directory structure should ~ match the `/cogeneration` directory structure, with `_test.py` suffix.
 
 ## Project Structure
 
@@ -86,14 +88,25 @@ This project introduces several extensions over MultiFlow:
 `/cogeneration/datasets` - Directory containing training and test data
 
 `/cogeneration/models`
+`/cogeneration/models/attention`
+`/cogeneration/models/attention/attention_pair_bias.py` - Adapted from Boltz, `AttentionPairBias` module
+`/cogeneration/models/attention/attention_trunk.py` - `AttentionTrunk` switch module, to create attention trunks
+`/cogeneration/models/attention/double_attention_pair.py` - Double Attention pair, hacky triangle attention alternative
+`/cogeneration/models/attention/dropout.py` - Adapted from Boltz, Dropout module
+`/cogeneration/models/attention/ipa_attention.py` - AttentionIPATrunk module
+`/cogeneration/models/attention/ipa_flash.py` - FlashIPA wrapper 
+`/cogeneration/models/attention/ipa_pytorch.py` - Mostly from Openfold, IPA submodules
+`/cogeneration/models/attention/pairformer.py` - Adapted from Boltz, Pairformer block / module, and `NoSeq` variant.
+`/cogeneration/models/attention/transition.py` - MLP transition module
+`/cogeneration/models/attention/triangle_attention.py`  - Adapted from Boltz, triangle attention 
+`/cogeneration/models/attention/triangle_mult.py` - Adapted from Boltz, triangle attention 
 `/cogeneration/models/aa_pred.py` - Simple Sequence prediction network using linear layer / MLP
 `/cogeneration/models/bfactors.py` - Module for predicting B-factors
+`/cogeneration/models/confidence.py` - Module for predicting pLDDT (potentially PAE, PTM in the future?)
 `/cogeneration/models/edge_feature_net.py` - Simple network for embedding edge features / pair representations. Embed edges using distrogram, plus self-conditioned dist, chain, masks etc.
 `/cogeneration/models/embed.py` - Embedding utilites for positions, time, distrogram
 `/cogeneration/models/esm_combiner.py` - Module which combines initial node and edge embeddings with ESM single and pair embeddings
 `/cogeneration/models/esm_frozen.py` - Frozen ESM model for ESM single and pair embeddings
-`/cogeneration/models/ipa_attention.py` - AttentionIPATrunk module
-`/cogeneration/models/ipa_pytorch.py` - Mostly from Openfold, IPA submodules
 `/cogeneration/models/loss_calculator.py` - class `BatchLossCalculator` which computes losses and serializes them into `TrainingLosses` and `AuxiliaryMetrics`.
 `/cogeneration/models/model.py` - complete Pytorch model
 `/cogeneration/models/module.py` - Lightning Module which defines losses, training + validation + prediction steps
