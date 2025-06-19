@@ -105,6 +105,7 @@ class AttentionPairBias(nn.Module):
             # Compute output
             o = torch.einsum("bhij,bjhd->bihd", attn, v.float()).to(v.dtype)
         o = o.reshape(B, -1, self.cfg.node_dim)
+
         o = self.proj_o(g * o)
 
         return o

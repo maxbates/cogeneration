@@ -132,6 +132,8 @@ class SharedConfig(BaseClassConfig):
     project_root: str = str(PATH_PROJECT_ROOT)
     # random number generator shared seed
     seed: int = 123
+    # default dropout rate for attention modules
+    dropout: float = 0.1
 
 
 @dataclass
@@ -273,6 +275,7 @@ class ModelDoubleAttentionPairConfig(BaseClassConfig):
     # hidden dim for time conditioning MLP, i.e. Feature-wise Linear Modulation (FiLM)
     use_film: bool = True  # enable time conditioning, requires r3_t
     time_mlp_hidden_dim: int = "${model.hyper_params.timestep_embed_size}"
+    dropout: float = "${shared.dropout}"
 
 
 @dataclass
@@ -281,7 +284,7 @@ class ModelPairformerConfig(BaseClassConfig):
     num_layers: int = "${model.hyper_params.trunk_num_layers}"
     node_dim: int = "${model.hyper_params.node_embed_size}"  # aka token_s
     edge_dim: int = "${model.hyper_params.edge_embed_size}"  # aka token_z
-    dropout: float = 0.1
+    dropout: float = "${shared.dropout}"
     attention_pair_bias: ModelAttentionPairBiasConfig = field(
         default_factory=ModelAttentionPairBiasConfig
     )
@@ -311,10 +314,10 @@ class ModelIPAConfig(BaseClassConfig):
     no_v_points: int = 12
     # Attention trunk parameters
     num_blocks: int = "${model.hyper_params.ipa_num_layers}"
-    dropout: float = 0.0
+    dropout: float = "${shared.dropout}"
     seq_tfmr_num_heads: int = 4
     seq_tfmr_num_layers: int = 4
-    transformer_dropout: float = 0.2
+    transformer_dropout: float = "${shared.dropout}"
     # FlashIPA
     use_flash_attn: bool = "${shared.kernels}"
     z_factor_rank: int = 0

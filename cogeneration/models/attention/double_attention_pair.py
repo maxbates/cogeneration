@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from cogeneration.config.base import ModelDoubleAttentionPairConfig
+from cogeneration.models.attention.dropout import get_dropout_mask
 from cogeneration.models.attention.ipa_pytorch import Linear
 
 
@@ -83,6 +84,11 @@ class DoubleAttentionPairBlock(nn.Module):
             O = O * (1 + scale.unsqueeze(1).unsqueeze(1)) + shift.unsqueeze(
                 1
             ).unsqueeze(1)
+
+        # Apply dropout
+        if self.cfg.dropout > 0.0:
+            dropout = get_dropout_mask(self.cfg.dropout, O, self.training)
+            O = O * dropout
 
         # residual update
         return edge_embed + O
