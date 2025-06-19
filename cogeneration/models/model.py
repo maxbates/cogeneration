@@ -148,28 +148,46 @@ class FlowModel(nn.Module):
         else:
             node_embed, edge_embed = init_node_embed, init_edge_embed
 
-        # Trunk
-        if self.cfg.trunk.enabled:
-            node_embed, edge_embed = self.trunk(
-                init_node_embed=init_node_embed,
-                init_edge_embed=init_edge_embed,
-                node_embed=node_embed,
-                edge_embed=edge_embed,
+        curr_rigids_nm = init_rigids_nm
+
+        # Recycling
+        for recycle_idx in range(self.cfg.num_recycles + 1):
+            is_final_recycle = recycle_idx == self.cfg.num_recycles
+
+            # Only track gradients on the final iteration, otherwise detach
+            if not is_final_recycle:
+                node_embed_input = node_embed.detach()
+                edge_embed_input = edge_embed.detach()
+                curr_rigids_nm = curr_rigids_nm.detach()
+            else:
+                node_embed_input = node_embed
+                edge_embed_input = edge_embed
+
+            # Trunk
+            if self.cfg.trunk.enabled:
+                node_embed_input, edge_embed_input = self.trunk(
+                    init_node_embed=init_node_embed,
+                    init_edge_embed=init_edge_embed,
+                    node_embed=node_embed_input,
+                    edge_embed=edge_embed_input,
+                    node_mask=node_mask,
+                    edge_mask=edge_mask,
+                    rigid=curr_rigids_nm,
+                    r3_t=r3_t,
+                )
+
+            # IPA trunk
+            node_embed, edge_embed, curr_rigids_nm, pred_torsions = self.ipa_trunk(
+                node_embed=node_embed_input,
+                edge_embed=edge_embed_input,
                 node_mask=node_mask,
                 edge_mask=edge_mask,
-                rigid=init_rigids_nm,
-                r3_t=r3_t,
+                diffuse_mask=diffuse_mask,
+                curr_rigids_nm=curr_rigids_nm,
             )
 
-        # IPA trunk - note works in nm scale, not angstroms
-        node_embed, edge_embed, pred_rigids_nm, pred_torsions = self.ipa_trunk(
-            node_embed=node_embed,
-            edge_embed=edge_embed,
-            node_mask=node_mask,
-            edge_mask=edge_mask,
-            diffuse_mask=diffuse_mask,
-            curr_rigids_nm=init_rigids_nm,
-        )
+        # Final predictions from the last recycle
+        pred_rigids_nm = curr_rigids_nm
         # Convert rigid back to angstroms
         pred_rigids_ang = rigids_nm_to_ang(pred_rigids_nm)
         pred_trans = pred_rigids_ang.get_trans()

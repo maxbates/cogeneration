@@ -20,6 +20,7 @@ This project introduces several extensions over MultiFlow:
 - additional losses (e.g. for atomic interactions, clashes)
 - data pipeline to generate or augment training data
 - Adds a trunk with choice of attention mechanisms, e.g. IPA, Pairformer (triangle attention)
+- Enables recyling through the trunk + IPA
 - CUDA optimizations, e.g. Flash Attention, Flash IPA, cuEquivariant triangle attention
 - many improvements to code base: typing, enums, documentation, tests, etc.
 - these new features and modules are optional - easily reverse compatible with MultiFlow, and public Multiflow weights

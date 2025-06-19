@@ -484,6 +484,10 @@ class ModelConfig(BaseClassConfig):
     predict_psi_torsions: bool = True  # -> 1 (psi): orients peptide plane & side chain
     predict_all_torsions: bool = True  # -> 7 angles: omega, phi, psi, chi1-chi4
 
+    # Recycling - number of times to recycle through trunk and IPA trunk
+    # 0 = no recycling (single pass)
+    num_recycles: int = 3
+
     seq_trunk: ModelAttentionTrunkConfig = field(
         default_factory=lambda: ModelAttentionTrunkConfig(
             attn_type=AttentionType.PAIRFORMER,
@@ -1396,6 +1400,8 @@ class Config(BaseClassConfig):
         raw_cfg.model.edge_features.feat_dim = 8
         # and smaller transformers
         raw_cfg.model.ipa.no_heads = 2
+        # no recycling
+        raw_cfg.model.num_recycles = 0
 
         # filter to small PDBs for faster model + sampling
         raw_cfg.dataset.debug_head_samples = 1000
@@ -1464,6 +1470,8 @@ class Config(BaseClassConfig):
         raw_cfg.model.plddt.enabled = False
         # Use simple aa_pred_net from public MultiFlow
         raw_cfg.model.sequence_pred_type = ModelSequencePredictionEnum.aa_pred
+        # disable recycling
+        raw_cfg.model.num_recycles = 0
         # stochastic paths not part of public MultiFlow
         raw_cfg.shared.stochastic = False
         # use simple gaussian prior for translations
