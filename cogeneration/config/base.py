@@ -392,11 +392,6 @@ class ModelESMCombinerConfig(BaseClassConfig):
     only_single: bool = False
     # which ESM model size to use
     esm_model_key: ModelESMKey = ModelESMKey.esm2_t30_150M_UR50D
-    # representation enriched using attention blocks
-    # TODO(attn) support folding blocks instead
-    double_attention_pair_trunk: ModelDoubleAttentionPairConfig = field(
-        default_factory=ModelDoubleAttentionPairConfig
-    )
     # dims coming from simple node/edge networks
     node_embed_size: int = "${model.hyper_params.node_embed_size}"
     edge_embed_size: int = "${model.hyper_params.edge_embed_size}"

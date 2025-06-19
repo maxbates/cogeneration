@@ -117,14 +117,14 @@ Need to determine a reasonable ratio of pairformer:IPA blocks, or a minimum numb
   - [x] cuEquivariance env setup helper, e.g. set `CUQUI_ENABLE_BF16` etc. if kernels enabled
   - [x] use bf16 where appropriate
 
-- [ ] `setup.py` optional dependencies in `[cuda]` extras
-  - [ ] improve `torch`
-  - [ ] `cuequivariance` install
-  - [ ] install flash-ipa
-  - [ ] `pip install flash-attn --no-build-isolation`
-
-- [ ] test CUDA kernels work, install works
-
-- [ ] address TODO(attn)
+- [x] `setup.py` optional dependencies in `[cuda]` extras
+  - [x] improve `torch`
+  - [x] `cuequivariance` install
+  - [x] install flash-ipa
+  - [x] `pip install flash-attn --no-build-isolation`
 
 - [x] update README code layout
+
+- [x] address attn todos
+
+- [ ] test CUDA kernels work, install works
