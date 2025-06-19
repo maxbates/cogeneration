@@ -100,6 +100,13 @@ setup wandb
 wandb login
 ```
 
+Load CUDA environment variables
+```
+set -a  # automatically export all variables
+source "$(dirname "$0")/.env.cuda"
+set +a
+```
+
 Simple training with logging
 ```
 python cogeneration/scripts/train.py 2>&1 | tee train.log

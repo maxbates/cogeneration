@@ -33,27 +33,3 @@ def print_timing(f):
         return result
 
     return wrap
-
-
-def setup_cuequivariance_env(kernels_enabled: bool = True, enable_bf16: bool = True):
-    """
-    Set up environment variables for optimal cuEquivariance kernel performance.
-    Should be called early in training/inference scripts.
-
-    Args:
-        kernels_enabled: Whether CUDA kernels are enabled
-        enable_bf16: Whether to enable bf16 precision for kernels
-    """
-    if not kernels_enabled or not torch.cuda.is_available():
-        return
-
-    # Enable bf16 precision for cuEquivariance kernels
-    if enable_bf16:
-        os.environ["CUQUI_ENABLE_BF16"] = "1"
-
-    # Enable other cuEquivariance optimizations
-    os.environ["CUQUI_ENABLE_FAST_MATH"] = "1"
-    os.environ["CUQUI_ENABLE_TENSOR_CORES"] = "1"
-
-    # Set memory pool allocation for better performance
-    os.environ["CUQUI_MEMORY_POOL"] = "1"

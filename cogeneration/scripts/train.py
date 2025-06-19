@@ -15,11 +15,7 @@ from cogeneration.config.base import Config
 from cogeneration.dataset.datasets import DatasetConstructor
 from cogeneration.dataset.protein_dataloader import ProteinData
 from cogeneration.models.module import FlowModule
-from cogeneration.scripts.utils import (
-    get_available_device,
-    print_timing,
-    setup_cuequivariance_env,
-)
+from cogeneration.scripts.utils import get_available_device, print_timing
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
 from cogeneration.util.log import rank_zero_logger
 
@@ -52,13 +48,6 @@ class Experiment:
                 if merged_ckpt_path != ckpt_cfg_path:
                     log.info(f"Checkpoint path changed to {merged_ckpt_path}")
                     cfg.experiment.warm_start_ckpt = merged_ckpt_path
-
-        # Setup for cuEquivariance
-        setup_cuequivariance_env(
-            kernels_enabled=cfg.shared.kernels,
-            enable_bf16=cfg.shared.kernels_bf16
-            and (cfg.experiment.trainer.precision == "bf16"),
-        )
 
         # Handle DDP set up in case pytorch lightning doesn't handle it
         # (e.g. on mac laptop)

@@ -17,7 +17,7 @@ def get_dropout_mask(
     dropout : float
         The dropout rate
     z : torch.Tensor
-        The tensor to apply dropout to
+        The tensor to apply dropout to, 4 dim e.g. (B, N, N, c_z)
     training : bool
         Whether the model is in training mode
     columnwise : bool, optional
