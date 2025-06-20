@@ -1215,14 +1215,52 @@ class InferenceConfig(BaseClassConfig):
     animation_max_frames: int = 50
 
 
+class ModelType(StrEnum):
+    """Supported ProteinMPNN model types."""
+
+    PROTEIN_MPNN = "protein_mpnn"
+    LIGAND_MPNN = "ligand_mpnn"
+    SOLUBLE_MPNN = "soluble_mpnn"
+    MEMBRANE_MPNN = "membrane_mpnn"
+    GLOBAL_MEMBRANE_MPNN = "global_membrane_mpnn"
+
+
 @dataclass
 class ProteinMPNNRunnerConfig(BaseClassConfig):
     """Configuration for ProteinMPNN runner."""
 
-    # Assume ProteinMPNN to be a sibling to project root, installed separately
-    pmpnn_path: Path = PATH_PROJECT_ROOT.parent / "ProteinMPNN"
+    # Path to LigandMPNN installation (sibling to project root)
+    pmpnn_path: Path = PATH_PROJECT_ROOT.parent / "LigandMPNN"
+    # Path to directory containing ProteinMPNN model weights, "" for same directory
+    pmpnn_weights_dir: Path = ""
     pmpnn_seed: int = "${shared.seed}"
     seq_per_sample: int = 8
+
+    # Native runner options
+    use_native_runner: bool = True  # Use native runner instead of subprocess
+    accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'gpu'}"
+    model_type: ModelType = ModelType.PROTEIN_MPNN
+    temperature: float = 0.1  # Sampling temperature
+
+    # Advanced features from LigandMPNN
+    ligand_mpnn_use_atom_context: bool = True  # For ligand_mpnn
+    ligand_mpnn_cutoff_for_score: float = 8.0  # Cutoff distance for scoring
+    ligand_mpnn_use_side_chain_context: bool = False  # Use side chain context
+
+    # Amino acid biasing and omission
+    bias_AA: Optional[str] = None  # Format: "A:-1.024,P:2.34,C:-12.34"
+    omit_AA: str = ""  # Format: "ACG"
+
+    # Membrane protein specific (for membrane variants)
+    global_transmembrane_label: int = 0  # 1 for transmembrane, 0 for soluble
+
+    # Side chain packing
+    pack_side_chains: bool = False  # Enable side chain packing
+    checkpoint_path_sc: Optional[Path] = None  # Side chain packer checkpoint
+    number_of_packs_per_design: int = 4  # Number of packing samples
+    sc_num_denoising_steps: int = 3  # Denoising steps for packing
+    sc_num_samples: int = 16  # Samples for mixture distribution
+    repack_everything: bool = False  # Repack all residues or just redesigned ones
 
 
 @dataclass

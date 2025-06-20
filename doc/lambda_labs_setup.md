@@ -66,10 +66,16 @@ sudo apt-get install ffmpeg
 Install ProteinMPNN
 
 ```bash
-# Clone ProteinMPNN to ~/tools directory
+# Clone ligandMPNN (for local) ProteinMPNN (for subprocess) to ~/tools directory
 mkdir -p ~/tools
 cd ~/tools
 git clone https://github.com/dauparas/ProteinMPNN.git
+git clone https://github.com/dauparas/LigandMPNN.git
+
+# Download ligandMPNN weights to run natively (much faster)
+wget -q https://files.ipd.uw.edu/pub/ligandmpnn/proteinmpnn_v_48_020.pt -O "~/tools/LigandMPNN/proteinmpnn_v_48_020.pt"
+wget -q https://files.ipd.uw.edu/pub/ligandmpnn/ligandmpnn_v_32_010_25.pt -O "~/tools/LigandMPNN/ligandmpnn_v_32_010_25.pt"
+wget -q https://files.ipd.uw.edu/pub/ligandmpnn/ligandmpnn_sc_v_32_002_16.pt -O "~/tools/LigandMPNN/ligandmpnn_sc_v_32_002_16.pt"
 
 # Install dependencies in current environment
 pip install prody pyparsing==3.1.1

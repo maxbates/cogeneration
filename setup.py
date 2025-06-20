@@ -48,6 +48,8 @@ install_requires = [
     "platformdirs==4.3.6",
     "pluggy==1.5.0",
     "protobuf==5.28.2",
+    # ProDy - molecular dynamics analysis library used by ProteinMPNN
+    "prody @ git+https://github.com/prody/ProDy",
     "psutil==6.0.0",
     "pyparsing==3.2.0",
     "pytest==8.3.3",
