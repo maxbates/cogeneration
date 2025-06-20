@@ -1,6 +1,7 @@
 import datetime as dt
 from typing import Any, Mapping, Optional, Set
 
+import pandas as pd
 import torch
 from Bio.PDB.Structure import Structure
 
@@ -102,6 +103,10 @@ class StructureExperimentalMethod(StrEnum):
         """
         if isinstance(value, cls):
             return value
+
+        # handle missing in CSV as default to X-RAY DIFFRACTION
+        if pd.isna(value):
+            return cls.XRAY_DIFFRACTION
 
         _STR_TO_METHOD: Mapping[str, StructureExperimentalMethod] = {
             "MD": cls.MD,

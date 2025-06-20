@@ -2,9 +2,11 @@
 Unified ProteinMPNN runner
 
 This module provides a unified interface for running ProteinMPNN inverse folding,
-supporting both native (in-memory model) and subprocess execution modes.
+supporting  `run_native` (in-memory model) and `run_subprocess` (subprocess execution modes).
 The native mode loads the model once and keeps it in memory for fast inference,
 while subprocess mode calls the original ProteinMPNN script.
+
+Also supports `run_batch` which bypasses PDB I/O overhead and runs inference trans ,rots, aatypes etc. tensors directly.
 
 Running natively requires `LigandMPNN` is installed, and location specified in the config.
 
@@ -12,10 +14,51 @@ Note: lots of Claude generated code here. Which I blame on LigandMPNN
 having an outrageously complicated `main()` function and no straightforward 
 way to create a model, keep it in memory, and call the inference functions. 
 So much of it's main() is ported here to support some of its features.
+
+================================================================================
+Claude generated note on batching / vectorized execution:
+
+ProteinMPNN/LigandMPNN models do NOT support true vectorized batching of multiple 
+different protein structures. This is a fundamental architectural limitation of 
+these models. Here's why:
+
+1. **Single Structure Architecture**: The models are designed to process one protein 
+   structure at a time. The "batch_size" parameter in the model refers to the number 
+   of sequences to generate for a SINGLE structure, not the number of different 
+   structures to process simultaneously.
+
+2. **Structure-Specific Features**: Each protein structure has its own unique:
+   - Sequence length (variable L)
+   - Chain topology and connectivity
+   - Residue-residue contact maps
+   - Geometric features (distances, angles)
+   - Ligand context (for LigandMPNN)
+   
+   These cannot be meaningfully batched together as they have different dimensions
+   and semantic meanings.
+
+3. **Featurization Limitations**: The featurization process (in data_utils.featurize())
+   creates structure-specific features that assume a single protein structure. The
+   resulting feature tensors have shapes like (1, L, ...) where the first dimension
+   is always 1 (single structure).
+
+4. **Model Sample Method**: The model.sample() method expects:
+   - feature_dict["batch_size"] = number of sequences to generate for ONE structure
+   - All input tensors shaped for a single structure
+   - Returns sequences shaped as (batch_size, L) where batch_size is the number
+     of sequences generated for the single input structure
+
+5. **Memory Layout**: The model's internal computations assume that all sequences
+   in a batch correspond to the same underlying protein structure, sharing the
+   same backbone coordinates, contact maps, and geometric features.
+
+This limitation is inherent to the ProteinMPNN model family and cannot be
+circumvented without fundamental changes to the model architecture.
 """
 
 import copy
 import importlib.util
+import json
 import logging
 import os
 import random
@@ -48,19 +91,24 @@ MPNNLogits = torch.Tensor  # Logits in ProteinMPNN alphabetical ordering (21,)
 CogenAATypes = torch.Tensor  # Amino acid types in project's AlphaFold ordering
 CogenLogits = torch.Tensor  # Logits in project's AlphaFold ordering (21,)
 
+MPNNProteinDict = Dict  # Dictionary containing protein structure data (coordinates, sequences, chains, etc.)
+
 
 @dataclass
 class NativeMPNNResult:
     """
     Result structure from native ProteinMPNN inference.
 
-    This provides a consistent interface for ProteinMPNN results with support
-    for both single structure and batch processing.
+    This provides a consistent interface for ProteinMPNN results
     """
 
-    logits: CogenLogits  # All sequence logits in project's AlphaFold ordering
-    confidence_scores: torch.Tensor  # Confidence scores for each sequence
-    _sequences: Optional[CogenAATypes] = None  # Cached sequences (computed on demand)
+    logits: CogenLogits  # (B, num_sequences, N, 21) - All sequence logits in project's AlphaFold ordering
+    confidence_scores: (
+        torch.Tensor
+    )  # (B, num_sequences) - Confidence scores for each sequence
+    _sequences: Optional[CogenAATypes] = (
+        None  # (B, num_sequences, N) - Cached sequences (computed on demand)
+    )
 
     @property
     def sequences(self) -> CogenAATypes:
@@ -70,7 +118,7 @@ class NativeMPNNResult:
         Computed on-demand from logits using argmax sampling.
 
         Returns:
-            sequences: Amino acid sequences in project's AlphaFold ordering
+            sequences: Amino acid sequences in project's AlphaFold ordering (B, num_sequences, N)
         """
         if self._sequences is None:
             # Generate sequences from logits using argmax
@@ -82,7 +130,7 @@ class NativeMPNNResult:
         Explicitly set the sequences (useful when sequences were generated via sampling).
 
         Args:
-            sequences: Amino acid sequences in project's AlphaFold ordering
+            sequences: Amino acid sequences in project's AlphaFold ordering (B, num_sequences, N)
         """
         self._sequences = sequences
 
@@ -94,15 +142,10 @@ class NativeMPNNResult:
         For compatibility with existing code that expects averaged_logits.
 
         Returns:
-            averaged_logits: Mean logits across the sequence dimension
+            averaged_logits: Mean logits across the sequence dimension (B, N, 21)
         """
-        if len(self.logits.shape) >= 2:
-            # Average across the sequence dimension (first non-batch dimension)
-            return torch.mean(
-                self.logits, dim=-3 if len(self.logits.shape) == 4 else -2
-            )
-        else:
-            return self.logits
+        # Average across the num_sequences dimension
+        return torch.mean(self.logits, dim=-3)
 
     @property
     def all_logits(self) -> CogenLogits:
@@ -110,6 +153,9 @@ class NativeMPNNResult:
         All sequence logits (alias for logits property).
 
         For compatibility with existing code.
+
+        Returns:
+            all_logits: All sequence logits (B, num_sequences, N, 21)
         """
         return self.logits
 
@@ -149,6 +195,11 @@ class ProteinMPNNRunner:
             logger.info(
                 f"ProteinMPNN native runner initialized on device: {self._device}"
             )
+
+    @property
+    def device(self) -> torch.device:
+        """Public access to the device."""
+        return self._device
 
     def _create_mpnn_to_cogen_conversion_map(self) -> torch.Tensor:
         """
@@ -303,7 +354,7 @@ class ProteinMPNNRunner:
         if module_name in self._ligandmpnn_modules:
             return self._ligandmpnn_modules[module_name]
 
-        ligandmpnn_path = self.config.pmpnn_path
+        ligandmpnn_path = self.config.ligand_mpnn_path
         if not ligandmpnn_path.exists():
             raise FileNotFoundError(f"LigandMPNN path not found: {ligandmpnn_path}")
 
@@ -434,7 +485,9 @@ class ProteinMPNNRunner:
 
             checkpoint_path_sc = self.config.checkpoint_path_sc
             if checkpoint_path_sc is None:
-                weights_path = self.config.pmpnn_path / self.config.pmpnn_weights_dir
+                weights_path = (
+                    self.config.ligand_mpnn_path / self.config.pmpnn_weights_dir
+                )
 
                 # Default side chain checkpoint filename
                 checkpoint_filename = "ligandmpnn_sc_v_32_002_16.pt"
@@ -443,7 +496,9 @@ class ProteinMPNNRunner:
                 if weights_path is not None:
                     possible_sc_paths = [
                         weights_path / checkpoint_filename,
-                        self.config.pmpnn_path / "model_params" / checkpoint_filename,
+                        self.config.ligand_mpnn_path
+                        / "model_params"
+                        / checkpoint_filename,
                     ]
                     for path in possible_sc_paths:
                         if path.exists():
@@ -452,7 +507,9 @@ class ProteinMPNNRunner:
 
                 # Fallback to ligandmpnn_path if not found in weights directory
                 if checkpoint_path_sc is None:
-                    checkpoint_path_sc = self.config.pmpnn_path / checkpoint_filename
+                    checkpoint_path_sc = (
+                        self.config.ligand_mpnn_path / checkpoint_filename
+                    )
 
             if not checkpoint_path_sc.exists():
                 logger.warning(
@@ -504,7 +561,7 @@ class ProteinMPNNRunner:
         if self._checkpoint_path is not None:
             return self._checkpoint_path
 
-        ligandmpnn_path = self.config.pmpnn_path
+        ligandmpnn_path = self.config.ligand_mpnn_path
         weights_path = ligandmpnn_path / self.config.pmpnn_weights_dir
 
         # Map model types to checkpoint files
@@ -551,50 +608,7 @@ class ProteinMPNNRunner:
             f"Tried: {[str(p) for p in possible_paths]}"
         )
 
-    def _parse_bias_AA(self, bias_str: Optional[str]) -> torch.Tensor:
-        """
-        Parse amino acid bias string into tensor.
-
-        Args:
-            bias_str: Bias string in format "A:-1.024,P:2.34"
-
-        Returns:
-            Bias tensor of shape [21]
-        """
-        # Load required module
-        data_utils = self._load_ligandmpnn_module("data_utils")
-
-        bias_AA = torch.zeros([21], device=self._device, dtype=torch.float32)
-        if bias_str:
-            try:
-                items = [item.split(":") for item in bias_str.split(",")]
-                for aa, bias_val in items:
-                    if aa in data_utils.restype_str_to_int:
-                        bias_AA[data_utils.restype_str_to_int[aa]] = float(bias_val)
-            except Exception as e:
-                logger.warning(f"Failed to parse bias_AA '{bias_str}': {e}")
-        return bias_AA
-
-    def _parse_omit_AA(self, omit_str: str) -> torch.Tensor:
-        """
-        Parse amino acid omission string into tensor.
-
-        Args:
-            omit_str: String of amino acids to omit, e.g., "ACG"
-
-        Returns:
-            Omission tensor of shape [21]
-        """
-        # Load required module
-        data_utils = self._load_ligandmpnn_module("data_utils")
-
-        omit_AA = torch.tensor(
-            np.array([AA in omit_str for AA in data_utils.alphabet]).astype(np.float32),
-            device=self._device,
-        )
-        return omit_AA
-
-    def generate_fasta(
+    def run_pdb(
         self,
         pdb_path: Path,
         output_dir: Path,
@@ -604,9 +618,6 @@ class ProteinMPNNRunner:
         temperature: Optional[float] = None,
         chains_to_design: Optional[List[str]] = None,
         fixed_residues: Optional[List[str]] = None,
-        redesigned_residues: Optional[List[str]] = None,
-        bias_AA: Optional[str] = None,
-        omit_AA: Optional[str] = None,
         parse_these_chains_only: Optional[List[str]] = None,
         **kwargs,
     ) -> Path:
@@ -622,9 +633,6 @@ class ProteinMPNNRunner:
             temperature: Sampling temperature
             chains_to_design: List of chain IDs to design
             fixed_residues: List of residue positions to keep fixed
-            redesigned_residues: List of residue positions to redesign
-            bias_AA: Amino acid bias string (format: "A:-1.024,P:2.34")
-            omit_AA: Amino acids to omit (format: "ACG")
             parse_these_chains_only: Chains to parse from PDB
             **kwargs: Additional arguments
 
@@ -632,7 +640,7 @@ class ProteinMPNNRunner:
             Path to output FASTA file
         """
         if self.config.use_native_runner:
-            return self.run_native(
+            return self.run_pdb_native(
                 pdb_path=pdb_path,
                 output_dir=output_dir,
                 device_id=device_id,
@@ -641,19 +649,19 @@ class ProteinMPNNRunner:
                 temperature=temperature,
                 chains_to_design=chains_to_design,
                 fixed_residues=fixed_residues,
-                redesigned_residues=redesigned_residues,
-                bias_AA=bias_AA,
-                omit_AA=omit_AA,
                 parse_these_chains_only=parse_these_chains_only,
                 **kwargs,
             )
         else:
-            return self.run_subprocess(
+            return self.run_pdb_subprocess(
                 pdb_path=pdb_path,
                 output_dir=output_dir,
                 device_id=device_id,
                 num_sequences=num_sequences,
                 seed=seed,
+                temperature=temperature,
+                chains_to_design=chains_to_design,
+                fixed_residues=fixed_residues,
                 **kwargs,
             )
 
@@ -694,7 +702,7 @@ class ProteinMPNNRunner:
 
         return output_fasta
 
-    def run_native(
+    def run_pdb_native(
         self,
         pdb_path: Path,
         output_dir: Path,
@@ -704,11 +712,7 @@ class ProteinMPNNRunner:
         temperature: Optional[float] = None,
         chains_to_design: Optional[List[str]] = None,
         fixed_residues: Optional[List[str]] = None,
-        redesigned_residues: Optional[List[str]] = None,
-        bias_AA: Optional[str] = None,
-        omit_AA: Optional[str] = None,
         parse_these_chains_only: Optional[List[str]] = None,
-        **kwargs,
     ) -> Path:
         """
         Run ProteinMPNN using native (in-memory) model.
@@ -733,8 +737,6 @@ class ProteinMPNNRunner:
         num_sequences = num_sequences or self.config.seq_per_sample
         seed = seed or self.config.pmpnn_seed
         temperature = temperature or self.config.temperature
-        omit_AA = omit_AA or self.config.omit_AA
-        bias_AA = bias_AA or self.config.bias_AA
 
         # Set random seeds
         torch.manual_seed(seed)
@@ -778,11 +780,8 @@ class ProteinMPNNRunner:
             protein_dict=protein_dict,
             temperature=temperature,
             num_sequences=num_sequences,
-            bias_AA=bias_AA,
-            omit_AA=omit_AA,
             chains_to_design=chains_to_design,
             fixed_residues=fixed_residues,
-            redesigned_residues=redesigned_residues,
             model=model,
         )
 
@@ -816,17 +815,19 @@ class ProteinMPNNRunner:
         logger.info(f"Native ProteinMPNN completed successfully")
         return processed_fasta
 
-    def run_subprocess(
+    def run_pdb_subprocess(
         self,
         pdb_path: Path,
         output_dir: Path,
         device_id: Optional[int],
         num_sequences: Optional[int] = None,
+        temperature: Optional[float] = None,
         seed: Optional[int] = None,
-        **kwargs,
+        fixed_residues: Optional[List[str]] = None,
+        chains_to_design: Optional[List[str]] = None,
     ) -> Path:
         """
-        Run ProteinMPNN using subprocess (original script).
+        Run ProteinMPNN using subprocess.
 
         Returns:
             Path to output FASTA file
@@ -838,6 +839,7 @@ class ProteinMPNNRunner:
         # Set defaults
         num_sequences = num_sequences or self.config.seq_per_sample
         seed = seed or self.config.pmpnn_seed
+        temperature = temperature or self.config.temperature
 
         # Create output directory
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -847,7 +849,7 @@ class ProteinMPNNRunner:
         shutil.copy2(pdb_path, pdb_copy_path)
 
         # Construct ProteinMPNN command
-        run_script = self.config.pmpnn_path / "run.py"
+        run_script = self.config.protein_mpnn_path / "run.py"
         assert run_script.exists(), f"ProteinMPNN run.py not found: {run_script}"
 
         cmd = [
@@ -862,7 +864,7 @@ class ProteinMPNNRunner:
             "--num_seq_per_target",
             str(num_sequences),
             "--sampling_temp",
-            str(self.config.temperature),
+            str(temperature),
             "--seed",
             str(seed),
             "--batch_size",
@@ -870,10 +872,15 @@ class ProteinMPNNRunner:
         ]
 
         # Add additional arguments
-        if self.config.bias_AA:
-            cmd.extend(["--bias_AA", self.config.bias_AA])
-        if self.config.omit_AA:
-            cmd.extend(["--omit_AA", self.config.omit_AA])
+        if chains_to_design is not None:
+            cmd.extend(["--pdb_path_chains", ",".join(chains_to_design)])
+
+        # fixed positions requires jsonl file
+        if fixed_residues is not None:
+            fixed_positions_path = output_dir / "fixed_positions.jsonl"
+            with open(fixed_positions_path, "w") as f:
+                json.dump(fixed_residues, f)
+            cmd.extend(["--fixed_positions", str(fixed_positions_path)])
 
         logger.info(f"Running ProteinMPNN subprocess: {' '.join(cmd)}")
 
@@ -885,7 +892,7 @@ class ProteinMPNNRunner:
         try:
             result = subprocess.run(
                 cmd,
-                cwd=self.config.pmpnn_path,
+                cwd=self.config.ligand_mpnn_path,
                 env=env,
                 capture_output=True,
                 text=True,
@@ -930,25 +937,91 @@ class ProteinMPNNRunner:
 
         return processed_fasta
 
+    def _protein_dict_from_batch(
+        self,
+        trans: torch.Tensor,  # (B, N, 3)
+        rotmats: torch.Tensor,  # (B, N, 3, 3)
+        aatypes: CogenAATypes,  # (B, N) - amino acid types in project's AlphaFold ordering
+        res_mask: torch.Tensor,  # (B, N) - residue mask
+        chain_idx: Optional[torch.Tensor] = None,  # (B, N) - chain indices
+        torsions: Optional[torch.Tensor] = None,  # (B, N, 7, 2)
+    ) -> List[MPNNProteinDict]:
+        """
+        Create protein dictionaries from batch tensor data.
+
+        This method handles the conversion from batch tensors (translations, rotations, etc.)
+        to ProteinMPNN-compatible protein dictionaries for inference.
+
+        Args:
+            trans: Predicted frame translations (B, N, 3)
+            rotmats: Predicted frame rotations (B, N, 3, 3)
+            aatypes: Predicted amino acid types in project's AlphaFold ordering (B, N)
+            res_mask: Residue mask indicating valid positions (B, N)
+            chain_idx: Optional chain indices (B, N), defaults to single chain
+            torsions: Optional predicted torsion angles (B, N, 7, 2)
+
+        Returns:
+            List of protein dictionaries, one per batch element
+        """
+
+        # Move all input tensors to the runner's device and handle MPS compatibility
+        def move_tensor_to_device(tensor: torch.Tensor) -> torch.Tensor:
+            """Move tensor to runner's device with MPS float64 compatibility."""
+            if self._device.type == "mps" and tensor.dtype == torch.float64:
+                tensor = tensor.float()
+            return tensor.to(self._device)
+
+        trans = move_tensor_to_device(trans)
+        rotmats = move_tensor_to_device(rotmats)
+        aatypes = move_tensor_to_device(aatypes)
+        res_mask = move_tensor_to_device(res_mask)
+
+        if torsions is not None:
+            torsions = move_tensor_to_device(torsions)
+
+        if chain_idx is not None:
+            chain_idx = move_tensor_to_device(chain_idx)
+        else:
+            chain_idx = torch.ones_like(res_mask)
+
+        # Convert frames to atom37 coordinates for the entire batch
+        atom37 = all_atom.atom37_from_trans_rot(
+            trans=trans,  # (B, N, 3)
+            rots=rotmats,  # (B, N, 3, 3)
+            torsions=torsions,  # (B, N, 7, 2) or None
+            aatype=aatypes,  # (B, N)
+            res_mask=res_mask,  # (B, N)
+            unknown_to_alanine=True,
+        )  # (B, N, 37, 3)
+
+        # Convert amino acid types from project format to MPNN format
+        mpnn_aatypes = self._convert_cogen_aatypes_to_mpnn(aatypes)  # (B, N)
+
+        # Create batch protein_dict for all structures
+        protein_dicts: List[MPNNProteinDict] = self._create_protein_dict_from_frames(
+            atom37=atom37,  # (B, N, 37, 3)
+            aatypes=mpnn_aatypes,  # (B, N)
+            chain_idx=chain_idx,  # (B, N)
+            device=self._device,
+            res_mask=res_mask,  # (B, N)
+        )
+
+        return protein_dicts
+
     # TODO run_batch should take `num_logits` or `is_masking` to determine whether 20 or 21 logits are used
 
     def run_batch(
         self,
-        pred_trans: torch.Tensor,  # (B, N, 3)
-        pred_rotmats: torch.Tensor,  # (B, N, 3, 3)
-        pred_aatypes: CogenAATypes,  # (B, N) - amino acid types in project's AlphaFold ordering
+        trans: torch.Tensor,  # (B, N, 3)
+        rotmats: torch.Tensor,  # (B, N, 3, 3)
+        aatypes: CogenAATypes,  # (B, N) - amino acid types in project's AlphaFold ordering
         res_mask: torch.Tensor,  # (B, N) - residue mask
-        pred_torsions: Optional[torch.Tensor] = None,  # (B, N, 7, 2)
-        chain_idx: Optional[torch.Tensor] = None,  # (B, N) - chain indices
+        chain_idx: torch.Tensor,  # (B, N) - chain indices
+        torsions: Optional[torch.Tensor] = None,  # (B, N, 7, 2)
         num_sequences: Optional[int] = 1,
         temperature: Optional[float] = None,
         chains_to_design: Optional[List[str]] = None,
         fixed_residues: Optional[List[str]] = None,
-        redesigned_residues: Optional[List[str]] = None,
-        bias_AA: Optional[str] = None,
-        omit_AA: Optional[str] = None,
-        batch_size_limit: Optional[int] = None,  # memory management
-        **kwargs,
     ) -> NativeMPNNResult:
         """
         Run ProteinMPNN on a batch of protein frames directly.
@@ -958,20 +1031,16 @@ class ProteinMPNNRunner:
         on the model's frame representation.
 
         Args:
-            pred_trans: Predicted frame translations (B, N, 3)
-            pred_rotmats: Predicted frame rotations (B, N, 3, 3)
-            pred_aatypes: Predicted amino acid types in project's AlphaFold ordering (B, N)
+            trans: Predicted frame translations (B, N, 3)
+            rotmats: Predicted frame rotations (B, N, 3, 3)
+            aatypes: Predicted amino acid types in project's AlphaFold ordering (B, N)
             res_mask: Residue mask indicating valid positions (B, N)
-            pred_torsions: Optional predicted torsion angles (B, N, 7, 2)
             chain_idx: Optional chain indices (B, N), defaults to single chain
-            num_sequences: Number of sequences to generate per batch element (per structure)
+            torsions: Optional predicted torsion angles (B, N, 7, 2)
+            num_sequences: Number of sequences/logits to generate per batch element
             temperature: Sampling temperature, defaults to config value
             chains_to_design: List of chain IDs to design
             fixed_residues: List of residue positions to keep fixed
-            redesigned_residues: List of residue positions to redesign
-            bias_AA: Amino acid bias string (format: "A:-1.024,P:2.34")
-            omit_AA: Amino acids to omit (format: "ACG")
-            batch_size_limit: Maximum batch size for processing (for memory management)
             **kwargs: Additional arguments
 
         Returns:
@@ -990,124 +1059,29 @@ class ProteinMPNNRunner:
             logger.error(f"Failed to import LigandMPNN data_utils: {e}")
             raise
 
-        # Move all input tensors to the runner's device and handle MPS compatibility
-        def move_tensor_to_device(tensor: torch.Tensor) -> torch.Tensor:
-            """Move tensor to runner's device with MPS float64 compatibility."""
-            if self._device.type == "mps" and tensor.dtype == torch.float64:
-                tensor = tensor.float()
-            return tensor.to(self._device)
-
-        pred_trans = move_tensor_to_device(pred_trans)
-        pred_rotmats = move_tensor_to_device(pred_rotmats)
-        pred_aatypes = move_tensor_to_device(pred_aatypes)
-        res_mask = move_tensor_to_device(res_mask)
-
-        if pred_torsions is not None:
-            pred_torsions = move_tensor_to_device(pred_torsions)
-
-        if chain_idx is not None:
-            chain_idx = move_tensor_to_device(chain_idx)
-        else:
-            chain_idx = torch.ones_like(res_mask)
-
-        B, N = pred_trans.shape[:2]
-
         # Set defaults
         temperature = temperature or self.config.temperature
-        omit_AA = omit_AA or self.config.omit_AA
-        bias_AA = bias_AA or self.config.bias_AA
-        batch_size_limit = batch_size_limit or max(
-            8, B // 4
-        )  # Process in chunks if large batch
 
         # Load model
         model = self._load_model()
 
-        # Process batch in chunks if needed for memory management
-        if B > batch_size_limit:
-            logger.info(
-                f"Processing large batch of {B} structures in chunks of {batch_size_limit}"
-            )
-            chunk_results = []
-
-            for chunk_start in range(0, B, batch_size_limit):
-                chunk_end = min(chunk_start + batch_size_limit, B)
-
-                # Extract chunk
-                chunk_trans = pred_trans[chunk_start:chunk_end]
-                chunk_rotmats = pred_rotmats[chunk_start:chunk_end]
-                chunk_aatypes = pred_aatypes[chunk_start:chunk_end]
-                chunk_res_mask = res_mask[chunk_start:chunk_end]
-                chunk_chain_idx = chain_idx[chunk_start:chunk_end]
-                chunk_torsions = (
-                    pred_torsions[chunk_start:chunk_end]
-                    if pred_torsions is not None
-                    else None
-                )
-
-                # Process chunk recursively
-                chunk_result = self.run_batch(
-                    pred_trans=chunk_trans,
-                    pred_rotmats=chunk_rotmats,
-                    pred_aatypes=chunk_aatypes,
-                    res_mask=chunk_res_mask,
-                    pred_torsions=chunk_torsions,
-                    chain_idx=chunk_chain_idx,
-                    temperature=temperature,
-                    num_sequences=num_sequences,
-                    chains_to_design=chains_to_design,
-                    fixed_residues=fixed_residues,
-                    redesigned_residues=redesigned_residues,
-                    bias_AA=bias_AA,
-                    omit_AA=omit_AA,
-                    batch_size_limit=None,  # Prevent infinite recursion
-                )
-                chunk_results.append(chunk_result)
-
-            # Combine chunk results
-            sequences = torch.cat([r.sequences for r in chunk_results], dim=0)
-            all_logits = torch.cat([r.logits for r in chunk_results], dim=0)
-            confidence_scores = torch.cat(
-                [r.confidence_scores for r in chunk_results], dim=0
-            )
-            return NativeMPNNResult(
-                logits=all_logits,
-                confidence_scores=confidence_scores,
-                _sequences=sequences,
-            )
-
-        # Convert frames to atom37 coordinates for the entire batch
-        atom37 = all_atom.atom37_from_trans_rot(
-            trans=pred_trans,  # (B, N, 3)
-            rots=pred_rotmats,  # (B, N, 3, 3)
-            torsions=pred_torsions,  # (B, N, 7, 2) or None
-            aatype=pred_aatypes,  # (B, N)
-            res_mask=res_mask,  # (B, N)
-            unknown_to_alanine=True,
-        )  # (B, N, 37, 3)
-
-        # Convert amino acid types from project format to MPNN format
-        mpnn_aatypes = self._convert_cogen_aatypes_to_mpnn(pred_aatypes)  # (B, N)
-
-        # Create batch protein_dict for all structures
-        batch_protein_dict = self._create_protein_dict_from_frames(
-            atom37=atom37,  # (B, N, 37, 3)
-            aatypes=mpnn_aatypes,  # (B, N)
-            chain_idx=chain_idx,  # (B, N)
-            device=self._device,
-            res_mask=res_mask,  # (B, N)
+        # Create protein dictionaries from batch data
+        protein_dicts = self._protein_dict_from_batch(
+            trans=trans,
+            rotmats=rotmats,
+            aatypes=aatypes,
+            res_mask=res_mask,
+            chain_idx=chain_idx,
+            torsions=torsions,
         )
 
-        # Run inference on the entire batch
+        # Run inference on the list of protein_dicts
         batch_result = self._run_inference_on_protein_dict(
-            protein_dict=batch_protein_dict,
+            protein_dict=protein_dicts,
             temperature=temperature,
             num_sequences=num_sequences,
-            bias_AA=bias_AA,
-            omit_AA=omit_AA,
             chains_to_design=chains_to_design,
             fixed_residues=fixed_residues,
-            redesigned_residues=redesigned_residues,
             model=model,
         )
 
@@ -1135,20 +1109,18 @@ class ProteinMPNNRunner:
         res_mask: Optional[
             torch.Tensor
         ] = None,  # (B, N) - only required for batch inputs
-    ) -> Dict:
+    ) -> Union[MPNNProteinDict, List[MPNNProteinDict]]:
         """
-        Create a protein_dict that mimics the output of parse_PDB.
+        Create protein_dict(s) that mimic the output of parse_PDB.
 
         This method creates ProteinMPNN-compatible data structures from frame coordinates
         and amino acid types. The input amino acid types should already be in ProteinMPNN's
         alphabetical ordering [A,C,D,E,F,G,H,I,K,L,M,N,P,Q,R,S,T,V,W,Y].
 
-        Supports both single structure and batch inputs by automatically detecting dimensionality.
-
         Args:
             atom37: Atom coordinates in atom37 format
-                   - Single: (N, 37, 3)
-                   - Batch: (B, N, 37, 3)
+                   - Single: (N, 37, 3) -> returns Dict
+                   - Batch: (B, N, 37, 3) -> returns List[Dict]
             aatypes: Amino acid types in ProteinMPNN alphabetical ordering
                     - Single: (N,)
                     - Batch: (B, N)
@@ -1160,8 +1132,8 @@ class ProteinMPNNRunner:
                      - Batch: (B, N)
 
         Returns:
-            protein_dict: Dictionary similar to parse_PDB output with ProteinMPNN-compatible data
-                         For batch inputs, includes 'batch_size' field to indicate batch processing
+            If single structure: protein_dict (ProteinDict)
+            If batch: List of protein_dicts (List[ProteinDict])
         """
         # Load the required modules
         data_utils = self._load_ligandmpnn_module("data_utils")
@@ -1170,10 +1142,28 @@ class ProteinMPNNRunner:
         is_batched = len(atom37.shape) == 4  # (B, N, 37, 3) vs (N, 37, 3)
 
         if is_batched:
-            return self._create_batch_protein_dict_impl(
-                atom37, aatypes, chain_idx, res_mask, device, data_utils
-            )
+            # Return list of protein_dicts, one per batch element
+            if res_mask is None:
+                raise ValueError("res_mask is required for batch inputs")
+
+            B = atom37.shape[0]
+            protein_dicts = []
+
+            for b in range(B):
+                # Extract single structure from batch
+                single_atom37 = atom37[b]  # (N, 37, 3)
+                single_aatypes = aatypes[b]  # (N,)
+                single_chain_idx = chain_idx[b]  # (N,)
+
+                # Create single protein_dict
+                protein_dict = self._create_single_protein_dict_impl(
+                    single_atom37, single_aatypes, single_chain_idx, device, data_utils
+                )
+                protein_dicts.append(protein_dict)
+
+            return protein_dicts
         else:
+            # Return single protein_dict
             return self._create_single_protein_dict_impl(
                 atom37, aatypes, chain_idx, device, data_utils
             )
@@ -1185,7 +1175,7 @@ class ProteinMPNNRunner:
         chain_idx: torch.Tensor,  # (N,)
         device: torch.device,
         data_utils,
-    ) -> Dict:
+    ) -> MPNNProteinDict:
         """Implementation for single structure protein_dict creation."""
         N = atom37.shape[0]
 
@@ -1240,140 +1230,45 @@ class ProteinMPNNRunner:
 
         return protein_dict
 
-    def _create_batch_protein_dict_impl(
-        self,
-        atom37: torch.Tensor,  # (B, N, 37, 3)
-        aatypes: MPNNAATypes,  # (B, N) - amino acid types in ProteinMPNN alphabetical ordering
-        chain_idx: torch.Tensor,  # (B, N)
-        res_mask: torch.Tensor,  # (B, N)
-        device: torch.device,
-        data_utils,
-    ) -> Dict:
-        """Implementation for batch protein_dict creation."""
-        if res_mask is None:
-            raise ValueError("res_mask is required for batch inputs")
-
-        B, N = atom37.shape[:2]
-
-        # Convert ProteinMPNN amino acid integers to sequence strings for each batch item
-        batch_sequences = []
-        batch_chain_letters_list = []
-
-        for b in range(B):
-            # Convert sequence for this batch item
-            sequence_chars = []
-            for aa_int in aatypes[b]:
-                mpnn_char = data_utils.restype_int_to_str.get(int(aa_int), "A")
-                sequence_chars.append(mpnn_char)
-            batch_sequences.append("".join(sequence_chars))
-
-            # Create chain labels (letters A, B, C, etc.) for this batch item
-            unique_chains = torch.unique(chain_idx[b], sorted=True)
-            chain_mapping = {}
-            for i, chain_id in enumerate(unique_chains):
-                chain_mapping[int(chain_id)] = chr(ord("A") + i)
-
-            chain_letters_list = [chain_mapping[int(idx)] for idx in chain_idx[b]]
-            batch_chain_letters_list.append(chain_letters_list)
-
-        # Convert to batch tensors/formats expected by featurize
-        # For batch processing, we'll use the first batch item's chain structure as template
-        # This assumes all batch items have similar chain structure (common in practice)
-        chain_label_to_int = {
-            label: i for i, label in enumerate(set(batch_chain_letters_list[0]))
-        }
-
-        # Create chain labels tensor for each batch item
-        batch_chain_labels = []
-        for b in range(B):
-            chain_labels_tensor = torch.tensor(
-                [
-                    chain_label_to_int.get(label, 0)
-                    for label in batch_chain_letters_list[b]
-                ],
-                device=device,
-            )
-            batch_chain_labels.append(chain_labels_tensor)
-        batch_chain_labels_tensor = torch.stack(batch_chain_labels, dim=0)  # (B, N)
-
-        # Prepare the coordinates in the expected format
-        # featurize expects X with shape (B, N, 4, 3) for N, CA, C, O atoms
-        X_backbone = atom37[:, :, :4, :]  # (B, N, 4, 3)
-
-        # For batch processing, we'll handle each structure separately but use the same protein_dict structure
-        batch_protein_dict = {
-            "coords": atom37,  # (B, N, 37, 3) - full atom coordinates
-            "X": X_backbone,  # (B, N, 4, 3) - backbone coordinates for featurize
-            "S": aatypes,  # (B, N) - sequence as ProteinMPNN integers
-            "seq": batch_sequences,  # List of sequences as strings using ProteinMPNN alphabet
-            "mask": res_mask.float(),  # (B, N) - residue mask converted to float for LigandMPNN compatibility
-            "R_idx": torch.arange(1, N + 1, device=device)
-            .unsqueeze(0)
-            .repeat(B, 1),  # (B, N) - residue indices starting from 1
-            "chain_labels": batch_chain_labels_tensor,  # (B, N) - tensor of chain labels (for featurize)
-            "chain_letters": batch_chain_letters_list,  # List of lists of chain letters (for inference)
-            "chain_idx": chain_idx,  # (B, N) - original chain indices
-            "chain_mask": torch.ones_like(
-                res_mask, device=device, dtype=torch.float32
-            ),  # (B, N) - all residues can be designed by default, float format
-            "batch_size": B,  # Mark as batch data
-        }
-
-        return batch_protein_dict
-
     def _run_inference_on_protein_dict(
         self,
-        protein_dict: Dict,
+        protein_dict: Union[MPNNProteinDict, List[MPNNProteinDict]],
         temperature: float,
         num_sequences: int,
-        bias_AA: Optional[str],
-        omit_AA: Optional[str],
         chains_to_design: Optional[List[str]],
         fixed_residues: Optional[List[str]],
-        redesigned_residues: Optional[List[str]],
         model: torch.nn.Module,
     ) -> NativeMPNNResult:
         """
-        Run inference on a protein_dict.
+        Run inference on protein_dict(s).
 
         ProteinMPNN generates each batch autoregressively, and it is recommended to generate multiple independent batches per input.
         --num_sequences is roughly equivalent to --number_of_batches in LigandMPNN.
         Each is generated independently.
 
         Args:
-            protein_dict: Dictionary containing protein structures
+            protein_dict: Single protein_dict or list of protein_dicts (each representing a single structure)
             temperature: Sampling temperature
             num_sequences: Number of independent autoregressive sequences to generate per structure (equivalent to --number_of_batches in LigandMPNN)
-            bias_AA: Amino acid bias string (optional)
-            omit_AA: Amino acids to omit (optional)
             chains_to_design: Chains to design (optional)
             fixed_residues: Fixed residues (optional)
-            redesigned_residues: Redesigned residues (optional)
             model: ProteinMPNN model
 
         Returns:
-            NativeMPNNResult containing logits, confidence scores, and sequences
+            NativeMPNNResult with batch dimensions: (B, num_sequences, N, 21) for logits, etc.
         """
         data_utils = self._load_ligandmpnn_module("data_utils")
 
-        # Check if this is a batch of structures or a single structure
-        if "X" in protein_dict:
-            X = protein_dict["X"]
-            if X.dim() == 4:  # (B, N, 4, 3) - batch of structures
-                B, N = X.shape[:2]
-                is_batch = True
-            elif X.dim() == 3:  # (N, 4, 3) - single structure
-                B, N = 1, X.shape[0]
-                is_batch = False
-            else:
-                raise ValueError(f"Unexpected X shape: {X.shape}")
+        # Normalize input to list of protein_dicts
+        if isinstance(protein_dict, dict):
+            protein_dicts = [protein_dict]
         else:
-            raise ValueError(
-                "protein_dict must contain 'X' key with backbone coordinates"
-            )
+            protein_dicts = protein_dict
+
+        B = len(protein_dicts)  # Number of structures
 
         logger.info(
-            f"Generating {num_sequences} sequences with temperature {temperature}"
+            f"Generating {num_sequences} sequences per structure for {B} structures with temperature {temperature}"
         )
 
         # Collect results for all structures
@@ -1381,21 +1276,19 @@ class ProteinMPNNRunner:
         all_batch_sequences = []
         all_batch_confidence = []
 
-        # Process each structure individually
-        for struct_idx in range(B):
-            # Extract single structure from batch
-            if is_batch:
-                single_protein_dict = {}
-                for key, value in protein_dict.items():
-                    if key == "_parsed_metadata":
-                        single_protein_dict[key] = value
-                        continue
-                    if isinstance(value, torch.Tensor) and value.dim() >= 2:
-                        single_protein_dict[key] = value[struct_idx]
-                    else:
-                        single_protein_dict[key] = value
+        # Process each structure individually ( therefore, batch_size=1 )
+        # Ideally, we would process each batch in parallel, `num_sequences` indendent runs,
+        # but it appears `data_utils.featurize` only works for single item `protein_dict` instances
+        # and the model only supports running one structure at a time.
+
+        for struct_idx, single_protein_dict in enumerate(protein_dicts):
+            # Get sequence length for this structure
+            if "X" in single_protein_dict:
+                N = single_protein_dict["X"].shape[0]
             else:
-                single_protein_dict = protein_dict
+                raise ValueError(
+                    "protein_dict must contain 'X' key with backbone coordinates"
+                )
 
             # Featurize the single structure
             feature_dict = data_utils.featurize(
@@ -1404,33 +1297,14 @@ class ProteinMPNNRunner:
                 use_atom_context=True,
             )
 
-            # NOTE: batch_size=1 always for autoregressive sampling, num_sequences controls number of independent runs
-            # TODO - however, if we have a batch input, we can run each member of the batch simultaneously,
-            #   so there are only `num_sequences` independent runs
-
-            # Set up the feature dict for sampling sequences
             feature_dict["batch_size"] = 1
             feature_dict["temperature"] = temperature
 
-            # Set up bias and omit tensors
+            # Set up bias and omit tensors (no bias or omit applied)
             bias_tensor = torch.zeros(1, N, 21, device=self._device)
             omit_tensor = torch.zeros(1, N, 21, device=self._device)
 
-            if bias_AA:
-                bias_values = self._parse_bias_AA(
-                    bias_AA
-                )  # Returns tensor of shape [21]
-                # Apply the same bias to all positions
-                bias_tensor[0, :, :] = bias_values.unsqueeze(0).expand(N, -1)
-
-            if omit_AA:
-                omit_values = self._parse_omit_AA(
-                    omit_AA
-                )  # Returns tensor of shape [21]
-                # Apply the same omit mask to all positions
-                omit_tensor[0, :, :] = omit_values.unsqueeze(0).expand(N, -1)
-
-            # Combine bias and omit
+            # Combine bias and omit (no effect since both are zero)
             feature_dict["bias"] = bias_tensor - 1e8 * omit_tensor
 
             # Set up chain mask
@@ -1504,33 +1378,20 @@ class ProteinMPNNRunner:
         batch_confidence = torch.stack(all_batch_confidence)  # (B, num_sequences)
 
         logger.info(
-            f"Successfully generated {num_sequences * B} independent autoregressive sequences across {B} structures"
+            f"Successfully generated {num_sequences * B} sequences across {B} structures"
         )
 
-        if is_batch:
-            # Return batch format
-            return NativeMPNNResult(
-                logits=batch_logits,
-                confidence_scores=batch_confidence,
-                _sequences=batch_sequences,
-            )
-        else:
-            # Remove batch dimension (B=1) for single structure case
-            all_logits_tensor = batch_logits[0]  # (num_sequences, N, 21)
-            all_confidence_scores_tensor = batch_confidence[0]  # (num_sequences,)
-            sequences = batch_sequences[0]  # (num_sequences, N)
-
-            return NativeMPNNResult(
-                logits=all_logits_tensor,
-                confidence_scores=all_confidence_scores_tensor,
-                _sequences=sequences,
-            )
+        return NativeMPNNResult(
+            logits=batch_logits,
+            confidence_scores=batch_confidence,
+            _sequences=batch_sequences,
+        )
 
     def _parse_pdb_to_protein_dict(
         self,
         pdb_path: Path,
         parse_these_chains_only: Optional[List[str]] = None,
-    ) -> Dict:
+    ) -> MPNNProteinDict:
         """
         Parse PDB file into protein_dict format.
 
@@ -1581,52 +1442,10 @@ class ProteinMPNNRunner:
 
         return protein_dict
 
-    def _pad_result_to_original_length(
-        self,
-        structure_result: NativeMPNNResult,
-        valid_mask: torch.Tensor,
-        original_length: int,
-        temperature: float,
-    ) -> NativeMPNNResult:
-        """
-        Pad the inference result back to the original sequence length.
-
-        This handles cases where only a subset of residues were processed.
-        """
-        device = valid_mask.device
-        num_sequences = structure_result.logits.shape[0]
-
-        # Create padded tensors
-        padded_all_logits = torch.zeros(
-            num_sequences, original_length, 21, device=device
-        )
-        padded_sequences = torch.zeros(
-            num_sequences, original_length, device=device, dtype=torch.long
-        )
-
-        # Fill in valid positions
-        padded_all_logits[:, valid_mask, :] = structure_result.logits
-        padded_sequences[:, valid_mask] = structure_result.sequences
-
-        # For invalid positions, set uniform probabilities (or very low confidence)
-        invalid_mask = ~valid_mask
-        if invalid_mask.any():
-            # Set to uniform distribution in log space
-            uniform_logits = torch.full(
-                (21,), -torch.log(torch.tensor(21.0)), device=device
-            )
-            padded_all_logits[:, invalid_mask, :] = uniform_logits
-
-        return NativeMPNNResult(
-            logits=padded_all_logits,
-            confidence_scores=structure_result.confidence_scores,
-            _sequences=padded_sequences,
-        )
-
     def _save_inference_results_to_fasta(
         self,
         inference_result: NativeMPNNResult,
-        protein_dict: Dict,
+        protein_dict: MPNNProteinDict,
         output_dir: Path,
         pdb_path: Path,
         temperature: float,
@@ -1642,10 +1461,10 @@ class ProteinMPNNRunner:
         # Load required module
         data_utils = self._load_ligandmpnn_module("data_utils")
 
-        # Extract results
-        S_stack = inference_result.sequences  # (num_sequences, L)
-        log_probs_stack = inference_result.logits  # (num_sequences, L, 21)
-        confidence_scores = inference_result.confidence_scores  # (num_sequences,)
+        # Extract results from first batch element (B=1 for single structure)
+        S_stack = inference_result.sequences[0]  # (num_sequences, L)
+        log_probs_stack = inference_result.logits[0]  # (num_sequences, L, 21)
+        confidence_scores = inference_result.confidence_scores[0]  # (num_sequences,)
 
         # Create additional derived results for compatibility
         # Compute sequence recovery
@@ -1772,7 +1591,7 @@ class ProteinMPNNRunner:
     def _apply_side_chain_packing(
         self,
         inference_result: NativeMPNNResult,
-        protein_dict: Dict,
+        protein_dict: MPNNProteinDict,
         model_sc: torch.nn.Module,
         output_dir: Path,
         pdb_path: Path,
@@ -1796,7 +1615,7 @@ class ProteinMPNNRunner:
             return
 
         # Extract results
-        S_stack = inference_result.sequences  # (num_sequences, L)
+        S_stack = inference_result.sequences[0]  # (num_sequences, L)
 
         # Get metadata from parsing
         parsed_metadata = protein_dict.get("_parsed_metadata", {})
@@ -1920,16 +1739,6 @@ class ProteinMPNNRunner:
         else:
             logger.warning("No packed structures were generated successfully")
 
-    def __del__(self):
-        """Clean up resources."""
-        if hasattr(self, "_model") and self._model is not None:
-            del self._model
-        if hasattr(self, "_model_sc") and self._model_sc is not None:
-            del self._model_sc
-        if hasattr(self, "_device"):
-            if torch.cuda.is_available() and str(self._device).startswith("cuda"):
-                torch.cuda.empty_cache()
-
     def _convert_mpnn_sequences_to_cogen(
         self, mpnn_sequences: torch.Tensor
     ) -> torch.Tensor:
@@ -1981,3 +1790,13 @@ class ProteinMPNNRunner:
         cogen_sequences = conversion_map[mpnn_sequences]
 
         return cogen_sequences
+
+    def __del__(self):
+        """Clean up resources."""
+        if hasattr(self, "_model") and self._model is not None:
+            del self._model
+        if hasattr(self, "_model_sc") and self._model_sc is not None:
+            del self._model_sc
+        if hasattr(self, "_device"):
+            if torch.cuda.is_available() and str(self._device).startswith("cuda"):
+                torch.cuda.empty_cache()

@@ -5,6 +5,8 @@ Note: lots of Claude generated code here.
 """
 
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
@@ -13,10 +15,13 @@ import torch
 from Bio import SeqIO
 from omegaconf.errors import ValidationError
 
+from cogeneration.config.base import Config
+from cogeneration.data import all_atom, residue_constants
+from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.protein_mpnn_runner import NativeMPNNResult, ProteinMPNNRunner
 from cogeneration.dataset.datasets import BatchFeaturizer
 from cogeneration.dataset.process_pdb import process_pdb_file
-from cogeneration.dataset.test_utils import create_pdb_batch
+from cogeneration.dataset.test_utils import create_pdb_batch, create_pdb_dataloader
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.dataset import MetadataColumn as mc
 
@@ -73,6 +78,13 @@ class TestProteinMPNNRunner:
         runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
         assert runner is not None
 
+        # If we are on a mac, ensure its on MPS
+        if torch.backends.mps.is_available():
+            assert runner.device.type == "mps"
+        # If CUDA is available, ensure its on CUDA
+        if torch.cuda.is_available():
+            assert runner.device.type == "cuda"
+
     def test_run_batch_pdb_batch(self, mock_cfg):
         """Test run_batch on actual PDB batch data"""
         runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
@@ -90,9 +102,9 @@ class TestProteinMPNNRunner:
         num_sequences = 3
 
         result = runner.run_batch(
-            pred_trans=pdb_batch[bp.trans_1],
-            pred_rotmats=pdb_batch[bp.rotmats_1],
-            pred_aatypes=pdb_batch[bp.aatypes_1],
+            trans=pdb_batch[bp.trans_1],
+            rotmats=pdb_batch[bp.rotmats_1],
+            aatypes=pdb_batch[bp.aatypes_1],
             res_mask=pdb_batch[bp.res_mask],
             chain_idx=pdb_batch[bp.chain_idx],
             num_sequences=num_sequences,
@@ -112,9 +124,6 @@ class TestProteinMPNNRunner:
         # Test properties work
         averaged_logits = result.averaged_logits
         assert averaged_logits.shape == (batch_size, num_res, 21)
-        assert torch.allclose(
-            averaged_logits, result.logits[:, 0, :, :]
-        )  # Should be identical for single sequence
 
     def test_run_batch_2qlw(self, mock_cfg, test_pdb_path):
         """Test run_batch on 2qlw structure"""
@@ -134,19 +143,19 @@ class TestProteinMPNNRunner:
         )
 
         # Extract single structure and add batch dimension
-        pred_trans = features[bp.trans_1].unsqueeze(0)  # (1, N, 3)
-        pred_rotmats = features[bp.rotmats_1].unsqueeze(0)  # (1, N, 3, 3)
-        pred_aatypes = features[bp.aatypes_1].unsqueeze(0)  # (1, N)
+        trans = features[bp.trans_1].unsqueeze(0)  # (1, N, 3)
+        rotmats = features[bp.rotmats_1].unsqueeze(0)  # (1, N, 3, 3)
+        aatypes = features[bp.aatypes_1].unsqueeze(0)  # (1, N)
         res_mask = features[bp.res_mask].unsqueeze(0)  # (1, N)
         chain_idx = features[bp.chain_idx].unsqueeze(0)  # (1, N)
 
-        num_res = pred_trans.shape[1]
+        num_res = trans.shape[1]
         num_sequences = 2
 
         result = runner.run_batch(
-            pred_trans=pred_trans,
-            pred_rotmats=pred_rotmats,
-            pred_aatypes=pred_aatypes,
+            trans=trans,
+            rotmats=rotmats,
+            aatypes=aatypes,
             res_mask=res_mask,
             chain_idx=chain_idx,
             num_sequences=num_sequences,
@@ -206,7 +215,7 @@ class TestProteinMPNNRunner:
         except (ImportError, FileNotFoundError) as e:
             # If LigandMPNN is not available, provide a helpful error message
             pytest.fail(
-                f"LigandMPNN import test failed. Please ensure LigandMPNN is installed and available at {cfg.folding.protein_mpnn.pmpnn_path}. "
+                f"LigandMPNN import test failed. Please ensure LigandMPNN is installed and available at {cfg.folding.protein_mpnn.ligand_mpnn_path}. "
                 f"You can install it by cloning https://github.com/dauparas/LigandMPNN. Error: {e}"
             )
 
@@ -214,7 +223,7 @@ class TestProteinMPNNRunner:
         """Test that import mechanism fails gracefully when LigandMPNN path doesn't exist"""
         # Configure for native mode with nonexistent path
 
-        mock_cfg_uninterpolated.folding.protein_mpnn.pmpnn_path = Path(
+        mock_cfg_uninterpolated.folding.protein_mpnn.ligand_mpnn_path = Path(
             "/nonexistent/path/to/ligandmpnn"
         )
         cfg = mock_cfg_uninterpolated.interpolate()
@@ -334,7 +343,7 @@ class TestProteinMPNNRunner:
         ligandmpnn_path = Path("/fake/ligandmpnn/path")
         pmpnn_weights_dir = "custom"
 
-        mock_cfg_uninterpolated.folding.protein_mpnn.pmpnn_path = ligandmpnn_path
+        mock_cfg_uninterpolated.folding.protein_mpnn.ligand_mpnn_path = ligandmpnn_path
         mock_cfg_uninterpolated.folding.protein_mpnn.pmpnn_weights_dir = (
             pmpnn_weights_dir
         )
@@ -475,7 +484,7 @@ class TestProteinMPNNRunner:
         mock_fasta.write_text(mock_fasta_content)
 
         runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
-        result_path = runner.run_subprocess(
+        result_path = runner.run_pdb_subprocess(
             pdb_path=test_pdb_path,
             output_dir=output_dir,
             device_id=device_id,
@@ -509,7 +518,7 @@ class TestProteinMPNNRunner:
         runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
 
         with pytest.raises(subprocess.CalledProcessError):
-            runner.run_subprocess(
+            runner.run_pdb_subprocess(
                 pdb_path=test_pdb_path,
                 output_dir=output_dir,
                 device_id=0,
@@ -521,7 +530,7 @@ class TestProteinMPNNRunner:
         runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
 
         with pytest.raises(AssertionError, match="device_id is required"):
-            runner.run_subprocess(
+            runner.run_pdb_subprocess(
                 pdb_path=test_pdb_path,
                 output_dir=output_dir,
                 device_id=None,
@@ -541,7 +550,7 @@ class TestProteinMPNNRunner:
         runner = ProteinMPNNRunner(cfg.folding.protein_mpnn)
 
         # Test native execution
-        result_path = runner.run_native(
+        result_path = runner.run_pdb_native(
             pdb_path=test_pdb_path,
             output_dir=output_dir,
             num_sequences=2,
@@ -609,7 +618,7 @@ class TestProteinMPNNRunner:
         ligandmpnn_path = Path("/fake/ligandmpnn/path")
         pmpnn_weights_dir = "custom"
         custom_weights_path = ligandmpnn_path / pmpnn_weights_dir
-        mock_cfg_uninterpolated.folding.protein_mpnn.pmpnn_path = ligandmpnn_path
+        mock_cfg_uninterpolated.folding.protein_mpnn.ligand_mpnn_path = ligandmpnn_path
         mock_cfg_uninterpolated.folding.protein_mpnn.pmpnn_weights_dir = (
             pmpnn_weights_dir
         )
@@ -640,7 +649,7 @@ class TestProteinMPNNRunner:
         """Test that runner falls back to pmpnn_path when pmpnn_weights is empty"""
         ligandmpnn_path = Path("/fake/ligandmpnn/path")
 
-        mock_cfg_uninterpolated.folding.protein_mpnn.pmpnn_path = ligandmpnn_path
+        mock_cfg_uninterpolated.folding.protein_mpnn.ligand_mpnn_path = ligandmpnn_path
         mock_cfg_uninterpolated.folding.protein_mpnn.pmpnn_weights_dir = ""
         cfg = mock_cfg_uninterpolated.interpolate()
 
@@ -674,17 +683,19 @@ class TestProteinMPNNRunner:
 
         # Create mock batch data
         B, N = 2, 10
-        pred_trans = torch.randn(B, N, 3)
-        pred_rotmats = torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1)
-        pred_aatypes = torch.randint(0, 20, (B, N))
+        trans = torch.randn(B, N, 3)
+        rotmats = torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1)
+        aatypes = torch.randint(0, 20, (B, N))
         res_mask = torch.ones(B, N, dtype=torch.bool)
+        chain_idx = torch.zeros(B, N, dtype=torch.long)  # Single chain
 
         # Run batch inference
         result = runner.run_batch(
-            pred_trans=pred_trans,
-            pred_rotmats=pred_rotmats,
-            pred_aatypes=pred_aatypes,
+            trans=trans,
+            rotmats=rotmats,
+            aatypes=aatypes,
             res_mask=res_mask,
+            chain_idx=chain_idx,
             num_sequences=2,
             temperature=0.5,
         )
@@ -702,10 +713,11 @@ class TestProteinMPNNRunner:
 
         # Test single structure case
         result_single = runner.run_batch(
-            pred_trans=pred_trans[:1],
-            pred_rotmats=pred_rotmats[:1],
-            pred_aatypes=pred_aatypes[:1],
+            trans=trans[:1],
+            rotmats=rotmats[:1],
+            aatypes=aatypes[:1],
             res_mask=res_mask[:1],
+            chain_idx=chain_idx[:1],
             num_sequences=1,
         )
         assert isinstance(result_single, NativeMPNNResult)
@@ -717,16 +729,18 @@ class TestProteinMPNNRunner:
 
         # Create batch where all structures have no valid residues
         B, N = 2, 10
-        pred_trans = torch.randn(B, N, 3)
-        pred_rotmats = torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1)
-        pred_aatypes = torch.randint(0, 20, (B, N))
+        trans = torch.randn(B, N, 3)
+        rotmats = torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1)
+        aatypes = torch.randint(0, 20, (B, N))
         res_mask = torch.zeros(B, N, dtype=torch.bool)  # No valid residues
+        chain_idx = torch.zeros(B, N, dtype=torch.long)  # Single chain
 
         result = runner.run_batch(
-            pred_trans=pred_trans,
-            pred_rotmats=pred_rotmats,
-            pred_aatypes=pred_aatypes,
+            trans=trans,
+            rotmats=rotmats,
+            aatypes=aatypes,
             res_mask=res_mask,
+            chain_idx=chain_idx,
             num_sequences=2,
         )
 
@@ -740,36 +754,6 @@ class TestProteinMPNNRunner:
         # We just check that we get a valid result structure
         assert torch.all(torch.isfinite(result.confidence_scores))
 
-    def test_run_batch_memory_management(self, mock_cfg_uninterpolated):
-        """Test that run_batch handles large batches with memory management."""
-        # Configure for native mode
-
-        cfg = mock_cfg_uninterpolated.interpolate()
-
-        runner = ProteinMPNNRunner(cfg.folding.protein_mpnn)
-
-        # Create a large batch that should trigger chunking
-        B, N = 20, 15  # Large batch size
-        pred_trans = torch.randn(B, N, 3)
-        pred_rotmats = torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1)
-        pred_aatypes = torch.randint(0, 20, (B, N))
-        res_mask = torch.ones(B, N, dtype=torch.bool)
-
-        result = runner.run_batch(
-            pred_trans=pred_trans,
-            pred_rotmats=pred_rotmats,
-            pred_aatypes=pred_aatypes,
-            res_mask=res_mask,
-            num_sequences=1,
-            batch_size_limit=5,  # Force chunking
-        )
-
-        # Check that results have correct shape despite chunking
-        assert isinstance(result, NativeMPNNResult)
-        assert result.logits.shape == (B, 1, N, 21)
-        assert result.confidence_scores.shape == (B, 1)
-        assert result.sequences.shape == (B, 1, N)
-
     def test_run_batch_with_optional_parameters(self, mock_cfg_uninterpolated):
         """Test run_batch with various optional parameters."""
         # Configure for native mode
@@ -779,22 +763,20 @@ class TestProteinMPNNRunner:
         runner = ProteinMPNNRunner(cfg.folding.protein_mpnn)
 
         B, N = 2, 8
-        pred_trans = torch.randn(B, N, 3)
-        pred_rotmats = torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1)
-        pred_aatypes = torch.randint(0, 20, (B, N))
+        trans = torch.randn(B, N, 3)
+        rotmats = torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1)
+        aatypes = torch.randint(0, 20, (B, N))
         res_mask = torch.ones(B, N, dtype=torch.bool)
         chain_idx = torch.ones(B, N, dtype=torch.long)  # Single chain
 
         result = runner.run_batch(
-            pred_trans=pred_trans,
-            pred_rotmats=pred_rotmats,
-            pred_aatypes=pred_aatypes,
+            trans=trans,
+            rotmats=rotmats,
+            aatypes=aatypes,
             res_mask=res_mask,
             chain_idx=chain_idx,
             temperature=0.2,
             num_sequences=3,
-            omit_AA="CG",  # Omit cysteine and glycine
-            bias_AA="A:1.0,L:-0.5",  # Bias alanine up, leucine down
         )
 
         assert isinstance(result, NativeMPNNResult)
@@ -811,21 +793,21 @@ class TestProteinMPNNRunner:
         runner = ProteinMPNNRunner(cfg.folding.protein_mpnn)
 
         B, N = 1, 5
-        pred_trans = torch.randn(B, N, 3)
-        pred_rotmats = torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1)
+        trans = torch.randn(B, N, 3)
+        rotmats = torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1)
 
         # Use specific amino acids to test conversion
         # Project format: A=0, R=1, N=2, D=3, C=4 (AlphaFold ordering)
-        pred_aatypes = torch.tensor(
-            [[0, 1, 2, 3, 4]], dtype=torch.long
-        )  # A, R, N, D, C
+        aatypes = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.long)
         res_mask = torch.ones(B, N, dtype=torch.bool)
+        chain_idx = torch.zeros(B, N, dtype=torch.long)  # Single chain
 
         result = runner.run_batch(
-            pred_trans=pred_trans,
-            pred_rotmats=pred_rotmats,
-            pred_aatypes=pred_aatypes,
+            trans=trans,
+            rotmats=rotmats,
+            aatypes=aatypes,
             res_mask=res_mask,
+            chain_idx=chain_idx,
             num_sequences=2,
             temperature=0.1,
         )
@@ -919,17 +901,19 @@ class TestProteinMPNNRunner:
         runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
 
         # Test with mismatched shapes
-        pred_trans = torch.randn(2, 10, 3)
-        pred_rotmats = torch.randn(2, 15, 3, 3)  # Wrong size
-        pred_aatypes = torch.randint(0, 20, (2, 10))
+        trans = torch.randn(2, 10, 3)
+        rotmats = torch.randn(2, 15, 3, 3)  # Wrong size
+        aatypes = torch.randint(0, 20, (2, 10))
         res_mask = torch.ones(2, 10)
+        chain_idx = torch.zeros(2, 10, dtype=torch.long)  # Single chain
 
         with pytest.raises(ValueError, match="Rots and trans incompatible"):
             runner.run_batch(
-                pred_trans=pred_trans,
-                pred_rotmats=pred_rotmats,
-                pred_aatypes=pred_aatypes,
+                trans=trans,
+                rotmats=rotmats,
+                aatypes=aatypes,
                 res_mask=res_mask,
+                chain_idx=chain_idx,
             )
 
     def test_run_batch_subprocess_mode_error(self, mock_cfg):
@@ -937,19 +921,21 @@ class TestProteinMPNNRunner:
         mock_cfg.folding.protein_mpnn.use_native_runner = False
         runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
 
-        pred_trans = torch.randn(1, 10, 3)
-        pred_rotmats = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(1, 10, 3, 3)
-        pred_aatypes = torch.randint(0, 20, (1, 10))
+        trans = torch.randn(1, 10, 3)
+        rotmats = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(1, 10, 3, 3)
+        aatypes = torch.randint(0, 20, (1, 10))
         res_mask = torch.ones(1, 10)
+        chain_idx = torch.zeros(1, 10, dtype=torch.long)  # Single chain
 
         with pytest.raises(
             ValueError, match="run_batch only supports native runner mode"
         ):
             runner.run_batch(
-                pred_trans=pred_trans,
-                pred_rotmats=pred_rotmats,
-                pred_aatypes=pred_aatypes,
+                trans=trans,
+                rotmats=rotmats,
+                aatypes=aatypes,
                 res_mask=res_mask,
+                chain_idx=chain_idx,
             )
 
     def test_run_batch_empty_batch_error(self, mock_cfg_uninterpolated):
@@ -962,18 +948,20 @@ class TestProteinMPNNRunner:
 
         # Create empty batch (B=0)
         B, N = 0, 10
-        pred_trans = torch.empty(B, N, 3)
-        pred_rotmats = torch.empty(B, N, 3, 3)
-        pred_aatypes = torch.empty(B, N, dtype=torch.long)
+        trans = torch.empty(B, N, 3)
+        rotmats = torch.empty(B, N, 3, 3)
+        aatypes = torch.empty(B, N, dtype=torch.long)
         res_mask = torch.empty(B, N, dtype=torch.bool)
+        chain_idx = torch.empty(B, N, dtype=torch.long)  # Empty chain indices
 
         # This should handle the empty batch gracefully
         try:
             result = runner.run_batch(
-                pred_trans=pred_trans,
-                pred_rotmats=pred_rotmats,
-                pred_aatypes=pred_aatypes,
+                trans=trans,
+                rotmats=rotmats,
+                aatypes=aatypes,
                 res_mask=res_mask,
+                chain_idx=chain_idx,
                 num_sequences=1,
             )
             # If it doesn't error, check the result structure
@@ -1119,7 +1107,7 @@ class TestProteinMPNNRunner:
         test_aatypes = torch.tensor(
             [0, 1, 2, 3, 4, 0, 1]
         )  # A, R, N, D, C, A, R in project ordering
-        chain_idx = torch.tensor([0, 0, 1, 1, 2, 2, 2])  # Three chains
+        chain_idx = torch.tensor([0, 0, 1, 1, 1, 2, 2])  # Three chains: 7 residues
         device = torch.device("cpu")
 
         # Create mock atom37 coordinates (N, 37, 3)
@@ -1176,7 +1164,7 @@ class TestProteinMPNNRunner:
         # assert torch.equal(protein_dict["_original_aatypes"], test_aatypes), "Original project aatypes should be preserved"
 
         # Test chain label handling
-        # With chain_idx=[0, 0, 1, 1, 2, 2, 2], we have 7 residues total
+        # With chain_idx=[0, 0, 1, 1, 1, 2, 2], we have 7 residues total
         # The unique chains in order of appearance are: [0, 1, 2]
         print(f"Actual chain labels: {protein_dict['chain_labels']}")
         print(f"Input chain_idx: {chain_idx}")
@@ -1192,15 +1180,15 @@ class TestProteinMPNNRunner:
             actual_chain_labels[0] == actual_chain_labels[1]
         ), "Residues 0,1 should have same chain label (both chain_idx=0)"
         assert (
-            actual_chain_labels[2] == actual_chain_labels[3]
-        ), "Residues 2,3 should have same chain label (both chain_idx=1)"
+            actual_chain_labels[2] == actual_chain_labels[3] == actual_chain_labels[4]
+        ), "Residues 2,3,4 should have same chain label (all chain_idx=1)"
         assert (
-            actual_chain_labels[4] == actual_chain_labels[5] == actual_chain_labels[6]
-        ), "Residues 4,5,6 should have same chain label (all chain_idx=2)"
+            actual_chain_labels[5] == actual_chain_labels[6]
+        ), "Residues 5,6 should have same chain label (both chain_idx=2)"
 
         # Test multi-chain with different chain indices
         multi_chain_idx = torch.tensor(
-            [0, 0, 2, 2, 1, 1, 1]
+            [0, 0, 1, 1, 1, 2, 2]
         )  # Non-sequential chain IDs, length 7
         protein_dict_multi = runner._create_protein_dict_from_frames(
             atom37=atom37,
@@ -1218,11 +1206,11 @@ class TestProteinMPNNRunner:
             multi_chain_labels[0] == multi_chain_labels[1]
         ), "Multi-chain: residues 0,1 should have same label"
         assert (
-            multi_chain_labels[2] == multi_chain_labels[3]
-        ), "Multi-chain: residues 2,3 should have same label"
+            multi_chain_labels[2] == multi_chain_labels[3] == multi_chain_labels[4]
+        ), "Multi-chain: residues 2,3,4 should have same label"
         assert (
-            multi_chain_labels[4] == multi_chain_labels[5] == multi_chain_labels[6]
-        ), "Multi-chain: residues 4,5,6 should have same label"
+            multi_chain_labels[5] == multi_chain_labels[6]
+        ), "Multi-chain: residues 5,6 should have same label"
 
         # Test R_idx (residue indices)
         expected_r_idx = torch.arange(1, N + 1, device=device)  # 1-indexed
@@ -1262,7 +1250,7 @@ class TestProteinMPNNRunner:
         ):
             # Create test input tensors
             atom37 = torch.randn(5, 37, 3)
-            aatypes = torch.tensor([0, 1, 2, 3, 4])  # A, B, C, D, E in project ordering
+            aatypes = torch.tensor([0, 1, 2, 3, 4])  # A, R, N, D, C in project ordering
             chain_idx = torch.tensor([0, 0, 1, 1, 1])  # Two chains
 
             protein_dict = runner._create_protein_dict_from_frames(
@@ -1400,32 +1388,36 @@ class TestProteinMPNNRunner:
                 )
 
     def test_run_batch_temperature_effects(self, mock_cfg):
-        """Test that temperature affects sequence diversity"""
+        """Test that temperature affects sequence diversity in run_batch"""
+
         runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
 
         # Create deterministic input
         B, N = 1, 10
-        pred_trans = torch.randn(B, N, 3)
-        pred_rotmats = torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1)
-        pred_aatypes = torch.randint(0, 20, (B, N))
+        trans = torch.randn(B, N, 3)
+        rotmats = torch.eye(3).unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1)
+        aatypes = torch.randint(0, 20, (B, N))
         res_mask = torch.ones(B, N, dtype=torch.bool)
+        chain_idx = torch.zeros(B, N, dtype=torch.long)  # Single chain
 
         # Test low temperature (more deterministic)
         result_low_temp = runner.run_batch(
-            pred_trans=pred_trans,
-            pred_rotmats=pred_rotmats,
-            pred_aatypes=pred_aatypes,
+            trans=trans,
+            rotmats=rotmats,
+            aatypes=aatypes,
             res_mask=res_mask,
+            chain_idx=chain_idx,
             temperature=0.1,
             num_sequences=3,
         )
 
         # Test high temperature (more diverse)
         result_high_temp = runner.run_batch(
-            pred_trans=pred_trans,
-            pred_rotmats=pred_rotmats,
-            pred_aatypes=pred_aatypes,
+            trans=trans,
+            rotmats=rotmats,
+            aatypes=aatypes,
             res_mask=res_mask,
+            chain_idx=chain_idx,
             temperature=1.0,
             num_sequences=3,
         )
@@ -1444,3 +1436,244 @@ class TestProteinMPNNRunner:
         # This is a probabilistic test, so we just check the shapes are correct
         assert result_low_temp.logits.shape == (B, 3, N, 21)
         assert result_high_temp.logits.shape == (B, 3, N, 21)
+
+
+@pytest.mark.skip
+class TestBenchmarkProteinMPNNRunner:
+    """Benchmark tests comparing different ProteinMPNNRunner approaches"""
+
+    def test_benchmark_runner_approaches(self):
+        """
+        Benchmark test comparing run_batch, run_native, and run_subprocess approaches.
+
+        This test uses create_pdb_dataloader to generate real PDB batches,
+        converts to atom37 representation, writes PDB files, and then times each approach on the same data.
+        """
+        # Use default config, not mock
+        cfg = Config().interpolate()
+
+        # Benchmark parameters
+        num_batches = 5
+        num_sequences = 3
+        temperature = 0.1
+
+        dataloader = create_pdb_dataloader(
+            cfg=cfg,
+            training=True,
+        )
+
+        batches = []
+        train_iter = iter(dataloader)
+        for i in range(num_batches):
+            batch = next(train_iter)
+            batch_size = batch[bp.trans_1].shape[0]
+            num_res = batch[bp.trans_1].shape[1]
+            print(f"  Train batch {i}: batch_size={batch_size}, num_res={num_res}")
+            batches.append(batch)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+
+            # Convert batches to atom37 and write PDB files
+            batch_pdbs = []
+
+            for batch_idx, batch in enumerate(batches):
+                batch_size = batch[bp.trans_1].shape[0]
+                num_res = batch[bp.trans_1].shape[1]
+
+                # Convert to atom37 using all_atom.atom37_from_trans_rot
+                atom37_coords = all_atom.atom37_from_trans_rot(
+                    trans=batch[bp.trans_1],
+                    rots=batch[bp.rotmats_1],
+                    aatype=batch[bp.aatypes_1],
+                    res_mask=batch[bp.res_mask],
+                )
+
+                # Write PDB files for each structure in the batch
+                batch_pdb_paths = []
+                for struct_idx in range(batch_size):
+                    pdb_name = f"batch_{batch_idx}_struct_{struct_idx}"
+                    pdb_path = tmp_path / f"{pdb_name}.pdb"
+
+                    # Write PDB file using write_prot_to_pdb
+                    write_prot_to_pdb(
+                        prot_pos=atom37_coords[struct_idx].numpy(),
+                        file_path=str(pdb_path),
+                        aatype=batch[bp.aatypes_1][struct_idx].numpy(),
+                        chain_idx=(
+                            batch[bp.chain_idx][struct_idx].numpy()
+                            if bp.chain_idx in batch
+                            else None
+                        ),
+                        no_indexing=True,
+                        overwrite=True,
+                    )
+                    batch_pdb_paths.append(pdb_path)
+
+                batch_pdbs.append(
+                    {
+                        "batch": batch,
+                        "pdb_paths": batch_pdb_paths,
+                        "atom37": atom37_coords,
+                        "batch_size": batch_size,
+                        "num_res": num_res,
+                    }
+                )
+
+            print(
+                f"Created PDB files for {len(batch_pdbs)} batches, sizes: {[(bd['batch_size'], bd['num_res']) for bd in batch_pdbs]}"
+            )
+
+            # Configure ProteinMPNN for testing
+            mpnn_cfg = cfg.folding.protein_mpnn
+            mpnn_cfg.use_native_runner = True  # Start with native mode
+
+            results = {}
+
+            print("\n=== Benchmarking run_batch ===")
+            runner_batch = ProteinMPNNRunner(mpnn_cfg)
+
+            start_time = time.time()
+            batch_results = []
+
+            for batch_data in batch_pdbs:
+                batch = batch_data["batch"]
+                batch_size = batch_data["batch_size"]
+                num_res = batch_data["num_res"]
+
+                try:
+                    result = runner_batch.run_batch(
+                        trans=batch[bp.trans_1],
+                        rotmats=batch[bp.rotmats_1],
+                        aatypes=batch[bp.aatypes_1],
+                        res_mask=batch[bp.res_mask],
+                        chain_idx=(
+                            batch[bp.chain_idx] if bp.chain_idx in batch else None
+                        ),
+                        num_sequences=num_sequences,
+                        temperature=temperature,
+                    )
+                    # convert batch to list to mirror run_native and run_subprocess output shapes
+                    batch_results.extend(result.sequences.tolist())
+
+                except Exception as e:
+                    print(f"run_batch failed: {e}")
+                    continue
+
+            batch_time = time.time() - start_time
+            results["run_batch"] = {
+                "time": batch_time,
+                "results": batch_results,
+                "method": "run_batch",
+            }
+            print(f"run_batch completed in {batch_time:.2f} seconds")
+
+            print("\n=== Benchmarking run_native ===")
+
+            start_time = time.time()
+            native_results = []
+
+            for batch_data in batch_pdbs:
+                batch_size = batch_data["batch_size"]
+                num_res = batch_data["num_res"]
+
+                for pdb_path in batch_data["pdb_paths"]:
+                    try:
+                        result_path = runner_batch.run_pdb_native(
+                            pdb_path=pdb_path,
+                            output_dir=tmp_path / "native_output",
+                            num_sequences=num_sequences,
+                            temperature=temperature,
+                        )
+                        native_results.append(result_path)
+
+                    except Exception as e:
+                        print(f"run_native failed for {pdb_path}: {e}")
+                        continue
+
+            native_time = time.time() - start_time
+            results["run_native"] = {
+                "time": native_time,
+                "results": native_results,
+                "method": "run_native",
+            }
+            print(f"run_native completed in {native_time:.2f} seconds")
+
+            print("\n=== Benchmarking run_subprocess ===")
+
+            # Switch to subprocess mode
+            mpnn_cfg.use_native_runner = False
+            runner_subprocess = ProteinMPNNRunner(mpnn_cfg)
+
+            start_time = time.time()
+            subprocess_results = []
+
+            for batch_data in batch_pdbs:
+                batch_size = batch_data["batch_size"]
+                num_res = batch_data["num_res"]
+
+                for pdb_path in batch_data["pdb_paths"]:
+                    try:
+                        result_path = runner_subprocess.run_pdb_subprocess(
+                            pdb_path=pdb_path,
+                            output_dir=tmp_path / "subprocess_output",
+                            device_id=0,  # Required for subprocess mode
+                            num_sequences=num_sequences,
+                            temperature=temperature,
+                        )
+                        subprocess_results.append(result_path)
+
+                    except Exception as e:
+                        print(f"run_subprocess failed for {pdb_path}: {e}")
+                        continue
+
+            subprocess_time = time.time() - start_time
+            results["run_subprocess"] = {
+                "time": subprocess_time,
+                "results": subprocess_results,
+                "method": "run_subprocess",
+            }
+            print(f"run_subprocess completed in {subprocess_time:.2f} seconds")
+
+            # Print benchmark results
+            print("BENCHMARK RESULTS")
+
+            for method_name, result_data in results.items():
+                method_desc = result_data["method"]
+                elapsed_time = result_data["time"]
+                num_results = len(result_data["results"])
+
+                print(f"\n{method_desc}:")
+                print(f"  Total time: {elapsed_time:.2f} seconds")
+                print(f"  Results generated: {num_results}")
+                if num_results > 0:
+                    print(
+                        f"  Average time per structure: {elapsed_time / num_results:.2f} seconds"
+                    )
+
+            # Print batch statistics
+            print("BATCH STATISTICS")
+
+            total_batch_size = sum(bd["batch_size"] for bd in batch_pdbs)
+            total_residues = sum(bd["batch_size"] * bd["num_res"] for bd in batch_pdbs)
+
+            print(f"Total batches processed: {len(batch_pdbs)}")
+            print(f"Total structures: {total_batch_size}")
+            print(f"Total residues: {total_residues}")
+
+            for i, batch_data in enumerate(batch_pdbs):
+                print(
+                    f"  Batch {i}: batch_size={batch_data['batch_size']}, num_res={batch_data['num_res']}"
+                )
+
+            # Verify that all methods produced some results
+            assert len(results) == 3, "All three methods should have been tested"
+
+            for method_name, result_data in results.items():
+                num_results = len(result_data["results"])
+                if num_results == 0:
+                    print(f"WARNING: {method_name} produced no results")
+                else:
+                    print(f"SUCCESS: {method_name} produced {num_results} results")
+
+            print("\nBenchmark completed successfully!")

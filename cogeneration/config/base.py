@@ -962,7 +962,7 @@ class DatasetConfig(BaseClassConfig):
     debug_head_samples: Optional[int] = None
 
     # Redesigned, i.e. use ProteinMPNN to generate sequences for a structure
-    use_redesigned: bool = True
+    use_redesigned: bool = False
     redesigned_csv_path: Optional[Path] = (
         dataset_metadata_dir_path / "pdb_redesigned.csv"
     )
@@ -1229,8 +1229,10 @@ class ModelType(StrEnum):
 class ProteinMPNNRunnerConfig(BaseClassConfig):
     """Configuration for ProteinMPNN runner."""
 
-    # Path to LigandMPNN installation (sibling to project root)
-    pmpnn_path: Path = PATH_PROJECT_ROOT.parent / "LigandMPNN"
+    # Path to ProteinMPNN installation (sibling to project root), used for subprocess mode
+    protein_mpnn_path: Path = PATH_PROJECT_ROOT.parent / "ProteinMPNN"
+    # Path to LigandMPNN installation (sibling to project root), used for native mode
+    ligand_mpnn_path: Path = PATH_PROJECT_ROOT.parent / "LigandMPNN"
     # Path to directory containing ProteinMPNN model weights, "" for same directory
     pmpnn_weights_dir: Path = ""
     pmpnn_seed: int = "${shared.seed}"
@@ -1242,17 +1244,10 @@ class ProteinMPNNRunnerConfig(BaseClassConfig):
     model_type: ModelType = ModelType.PROTEIN_MPNN
     temperature: float = 0.1  # Sampling temperature
 
-    # Amino acid biasing and omission
-    bias_AA: Optional[str] = None  # Format: "A:-1.024,P:2.34,C:-12.34"
-    omit_AA: str = ""  # Format: "ACG"
-
     # Advanced features from LigandMPNN
     ligand_mpnn_use_atom_context: bool = True  # For ligand_mpnn
     ligand_mpnn_cutoff_for_score: float = 8.0  # Cutoff distance for scoring
     ligand_mpnn_use_side_chain_context: bool = False  # Use side chain context
-
-    # Membrane protein specific (for membrane variants)
-    global_transmembrane_label: int = 0  # 1 for transmembrane, 0 for soluble
 
     # Side chain packing
     pack_side_chains: bool = False  # Enable side chain packing
