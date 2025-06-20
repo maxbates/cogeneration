@@ -1471,7 +1471,8 @@ class Interpolant:
         )
 
         # Feynman-Kac steering, if enabled.
-        noisy_batch, resample_idx = self.resampler.on_step(
+        # TODO(FK) better expose metrics, to track in trajectory over time
+        noisy_batch, resample_idx, step_metrics = self.resampler.on_step(
             step_idx=step_idx,
             batch=noisy_batch,
             protein_pred=protein_pred,

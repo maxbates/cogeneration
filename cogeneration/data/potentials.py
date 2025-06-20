@@ -1,4 +1,5 @@
 import logging
+from textwrap import dedent
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -67,6 +68,26 @@ class Potential(ABC):
         protein_state: SamplingStep,
     ) -> torch.Tensor:  # (B,)
         """Return the energy per predicted sample in the batch, scaled to [0, 1]."""
+
+
+@dataclass
+class FKStepMetric:
+    step: int
+    energy: List[float]
+    log_G: List[float]
+    log_G_delta: List[float]
+    weights: List[float]
+    effective_sample_size: float
+    keep: List[int]
+
+    def log(self) -> str:
+        return dedent(f"""
+        Step {self.step} | energy = {self.energy}
+        Step {self.step} | ∆G     = {self.log_G_delta}
+        Step {self.step} | Log G  = {self.log_G}
+        Step {self.step} | ESS    = {self.effective_sample_size}
+        Step {self.step} | keep   = {self.keep}
+        """)
 
 
 @dataclass
@@ -240,7 +261,7 @@ class FKSteeringResampler:
         model_pred: SamplingStep,
         protein_pred: SamplingStep,
         protein_state: SamplingStep,
-    ) -> Tuple[NoisyFeatures, Optional[torch.Tensor]]:
+    ) -> Tuple[NoisyFeatures, Optional[torch.Tensor], FKStepMetric]:
         """
         If enabled, resample particles in a batch according to their energy.
         Updates the batch's particles and returns the resampled indices.
@@ -250,9 +271,9 @@ class FKSteeringResampler:
         """
         # escape if disabled or not resampling on this step
         if not self.enabled:
-            return batch, None
+            return batch, None, None
         if (step_idx % self.cfg.resampling_interval) != 0:
-            return batch, None
+            return batch, None, None
 
         assert self._energy_trajectory is not None, "FK Steering not initialized."
 
@@ -317,13 +338,16 @@ class FKSteeringResampler:
             + torch.arange(num_batch, device=device).unsqueeze(1) * num_particles
         ).flatten()
 
-        self._log.debug(f"Step {step_idx} | energy = {energy.tolist()}")
-        self._log.debug(f"Step {step_idx} | ∆G     = {log_G_delta.tolist()}")
-        self._log.debug(f"Step {step_idx} | Log G  = {log_G_score.tolist()}")
-        self._log.debug(f"Step {step_idx} | keep   = {idx.tolist()}")
-        self._log.debug(
-            f"Step {step_idx} | ESS    = {effective_sample_size.mean().item():.2f}"
+        step_metric = FKStepMetric(
+            step=step_idx,
+            energy=energy.tolist(),
+            log_G=log_G_score.tolist(),
+            log_G_delta=log_G_delta.tolist(),
+            weights=resampling_weights.tolist(),
+            effective_sample_size=effective_sample_size.mean().item(),
+            keep=idx.tolist(),
         )
+        self._log.debug(step_metric.log())
 
         # reindex batch + internal state using the sampled indices
         batch = {k: _batch_select_feat(v, idx) for k, v in batch.items()}
@@ -331,7 +355,7 @@ class FKSteeringResampler:
         self._log_G = self._log_G.index_select(0, idx)
         self._log_G_delta = self._log_G_delta.index_select(0, idx)
 
-        return batch, idx
+        return batch, idx, step_metric
 
     def best_particle_in_batch(
         self, batch: NoisyFeatures
