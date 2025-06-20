@@ -1242,14 +1242,14 @@ class ProteinMPNNRunnerConfig(BaseClassConfig):
     model_type: ModelType = ModelType.PROTEIN_MPNN
     temperature: float = 0.1  # Sampling temperature
 
+    # Amino acid biasing and omission
+    bias_AA: Optional[str] = None  # Format: "A:-1.024,P:2.34,C:-12.34"
+    omit_AA: str = ""  # Format: "ACG"
+
     # Advanced features from LigandMPNN
     ligand_mpnn_use_atom_context: bool = True  # For ligand_mpnn
     ligand_mpnn_cutoff_for_score: float = 8.0  # Cutoff distance for scoring
     ligand_mpnn_use_side_chain_context: bool = False  # Use side chain context
-
-    # Amino acid biasing and omission
-    bias_AA: Optional[str] = None  # Format: "A:-1.024,P:2.34,C:-12.34"
-    omit_AA: str = ""  # Format: "ACG"
 
     # Membrane protein specific (for membrane variants)
     global_transmembrane_label: int = 0  # 1 for transmembrane, 0 for soluble
@@ -1257,7 +1257,7 @@ class ProteinMPNNRunnerConfig(BaseClassConfig):
     # Side chain packing
     pack_side_chains: bool = False  # Enable side chain packing
     checkpoint_path_sc: Optional[Path] = None  # Side chain packer checkpoint
-    number_of_packs_per_design: int = 4  # Number of packing samples
+    number_of_packs_per_design: int = 1  # Number of packing samples
     sc_num_denoising_steps: int = 3  # Denoising steps for packing
     sc_num_samples: int = 16  # Samples for mixture distribution
     repack_everything: bool = False  # Repack all residues or just redesigned ones

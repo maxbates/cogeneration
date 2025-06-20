@@ -555,7 +555,7 @@ class FoldingValidator:
         uncompressed_pdb_path, is_temp_file = get_uncompressed_pdb_path(pdb_input_path)
 
         # Run ProteinMPNN
-        fasta_path = self.protein_mpnn_runner.run(
+        fasta_path = self.protein_mpnn_runner.generate_fasta(
             pdb_path=Path(uncompressed_pdb_path),
             output_dir=Path(output_dir),
             device_id=self.device_id,

@@ -120,7 +120,7 @@ class TestFKSteeringResampler:
         step = step.select_batch_idx(idx=torch.tensor([0, 0, 0, 1, 1, 1]))
         assert step.trans.shape[0] == steer_batch_size
 
-        batch, idx = resampler.on_step(
+        batch, idx, metric = resampler.on_step(
             step_idx=0,
             batch=batch,
             model_pred=step,

@@ -1,7 +1,7 @@
 import logging
-from textwrap import dedent
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from textwrap import dedent
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -81,13 +81,15 @@ class FKStepMetric:
     keep: List[int]
 
     def log(self) -> str:
-        return dedent(f"""
+        return dedent(
+            f"""
         Step {self.step} | energy = {self.energy}
         Step {self.step} | ∆G     = {self.log_G_delta}
         Step {self.step} | Log G  = {self.log_G}
         Step {self.step} | ESS    = {self.effective_sample_size}
         Step {self.step} | keep   = {self.keep}
-        """)
+        """
+        )
 
 
 @dataclass
