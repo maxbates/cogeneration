@@ -1235,7 +1235,9 @@ class ProteinMPNNRunnerConfig(BaseClassConfig):
     ligand_mpnn_path: Path = PATH_PROJECT_ROOT.parent / "LigandMPNN"
     # Path to directory containing ProteinMPNN model weights, "" for same directory
     pmpnn_weights_dir: Path = ""
-    pmpnn_seed: int = "${shared.seed}"
+    # Seed for ProteinMPNN
+    # each `num_sequences` will get a unique seed but otherwise set every inference call.
+    pmpnn_seed: Optional[int] = None
     seq_per_sample: int = 8
 
     # Native runner options

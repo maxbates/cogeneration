@@ -15,13 +15,12 @@ from cogeneration.dataset.motif_factory import ChainBreak, Motif, MotifFactory, 
 from cogeneration.dataset.process_pdb import process_pdb_file
 from cogeneration.type.batch import BatchProp as bp
 
-# Use protein with weird stuff happening, is multimeric, has cross-chain interactions
-example_pdb_path = Path(__file__).parent / "2qlw.pdb"
-
 
 class TestMotifFactory:
     @pytest.mark.parametrize("strategy", list(DatasetInpaintingMotifStrategy))
-    def test_generate_diffuse_mask(self, strategy: DatasetInpaintingMotifStrategy):
+    def test_generate_diffuse_mask(
+        self, strategy: DatasetInpaintingMotifStrategy, pdb_2qlw_path
+    ):
         if strategy == DatasetInpaintingMotifStrategy.ALL:
             return
 
@@ -30,14 +29,14 @@ class TestMotifFactory:
         factory = MotifFactory(cfg=cfg, rng=rng)
 
         processed_pdb = process_pdb_file(
-            pdb_file_path=str(example_pdb_path),
+            pdb_file_path=str(pdb_2qlw_path),
             pdb_name="2qlw",
         )
         pdb_batch_features = BatchFeaturizer.batch_features_from_processed_file(
             processed_file=processed_pdb,
             csv_row={},
             cfg=DatasetConfig(),
-            processed_file_path=str(example_pdb_path),
+            processed_file_path=str(pdb_2qlw_path),
         )
 
         motif_mask = factory.generate_motif_mask(

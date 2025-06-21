@@ -6,7 +6,11 @@ supporting  `run_native` (in-memory model) and `run_subprocess` (subprocess exec
 The native mode loads the model once and keeps it in memory for fast inference,
 while subprocess mode calls the original ProteinMPNN script.
 
-Also supports `run_batch` which bypasses PDB I/O overhead and runs inference trans ,rots, aatypes etc. tensors directly.
+Also supports `run_batch` which bypasses PDB I/O overhead and runs inference trans, rots, aatypes etc. tensors directly.
+
+In theory, we improve parallelism using a `ProteinMPNNRunnerPool`, which is a pool 
+of ProteinMPNNRunner instances that can be used to run inference on multiple structures in parallel.
+However, on MPS (on a Mac), MPS effectively serializes all inference requests. On CUDA, it should help some.
 
 Running natively requires `LigandMPNN` is installed, and location specified in the config.
 
@@ -56,6 +60,7 @@ This limitation is inherent to the ProteinMPNN model family and cannot be
 circumvented without fundamental changes to the model architecture.
 """
 
+import asyncio
 import copy
 import importlib.util
 import json
@@ -65,8 +70,10 @@ import random
 import shutil
 import subprocess
 import sys
-import tempfile
+import threading
+import time
 import warnings
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -102,13 +109,9 @@ class NativeMPNNResult:
     This provides a consistent interface for ProteinMPNN results
     """
 
-    logits: CogenLogits  # (B, num_sequences, N, 21) - All sequence logits in project's AlphaFold ordering
-    confidence_scores: (
-        torch.Tensor
-    )  # (B, num_sequences) - Confidence scores for each sequence
-    _sequences: Optional[CogenAATypes] = (
-        None  # (B, num_sequences, N) - Cached sequences (computed on demand)
-    )
+    logits: CogenLogits  # (B, num_sequences, N, 21)
+    confidence_scores: torch.Tensor  # (B, num_sequences)
+    _sequences: Optional[CogenAATypes] = None  # (B, num_sequences, N)
 
     @property
     def sequences(self) -> CogenAATypes:
@@ -738,11 +741,6 @@ class ProteinMPNNRunner:
         seed = seed or self.config.pmpnn_seed
         temperature = temperature or self.config.temperature
 
-        # Set random seeds
-        torch.manual_seed(seed)
-        random.seed(seed)
-        np.random.seed(seed)
-
         # Create output directory
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -783,6 +781,7 @@ class ProteinMPNNRunner:
             chains_to_design=chains_to_design,
             fixed_residues=fixed_residues,
             model=model,
+            seed=seed,
         )
 
         # Save results to FASTA using shared method
@@ -1022,6 +1021,7 @@ class ProteinMPNNRunner:
         temperature: Optional[float] = None,
         chains_to_design: Optional[List[str]] = None,
         fixed_residues: Optional[List[str]] = None,
+        seed: Optional[int] = None,
     ) -> NativeMPNNResult:
         """
         Run ProteinMPNN on a batch of protein frames directly.
@@ -1041,7 +1041,7 @@ class ProteinMPNNRunner:
             temperature: Sampling temperature, defaults to config value
             chains_to_design: List of chain IDs to design
             fixed_residues: List of residue positions to keep fixed
-            **kwargs: Additional arguments
+            seed: Random seed for reproducible results
 
         Returns:
             NativeMPNNResult containing:
@@ -1061,6 +1061,7 @@ class ProteinMPNNRunner:
 
         # Set defaults
         temperature = temperature or self.config.temperature
+        seed = seed or self.config.pmpnn_seed
 
         # Load model
         model = self._load_model()
@@ -1083,6 +1084,7 @@ class ProteinMPNNRunner:
             chains_to_design=chains_to_design,
             fixed_residues=fixed_residues,
             model=model,
+            seed=seed,
         )
 
         # Extract results
@@ -1157,7 +1159,10 @@ class ProteinMPNNRunner:
 
                 # Create single protein_dict
                 protein_dict = self._create_single_protein_dict_impl(
-                    single_atom37, single_aatypes, single_chain_idx, device, data_utils
+                    atom37=single_atom37,
+                    aatypes=single_aatypes,
+                    chain_idx=single_chain_idx,
+                    device=device,
                 )
                 protein_dicts.append(protein_dict)
 
@@ -1165,7 +1170,10 @@ class ProteinMPNNRunner:
         else:
             # Return single protein_dict
             return self._create_single_protein_dict_impl(
-                atom37, aatypes, chain_idx, device, data_utils
+                atom37=atom37,
+                aatypes=aatypes,
+                chain_idx=chain_idx,
+                device=device,
             )
 
     def _create_single_protein_dict_impl(
@@ -1174,9 +1182,10 @@ class ProteinMPNNRunner:
         aatypes: MPNNAATypes,  # (N,) - amino acid types in ProteinMPNN alphabetical ordering
         chain_idx: torch.Tensor,  # (N,)
         device: torch.device,
-        data_utils,
     ) -> MPNNProteinDict:
         """Implementation for single structure protein_dict creation."""
+        data_utils = self._load_ligandmpnn_module("data_utils")
+
         N = atom37.shape[0]
 
         # Convert ProteinMPNN amino acid integers to sequence string
@@ -1238,6 +1247,7 @@ class ProteinMPNNRunner:
         chains_to_design: Optional[List[str]],
         fixed_residues: Optional[List[str]],
         model: torch.nn.Module,
+        seed: int,
     ) -> NativeMPNNResult:
         """
         Run inference on protein_dict(s).
@@ -1253,6 +1263,7 @@ class ProteinMPNNRunner:
             chains_to_design: Chains to design (optional)
             fixed_residues: Fixed residues (optional)
             model: ProteinMPNN model
+            seed: Random seed for reproducible results
 
         Returns:
             NativeMPNNResult with batch dimensions: (B, num_sequences, N, 21) for logits, etc.
@@ -1319,6 +1330,8 @@ class ProteinMPNNRunner:
             feature_dict["symmetry_residues"] = [[]]
             feature_dict["symmetry_weights"] = [[]]
 
+            # TODO set up `fixed_residues` and `chains_to_design`
+
             # Generate multiple sequences through independent autoregressive runs
             # This follows LigandMPNN's approach of running model.sample() multiple times
             all_S_samples = []
@@ -1329,9 +1342,19 @@ class ProteinMPNNRunner:
                 for seq_idx in range(num_sequences):
                     # Generate different random seed for each autoregressive sequence generation
                     # This is critical for ensuring independent samples from the autoregressive model
+
+                    # Set the seed for `randn` but also for `model.sample` which calls `torch.multinomial` on logits
+                    # Ensure we have a unique seed per `num_sequences`
+                    # However, the batch size / number of structures is determined by the caller.
+                    # ProteinMPNNRunnerPool will split a batch and run each independently.
+                    # Assuming each input is different, it shouldn't matter if they get the same seed or not then.
+                    # But, if we pass the same seed for the same input, I think we would expect the same output.
+                    if seed is not None:
+                        struct_seq_seed = seed + seq_idx
+                        torch.manual_seed(struct_seq_seed)
+
                     feature_dict["randn"] = torch.randn(1, N, device=self._device)
 
-                    # Run autoregressive model inference - generates 1 sequence
                     output_dict = model.sample(feature_dict)
 
                     # Extract results
@@ -1800,3 +1823,341 @@ class ProteinMPNNRunner:
         if hasattr(self, "_device"):
             if torch.cuda.is_available() and str(self._device).startswith("cuda"):
                 torch.cuda.empty_cache()
+
+
+class ProteinMPNNRunnerPool:
+    """
+    Pool of ProteinMPNNRunner instances for parallel inference.
+
+    Since ProteinMPNN doesn't support true batching of different structures,
+    this pool manages multiple model instances to enable parallel processing.
+    Models are loaded lazily when first used to reduce initialization time.
+
+    On CUDA systems, runners can be distributed across multiple GPUs for better scaling.
+    """
+
+    def __init__(
+        self,
+        cfg: ProteinMPNNRunnerConfig,
+        num_models: int,
+        device_ids: Optional[List[int]] = None,
+    ):
+        """
+        Initialize the pool with multiple ProteinMPNN runners.
+
+        Args:
+            cfg: ProteinMPNN configuration
+            num_models: Number of model instances to create
+            device_ids: Optional list of CUDA device IDs to distribute runners across.
+                       If None, all runners use the same device from cfg.
+                       If provided, runners are distributed round-robin across devices.
+        """
+        if not cfg.use_native_runner:
+            raise ValueError("ProteinMPNNRunnerPool only supports native runner mode")
+
+        self.cfg = cfg
+        self.num_models = num_models
+        self.device_ids = device_ids
+
+        # Create pool of runners (without loading models yet)
+        self.runners = []
+        for i in range(num_models):
+            runner_cfg = copy.deepcopy(cfg)  # Create separate config for each runner
+            runner = ProteinMPNNRunner(runner_cfg)
+
+            # Assign specific device if device_ids provided (for multi-GPU CUDA)
+            if device_ids and len(device_ids) > 0:
+                device_id = device_ids[i % len(device_ids)]
+                if torch.cuda.is_available():
+                    runner._device = torch.device(f"cuda:{device_id}")
+                    logger.info(f"Runner {i} assigned to cuda:{device_id}")
+                else:
+                    logger.warning(f"CUDA not available, ignoring device_ids")
+
+            self.runners.append(runner)
+
+        # Track which runners are available and which have models loaded
+        self.available_runners = deque(self.runners)
+        self.busy_runners = set()
+        self.loaded_runners = set()  # Track which runners have loaded models
+
+        # Simple queue for waiting requests
+        self.waiting_queue = deque()
+
+        # Lock for thread safety
+        self.lock = threading.Lock()
+
+    def run_batch(
+        self,
+        trans: torch.Tensor,  # (B, N, 3)
+        rotmats: torch.Tensor,  # (B, N, 3, 3)
+        aatypes: CogenAATypes,  # (B, N) - amino acid types in project's AlphaFold ordering
+        res_mask: torch.Tensor,  # (B, N) - residue mask
+        chain_idx: torch.Tensor,  # (B, N) - chain indices
+        torsions: Optional[torch.Tensor] = None,  # (B, N, 7, 2)
+        num_sequences: Optional[int] = 1,
+        temperature: Optional[float] = None,
+        chains_to_design: Optional[List[str]] = None,
+        fixed_residues: Optional[List[str]] = None,
+        seed: Optional[int] = None,
+    ) -> NativeMPNNResult:
+        """
+        Run ProteinMPNN inference using available models from the pool.
+
+        If there's only one model, delegates directly to the single runner.
+        If there are multiple models, splits the batch and runs in parallel.
+
+        Args:
+            Same as ProteinMPNNRunner.run_batch
+
+        Returns:
+            NativeMPNNResult from the inference
+        """
+        B = trans.shape[0]
+
+        # If only one model or single batch element, use direct delegation
+        if self.num_models == 1 or B == 1:
+            return self._run_batch_single(
+                trans=trans,
+                rotmats=rotmats,
+                aatypes=aatypes,
+                res_mask=res_mask,
+                chain_idx=chain_idx,
+                torsions=torsions,
+                num_sequences=num_sequences,
+                temperature=temperature,
+                chains_to_design=chains_to_design,
+                fixed_residues=fixed_residues,
+                seed=seed,
+            )
+
+        # Multiple models and multiple batch elements - run in parallel
+        return asyncio.run(
+            self._run_batch_parallel(
+                trans=trans,
+                rotmats=rotmats,
+                aatypes=aatypes,
+                res_mask=res_mask,
+                chain_idx=chain_idx,
+                torsions=torsions,
+                num_sequences=num_sequences,
+                temperature=temperature,
+                chains_to_design=chains_to_design,
+                fixed_residues=fixed_residues,
+                seed=seed,
+            )
+        )
+
+    async def _run_batch_parallel(
+        self,
+        trans: torch.Tensor,  # (B, N, 3)
+        rotmats: torch.Tensor,  # (B, N, 3, 3)
+        aatypes: CogenAATypes,  # (B, N)
+        res_mask: torch.Tensor,  # (B, N)
+        chain_idx: torch.Tensor,  # (B, N)
+        torsions: Optional[torch.Tensor] = None,  # (B, N, 7, 2)
+        num_sequences: Optional[int] = 1,
+        temperature: Optional[float] = None,
+        chains_to_design: Optional[List[str]] = None,
+        fixed_residues: Optional[List[str]] = None,
+        seed: Optional[int] = None,
+    ) -> NativeMPNNResult:
+        """
+        Run batch items in parallel using async/await pattern.
+        """
+        B = trans.shape[0]
+
+        # Create tasks for each batch element
+        tasks = []
+        for b in range(B):
+            task = self._run_batch_single_async(
+                trans=trans[b : b + 1],
+                rotmats=rotmats[b : b + 1],
+                aatypes=aatypes[b : b + 1],
+                res_mask=res_mask[b : b + 1],
+                chain_idx=chain_idx[b : b + 1],
+                torsions=torsions[b : b + 1] if torsions is not None else None,
+                num_sequences=num_sequences,
+                temperature=temperature,
+                chains_to_design=chains_to_design,
+                fixed_residues=fixed_residues,
+                seed=seed,
+            )
+            tasks.append(task)
+
+        # Run all tasks in parallel
+        results = await asyncio.gather(*tasks)
+
+        # Collate results
+        return self._collate_mpnn_results(results)
+
+    async def _run_batch_single_async(
+        self,
+        trans: torch.Tensor,  # (1, N, 3)
+        rotmats: torch.Tensor,  # (1, N, 3, 3)
+        aatypes: CogenAATypes,  # (1, N)
+        res_mask: torch.Tensor,  # (1, N)
+        chain_idx: torch.Tensor,  # (1, N)
+        torsions: Optional[torch.Tensor] = None,  # (1, N, 7, 2)
+        num_sequences: Optional[int] = 1,
+        temperature: Optional[float] = None,
+        chains_to_design: Optional[List[str]] = None,
+        fixed_residues: Optional[List[str]] = None,
+        seed: Optional[int] = None,
+    ) -> NativeMPNNResult:
+        """
+        Async wrapper for running a single batch element.
+        """
+        return await asyncio.get_event_loop().run_in_executor(
+            None,
+            self._run_batch_single,
+            trans,
+            rotmats,
+            aatypes,
+            res_mask,
+            chain_idx,
+            torsions,
+            num_sequences,
+            temperature,
+            chains_to_design,
+            fixed_residues,
+            seed,
+        )
+
+    def _run_batch_single(
+        self,
+        trans: torch.Tensor,  # (1, N, 3)
+        rotmats: torch.Tensor,  # (1, N, 3, 3)
+        aatypes: CogenAATypes,  # (1, N)
+        res_mask: torch.Tensor,  # (1, N)
+        chain_idx: torch.Tensor,  # (1, N)
+        torsions: Optional[torch.Tensor] = None,  # (1, N, 7, 2)
+        num_sequences: Optional[int] = 1,
+        temperature: Optional[float] = None,
+        chains_to_design: Optional[List[str]] = None,
+        fixed_residues: Optional[List[str]] = None,
+        seed: Optional[int] = None,
+    ) -> NativeMPNNResult:
+        """
+        Run ProteinMPNN inference on a single batch element (batch size 1).
+
+        Args:
+            All tensors should have batch dimension 1 (1, ...)
+            Other args same as run_batch
+
+        Returns:
+            NativeMPNNResult for the single structure
+        """
+        # Validate batch size is 1
+        assert trans.shape[0] == 1, f"Expected batch size 1, got {trans.shape[0]}"
+
+        # Get an available runner
+        runner = self._get_runner()
+
+        try:
+            # Run inference
+            result = runner.run_batch(
+                trans=trans,
+                rotmats=rotmats,
+                aatypes=aatypes,
+                res_mask=res_mask,
+                chain_idx=chain_idx,
+                torsions=torsions,
+                num_sequences=num_sequences,
+                temperature=temperature,
+                chains_to_design=chains_to_design,
+                fixed_residues=fixed_residues,
+                seed=seed,
+            )
+            return result
+        finally:
+            # Return runner to pool
+            self._return_runner(runner)
+
+    def _collate_mpnn_results(
+        self, results: List[NativeMPNNResult]
+    ) -> NativeMPNNResult:
+        """
+        Collate multiple NativeMPNNResult instances into a single batched result.
+
+        Args:
+            results: List of NativeMPNNResult, each with batch dimension 1
+
+        Returns:
+            Single NativeMPNNResult with batch dimension len(results)
+        """
+        if not results:
+            raise ValueError("Cannot collate empty results list")
+
+        # Extract components from all results
+        all_logits = []
+        all_confidence_scores = []
+        all_sequences = []
+
+        for result in results:
+            # Each result should have batch dimension 1
+            assert (
+                result.logits.shape[0] == 1
+            ), f"Expected batch size 1, got {result.logits.shape[0]}"
+
+            all_logits.append(result.logits)
+            all_confidence_scores.append(result.confidence_scores)
+
+            # Get sequences (computed on demand if needed)
+            if result._sequences is not None:
+                all_sequences.append(result._sequences)
+            else:
+                all_sequences.append(result.sequences)
+
+        # Concatenate along batch dimension
+        collated_logits = torch.cat(all_logits, dim=0)  # (B, num_sequences, N, 21)
+        collated_confidence = torch.cat(
+            all_confidence_scores, dim=0
+        )  # (B, num_sequences)
+        collated_sequences = torch.cat(all_sequences, dim=0)  # (B, num_sequences, N)
+
+        return NativeMPNNResult(
+            logits=collated_logits,
+            confidence_scores=collated_confidence,
+            _sequences=collated_sequences,
+        )
+
+    def _get_runner(self) -> ProteinMPNNRunner:
+        """
+        Get an available runner from the pool.
+        Loads the model if not already loaded.
+        Blocks until one becomes available.
+        """
+        while True:
+            with self.lock:
+                if self.available_runners:
+                    runner = self.available_runners.popleft()
+                    self.busy_runners.add(runner)
+
+                    # Check if model needs to be loaded
+                    if runner not in self.loaded_runners:
+                        runner._load_model()
+                        self.loaded_runners.add(runner)
+
+                    return runner
+
+            # No runners available, yield and wait a bit and try again
+            time.sleep(0.01)
+
+    def _return_runner(self, runner: ProteinMPNNRunner) -> None:
+        """
+        Return a runner to the available pool.
+        """
+        with self.lock:
+            if runner in self.busy_runners:
+                self.busy_runners.remove(runner)
+                self.available_runners.append(runner)
+
+    def __len__(self) -> int:
+        """Return the number of runners in the pool."""
+        return self.num_models
+
+    def __del__(self):
+        """Clean up all runners."""
+        for runner in self.runners:
+            del runner

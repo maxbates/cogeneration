@@ -19,17 +19,6 @@ from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.structure import StructureExperimentalMethod
 from cogeneration.type.task import DataTask
 
-# https://www2.rcsb.org/structure/2QLW
-# This protein has a fair amount of weird stuff going on to make it a good test case:
-# - it is a dimer
-# - has small molcules after chains that should be trimmed
-# - has small molecules between chains (MG and FMT)
-# - has non-residue atom types (MG atoms)
-# - has some unknown residues (like seleniummethionine)
-# - has preceding sequence without atoms
-# - glycine starts at position -1 in each chain
-example_pdb_path = Path(__file__).parent / "2qlw.pdb"
-
 
 def shallow_copy_dict(d):
     return {k: v.copy() if isinstance(v, np.ndarray) else v for k, v in d.items()}
@@ -44,9 +33,9 @@ def unk_run(aatype) -> int:
 
 
 class TestProcessPDBFiles:
-    def test_process_file(self, tmp_path):
+    def test_process_file(self, tmp_path, pdb_2qlw_path):
         metadata, processed_pdb = process_pdb_with_metadata(
-            pdb_file_path=str(example_pdb_path.absolute()),
+            pdb_file_path=str(pdb_2qlw_path.absolute()),
             write_dir=str(tmp_path),
         )
         assert metadata is not None
@@ -108,17 +97,17 @@ class TestProcessPDBFiles:
             len(extra_keys) == 0 and len(missing_keys) == 0
         ), f"Extra keys: {extra_keys}, Missing keys: {missing_keys}"
 
-    def test_parsing_processed_file(self, tmp_path):
+    def test_parsing_processed_file(self, tmp_path, pdb_2qlw_path):
         metadata, _ = process_pdb_with_metadata(
-            pdb_file_path=str(example_pdb_path.absolute()),
+            pdb_file_path=str(pdb_2qlw_path.absolute()),
             write_dir=str(tmp_path),
         )
         # Test can load and process
         _ = read_processed_file(processed_file_path=metadata[mc.processed_path])
 
-    def test_dataset_using_processed_file(self, tmp_path):
+    def test_dataset_using_processed_file(self, tmp_path, pdb_2qlw_path):
         metadata, _ = process_pdb_with_metadata(
-            pdb_file_path=str(example_pdb_path.absolute()),
+            pdb_file_path=str(pdb_2qlw_path.absolute()),
             write_dir=str(tmp_path),
         )
 
@@ -157,9 +146,9 @@ class TestProcessPDBFiles:
             csv_row=metadata,
         )
 
-    def test_trim_chain_feats_to_modeled_residues(self, tmp_path):
+    def test_trim_chain_feats_to_modeled_residues(self, tmp_path, pdb_2qlw_path):
         _, processed_pdb = process_pdb_with_metadata(
-            pdb_file_path=str(example_pdb_path.absolute()),
+            pdb_file_path=str(pdb_2qlw_path.absolute()),
             write_dir=str(tmp_path),
         )
 

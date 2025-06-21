@@ -392,3 +392,19 @@ def mock_checkpoint(mock_folding_validation):
         return cfg, ckpt_path
 
     return create_mock_checkpoint
+
+
+@pytest.fixture
+def pdb_2qlw_path():
+    """
+    https://www2.rcsb.org/structure/2QLW
+    This protein has a fair amount of weird stuff going on to make it a good test case:
+    - it is a dimer
+    - has small molcules after chains that should be trimmed
+    - has small molecules between chains (MG and FMT)
+    - has non-residue atom types (MG atoms)
+    - has some unknown residues (like seleniummethionine)
+    - has preceding sequence without atoms
+    - glycine starts at position -1 in each chain
+    """
+    return Path(__file__).parent / "dataset" / "2qlw.pdb"
