@@ -1236,7 +1236,7 @@ class ProteinMPNNRunnerConfig(BaseClassConfig):
     # Path to directory containing ProteinMPNN model weights, "" for same directory
     pmpnn_weights_dir: Path = ""
     # Seed for ProteinMPNN
-    # each `num_sequences` will get a unique seed but otherwise set every inference call.
+    # each `num_passes` will get a unique seed but otherwise set every inference call.
     pmpnn_seed: Optional[int] = None
     seq_per_sample: int = 8
 

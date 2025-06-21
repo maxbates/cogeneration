@@ -559,7 +559,7 @@ class FoldingValidator:
             pdb_path=Path(uncompressed_pdb_path),
             output_dir=Path(output_dir),
             device_id=self.device_id,
-            num_sequences=num_sequences,
+            num_passes=num_sequences,
             seed=seed,
         )
 

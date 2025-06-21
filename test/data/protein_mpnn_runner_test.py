@@ -31,7 +31,7 @@ from cogeneration.type.dataset import MetadataColumn as mc
 
 
 def generate_mock_mpnn_fasta(
-    pdb_name: str, num_sequences: int = 2, temperature: float = 0.1, seed: int = 123
+    pdb_name: str, num_passes: int = 2, temperature: float = 0.1, seed: int = 123
 ) -> str:
     """
     Generate a mock MPNN-format FASTA string that mimics the output format
@@ -40,7 +40,7 @@ def generate_mock_mpnn_fasta(
 
     Args:
         pdb_name: Name of the PDB file (used in headers)
-        num_sequences: Number of generated sequences to create
+        num_passes: Number of generated sequences to create
         temperature: Sampling temperature for headers
         seed: Random seed for headers
 
@@ -49,12 +49,12 @@ def generate_mock_mpnn_fasta(
     """
     # Mock native sequence header and sequence
     fasta_lines = [
-        f">{pdb_name}, T={temperature}, seed={seed}, num_res=100, num_ligand_res=100, use_ligand_context=False, ligand_cutoff_distance=8.0, batch_size=1, number_of_batches={num_sequences}, model_path=/path/to/model",
+        f">{pdb_name}, T={temperature}, seed={seed}, num_res=100, num_ligand_res=100, use_ligand_context=False, ligand_cutoff_distance=8.0, batch_size=1, number_of_batches={num_passes}, model_path=/path/to/model",
         "MKLLVLGLGGVGKSALTVQFVQGIFVEKYDPTIEDFRKYTLPTVAIGLQLFLHYTSLLQEKLSPEDRKNLIVGSCDTAGQAMALQVEKQARELTGLEVLFQGPVLQV",
     ]
 
     # Add generated sequences
-    for i in range(1, num_sequences + 1):
+    for i in range(1, num_passes + 1):
         # Mock generated sequence header
         fasta_lines.append(
             f">{pdb_name}, id={i}, T={temperature}, seed={seed}, overall_confidence=0.8000, ligand_confidence=0.7500, seq_rec=0.9200"
@@ -98,7 +98,8 @@ class TestProteinMPNNRunner:
         # Get actual dimensions from the input
         batch_size = pdb_batch[bp.trans_1].shape[0]
         num_res = pdb_batch[bp.trans_1].shape[1]
-        num_sequences = 3
+        num_passes = 3
+        sequences_per_pass = 2
 
         result = runner.run_batch(
             trans=pdb_batch[bp.trans_1],
@@ -106,23 +107,38 @@ class TestProteinMPNNRunner:
             aatypes=pdb_batch[bp.aatypes_1],
             res_mask=pdb_batch[bp.res_mask],
             chain_idx=pdb_batch[bp.chain_idx],
-            num_sequences=num_sequences,
+            num_passes=num_passes,
+            sequences_per_pass=sequences_per_pass,
             temperature=0.1,
         )
 
         # Verify results
         assert isinstance(result, NativeMPNNResult)
         assert result.logits.shape[0] == batch_size
-        assert result.logits.shape[1] == num_sequences
-        assert result.logits.shape[2] == num_res
-        assert result.logits.shape[3] == 21  # vocab size
+        assert result.logits.shape[1] == num_passes
+        assert result.logits.shape[2] == sequences_per_pass
+        assert result.logits.shape[3] == num_res
+        assert result.logits.shape[4] == 21  # vocab size
 
-        assert result.confidence_scores.shape == (batch_size, num_sequences)
-        assert result.sequences.shape == (batch_size, num_sequences, num_res)
+        assert result.confidence_scores.shape == (
+            batch_size,
+            num_passes,
+            sequences_per_pass,
+        )
+        assert result.sequences.shape == (
+            batch_size,
+            num_passes,
+            sequences_per_pass,
+            num_res,
+        )
 
         # Test properties work
         averaged_logits = result.averaged_logits
         assert averaged_logits.shape == (batch_size, num_res, 21)
+
+        # Test the new average_logits_per_pass property
+        avg_logits_per_pass = result.average_logits_per_pass
+        assert avg_logits_per_pass.shape == (batch_size, num_passes, num_res, 21)
 
     def test_run_batch_2qlw(self, mock_cfg, pdb_2qlw_path):
         """Test run_batch on 2qlw structure"""
@@ -149,7 +165,8 @@ class TestProteinMPNNRunner:
         chain_idx = features[bp.chain_idx].unsqueeze(0)  # (1, N)
 
         num_res = trans.shape[1]
-        num_sequences = 2
+        num_passes = 2
+        sequences_per_pass = 1
 
         result = runner.run_batch(
             trans=trans,
@@ -157,15 +174,17 @@ class TestProteinMPNNRunner:
             aatypes=aatypes,
             res_mask=res_mask,
             chain_idx=chain_idx,
-            num_sequences=num_sequences,
+            num_passes=num_passes,
+            sequences_per_pass=sequences_per_pass,
             temperature=0.2,
         )
 
         assert isinstance(result, NativeMPNNResult)
         assert result.logits.shape[0] == 1
-        assert result.logits.shape[1] == num_sequences
-        assert result.logits.shape[2] == num_res
-        assert result.logits.shape[3] == 21
+        assert result.logits.shape[1] == num_passes
+        assert result.logits.shape[2] == sequences_per_pass
+        assert result.logits.shape[3] == num_res
+        assert result.logits.shape[4] == 21
 
         assert torch.all(result.confidence_scores >= 0.0)
         assert torch.all(result.confidence_scores <= 1.0)
@@ -175,7 +194,7 @@ class TestProteinMPNNRunner:
 
     def test_generate_mock_mpnn_fasta(self):
         """Test the mock FASTA generation function"""
-        fasta_content = generate_mock_mpnn_fasta("test_pdb", num_sequences=2)
+        fasta_content = generate_mock_mpnn_fasta("test_pdb", num_passes=2)
 
         # Check that it contains the expected number of sequences (2 generated + 1 native)
         lines = fasta_content.split("\n")
@@ -448,7 +467,7 @@ class TestProteinMPNNRunner:
                 model_sc=mock_model_sc,
                 output_dir=output_dir,
                 pdb_path=pdb_2qlw_path,
-                num_sequences=3,
+                num_passes=3,
             )
 
             # Verify that side chain packing was called
@@ -487,7 +506,7 @@ class TestProteinMPNNRunner:
             pdb_path=pdb_2qlw_path,
             output_dir=output_dir,
             device_id=device_id,
-            num_sequences=2,
+            num_passes=2,
             seed=123,
         )
 
@@ -552,7 +571,7 @@ class TestProteinMPNNRunner:
         result_path = runner.run_pdb_native(
             pdb_path=pdb_2qlw_path,
             output_dir=output_dir,
-            num_sequences=2,
+            num_passes=2,
             seed=123,
         )
 
@@ -576,7 +595,7 @@ class TestProteinMPNNRunner:
         runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
 
         # Create mock original FASTA with native + generated sequences
-        mock_fasta_content = generate_mock_mpnn_fasta("test_pdb", num_sequences=2)
+        mock_fasta_content = generate_mock_mpnn_fasta("test_pdb", num_passes=2)
         original_fasta = tmp_path / "original.fa"
         original_fasta.write_text(mock_fasta_content)
 
@@ -680,6 +699,9 @@ class TestProteinMPNNRunner:
 
         runner = ProteinMPNNRunner(cfg.folding.protein_mpnn)
 
+        num_passes = 2
+        sequences_per_pass = 1
+
         # Create mock batch data
         B, N = 2, 10
         trans = torch.randn(B, N, 3)
@@ -695,7 +717,8 @@ class TestProteinMPNNRunner:
             aatypes=aatypes,
             res_mask=res_mask,
             chain_idx=chain_idx,
-            num_sequences=2,
+            num_passes=num_passes,
+            sequences_per_pass=sequences_per_pass,
             temperature=0.5,
         )
 
@@ -703,12 +726,22 @@ class TestProteinMPNNRunner:
         assert isinstance(result, NativeMPNNResult)
         assert result.logits.shape == (
             B,
-            2,
+            num_passes,
+            sequences_per_pass,
             N,
             21,
-        )  # (batch, num_sequences, length, vocab)
-        assert result.confidence_scores.shape == (B, 2)  # (batch, num_sequences)
-        assert result.sequences.shape == (B, 2, N)  # (batch, num_sequences, length)
+        )  # (batch, num_passes, sequences_per_pass, length, vocab)
+        assert result.confidence_scores.shape == (
+            B,
+            num_passes,
+            sequences_per_pass,
+        )  # (batch, num_passes, sequences_per_pass)
+        assert result.sequences.shape == (
+            B,
+            num_passes,
+            sequences_per_pass,
+            N,
+        )  # (batch, num_passes, sequences_per_pass, length)
 
         # Test single structure case
         result_single = runner.run_batch(
@@ -717,10 +750,11 @@ class TestProteinMPNNRunner:
             aatypes=aatypes[:1],
             res_mask=res_mask[:1],
             chain_idx=chain_idx[:1],
-            num_sequences=1,
+            num_passes=1,
+            sequences_per_pass=1,
         )
         assert isinstance(result_single, NativeMPNNResult)
-        assert result_single.sequences.shape == (1, 1, N)
+        assert result_single.sequences.shape == (1, 1, 1, N)
 
     def test_run_batch_with_invalid_structures(self, mock_cfg):
         """Test run_batch with structures that have no valid residues."""
@@ -734,20 +768,23 @@ class TestProteinMPNNRunner:
         res_mask = torch.zeros(B, N, dtype=torch.bool)  # No valid residues
         chain_idx = torch.zeros(B, N, dtype=torch.long)  # Single chain
 
+        num_passes = 2
+        sequences_per_pass = 1
         result = runner.run_batch(
             trans=trans,
             rotmats=rotmats,
             aatypes=aatypes,
             res_mask=res_mask,
             chain_idx=chain_idx,
-            num_sequences=2,
+            num_passes=num_passes,
+            sequences_per_pass=sequences_per_pass,
         )
 
         # Should return uniform logits/sequences
         assert isinstance(result, NativeMPNNResult)
-        assert result.logits.shape == (B, 2, N, 21)
-        assert result.confidence_scores.shape == (B, 2)
-        assert result.sequences.shape == (B, 2, N)
+        assert result.logits.shape == (B, num_passes, sequences_per_pass, N, 21)
+        assert result.confidence_scores.shape == (B, num_passes, sequences_per_pass)
+        assert result.sequences.shape == (B, num_passes, sequences_per_pass, N)
 
         # Even with no valid residues, the model may still generate sequences
         # We just check that we get a valid result structure
@@ -768,6 +805,8 @@ class TestProteinMPNNRunner:
         res_mask = torch.ones(B, N, dtype=torch.bool)
         chain_idx = torch.ones(B, N, dtype=torch.long)  # Single chain
 
+        num_passes = 3
+        sequences_per_pass = 2
         result = runner.run_batch(
             trans=trans,
             rotmats=rotmats,
@@ -775,13 +814,14 @@ class TestProteinMPNNRunner:
             res_mask=res_mask,
             chain_idx=chain_idx,
             temperature=0.2,
-            num_sequences=3,
+            num_passes=num_passes,
+            sequences_per_pass=sequences_per_pass,
         )
 
         assert isinstance(result, NativeMPNNResult)
-        assert result.logits.shape == (B, 3, N, 21)
-        assert result.confidence_scores.shape == (B, 3)
-        assert result.sequences.shape == (B, 3, N)
+        assert result.logits.shape == (B, num_passes, sequences_per_pass, N, 21)
+        assert result.confidence_scores.shape == (B, num_passes, sequences_per_pass)
+        assert result.sequences.shape == (B, num_passes, sequences_per_pass, N)
 
     def test_run_batch_format_conversion_integration(self, mock_cfg_uninterpolated):
         """Test that run_batch properly handles format conversion from project to MPNN and back."""
@@ -801,21 +841,24 @@ class TestProteinMPNNRunner:
         res_mask = torch.ones(B, N, dtype=torch.bool)
         chain_idx = torch.zeros(B, N, dtype=torch.long)  # Single chain
 
+        num_passes = 2
+        sequences_per_pass = 1
         result = runner.run_batch(
             trans=trans,
             rotmats=rotmats,
             aatypes=aatypes,
             res_mask=res_mask,
             chain_idx=chain_idx,
-            num_sequences=2,
+            num_passes=num_passes,
+            sequences_per_pass=sequences_per_pass,
             temperature=0.1,
         )
 
         # Check that format conversion worked
         assert isinstance(result, NativeMPNNResult)
-        assert result.logits.shape == (B, 2, N, 21)
-        assert result.confidence_scores.shape == (B, 2)
-        assert result.sequences.shape == (B, 2, N)
+        assert result.logits.shape == (B, num_passes, sequences_per_pass, N, 21)
+        assert result.confidence_scores.shape == (B, num_passes, sequences_per_pass)
+        assert result.sequences.shape == (B, num_passes, sequences_per_pass, N)
 
         # Check that sequences are in valid range for project format
         assert torch.all(result.sequences >= 0)
@@ -954,6 +997,8 @@ class TestProteinMPNNRunner:
         chain_idx = torch.empty(B, N, dtype=torch.long)  # Empty chain indices
 
         # This should handle the empty batch gracefully
+        num_passes = 1
+        sequences_per_pass = 1
         try:
             result = runner.run_batch(
                 trans=trans,
@@ -961,13 +1006,14 @@ class TestProteinMPNNRunner:
                 aatypes=aatypes,
                 res_mask=res_mask,
                 chain_idx=chain_idx,
-                num_sequences=1,
+                num_passes=num_passes,
+                sequences_per_pass=sequences_per_pass,
             )
             # If it doesn't error, check the result structure
             assert isinstance(result, NativeMPNNResult)
-            assert result.logits.shape == (B, 1, N, 21)
-            assert result.confidence_scores.shape == (B, 1)
-            assert result.sequences.shape == (B, 1, N)
+            assert result.logits.shape == (B, num_passes, sequences_per_pass, N, 21)
+            assert result.confidence_scores.shape == (B, num_passes, sequences_per_pass)
+            assert result.sequences.shape == (B, num_passes, sequences_per_pass, N)
         except (ValueError, RuntimeError):
             # Empty batch handling might raise an error, which is acceptable
             pass
@@ -1398,6 +1444,8 @@ class TestProteinMPNNRunner:
         res_mask = torch.ones(B, N, dtype=torch.bool)
         chain_idx = torch.zeros(B, N, dtype=torch.long)
 
+        num_passes = 3
+        sequences_per_pass = 2
         # Run with low temperature (more deterministic)
         result_low_temp = runner.run_batch(
             trans=trans,
@@ -1405,7 +1453,8 @@ class TestProteinMPNNRunner:
             aatypes=aatypes,
             res_mask=res_mask,
             chain_idx=chain_idx,
-            num_sequences=3,
+            num_passes=num_passes,
+            sequences_per_pass=sequences_per_pass,
             temperature=0.01,
         )
 
@@ -1416,13 +1465,26 @@ class TestProteinMPNNRunner:
             aatypes=aatypes,
             res_mask=res_mask,
             chain_idx=chain_idx,
-            num_sequences=3,
+            num_passes=num_passes,
+            sequences_per_pass=sequences_per_pass,
             temperature=1.0,
         )
 
         # This is a probabilistic test, so we just check the shapes are correct
-        assert result_low_temp.logits.shape == (B, 3, N, 21)
-        assert result_high_temp.logits.shape == (B, 3, N, 21)
+        assert result_low_temp.logits.shape == (
+            B,
+            num_passes,
+            sequences_per_pass,
+            N,
+            21,
+        )
+        assert result_high_temp.logits.shape == (
+            B,
+            num_passes,
+            sequences_per_pass,
+            N,
+            21,
+        )
 
     def test_run_batch_seed_reproducibility(self, mock_cfg):
         """Test that running with the same seed produces identical results"""
@@ -1430,7 +1492,8 @@ class TestProteinMPNNRunner:
 
         # Create a simple batch
         B, N = 2, 15
-        num_sequences = 2
+        num_passes = 2
+        sequences_per_pass = 3
         seed = 42
 
         # Set up test data
@@ -1448,7 +1511,8 @@ class TestProteinMPNNRunner:
             aatypes=aatypes,
             res_mask=res_mask,
             chain_idx=chain_idx,
-            num_sequences=num_sequences,
+            num_passes=num_passes,
+            sequences_per_pass=sequences_per_pass,
             temperature=0.1,
             seed=seed,
         )
@@ -1459,7 +1523,8 @@ class TestProteinMPNNRunner:
             aatypes=aatypes,
             res_mask=res_mask,
             chain_idx=chain_idx,
-            num_sequences=num_sequences,
+            num_passes=num_passes,
+            sequences_per_pass=sequences_per_pass,
             temperature=0.1,
             seed=seed,
         )
@@ -1484,7 +1549,8 @@ class TestProteinMPNNRunner:
             aatypes=aatypes,
             res_mask=res_mask,
             chain_idx=chain_idx,
-            num_sequences=num_sequences,
+            num_passes=num_passes,
+            sequences_per_pass=sequences_per_pass,
             temperature=0.1,
             seed=seed + 1,  # Different seed
         )
@@ -1516,7 +1582,7 @@ class TestProteinMPNNRunnerPool:
 
     def test_single_run_batch_2qlw(self, mock_cfg, pdb_2qlw_path):
         """Test pool run_batch on 2qlw structure"""
-        pool = ProteinMPNNRunnerPool(mock_cfg.folding.protein_mpnn, num_models=4)
+        pool = ProteinMPNNRunnerPool(mock_cfg.folding.protein_mpnn, num_models=2)
 
         # Process actual PDB file
         batch = process_pdb_file(str(pdb_2qlw_path), "2qlw")
@@ -1539,7 +1605,8 @@ class TestProteinMPNNRunnerPool:
         chain_idx = features[bp.chain_idx].unsqueeze(0)  # (1, N)
 
         num_res = trans.shape[1]
-        num_sequences = 2
+        num_passes = 2
+        sequences_per_pass = 1
 
         result = pool.run_batch(
             trans=trans,
@@ -1547,15 +1614,17 @@ class TestProteinMPNNRunnerPool:
             aatypes=aatypes,
             res_mask=res_mask,
             chain_idx=chain_idx,
-            num_sequences=num_sequences,
+            num_passes=num_passes,
+            sequences_per_pass=sequences_per_pass,
             temperature=0.2,
         )
 
         assert isinstance(result, NativeMPNNResult)
         assert result.logits.shape[0] == 1
-        assert result.logits.shape[1] == num_sequences
-        assert result.logits.shape[2] == num_res
-        assert result.logits.shape[3] == 21
+        assert result.logits.shape[1] == num_passes
+        assert result.logits.shape[2] == sequences_per_pass
+        assert result.logits.shape[3] == num_res
+        assert result.logits.shape[4] == 21
 
         assert torch.all(result.confidence_scores >= 0.0)
         assert torch.all(result.confidence_scores <= 1.0)
@@ -1580,7 +1649,7 @@ class TestBenchmarkProteinMPNNRunner:
 
         # Benchmark parameters
         num_batches = 5
-        num_sequences = 3
+        num_passes = 3
         temperature = 0.1
 
         dataloader = create_pdb_dataloader(
@@ -1676,7 +1745,8 @@ class TestBenchmarkProteinMPNNRunner:
                         chain_idx=(
                             batch[bp.chain_idx] if bp.chain_idx in batch else None
                         ),
-                        num_sequences=num_sequences,
+                        num_passes=num_passes,
+                        sequences_per_pass=1,
                         temperature=temperature,
                     )
                     # convert batch to list to mirror run_native and run_subprocess output shapes
@@ -1714,7 +1784,8 @@ class TestBenchmarkProteinMPNNRunner:
                         chain_idx=(
                             batch[bp.chain_idx] if bp.chain_idx in batch else None
                         ),
-                        num_sequences=num_sequences,
+                        num_passes=num_passes,
+                        sequences_per_pass=1,
                         temperature=temperature,
                     )
                     # convert batch to list to mirror run_native and run_subprocess output shapes
@@ -1746,7 +1817,7 @@ class TestBenchmarkProteinMPNNRunner:
                         result_path = runner_batch.run_pdb_native(
                             pdb_path=pdb_path,
                             output_dir=tmp_path / "native_output",
-                            num_sequences=num_sequences,
+                            num_passes=num_passes,
                             temperature=temperature,
                         )
                         native_results.append(result_path)
@@ -1782,7 +1853,7 @@ class TestBenchmarkProteinMPNNRunner:
                             pdb_path=pdb_path,
                             output_dir=tmp_path / "subprocess_output",
                             device_id=0,  # Required for subprocess mode
-                            num_sequences=num_sequences,
+                            num_passes=num_passes,
                             temperature=temperature,
                         )
                         subprocess_results.append(result_path)
