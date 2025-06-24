@@ -12,6 +12,8 @@ install_requires = [
     "attrs==24.2.0",
     "biopython==1.84",
     "black==24.10.0",
+    # Boltz 2.1.1 req CUDA
+    "boltz==2",
     "certifi==2024.8.30",
     "charset-normalizer==3.3.2",
     "click==8.1.7",

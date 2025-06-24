@@ -16,6 +16,7 @@ from Bio import SeqIO
 
 from cogeneration.config.base import FoldingConfig
 from cogeneration.data import residue_constants
+from cogeneration.data.boltz_runner import BoltzPredictor, ManifestBuilder
 from cogeneration.data.const import CA_IDX, aatype_to_seq
 from cogeneration.data.io import write_numpy_json
 from cogeneration.data.metrics import calc_ca_ca_metrics, calc_mdtraj_metrics
@@ -523,13 +524,18 @@ class FoldingValidator:
 
         Returns a dataframe with `header`, `sequence`, `folded_pdb_path`, `mean_plddt`
         """
+        assert os.path.exists(fasta_path), f"Fasta path {fasta_path} does not exist"
+
         if self.cfg.folding_model == "af2":
-            folded_output = self._run_alphafold2(
-                fasta_path=fasta_path, output_dir=output_dir
+            return self._run_alphafold2(
+                fasta_path=str(fasta_path), output_dir=str(output_dir)
+            )
+        elif self.cfg.folding_model == "boltz":
+            return self._run_boltz(
+                fasta_path=str(fasta_path), output_dir=str(output_dir)
             )
         else:
             raise ValueError(f"Unsupported folding model: {self.cfg.folding_model}")
-        return folded_output
 
     def inverse_fold_structure(
         self,
@@ -579,7 +585,6 @@ class FoldingValidator:
         assert (
             self.cfg.colabfold_path is not None
         ), "ColabFold path must be set for AF2 folding"
-        assert os.path.exists(fasta_path), f"ColabFold path {fasta_path} does not exist"
         assert os.path.exists(
             self.cfg.colabfold_path
         ), f"ColabFold path {self.cfg.colabfold_path} does not exist"
@@ -653,6 +658,29 @@ class FoldingValidator:
             )
 
         return pd.DataFrame(all_fold_metrics)
+
+    def _run_boltz(self, fasta_path: str, output_dir: str) -> pd.DataFrame:
+        """
+        Run Boltz folding on a fasta file
+        Returns a DataFrame describing the outputs, where `header` column is the sequence name.
+        """
+        # Require an empty output directory, so we can safely clean up outputs.
+        assert (
+            not os.path.exists(output_dir) or len(os.listdir(output_dir)) == 0
+        ), f"Output folding directory {output_dir} is not empty"
+        os.makedirs(output_dir, exist_ok=True)
+
+        # TODO - store in __init__ and construct once
+
+        manifest_builder = ManifestBuilder(target_dir=Path(output_dir) / "processed")
+        manifest, processed_dir = manifest_builder.from_fasta(fasta_path)
+
+        boltz_predictor = BoltzPredictor()
+        prediction_set = boltz_predictor.predict(
+            manifest=manifest, output_dir=output_dir, processed_dir=str(processed_dir)
+        )
+
+        return prediction_set.to_df()
 
     @staticmethod
     def calc_backbone_rmsd(

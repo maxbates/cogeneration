@@ -1262,7 +1262,7 @@ class ProteinMPNNRunnerConfig(BaseClassConfig):
 
 @dataclass
 class FoldingConfig(BaseClassConfig):
-    folding_model: str = "af2"  # "af2" only at the moment, maybe "esm" in the future
+    folding_model: str = "af2"  # "af2" or "boltz"  # TODO enum
     # dedicated device for folding. decrement other devices by 1 if True
     own_device: bool = False
     pt_hub_dir: Path = PATH_PROJECT_ROOT / "cache" / "torch"

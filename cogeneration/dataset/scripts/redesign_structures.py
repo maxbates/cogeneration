@@ -204,6 +204,7 @@ class SequenceRedesigner:
         # Fold the redesigned sequences
         folding_df = self.validator.fold_fasta(
             fasta_path=str(redesign_fasta_path),
+            folding_config=self.validator.cfg,
             output_dir=str(work_dir / "folding"),
         )
         assert (
