@@ -1,5 +1,6 @@
 import collections
 import gzip
+import logging
 import os
 import tempfile
 from dataclasses import asdict
@@ -524,6 +525,8 @@ def _process_pdb(
         # If we created a temp file, remove it
         if is_temp_file:
             os.remove(uncompressed_pdb_path)
+
+        logging.error(f"Error processing PDB file {pdb_file_path}: {e}")
 
         # re-raise original exception
         raise e

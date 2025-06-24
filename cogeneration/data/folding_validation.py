@@ -1,9 +1,5 @@
-import glob
-import json
 import logging
 import os
-import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
@@ -14,23 +10,27 @@ import pandas as pd
 import torch
 from Bio import SeqIO
 
-from cogeneration.config.base import FoldingConfig
+from cogeneration.config.base import FoldingConfig, FoldingModel
 from cogeneration.data import residue_constants
-from cogeneration.data.boltz_runner import BoltzPredictor, ManifestBuilder
 from cogeneration.data.const import CA_IDX, aatype_to_seq
 from cogeneration.data.io import write_numpy_json
 from cogeneration.data.metrics import calc_ca_ca_metrics, calc_mdtraj_metrics
 from cogeneration.data.protein import write_prot_to_pdb
-from cogeneration.data.protein_mpnn_runner import ProteinMPNNRunner
 from cogeneration.data.residue_constants import restype_order_with_x, restypes_with_x
 from cogeneration.data.superimposition import superimpose
+from cogeneration.data.tools.abc import (
+    FoldingDataFrame,
+    FoldingTool,
+    InverseFoldingFasta,
+    InverseFoldingTool,
+)
+from cogeneration.data.tools.alphafold2 import AlphaFold2Tool
+from cogeneration.data.tools.boltz_runner import BoltzRunner
+from cogeneration.data.tools.protein_mpnn_runner import ProteinMPNNRunner
 from cogeneration.dataset.process_pdb import get_uncompressed_pdb_path, process_pdb_file
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.metrics import MetricName, OutputFileName
 from cogeneration.type.task import InferenceTask
-
-# NOTE - would be nice to better make 3rd party software injectable so easier to mock
-# However, it is not hard to patch the relevant functions for now.
 
 
 @dataclass
@@ -52,21 +52,32 @@ class SavedFoldingValidation:
 @dataclass
 class FoldingValidator:
     """
-    Class to support folding and inverse folding with 3rd party tools.
-
-    For now, just support ProteinMPNN and AF2
+    Class to support folding and inverse folding with 3rd party tools,
+    and assess the generated samples using various metrics.
     """
 
     cfg: FoldingConfig
-    device_id: Optional[int] = None
 
     def __post_init__(self):
         self.log = logging.getLogger(__name__)
-        # Initialize ProteinMPNN runner once to avoid repeated instantiation
-        self.protein_mpnn_runner = ProteinMPNNRunner(self.cfg.protein_mpnn)
+
+        # Initialize inverse folding tool (ProteinMPNN)
+        self.inverse_folding_tool: InverseFoldingTool = ProteinMPNNRunner(
+            cfg=self.cfg.protein_mpnn
+        )
+
+        # Initialize folding tool
+        if self.cfg.folding_model == FoldingModel.AlphaFold2:
+            self.folding_tool = AlphaFold2Tool(cfg=self.cfg.alphafold)
+        elif self.cfg.folding_model == FoldingModel.Boltz2:
+            self.folding_tool = BoltzRunner(cfg=self.cfg.boltz)
+        else:
+            raise ValueError(f"Unsupported folding model: {self.cfg.folding_model}")
 
     def set_device_id(self, device_id: int):
-        self.device_id = device_id
+        # Update tool devices
+        self.folding_tool.set_device_id(device_id)
+        self.inverse_folding_tool.set_device_id(device_id)
 
     def assess_sample(
         self,
@@ -108,13 +119,16 @@ class FoldingValidator:
         ), f"Invalid pred_bb_positions shape {pred_bb_positions.shape}. No batch dim."
         sample_length = pred_bb_positions.shape[0]
 
+        pred_pdb_path = Path(pred_pdb_path)
+        sample_dir = Path(sample_dir)
+        inverse_folding_dir = sample_dir / "inverse_folding"
+        folding_dir = sample_dir / "folding"
+
         # Check files / directories
         assert os.path.exists(
             pred_pdb_path
         ), f"Predicted PDB path {pred_pdb_path} does not exist"
         os.makedirs(sample_dir, exist_ok=True)
-        inverse_folding_dir = os.path.join(sample_dir, "inverse_folding")
-        folding_dir = os.path.join(sample_dir, "folding")
         assert not os.path.exists(
             inverse_folding_dir
         ), f"{inverse_folding_dir} already exists"
@@ -147,10 +161,10 @@ class FoldingValidator:
         # Write PDB for true structure, if provided
         true_pdb_path = None
         if true_bb_positions is not None:
-            true_pdb_path = os.path.join(sample_dir, OutputFileName.true_structure_pdb)
+            true_pdb_path = sample_dir / OutputFileName.true_structure_pdb
             write_prot_to_pdb(
                 prot_pos=true_bb_positions,
-                file_path=true_pdb_path,
+                file_path=str(true_pdb_path),
                 aatype=true_aa,
                 chain_idx=chain_idx,
                 res_idx=res_idx,
@@ -159,13 +173,13 @@ class FoldingValidator:
         # Write fasta for true sequence, if provided
         true_fasta_path = None
         if true_aa is not None:
-            true_fasta_path = os.path.join(sample_dir, OutputFileName.true_sequence_fa)
+            true_fasta_path = sample_dir / OutputFileName.true_sequence_fa
             true_aa_seq = "".join([restypes_with_x[x] for x in true_aa])
             with open(true_fasta_path, "w") as f:
                 f.write(f">{sample_name}\n{true_aa_seq}\n")
 
         # Write fasta files for predicted sequences
-        sample_fasta_path = os.path.join(sample_dir, OutputFileName.sample_sequence_fa)
+        sample_fasta_path = sample_dir / OutputFileName.sample_sequence_fa
         pred_aa_seq = "".join([restypes_with_x[x] for x in pred_aa])
         with open(sample_fasta_path, "w") as f:
             f.write(f">{sample_name}\n{pred_aa_seq}\n")
@@ -220,8 +234,8 @@ class FoldingValidator:
             )
 
         # Run inverse folding
-        inverse_folded_fasta_path = self.inverse_fold_structure(
-            pdb_input_path=pred_pdb_path,
+        inverse_folded_fasta_path = self.inverse_fold_pdb(
+            pdb_path=pred_pdb_path,
             diffuse_mask=diffuse_mask,
             output_dir=inverse_folding_dir,
             num_sequences=n_inverse_folds,
@@ -390,8 +404,8 @@ class FoldingValidator:
         folding_validation_paths = SavedFoldingValidation(
             true_pdb=true_pdb_path,
             true_fasta=true_fasta_path,
-            sample_fasta=sample_fasta_path,
-            inverse_folded_fasta=inverse_folded_fasta_path,
+            sample_fasta=str(sample_fasta_path),
+            inverse_folded_fasta=str(inverse_folded_fasta_path),
             codesign_df=codesign_df_path,
             designability_df=designability_df_path,
             top_sample_json=top_sample_path,
@@ -515,36 +529,36 @@ class FoldingValidator:
         metrics_df.to_csv(metrics_csv_path, index=False)
         return metrics_df, metrics_csv_path
 
-    def fold_fasta(self, fasta_path: str, output_dir: str) -> pd.DataFrame:
+    def fold_fasta(self, fasta_path: Path, output_dir: Path) -> FoldingDataFrame:
         """
         Fold sequences in a fasta file.
 
-        Recommend `output_dir` to be empty,
+        Require `output_dir` to be empty,
         since content inside it will be removed to prevent AF2 artifact bloat.
 
         Returns a dataframe with `header`, `sequence`, `folded_pdb_path`, `mean_plddt`
         """
         assert os.path.exists(fasta_path), f"Fasta path {fasta_path} does not exist"
 
-        if self.cfg.folding_model == "af2":
-            return self._run_alphafold2(
-                fasta_path=str(fasta_path), output_dir=str(output_dir)
-            )
-        elif self.cfg.folding_model == "boltz":
-            return self._run_boltz(
-                fasta_path=str(fasta_path), output_dir=str(output_dir)
-            )
-        else:
-            raise ValueError(f"Unsupported folding model: {self.cfg.folding_model}")
+        # Require an empty output directory, so we can safely clean up outputs.
+        assert (
+            not os.path.exists(output_dir) or len(os.listdir(output_dir)) == 0
+        ), f"Output folding directory {output_dir} is not empty"
+        os.makedirs(output_dir, exist_ok=True)
 
-    def inverse_fold_structure(
+        return self.folding_tool.fold_fasta(
+            fasta_path=fasta_path, output_dir=output_dir
+        )
+
+    def inverse_fold_pdb(
         self,
-        pdb_input_path: str,
+        pdb_path: Path,
+        output_dir: Path,
         diffuse_mask: Optional[npt.NDArray],
-        output_dir: str,
         num_sequences: Optional[int] = None,
         seed: Optional[int] = None,
-    ) -> str:
+        temperature: Optional[float] = None,
+    ) -> InverseFoldingFasta:
         """
         Generates and returns a fasta of inverse folded sequences using ProteinMPNN.
         The number of sequences is determined by cfg.
@@ -554,133 +568,24 @@ class FoldingValidator:
         #    since some of the metrics check for sequence conservation of motifs.
         # assert diffuse_mask is None or (diffuse_mask == 1.0).all()
 
-        assert os.path.exists(
-            pdb_input_path
-        ), f"PDB path {pdb_input_path} does not exist"
+        assert os.path.exists(pdb_path), f"PDB path {pdb_path} does not exist"
 
-        uncompressed_pdb_path, is_temp_file = get_uncompressed_pdb_path(pdb_input_path)
+        uncompressed_pdb_path, is_temp_file = get_uncompressed_pdb_path(str(pdb_path))
 
         # Run ProteinMPNN
-        fasta_path = self.protein_mpnn_runner.run_pdb(
+        fasta_path = self.inverse_folding_tool.inverse_fold_pdb(
             pdb_path=Path(uncompressed_pdb_path),
-            output_dir=Path(output_dir),
-            device_id=self.device_id,
-            num_passes=num_sequences,
+            output_dir=output_dir,
+            diffuse_mask=diffuse_mask,
+            num_sequences=num_sequences,
             seed=seed,
+            temperature=temperature,
         )
 
         if is_temp_file:
             os.remove(uncompressed_pdb_path)
 
-        return str(fasta_path)
-
-    def _run_alphafold2(self, fasta_path: str, output_dir: str) -> pd.DataFrame:
-        """
-        Run ColabFold AF2 folding on a fasta file
-        Returns a DataFrame describing the outputs, where `header` column is the sequence name.
-
-        TODO(tools) make this static. It should delegate to a AlphaFold2Runner class, that can be mocked.
-        """
-        assert self.device_id is not None, "Device ID must be set for AF2 folding"
-        assert (
-            self.cfg.colabfold_path is not None
-        ), "ColabFold path must be set for AF2 folding"
-        assert os.path.exists(
-            self.cfg.colabfold_path
-        ), f"ColabFold path {self.cfg.colabfold_path} does not exist"
-
-        # Require an empty output directory, so we can safely clean up outputs.
-        assert (
-            not os.path.exists(output_dir) or len(os.listdir(output_dir)) == 0
-        ), f"Output folding directory {output_dir} is not empty"
-        os.makedirs(output_dir, exist_ok=True)
-
-        # NOTE - public MultiFlow only runs model 4, but may want to consider running others.
-        # TODO(tools) - pass device
-
-        af2_args = [
-            str(self.cfg.colabfold_path),
-            fasta_path,
-            output_dir,
-            "--msa-mode",
-            "single_sequence",
-            "--num-models",
-            "1",
-            "--random-seed",
-            str(self.cfg.protein_mpnn.pmpnn_seed),
-            "--model-order",
-            "4",
-            "--num-recycle",
-            "3",
-            "--model-type",
-            "alphafold2_ptm",
-        ]
-        process = subprocess.Popen(
-            af2_args, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
-        )
-        code = process.wait()
-        if code != 0:
-            raise RuntimeError(
-                f"AlphaFold2 run.py failed with code {code}. Args: {' '.join(af2_args)}"
-            )
-
-        fasta_seqs = SeqIO.to_dict(SeqIO.parse(fasta_path, "fasta"))
-        all_af2_files = glob.glob(os.path.join(output_dir, "*"))
-        af2_model_4_pdbs = {}
-        af2_model_4_jsons = {}
-        for x in all_af2_files:
-            # Only keep the model_4 PDB and json, delete everything else.
-            if "model_4" in x:
-                seq_name = os.path.basename(x)
-                if x.endswith(".json"):
-                    seq_name = seq_name.split("_scores")[0]
-                    af2_model_4_jsons[seq_name] = x
-                if x.endswith(".pdb"):
-                    seq_name = seq_name.split("_unrelaxed")[0]
-                    af2_model_4_pdbs[seq_name] = x
-            else:
-                os.remove(x)
-
-        all_fold_metrics = []
-        for header, seq_record in fasta_seqs.items():
-            af2_folded_path = af2_model_4_pdbs[header]
-            af2_json_path = af2_model_4_jsons[header]
-            with open(af2_json_path, "r") as f:
-                fold_metrics = json.load(f)
-
-            all_fold_metrics.append(
-                {
-                    MetricName.header: header,
-                    MetricName.sequence: seq_record.seq,
-                    MetricName.folded_pdb_path: af2_folded_path,
-                    MetricName.plddt_mean: np.mean(fold_metrics["plddt"]),
-                }
-            )
-
-        return pd.DataFrame(all_fold_metrics)
-
-    def _run_boltz(self, fasta_path: str, output_dir: str) -> pd.DataFrame:
-        """
-        Run Boltz folding on a fasta file
-        Returns a DataFrame describing the outputs, where `header` column is the sequence name.
-        """
-        # Require an empty output directory, so we can safely clean up outputs.
-        assert (
-            not os.path.exists(output_dir) or len(os.listdir(output_dir)) == 0
-        ), f"Output folding directory {output_dir} is not empty"
-        os.makedirs(output_dir, exist_ok=True)
-
-        # TODO - store in __init__ and construct once
-
-        manifest_builder = ManifestBuilder(target_dir=Path(output_dir) / "processed")
-        manifest, processed_dir = manifest_builder.from_fasta(fasta_path)
-
-        boltz_predictor = BoltzPredictor()
-        prediction_set = boltz_predictor.predict(
-            manifest=manifest, output_dir=output_dir, processed_dir=str(processed_dir)
-        )
-
-        return prediction_set.to_df()
+        return fasta_path
 
     @staticmethod
     def calc_backbone_rmsd(
@@ -690,6 +595,8 @@ class FoldingValidator:
     ) -> float:
         if mask is None:
             mask = np.ones(pos_1.shape[0], dtype=bool)
+        if isinstance(mask, np.ndarray):
+            mask = torch.tensor(mask)
 
         # tolerate either Ca (1) or Ca-C-N (3) atoms
         assert pos_1.shape == pos_2.shape, f"pos_1 {pos_1.shape} != pos_2 {pos_2.shape}"
@@ -702,20 +609,20 @@ class FoldingValidator:
             aligned_rmsd = superimpose(
                 torch.tensor(pos_1).reshape(-1, 3)[None],  # (1, N*3, 3)
                 torch.tensor(pos_2).reshape(-1, 3)[None],  # (1, N*3, 3)
-                mask=torch.tensor(mask)[:, None].repeat(1, 3).reshape(-1),  # (1, N*3)
+                mask=mask[:, None].repeat(1, 3).reshape(-1),  # (1, N*3)
             )
         else:
             aligned_rmsd = superimpose(
                 torch.tensor(pos_1)[None],  # (1, N, 3)
                 torch.tensor(pos_2)[None],  # (1, N, 3)
-                mask=torch.tensor(mask)[:, None].repeat(1, 1),  # (1, N)
+                mask=mask[:, None].repeat(1, 1),  # (1, N)
             )
 
         return aligned_rmsd[1].item()
 
     @staticmethod
     def assess_folded_structures(
-        sample_pdb_path: str,
+        sample_pdb_path: Path,
         pdb_name: str,
         folded_df: pd.DataFrame,
         true_bb_positions: Optional[npt.NDArray] = None,  # (N, 37, 3)
@@ -735,7 +642,7 @@ class FoldingValidator:
         edited from `process_folded_outputs()` in public multiflow
         """
         sample_feats = process_pdb_file(
-            pdb_file_path=sample_pdb_path,
+            pdb_file_path=str(sample_pdb_path),
             pdb_name=pdb_name,
         )
         sample_bb_pos = sample_feats[dpc.atom_positions][:, :3, :]  # (N, 3, 3)
@@ -761,7 +668,7 @@ class FoldingValidator:
                 **row.to_dict(),
                 # Associate with the generated sample
                 MetricName.sequence: aatype_to_seq(folded_feats[dpc.aatype]),
-                MetricName.sample_pdb_path: sample_pdb_path,
+                MetricName.sample_pdb_path: str(sample_pdb_path),
             }
 
             # Calculate RMSD to generated sample

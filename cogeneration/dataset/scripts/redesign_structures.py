@@ -194,18 +194,17 @@ class SequenceRedesigner:
         # TODO(validation) write fasta for original sequence, fold it, calculate RMSD to original structure
 
         # Redesign the structure using inverse folding
-        redesign_fasta_path = self.validator.inverse_fold_structure(
-            pdb_input_path=metadata_row[mc.raw_path],
+        redesign_fasta_path = self.validator.inverse_fold_pdb(
+            pdb_path=metadata_row[mc.raw_path],
             diffuse_mask=None,
-            output_dir=str(work_dir),
+            output_dir=work_dir,
             num_sequences=self.args.seqs_per_sample,
         )
 
         # Fold the redesigned sequences
         folding_df = self.validator.fold_fasta(
-            fasta_path=str(redesign_fasta_path),
-            folding_config=self.validator.cfg,
-            output_dir=str(work_dir / "folding"),
+            fasta_path=redesign_fasta_path,
+            output_dir=(work_dir / "folding"),
         )
         assert (
             MetricName.header in folding_df.columns
@@ -246,7 +245,7 @@ class SequenceRedesigner:
                     processed_file=processed_file,
                     sequence_id=folding_row[MetricName.header],
                     sequence=folding_row[MetricName.sequence],
-                    fasta_path=redesign_fasta_path,
+                    fasta_path=str(redesign_fasta_path),
                     fasta_idx=int(idx),
                     pred_pdb_path=folding_row[MetricName.folded_pdb_path],
                     rmsd=rmsd,

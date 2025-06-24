@@ -143,10 +143,10 @@ class FoldingValidationMockValue:
 @pytest.fixture
 def mock_folding_validation(tmp_path):
     with patch(
-        "cogeneration.data.protein_mpnn_runner.ProteinMPNNRunner.run_pdb"
-    ) as mock_run_protein_mpnn, patch(
-        "cogeneration.data.folding_validation.FoldingValidator._run_alphafold2"
-    ) as mock_run_alphafold2:
+        "cogeneration.data.folding_validation.FoldingValidator.inverse_fold_pdb"
+    ) as mock_inverse_fold_pdb, patch(
+        "cogeneration.data.folding_validation.FoldingValidator.fold_fasta"
+    ) as mock_fold_fasta:
 
         def setup_mocks(batch, cfg: Config, n_inverse_folds: int):
             assert batch is not None, "batch is required for folding validation mock"
@@ -236,22 +236,27 @@ def mock_folding_validation(tmp_path):
                 )
 
                 # Helper to create DataFrame for AF2 return. For now just reuse PDB across multiple seqs.
-                def create_af2_df(seq_names: List[str], af2_pdb_path: str):
+                def create_af2_df(
+                    seq_names: List[str], seqs: List[str], af2_pdb_path: str
+                ):
                     return pd.DataFrame.from_records(
                         [
                             {
                                 MetricName.header: header,
+                                MetricName.sequence: sequence,
                                 MetricName.folded_pdb_path: af2_pdb_path,
                                 MetricName.plddt_mean: np.random.rand() * 100,
                             }
-                            for header in seq_names
+                            for (header, sequence) in zip(seq_names, seqs)
                         ]
                     )
 
                 # Mock folding the designed seq
                 # we don't have easy access to sample_name / sample_id here, but it doesn't really matter
                 af2_df = create_af2_df(
-                    seq_names=[mock_seqs[0][0]], af2_pdb_path=af2_pdb_path
+                    seq_names=[mock_seqs[0][0]],
+                    seqs=[mock_seqs[0][1]],
+                    af2_pdb_path=af2_pdb_path,
                 )
                 mock_run_alphafold2_calls.append(af2_df)
 
@@ -262,6 +267,7 @@ def mock_folding_validation(tmp_path):
                 mock_run_alphafold2_calls.append(
                     create_af2_df(
                         seq_names=[seq[0] for seq in mock_seqs],
+                        seqs=[seq[1] for seq in mock_seqs],
                         af2_pdb_path=af2_pdb_path,
                     )
                 )
@@ -277,8 +283,8 @@ def mock_folding_validation(tmp_path):
                 mock_values.append(mock_value)
 
             # assign the returns to the mocked methods
-            mock_run_protein_mpnn.side_effect = mock_run_protein_mpnn_calls
-            mock_run_alphafold2.side_effect = mock_run_alphafold2_calls
+            mock_inverse_fold_pdb.side_effect = mock_run_protein_mpnn_calls
+            mock_fold_fasta.side_effect = mock_run_alphafold2_calls
 
             return mock_values
 

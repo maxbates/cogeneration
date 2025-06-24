@@ -63,7 +63,6 @@ class FlowModule(LightningModule):
 
         self.folding_validator = FoldingValidator(
             cfg=self.cfg.folding,
-            device_id=folding_device_id,
         )
 
         # self.logger defined in LightningModule

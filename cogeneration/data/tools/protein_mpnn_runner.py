@@ -2,9 +2,9 @@
 Unified ProteinMPNN runner
 
 This module provides a unified interface for running ProteinMPNN inverse folding:
-`run_subprocess` - calls original ProteinMPNN run.py script (slow) for a PDB structure 
-`run_native` - loads LigandMPNN model (cached in runner) and runs on a PDB structure
-`run_batch` - on trans, rots, aatypes etc. tensors directly, bypassing PDB I/O overhead
+`run_subprocess` (slow) - calls original ProteinMPNN run.py script for a PDB structure 
+`run_native` (fast) - loads LigandMPNN model (cached in runner) and runs on a PDB structure
+`run_batch` (fast) - on trans, rots, aatypes etc. tensors directly, bypassing PDB I/O overhead
 
 Note that LigandMPNN does not support batching, so `run_native` and `run_batch` have similar run times.
 
@@ -85,8 +85,7 @@ from Bio.SeqRecord import SeqRecord
 
 from cogeneration.config.base import ModelType, ProteinMPNNRunnerConfig
 from cogeneration.data import all_atom, residue_constants
-from cogeneration.type.batch import PredBatchProp as pbp
-from cogeneration.type.str_enum import StrEnum
+from cogeneration.data.tools.abc import InverseFoldingFasta, InverseFoldingTool
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +175,7 @@ class NativeMPNNResult:
         return self.logits
 
 
-class ProteinMPNNRunner:
+class ProteinMPNNRunner(InverseFoldingTool):
     """
     Unified ProteinMPNN runner supporting both native and subprocess modes.
 
@@ -190,32 +189,42 @@ class ProteinMPNNRunner:
     and returns logits without PDB I/O overhead.
     """
 
-    def __init__(self, config: ProteinMPNNRunnerConfig):
+    def __init__(self, cfg: ProteinMPNNRunnerConfig):
         """
         Initialize the ProteinMPNN runner.
 
         Args:
-            config: ProteinMPNN configuration object
+            cfg: ProteinMPNN configuration object
         """
-        self.config = config  # TODO rename to cfg
+        self.cfg = cfg  # TODO rename to cfg
         self._model = None
         self._model_sc = None  # Side chain packing model
-        self._device = None
         self._checkpoint_path = None
         self._ligandmpnn_modules = {}  # Cache for loaded modules
 
-        # Set up device
-        # TODO support its own device more explicitly
-        if self.config.use_native_runner:
-            self._device = torch.device(self.config.accelerator)
-            logger.info(
-                f"ProteinMPNN native runner initialized on device: {self._device}"
-            )
+        self.set_device_id(None)
 
     @property
     def device(self) -> torch.device:
         """Public access to the device."""
         return self._device
+
+    def set_device_id(self, device_id: Optional[int]):
+        """Set the device ID"""
+        if torch.cuda.is_available():
+            if device_id is None:
+                device = "cuda"
+            else:
+                device = f"cuda:{device_id}"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+
+        self._device = torch.device(device)
+
+        if self._model is not None:
+            self._model.to(self._device)
 
     def _create_mpnn_to_cogen_conversion_map(self) -> torch.Tensor:
         """
@@ -375,7 +384,7 @@ class ProteinMPNNRunner:
         if module_name in self._ligandmpnn_modules:
             return self._ligandmpnn_modules[module_name]
 
-        ligandmpnn_path = self.config.ligand_mpnn_path
+        ligandmpnn_path = self.cfg.ligand_mpnn_path
         if not ligandmpnn_path.exists():
             raise FileNotFoundError(f"LigandMPNN path not found: {ligandmpnn_path}")
 
@@ -430,10 +439,10 @@ class ProteinMPNNRunner:
             checkpoint = torch.load(checkpoint_path, map_location=self._device)
 
             # Determine model parameters based on model type
-            if self.config.model_type == ModelType.LIGAND_MPNN:
+            if self.cfg.model_type == ModelType.LIGAND_MPNN:
                 atom_context_num = checkpoint.get("atom_context_num", 16)
                 ligand_mpnn_use_side_chain_context = (
-                    self.config.ligand_mpnn_use_side_chain_context
+                    self.cfg.ligand_mpnn_use_side_chain_context
                 )
                 k_neighbors = checkpoint.get("num_edges", 48)
             else:
@@ -451,7 +460,7 @@ class ProteinMPNNRunner:
                 k_neighbors=k_neighbors,
                 device=self._device,
                 atom_context_num=atom_context_num,
-                model_type=self.config.model_type,
+                model_type=self.cfg.model_type,
                 ligand_mpnn_use_side_chain_context=ligand_mpnn_use_side_chain_context,
             )
 
@@ -460,7 +469,7 @@ class ProteinMPNNRunner:
             self._model.to(self._device)
             self._model.eval()
 
-            logger.info(f"Successfully loaded {self.config.model_type} model")
+            logger.info(f"Successfully loaded {self.cfg.model_type} model")
             return self._model
 
         except ImportError as e:
@@ -480,7 +489,7 @@ class ProteinMPNNRunner:
         Returns:
             Loaded side chain packing model or None
         """
-        if not self.config.pack_side_chains:
+        if not self.cfg.pack_side_chains:
             return None
 
         if self._model_sc is not None:
@@ -504,11 +513,9 @@ class ProteinMPNNRunner:
             sc_utils = self._load_ligandmpnn_module("sc_utils")
             Packer = sc_utils.Packer
 
-            checkpoint_path_sc = self.config.checkpoint_path_sc
+            checkpoint_path_sc = self.cfg.checkpoint_path_sc
             if checkpoint_path_sc is None:
-                weights_path = (
-                    self.config.ligand_mpnn_path / self.config.pmpnn_weights_dir
-                )
+                weights_path = self.cfg.ligand_mpnn_path / self.cfg.pmpnn_weights_dir
 
                 # Default side chain checkpoint filename
                 checkpoint_filename = "ligandmpnn_sc_v_32_002_16.pt"
@@ -517,7 +524,7 @@ class ProteinMPNNRunner:
                 if weights_path is not None:
                     possible_sc_paths = [
                         weights_path / checkpoint_filename,
-                        self.config.ligand_mpnn_path
+                        self.cfg.ligand_mpnn_path
                         / "model_params"
                         / checkpoint_filename,
                     ]
@@ -528,9 +535,7 @@ class ProteinMPNNRunner:
 
                 # Fallback to ligandmpnn_path if not found in weights directory
                 if checkpoint_path_sc is None:
-                    checkpoint_path_sc = (
-                        self.config.ligand_mpnn_path / checkpoint_filename
-                    )
+                    checkpoint_path_sc = self.cfg.ligand_mpnn_path / checkpoint_filename
 
             if not checkpoint_path_sc.exists():
                 logger.warning(
@@ -582,8 +587,8 @@ class ProteinMPNNRunner:
         if self._checkpoint_path is not None:
             return self._checkpoint_path
 
-        ligandmpnn_path = self.config.ligand_mpnn_path
-        weights_path = ligandmpnn_path / self.config.pmpnn_weights_dir
+        ligandmpnn_path = self.cfg.ligand_mpnn_path
+        weights_path = ligandmpnn_path / self.cfg.pmpnn_weights_dir
 
         # Map model types to checkpoint files
         checkpoint_mapping = {
@@ -594,9 +599,9 @@ class ProteinMPNNRunner:
             ModelType.GLOBAL_MEMBRANE_MPNN: "global_membrane_mpnn_v_48_020.pt",
         }
 
-        checkpoint_file = checkpoint_mapping.get(self.config.model_type)
+        checkpoint_file = checkpoint_mapping.get(self.cfg.model_type)
         if checkpoint_file is None:
-            raise ValueError(f"Unknown model type: {self.config.model_type}")
+            raise ValueError(f"Unknown model type: {self.cfg.model_type}")
 
         # Try different locations for the checkpoint
         possible_paths = []
@@ -625,65 +630,51 @@ class ProteinMPNNRunner:
                 return path
 
         raise FileNotFoundError(
-            f"Could not find checkpoint for {self.config.model_type}. "
+            f"Could not find checkpoint for {self.cfg.model_type}. "
             f"Tried: {[str(p) for p in possible_paths]}"
         )
 
-    def run_pdb(
+    def inverse_fold_pdb(
         self,
         pdb_path: Path,
         output_dir: Path,
-        device_id: Optional[int] = None,
-        num_passes: Optional[int] = None,
+        diffuse_mask: torch.Tensor,
+        num_sequences: Optional[int] = None,
         seed: Optional[int] = None,
         temperature: Optional[float] = None,
-        chains_to_design: Optional[List[str]] = None,
-        fixed_residues: Optional[List[str]] = None,
-        parse_these_chains_only: Optional[List[str]] = None,
-        **kwargs,
-    ) -> Path:
+    ) -> InverseFoldingFasta:
         """
         Run ProteinMPNN inverse folding on a PDB file.
+        Implements InverseFoldingTool interface.
 
         Args:
             pdb_path: Path to input PDB file
             output_dir: Directory to save output files
-            device_id: GPU device ID (required for subprocess mode)
-            num_passes: Number of sequences to generate
+            num_sequences: Number of sequences to generate
+            diffuse_mask: Diffusion mask tensor for sequence generation
             seed: Random seed
             temperature: Sampling temperature
-            chains_to_design: List of chain IDs to design
-            fixed_residues: List of residue positions to keep fixed
-            parse_these_chains_only: Chains to parse from PDB
-            **kwargs: Additional arguments
 
         Returns:
-            Path to output FASTA file
+            InverseFoldingFasta
         """
-        if self.config.use_native_runner:
-            return self.run_pdb_native(
+        if self.cfg.use_native_runner:
+            return self.inverse_fold_pdb_native(
                 pdb_path=pdb_path,
                 output_dir=output_dir,
-                device_id=device_id,
-                num_passes=num_passes,
+                num_sequences=num_sequences,
+                diffuse_mask=diffuse_mask,
                 seed=seed,
                 temperature=temperature,
-                chains_to_design=chains_to_design,
-                fixed_residues=fixed_residues,
-                parse_these_chains_only=parse_these_chains_only,
-                **kwargs,
             )
         else:
-            return self.run_pdb_subprocess(
+            return self.inverse_fold_pdb_subprocess(
                 pdb_path=pdb_path,
                 output_dir=output_dir,
-                device_id=device_id,
-                num_passes=num_passes,
+                num_sequences=num_sequences,
+                diffuse_mask=diffuse_mask,
                 seed=seed,
                 temperature=temperature,
-                chains_to_design=chains_to_design,
-                fixed_residues=fixed_residues,
-                **kwargs,
             )
 
     def _process_fasta_output(
@@ -723,65 +714,49 @@ class ProteinMPNNRunner:
 
         return output_fasta
 
-    def run_pdb_native(
+    def inverse_fold_pdb_native(
         self,
         pdb_path: Path,
         output_dir: Path,
-        device_id: Optional[int] = None,
-        num_passes: Optional[int] = None,
+        num_sequences: Optional[int] = None,
+        diffuse_mask: Optional[torch.Tensor] = None,
         seed: Optional[int] = None,
         temperature: Optional[float] = None,
-        chains_to_design: Optional[List[str]] = None,
-        fixed_residues: Optional[List[str]] = None,
-        parse_these_chains_only: Optional[List[str]] = None,
-    ) -> Path:
+    ) -> InverseFoldingFasta:
         """
         Run ProteinMPNN inference directly using the native model.
 
         This method loads the model directly and runs inference without subprocess.
         It supports side chain packing if configured.
 
-        Args:
-            pdb_path: Path to input PDB file
-            output_dir: Directory to save output files
-            device_id: GPU device ID (ignored for native mode)
-            num_passes: Number of sequence generation passes
-            seed: Random seed for reproducibility
-            temperature: Sampling temperature
-            chains_to_design: List of chain IDs to design
-            fixed_residues: List of residue positions to keep fixed
-            parse_these_chains_only: List of chain IDs to parse from PDB
-
-        Returns:
-            Path to output FASTA file
+        Returns fasta output path.
         """
         # Set defaults
-        num_passes = num_passes or self.config.seq_per_sample
-        seed = seed or self.config.pmpnn_seed
-        temperature = temperature or self.config.temperature
+        num_sequences = num_sequences or self.cfg.seq_per_sample
+        seed = seed or self.cfg.pmpnn_seed
+        temperature = temperature or self.cfg.temperature
+
+        # TODO parse `diffuse_mask` into `chains_to_design` and `fixed_residues`
 
         # Create output directory
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Load models
         model = self._load_model()
-        model_sc = (
-            self._load_side_chain_model() if self.config.pack_side_chains else None
-        )
+        model_sc = self._load_side_chain_model() if self.cfg.pack_side_chains else None
 
         logger.info(f"Running native ProteinMPNN on {pdb_path}")
 
         # Parse PDB and create protein_dict
         protein_dict = self._parse_pdb_to_protein_dict(
             pdb_path=pdb_path,
-            parse_these_chains_only=parse_these_chains_only,
         )
 
         # Prepare feature dictionary for inference
         data_utils = self._load_ligandmpnn_module("data_utils")
         feature_dict = data_utils.featurize(
             protein_dict,
-            cutoff_for_score=self.config.ligand_mpnn_cutoff_for_score,
+            cutoff_for_score=self.cfg.ligand_mpnn_cutoff_for_score,
             use_atom_context=True,
         )
 
@@ -804,7 +779,7 @@ class ProteinMPNNRunner:
         # Run inference using shared method
         inference_result = self._run_inference_on_protein_dict(
             feature_dict=feature_dict,
-            num_passes=num_passes,
+            num_passes=num_sequences,
             sequences_per_pass=1,  # Set default for PDB-based methods
             temperature=temperature,
             seed=seed,
@@ -818,18 +793,18 @@ class ProteinMPNNRunner:
             pdb_path=pdb_path,
             temperature=temperature,
             seed=seed,
-            num_passes=num_passes,
+            num_passes=num_sequences,
         )
 
         # Apply side chain packing if enabled and model is available
-        if self.config.pack_side_chains and model_sc is not None:
+        if self.cfg.pack_side_chains and model_sc is not None:
             self._apply_side_chain_packing(
                 inference_result=inference_result,
                 protein_dict=protein_dict,
                 model_sc=model_sc,
                 output_dir=output_dir,
                 pdb_path=pdb_path,
-                num_passes=num_passes,
+                num_passes=num_sequences,
             )
 
         # Process FASTA output
@@ -840,54 +815,54 @@ class ProteinMPNNRunner:
         logger.info(f"Native ProteinMPNN completed successfully")
         return processed_fasta
 
-    def run_pdb_subprocess(
+    def inverse_fold_pdb_subprocess(
         self,
         pdb_path: Path,
         output_dir: Path,
-        device_id: Optional[int],
-        num_passes: Optional[int] = None,
+        diffuse_mask: torch.Tensor,
+        num_sequences: Optional[int] = None,
         temperature: Optional[float] = None,
         seed: Optional[int] = None,
-        fixed_residues: Optional[List[str]] = None,
-        chains_to_design: Optional[List[str]] = None,
-    ) -> Path:
+    ) -> InverseFoldingFasta:
         """
         Run ProteinMPNN using subprocess.
 
-        Returns:
-            Path to output FASTA file
+        Returns fasta output path.
         """
         # Validate inputs
         assert pdb_path.exists(), f"PDB path does not exist: {pdb_path}"
-        assert device_id is not None, "device_id is required for subprocess mode"
 
         # Set defaults
-        num_passes = num_passes or self.config.seq_per_sample
-        seed = seed or self.config.pmpnn_seed
-        temperature = temperature or self.config.temperature
+        num_sequences = num_sequences or self.cfg.seq_per_sample
+        seed = seed or self.cfg.pmpnn_seed
+        temperature = temperature or self.cfg.temperature
 
         # Create output directory
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        # TODO - parse `diffuse_mask` into `chains_to_design` and `fixed_residues`
+        chains_to_design = None
+        fixed_residues = None
 
         # Copy PDB to output directory
         pdb_copy_path = output_dir / pdb_path.name
         shutil.copy2(pdb_path, pdb_copy_path)
 
         # Construct ProteinMPNN command
-        run_script = self.config.protein_mpnn_path / "run.py"
+        run_script = self.cfg.protein_mpnn_path / "run.py"
         assert run_script.exists(), f"ProteinMPNN run.py not found: {run_script}"
 
         cmd = [
             "python",
             str(run_script),
             "--model_type",
-            self.config.model_type,
+            self.cfg.model_type,
             "--pdb_path",
             str(pdb_copy_path),
             "--out_folder",
             str(output_dir),
             "--num_seq_per_target",
-            str(num_passes),
+            str(num_sequences),
             "--sampling_temp",
             str(temperature),
             "--seed",
@@ -909,15 +884,14 @@ class ProteinMPNNRunner:
 
         logger.info(f"Running ProteinMPNN subprocess: {' '.join(cmd)}")
 
-        # Set environment
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(device_id)
+        env["CUDA_VISIBLE_DEVICES"] = "0"  # Set to GPU 0 by default
 
         # Execute command
         try:
             result = subprocess.run(
                 cmd,
-                cwd=self.config.ligand_mpnn_path,
+                cwd=self.cfg.ligand_mpnn_path,
                 env=env,
                 capture_output=True,
                 text=True,
@@ -976,17 +950,6 @@ class ProteinMPNNRunner:
 
         This method handles the conversion from batch tensors (translations, rotations, etc.)
         to ProteinMPNN-compatible protein dictionaries for inference.
-
-        Args:
-            trans: Predicted frame translations (B, N, 3)
-            rotmats: Predicted frame rotations (B, N, 3, 3)
-            aatypes: Predicted amino acid types in project's AlphaFold ordering (B, N)
-            res_mask: Residue mask indicating valid positions (B, N)
-            chain_idx: Optional chain indices (B, N), defaults to single chain
-            torsions: Optional predicted torsion angles (B, N, 7, 2)
-
-        Returns:
-            List of protein dictionaries, one per batch element
         """
 
         # Move all input tensors to the runner's device and handle MPS compatibility
@@ -1039,44 +1002,29 @@ class ProteinMPNNRunner:
         self,
         trans: torch.Tensor,  # (B, N, 3)
         rotmats: torch.Tensor,  # (B, N, 3, 3)
-        aatypes: CogenAATypes,  # (B, N) - amino acid types in project's AlphaFold ordering
-        res_mask: torch.Tensor,  # (B, N) - residue mask
-        chain_idx: torch.Tensor,  # (B, N) - chain indices
+        aatypes: CogenAATypes,  # (B, N)
+        res_mask: torch.Tensor,  # (B, N)
+        diffuse_mask: torch.Tensor,  # (B, N)
+        chain_idx: torch.Tensor,  # (B, N)
         torsions: Optional[torch.Tensor] = None,  # (B, N, 7, 2)
         num_passes: Optional[int] = 1,
         sequences_per_pass: int = 1,
         temperature: Optional[float] = None,
-        chains_to_design: Optional[List[str]] = None,
-        fixed_residues: Optional[List[str]] = None,
         seed: Optional[int] = None,
     ) -> NativeMPNNResult:
         """
         Run ProteinMPNN inference on a batch of protein structures.
-
-        Args:
-            trans: Frame translations (B, N, 3)
-            rotmats: Frame rotations (B, N, 3, 3)
-            aatypes: Amino acid types in project's AlphaFold ordering (B, N)
-            res_mask: Residue mask indicating valid positions (B, N)
-            chain_idx: Chain indices (B, N)
-            torsions: Optional torsion angles (B, N, 7, 2)
-            num_passes: Number of independent sampling passes
-            sequences_per_pass: Number of sequences to generate per pass
-            temperature: Sampling temperature
-            chains_to_design: Chains to design (optional)
-            fixed_residues: Fixed residues (optional)
-            seed: Random seed for reproducibility
-
-        Returns:
-            NativeMPNNResult with tensors in Cogen format
+        Return NativeMPNNResult
         """
         # Check that native runner is enabled
-        if not self.config.use_native_runner:
+        if not self.cfg.use_native_runner:
             raise ValueError("run_batch only supports native runner mode")
 
         # Set defaults
-        temperature = temperature or self.config.temperature
-        seed = seed or self.config.pmpnn_seed
+        temperature = temperature or self.cfg.temperature
+        seed = seed or self.cfg.pmpnn_seed
+
+        # TODO parse `diffuse_mask` into `chains_to_design` and `fixed_residues`
 
         # Load model
         model = self._load_model()
@@ -1112,7 +1060,7 @@ class ProteinMPNNRunner:
         representative_dict = protein_dicts[0].copy()
         feature_dict = data_utils.featurize(
             representative_dict,
-            cutoff_for_score=self.config.ligand_mpnn_cutoff_for_score,
+            cutoff_for_score=self.cfg.ligand_mpnn_cutoff_for_score,
             use_atom_context=True,
         )
 
@@ -1445,8 +1393,8 @@ class ProteinMPNNRunner:
         data_utils = self._load_ligandmpnn_module("data_utils")
 
         # Parse PDB
-        parse_all_atoms_flag = self.config.ligand_mpnn_use_side_chain_context or (
-            self.config.pack_side_chains and not self.config.repack_everything
+        parse_all_atoms_flag = self.cfg.ligand_mpnn_use_side_chain_context or (
+            self.cfg.pack_side_chains and not self.cfg.repack_everything
         )
 
         protein_dict, backbone, other_atoms, icodes, _ = data_utils.parse_PDB(
@@ -1557,10 +1505,7 @@ class ProteinMPNNRunner:
         # Compute combined mask for ligand confidence
         feature_dict_mask = torch.ones(1, len(native_seq), device=self._device)
         chain_mask = torch.ones(1, len(native_seq), device=self._device)
-        if (
-            self.config.model_type == ModelType.LIGAND_MPNN
-            and "mask_XY" in protein_dict
-        ):
+        if self.cfg.model_type == ModelType.LIGAND_MPNN and "mask_XY" in protein_dict:
             combined_mask = (
                 feature_dict_mask
                 * protein_dict.get("mask_XY", feature_dict_mask)
@@ -1581,8 +1526,8 @@ class ProteinMPNNRunner:
                 f">{name}, T={temperature}, seed={seed}, "
                 f"num_res={torch.sum(rec_mask).cpu().numpy()}, "
                 f"num_ligand_res={torch.sum(chain_mask).cpu().numpy()}, "
-                f"use_ligand_context={bool(self.config.ligand_mpnn_use_atom_context)}, "
-                f"ligand_cutoff_distance={float(self.config.ligand_mpnn_cutoff_for_score)}, "
+                f"use_ligand_context={bool(self.cfg.ligand_mpnn_use_atom_context)}, "
+                f"ligand_cutoff_distance={float(self.cfg.ligand_mpnn_cutoff_for_score)}, "
                 f"batch_size=1, number_of_batches={num_passes}, "
                 f"model_path={self._get_checkpoint_path()}\n{seq_out_str}\n"
             )
@@ -1720,15 +1665,15 @@ class ProteinMPNNRunner:
 
             # Pack side chains multiple times as configured
             sequence_packed_structures = []
-            for pack_idx in range(self.config.number_of_packs_per_design):
+            for pack_idx in range(self.cfg.number_of_packs_per_design):
                 try:
                     # Apply side chain packing
                     packed_result = sc_utils.pack_side_chains(
                         sc_feature_dict,
                         model_sc,
-                        self.config.sc_num_denoising_steps,
-                        self.config.sc_num_samples,
-                        self.config.repack_everything,
+                        self.cfg.sc_num_denoising_steps,
+                        self.cfg.sc_num_samples,
+                        self.cfg.repack_everything,
                     )
 
                     # Store packed coordinates and metadata
@@ -1927,16 +1872,15 @@ class ProteinMPNNRunnerPool:
         self,
         trans: torch.Tensor,  # (B, N, 3)
         rotmats: torch.Tensor,  # (B, N, 3, 3)
-        aatypes: CogenAATypes,  # (B, N) - amino acid types in project's AlphaFold ordering
-        res_mask: torch.Tensor,  # (B, N) - residue mask
-        chain_idx: torch.Tensor,  # (B, N) - chain indices
+        aatypes: CogenAATypes,  # (B, N)
+        res_mask: torch.Tensor,  # (B, N)
+        diffuse_mask: torch.Tensor,  # (B, N)
+        chain_idx: torch.Tensor,  # (B, N)
         torsions: Optional[torch.Tensor] = None,  # (B, N, 7, 2)
         num_passes: Optional[int] = 1,
         sequences_per_pass: int = 1,
-        temperature: Optional[float] = None,
-        chains_to_design: Optional[List[str]] = None,
-        fixed_residues: Optional[List[str]] = None,
         seed: Optional[int] = None,
+        temperature: Optional[float] = None,
     ) -> NativeMPNNResult:
         """
         Run ProteinMPNN inference using available models from the pool.
@@ -1962,13 +1906,12 @@ class ProteinMPNNRunnerPool:
                 rotmats=rotmats,
                 aatypes=aatypes,
                 res_mask=res_mask,
+                diffuse_mask=diffuse_mask,
                 chain_idx=chain_idx,
                 torsions=torsions,
                 num_passes=num_passes,
                 sequences_per_pass=sequences_per_pass,
                 temperature=temperature,
-                chains_to_design=chains_to_design,
-                fixed_residues=fixed_residues,
                 seed=seed,
             )
 
@@ -1979,13 +1922,12 @@ class ProteinMPNNRunnerPool:
                 rotmats=rotmats,
                 aatypes=aatypes,
                 res_mask=res_mask,
+                diffuse_mask=diffuse_mask,
                 chain_idx=chain_idx,
                 torsions=torsions,
                 num_passes=num_passes,
                 sequences_per_pass=sequences_per_pass,
                 temperature=temperature,
-                chains_to_design=chains_to_design,
-                fixed_residues=fixed_residues,
                 seed=seed,
             )
         )
@@ -1996,13 +1938,12 @@ class ProteinMPNNRunnerPool:
         rotmats: torch.Tensor,  # (B, N, 3, 3)
         aatypes: CogenAATypes,  # (B, N)
         res_mask: torch.Tensor,  # (B, N)
+        diffuse_mask: torch.Tensor,  # (B, N)
         chain_idx: torch.Tensor,  # (B, N)
         torsions: Optional[torch.Tensor] = None,  # (B, N, 7, 2)
         num_passes: int = 1,
         sequences_per_pass: int = 1,
         temperature: Optional[float] = None,
-        chains_to_design: Optional[List[str]] = None,
-        fixed_residues: Optional[List[str]] = None,
         seed: Optional[int] = None,
     ) -> NativeMPNNResult:
         """
@@ -2018,13 +1959,12 @@ class ProteinMPNNRunnerPool:
                 rotmats=rotmats[b : b + 1],
                 aatypes=aatypes[b : b + 1],
                 res_mask=res_mask[b : b + 1],
+                diffuse_mask=diffuse_mask[b : b + 1],
                 chain_idx=chain_idx[b : b + 1],
                 torsions=torsions[b : b + 1] if torsions is not None else None,
                 num_passes=num_passes,
                 sequences_per_pass=sequences_per_pass,
                 temperature=temperature,
-                chains_to_design=chains_to_design,
-                fixed_residues=fixed_residues,
                 seed=seed,
             )
             tasks.append(task)
@@ -2041,13 +1981,12 @@ class ProteinMPNNRunnerPool:
         rotmats: torch.Tensor,  # (1, N, 3, 3)
         aatypes: CogenAATypes,  # (1, N)
         res_mask: torch.Tensor,  # (1, N)
+        diffuse_mask: torch.Tensor,  # (1, N)
         chain_idx: torch.Tensor,  # (1, N)
         torsions: Optional[torch.Tensor] = None,  # (1, N, 7, 2)
         num_passes: int = 1,
         sequences_per_pass: int = 1,
         temperature: Optional[float] = None,
-        chains_to_design: Optional[List[str]] = None,
-        fixed_residues: Optional[List[str]] = None,
         seed: Optional[int] = None,
     ) -> NativeMPNNResult:
         """
@@ -2060,13 +1999,12 @@ class ProteinMPNNRunnerPool:
             rotmats,
             aatypes,
             res_mask,
+            diffuse_mask,
             chain_idx,
             torsions,
             num_passes,
             sequences_per_pass,
             temperature,
-            chains_to_design,
-            fixed_residues,
             seed,
         )
 
@@ -2076,13 +2014,12 @@ class ProteinMPNNRunnerPool:
         rotmats: torch.Tensor,  # (1, N, 3, 3)
         aatypes: CogenAATypes,  # (1, N)
         res_mask: torch.Tensor,  # (1, N)
+        diffuse_mask: torch.Tensor,  # (1, N)
         chain_idx: torch.Tensor,  # (1, N)
         torsions: Optional[torch.Tensor] = None,  # (1, N, 7, 2)
         num_passes: int = 1,
         sequences_per_pass: int = 1,
         temperature: Optional[float] = None,
-        chains_to_design: Optional[List[str]] = None,
-        fixed_residues: Optional[List[str]] = None,
         seed: Optional[int] = None,
     ) -> NativeMPNNResult:
         """
@@ -2108,13 +2045,12 @@ class ProteinMPNNRunnerPool:
                 rotmats=rotmats,
                 aatypes=aatypes,
                 res_mask=res_mask,
+                diffuse_mask=diffuse_mask,
                 chain_idx=chain_idx,
                 torsions=torsions,
                 num_passes=num_passes,
                 sequences_per_pass=sequences_per_pass,
                 temperature=temperature,
-                chains_to_design=chains_to_design,
-                fixed_residues=fixed_residues,
                 seed=seed,
             )
             return result

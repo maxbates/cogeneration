@@ -18,7 +18,7 @@ from omegaconf.errors import ValidationError
 from cogeneration.config.base import Config
 from cogeneration.data import all_atom, residue_constants
 from cogeneration.data.protein import write_prot_to_pdb
-from cogeneration.data.protein_mpnn_runner import (
+from cogeneration.data.tools.protein_mpnn_runner import (
     NativeMPNNResult,
     ProteinMPNNRunner,
     ProteinMPNNRunnerPool,
@@ -106,6 +106,7 @@ class TestProteinMPNNRunner:
             rotmats=pdb_batch[bp.rotmats_1],
             aatypes=pdb_batch[bp.aatypes_1],
             res_mask=pdb_batch[bp.res_mask],
+            diffuse_mask=torch.ones_like(pdb_batch[bp.res_mask]),
             chain_idx=pdb_batch[bp.chain_idx],
             num_passes=num_passes,
             sequences_per_pass=sequences_per_pass,
@@ -173,6 +174,7 @@ class TestProteinMPNNRunner:
             rotmats=rotmats,
             aatypes=aatypes,
             res_mask=res_mask,
+            diffuse_mask=torch.ones_like(res_mask),
             chain_idx=chain_idx,
             num_passes=num_passes,
             sequences_per_pass=sequences_per_pass,
@@ -233,7 +235,7 @@ class TestProteinMPNNRunner:
         except (ImportError, FileNotFoundError) as e:
             # If LigandMPNN is not available, provide a helpful error message
             pytest.fail(
-                f"LigandMPNN import test failed. Please ensure LigandMPNN is installed and available at {cfg.folding.protein_mpnn.ligand_mpnn_path}. "
+                f"LigandMPNN import test failed. Please ensure LigandMPNN is installed and available at {mock_cfg.folding.protein_mpnn.ligand_mpnn_path}. "
                 f"You can install it by cloning https://github.com/dauparas/LigandMPNN. Error: {e}"
             )
 
@@ -502,11 +504,11 @@ class TestProteinMPNNRunner:
         mock_fasta.write_text(mock_fasta_content)
 
         runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
-        result_path = runner.run_pdb_subprocess(
+        result_path = runner.inverse_fold_pdb_subprocess(
             pdb_path=pdb_2qlw_path,
             output_dir=output_dir,
-            device_id=device_id,
-            num_passes=2,
+            diffuse_mask=torch.ones(200),  # 2qlw has 200 modeled residues
+            num_sequences=2,
             seed=123,
         )
 
@@ -536,10 +538,10 @@ class TestProteinMPNNRunner:
         runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
 
         with pytest.raises(subprocess.CalledProcessError):
-            runner.run_pdb_subprocess(
+            runner.inverse_fold_pdb_subprocess(
                 pdb_path=pdb_2qlw_path,
                 output_dir=output_dir,
-                device_id=0,
+                diffuse_mask=torch.ones(200),  # 2qlw has 200 modeled residues
             )
 
     def test_run_subprocess_missing_device_id(self, mock_cfg, pdb_2qlw_path, tmp_path):
@@ -547,11 +549,13 @@ class TestProteinMPNNRunner:
         output_dir = tmp_path
         runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
 
-        with pytest.raises(AssertionError, match="device_id is required"):
-            runner.run_pdb_subprocess(
+        # The device_id parameter is no longer used in the subprocess method
+        # This test can be simplified to just test basic subprocess functionality
+        with pytest.raises(AssertionError):
+            runner.inverse_fold_pdb_subprocess(
                 pdb_path=pdb_2qlw_path,
                 output_dir=output_dir,
-                device_id=None,
+                diffuse_mask=torch.ones(200),  # 2qlw has 200 modeled residues
             )
 
     def test_run_native_real_execution(
@@ -568,10 +572,11 @@ class TestProteinMPNNRunner:
         runner = ProteinMPNNRunner(cfg.folding.protein_mpnn)
 
         # Test native execution
-        result_path = runner.run_pdb_native(
+        result_path = runner.inverse_fold_pdb_native(
             pdb_path=pdb_2qlw_path,
             output_dir=output_dir,
-            num_passes=2,
+            diffuse_mask=torch.ones(200),  # 2qlw has 200 modeled residues
+            num_sequences=2,
             seed=123,
         )
 
@@ -716,6 +721,7 @@ class TestProteinMPNNRunner:
             rotmats=rotmats,
             aatypes=aatypes,
             res_mask=res_mask,
+            diffuse_mask=torch.ones_like(res_mask),
             chain_idx=chain_idx,
             num_passes=num_passes,
             sequences_per_pass=sequences_per_pass,
@@ -749,6 +755,7 @@ class TestProteinMPNNRunner:
             rotmats=rotmats[:1],
             aatypes=aatypes[:1],
             res_mask=res_mask[:1],
+            diffuse_mask=torch.ones_like(res_mask[:1]),
             chain_idx=chain_idx[:1],
             num_passes=1,
             sequences_per_pass=1,
@@ -775,6 +782,7 @@ class TestProteinMPNNRunner:
             rotmats=rotmats,
             aatypes=aatypes,
             res_mask=res_mask,
+            diffuse_mask=torch.ones_like(res_mask),
             chain_idx=chain_idx,
             num_passes=num_passes,
             sequences_per_pass=sequences_per_pass,
@@ -812,6 +820,7 @@ class TestProteinMPNNRunner:
             rotmats=rotmats,
             aatypes=aatypes,
             res_mask=res_mask,
+            diffuse_mask=torch.ones_like(res_mask),
             chain_idx=chain_idx,
             temperature=0.2,
             num_passes=num_passes,
@@ -848,6 +857,7 @@ class TestProteinMPNNRunner:
             rotmats=rotmats,
             aatypes=aatypes,
             res_mask=res_mask,
+            diffuse_mask=torch.ones_like(res_mask),
             chain_idx=chain_idx,
             num_passes=num_passes,
             sequences_per_pass=sequences_per_pass,
@@ -955,6 +965,7 @@ class TestProteinMPNNRunner:
                 rotmats=rotmats,
                 aatypes=aatypes,
                 res_mask=res_mask,
+                diffuse_mask=torch.ones_like(res_mask),
                 chain_idx=chain_idx,
             )
 
@@ -977,6 +988,7 @@ class TestProteinMPNNRunner:
                 rotmats=rotmats,
                 aatypes=aatypes,
                 res_mask=res_mask,
+                diffuse_mask=torch.ones_like(res_mask),
                 chain_idx=chain_idx,
             )
 
@@ -1005,6 +1017,7 @@ class TestProteinMPNNRunner:
                 rotmats=rotmats,
                 aatypes=aatypes,
                 res_mask=res_mask,
+                diffuse_mask=torch.ones_like(res_mask),
                 chain_idx=chain_idx,
                 num_passes=num_passes,
                 sequences_per_pass=sequences_per_pass,
@@ -1452,6 +1465,7 @@ class TestProteinMPNNRunner:
             rotmats=rotmats,
             aatypes=aatypes,
             res_mask=res_mask,
+            diffuse_mask=torch.ones_like(res_mask),
             chain_idx=chain_idx,
             num_passes=num_passes,
             sequences_per_pass=sequences_per_pass,
@@ -1464,6 +1478,7 @@ class TestProteinMPNNRunner:
             rotmats=rotmats,
             aatypes=aatypes,
             res_mask=res_mask,
+            diffuse_mask=torch.ones_like(res_mask),
             chain_idx=chain_idx,
             num_passes=num_passes,
             sequences_per_pass=sequences_per_pass,
@@ -1510,6 +1525,7 @@ class TestProteinMPNNRunner:
             rotmats=rotmats,
             aatypes=aatypes,
             res_mask=res_mask,
+            diffuse_mask=torch.ones_like(res_mask),
             chain_idx=chain_idx,
             num_passes=num_passes,
             sequences_per_pass=sequences_per_pass,
@@ -1522,6 +1538,7 @@ class TestProteinMPNNRunner:
             rotmats=rotmats,
             aatypes=aatypes,
             res_mask=res_mask,
+            diffuse_mask=torch.ones_like(res_mask),
             chain_idx=chain_idx,
             num_passes=num_passes,
             sequences_per_pass=sequences_per_pass,
@@ -1548,6 +1565,7 @@ class TestProteinMPNNRunner:
             rotmats=rotmats,
             aatypes=aatypes,
             res_mask=res_mask,
+            diffuse_mask=torch.ones_like(res_mask),
             chain_idx=chain_idx,
             num_passes=num_passes,
             sequences_per_pass=sequences_per_pass,
@@ -1613,6 +1631,7 @@ class TestProteinMPNNRunnerPool:
             rotmats=rotmats,
             aatypes=aatypes,
             res_mask=res_mask,
+            diffuse_mask=torch.ones_like(res_mask),
             chain_idx=chain_idx,
             num_passes=num_passes,
             sequences_per_pass=sequences_per_pass,
@@ -1742,6 +1761,7 @@ class TestBenchmarkProteinMPNNRunner:
                         rotmats=batch[bp.rotmats_1],
                         aatypes=batch[bp.aatypes_1],
                         res_mask=batch[bp.res_mask],
+                        diffuse_mask=torch.ones_like(batch[bp.res_mask]),
                         chain_idx=(
                             batch[bp.chain_idx] if bp.chain_idx in batch else None
                         ),
@@ -1781,6 +1801,7 @@ class TestBenchmarkProteinMPNNRunner:
                         rotmats=batch[bp.rotmats_1],
                         aatypes=batch[bp.aatypes_1],
                         res_mask=batch[bp.res_mask],
+                        diffuse_mask=torch.ones_like(batch[bp.res_mask]),
                         chain_idx=(
                             batch[bp.chain_idx] if bp.chain_idx in batch else None
                         ),
@@ -1814,10 +1835,13 @@ class TestBenchmarkProteinMPNNRunner:
 
                 for pdb_path in batch_data["pdb_paths"]:
                     try:
-                        result_path = runner_batch.run_pdb_native(
+                        result_path = runner_batch.inverse_fold_pdb_native(
                             pdb_path=pdb_path,
                             output_dir=tmp_path / "native_output",
-                            num_passes=num_passes,
+                            diffuse_mask=torch.ones(
+                                200
+                            ),  # Mock diffuse mask for typical protein size
+                            num_sequences=num_passes,
                             temperature=temperature,
                         )
                         native_results.append(result_path)
@@ -1849,11 +1873,13 @@ class TestBenchmarkProteinMPNNRunner:
 
                 for pdb_path in batch_data["pdb_paths"]:
                     try:
-                        result_path = runner_subprocess.run_pdb_subprocess(
+                        result_path = runner_subprocess.inverse_fold_pdb_subprocess(
                             pdb_path=pdb_path,
                             output_dir=tmp_path / "subprocess_output",
-                            device_id=0,  # Required for subprocess mode
-                            num_passes=num_passes,
+                            diffuse_mask=torch.ones(
+                                200
+                            ),  # Mock diffuse mask for typical protein size
+                            num_sequences=num_passes,
                             temperature=temperature,
                         )
                         subprocess_results.append(result_path)

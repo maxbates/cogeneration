@@ -1,7 +1,7 @@
 """
 Boltz-2 structure prediction module.
 
-This module provides a BoltzPredictor class that loads the Boltz-2 model once
+This module provides a BoltzRunner class that loads the Boltz-2 model once
 and allows for efficient repeated inference. It supports single-sequence mode
 (no templates, no MSA) with potentials support and batching.
 
@@ -14,19 +14,14 @@ bash /Applications/Python\\ 3.12/Install\\ Certificates.command
 
 import json
 import os
-import pickle
-import tempfile
-import uuid
-import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 import numpy as np
 import pandas as pd
 import torch
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
-from boltz.data.parse.fasta import parse_fasta
 from boltz.data.types import Input, Manifest, Record, Target
 from boltz.data.write.writer import BoltzWriter
 from boltz.main import (
@@ -40,11 +35,12 @@ from boltz.main import (
 )
 from boltz.model.models.boltz2 import Boltz2
 from pytorch_lightning import Trainer
-from pytorch_lightning.utilities import rank_zero_only
 
+from cogeneration.config.base import BoltzConfig
 from cogeneration.data import residue_constants
+from cogeneration.data.tools.abc import FoldingTool
 from cogeneration.dataset.process_pdb import pdb_path_pdb_name, process_pdb_file
-from cogeneration.type.dataset import ProcessedFile
+from cogeneration.type.dataset import DatasetProteinColumn, ProcessedFile
 from cogeneration.type.metrics import MetricName
 
 
@@ -64,6 +60,9 @@ class BoltzPrediction:
     path_structure_npz: Optional[Path] = None
     path_plddt_npz: Optional[Path] = None
     path_confidence_json: Optional[Path] = None
+
+    def __post_init__(self):
+        self._processed_file = None
 
     @classmethod
     def from_output_dir(cls, output_dir: Union[str, Path]) -> "BoltzPrediction":
@@ -119,18 +118,18 @@ class BoltzPrediction:
         """
         assert self.path_pdb is not None, "path_pdb is None"
 
-        pdb_name = pdb_path_pdb_name(str(self.path_pdb))
+        if self._processed_file is None:
+            pdb_name = pdb_path_pdb_name(str(self.path_pdb))
+            self._processed_file = process_pdb_file(
+                pdb_file_path=str(self.path_pdb),
+                pdb_name=pdb_name,
+                write_dir=None,
+                chain_id=None,
+                scale_factor=1.0,
+                max_combined_length=8192,
+            )
 
-        processed_file = process_pdb_file(
-            pdb_file_path=str(self.path_pdb),
-            pdb_name=pdb_name,
-            write_dir=None,
-            chain_id=None,
-            scale_factor=1.0,
-            max_combined_length=8192,
-        )
-
-        return processed_file
+        return self._processed_file
 
     def get_plddt_mean(self) -> Optional[float]:
         """
@@ -179,17 +178,13 @@ class BoltzPrediction:
         Returns:
             Amino acid sequence as a string if available, None otherwise.
         """
-        if self.path_pdb is None or not self.path_pdb.exists():
-            return None
+        assert self.path_pdb is not None, "path_pdb is None"
 
-        try:
-            processed_file = self.parsed_structure()
-            aatype = processed_file.aatype
-            # Convert aatype indices to sequence string
-            sequence = "".join([residue_constants.restypes_with_x[aa] for aa in aatype])
-            return sequence
-        except Exception:
-            return None
+        processed_file = self.parsed_structure()
+        aatype = processed_file[DatasetProteinColumn.aatype]
+        # Convert aatype indices to sequence string
+        sequence = "".join([residue_constants.restypes_with_x[aa] for aa in aatype])
+        return sequence
 
 
 class BoltzPredictionSet:
@@ -219,11 +214,7 @@ class BoltzPredictionSet:
         """
         rows = []
         for i, pred in enumerate(self.predictions):
-            # Generate header from PDB filename or use index
-            if pred.path_pdb:
-                header = pred.path_pdb.stem  # filename without extension
-            else:
-                header = f"boltz_prediction_{i}"
+            header = pred.path_pdb.stem
 
             # Get sequence from PDB structure
             sequence = pred.get_sequence()
@@ -244,7 +235,7 @@ class BoltzPredictionSet:
         return pd.DataFrame(rows)
 
 
-class ManifestBuilder:
+class BoltzManifestBuilder:
     """
     Builder class for creating Boltz Manifest + Target objects from sequences.
 
@@ -352,7 +343,7 @@ class ManifestBuilder:
     def _create_targets_from_sequences(
         self,
         sequences: List[str],
-        protein_ids: Optional[List[str]] = None,
+        protein_ids: List[str],
         ccd: Optional[Dict] = None,
         mol_dir: Optional[Path] = None,
     ) -> tuple[List[Record], Path]:
@@ -360,9 +351,6 @@ class ManifestBuilder:
         Internal method to create Target objects from sequences using process_input.
         This creates all necessary files that Boltz expects during inference.
         """
-
-        if protein_ids is None:
-            protein_ids = [f"protein_{i}" for i in range(len(sequences))]
 
         if len(sequences) != len(protein_ids):
             raise ValueError("Number of sequences and protein IDs must match")
@@ -422,7 +410,7 @@ class ManifestBuilder:
         return records, self.processed_dir
 
     def from_sequences(
-        self, sequences: List[str], protein_ids: Optional[List[str]] = None
+        self, sequences: List[str], protein_ids: List[str] = None
     ) -> tuple[Manifest, Path]:
         """
         Create processed input files from multiple sequences with optional chain breaks.
@@ -443,7 +431,7 @@ class ManifestBuilder:
         self,
         aatypes: torch.Tensor,
         chain_idx: torch.Tensor,
-        protein_ids: Optional[List[str]] = None,
+        protein_ids: List[str],
     ) -> tuple[Manifest, Path]:
         """
         Create processed input files from batch tensors with chain indices.
@@ -461,9 +449,6 @@ class ManifestBuilder:
         B, N = aatypes.shape
         if chain_idx.shape != (B, N):
             raise ValueError("aatypes and chain_idx must have the same shape")
-
-        if protein_ids is None:
-            protein_ids = [f"protein_{i}" for i in range(B)]
 
         if len(protein_ids) != B:
             raise ValueError("Number of protein IDs must match batch size")
@@ -558,10 +543,7 @@ class ManifestBuilder:
         return self.from_sequences(sequences, protein_ids)
 
 
-# TODO - move several args to config
-
-
-class BoltzPredictor:
+class BoltzRunner(FoldingTool):
     """
     Boltz-2 structure prediction class for efficient repeated inference.
 
@@ -572,79 +554,53 @@ class BoltzPredictor:
 
     def __init__(
         self,
-        *,
-        checkpoint_path: Optional[str] = None,
-        cache_dir: Optional[str] = None,
-        outputs_path: Optional[str] = None,
-        use_potentials: bool = True,
-        step_scale: float = 1.5,
-        recycling_steps: int = 3,
-        sampling_steps: int = 200,
-        diffusion_samples: int = 1,
-        device: Union[str, torch.device] = "auto",
-        output_format: str = "pdb",
-        precision: Optional[str] = None,
+        cfg: BoltzConfig,
     ):
         """
         Initialize the Boltz predictor.
 
-        Args:
-            checkpoint_path: Path to Boltz-2 checkpoint. If None, downloads default.
-            cache_dir: Cache directory for model files. If None, uses default.
-            outputs_path: Base directory for all outputs. If None, uses "./outputs".
-            use_potentials: Whether to use potentials for steering during inference.
-            step_scale: Step scale for diffusion sampling (temperature).
-            recycling_steps: Number of recycling steps during inference.
-            sampling_steps: Number of diffusion sampling steps.
-            diffusion_samples: Number of diffusion samples to generate.
-            device: Device to run inference on ("auto", "cuda", "mps", "cpu").
-                   "auto" selects cuda > mps > cpu in order of availability.
-            output_format: Output format for structures ("pdb", "mmcif").
-            precision: Training precision ("bf16-mixed", "32").
         """
-        self.use_potentials = use_potentials
-        self.recycling_steps = recycling_steps
-        self.sampling_steps = sampling_steps
-        self.diffusion_samples = diffusion_samples
-        self.output_format = output_format
+        self.cfg = cfg
 
-        if precision is None:
-            precision = "bf16-mixed" if torch.cuda.is_available() else "32"
-        self.precision = precision
+        # Set up precision with fallback logic
+        if self.cfg.precision is None:
+            self.precision = "bf16-mixed" if torch.cuda.is_available() else "32"
+        else:
+            self.precision = self.cfg.precision
 
         # Set up cache directory
-        if cache_dir is None:
+        if self.cfg.cache_dir is None:
             cache_dir = get_cache_path()
+        else:
+            cache_dir = self.cfg.cache_dir
         self.cache_dir = Path(cache_dir).expanduser()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Set up outputs directory
-        if outputs_path is None:
+        if self.cfg.outputs_path is None:
             outputs_path = "./outputs"
+        else:
+            outputs_path = self.cfg.outputs_path
         self.outputs_path = Path(outputs_path).expanduser()
         self.outputs_path.mkdir(parents=True, exist_ok=True)
 
-        # Download model if needed
-        self._download_model_if_needed()
-
         # Set up checkpoint path
-        if checkpoint_path is None:
+        if self.cfg.checkpoint_path is None:
             checkpoint_path = self.cache_dir / "boltz2_conf.ckpt"
+        else:
+            checkpoint_path = self.cfg.checkpoint_path
         self.checkpoint_path = Path(checkpoint_path)
 
-        # Set up device
-        if device == "auto":
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif torch.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
-        self.device = device
+        # Initialize model and trainer to None before setting device
+        self.model = None
+        self.trainer = None
+
+        # setup default device
+        self.set_device_id(None)
 
         # Configure model parameters
         self.diffusion_params = Boltz2DiffusionParams()
-        self.diffusion_params.step_scale = step_scale
+        self.diffusion_params.step_scale = self.cfg.step_scale
 
         self.pairformer_args = PairformerArgsV2()
         self.msa_args = MSAModuleArgs(
@@ -654,12 +610,31 @@ class BoltzPredictor:
         )
 
         self.steering_args = BoltzSteeringParams()
-        if not use_potentials:
+        if not self.cfg.use_potentials:
             self.steering_args.fk_steering = False
             self.steering_args.guidance_update = False
 
-        # Load model
-        self._load_model()
+        # Model loaded in `predict` when first needed
+
+    def set_device_id(self, device_id: int):
+        """Set the device ID for the folding tool."""
+        if torch.cuda.is_available():
+            if device_id is None:
+                device = "cuda"
+            else:
+                device = f"cuda:{device_id}"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+
+        self.device = torch.device(device)
+
+        # TODO confirm model + trainer moved properly
+        if self.model is not None:
+            self.model.to(self.device)
+        if self.trainer is not None:
+            self.trainer.accelerator = self.device
 
     def _download_model_if_needed(self):
         """Download Boltz-2 model if not present in cache."""
@@ -669,13 +644,14 @@ class BoltzPredictor:
 
     def _load_model(self):
         """Load the Boltz-2 model from checkpoint."""
-        torch.set_grad_enabled(False)
-        torch.set_float32_matmul_precision("highest")
+
+        # Download model if needed
+        self._download_model_if_needed()
 
         predict_args = {
-            "recycling_steps": self.recycling_steps,
-            "sampling_steps": self.sampling_steps,
-            "diffusion_samples": self.diffusion_samples,
+            "recycling_steps": self.cfg.recycling_steps,
+            "sampling_steps": self.cfg.sampling_steps,
+            "diffusion_samples": self.cfg.diffusion_samples,
             "max_parallel_samples": None,
             "write_confidence_summary": True,
             "write_full_pae": False,
@@ -698,18 +674,10 @@ class BoltzPredictor:
             steering_args=asdict(self.steering_args),
         )
         self.model.eval()
-
-        # Set up trainer
-        if self.device == "cuda":
-            accelerator = "gpu"
-        elif self.device == "mps":
-            accelerator = "mps"
-        else:
-            accelerator = "cpu"
+        self.model.to(self.device)
 
         self.trainer = Trainer(
-            accelerator=accelerator,
-            devices=1,
+            accelerator=self.cfg.accelerator,
             precision=self.precision,
             logger=False,
             enable_checkpointing=False,
@@ -719,8 +687,8 @@ class BoltzPredictor:
     def predict(
         self,
         manifest: Manifest,
-        output_dir: Optional[str] = None,
-        processed_dir: Optional[str] = None,
+        output_dir: Optional[Path] = None,
+        processed_dir: Optional[Path] = None,
     ) -> BoltzPredictionSet:
         """
         Fold structures from a manifest.
@@ -734,6 +702,11 @@ class BoltzPredictor:
         Returns:
             BoltzPredictionSet containing BoltzPrediction objects for each protein in the manifest.
         """
+
+        # Load model if not already loaded
+        if self.model is None or self.trainer is None:
+            self._load_model()
+
         if output_dir is None:
             output_dir = self.outputs_path
         else:
@@ -807,7 +780,7 @@ class BoltzPredictor:
                 processed_path / "structures"
             ),  # Point to structures directory
             output_dir=str(output_dir),
-            output_format=self.output_format,
+            output_format=self.cfg.output_format,
             boltz2=True,
         )
 
@@ -834,3 +807,23 @@ class BoltzPredictor:
             predictions.append(prediction)
 
         return BoltzPredictionSet(predictions)
+
+    def fold_fasta(
+        self,
+        fasta_path: Path,
+        output_dir: Path,
+    ) -> pd.DataFrame:
+        """
+        Fold a protein sequence from a FASTA file and save the results to an output directory.
+        Each fasta entry should be an entry in the DataFrame.
+
+        Implements the FoldingTool interface.
+        """
+        manifest_builder = BoltzManifestBuilder(target_dir=output_dir / "processed")
+        manifest, processed_dir = manifest_builder.from_fasta(fasta_path)
+
+        prediction_set = self.predict(
+            manifest=manifest, output_dir=output_dir, processed_dir=processed_dir
+        )
+
+        return prediction_set.to_df()

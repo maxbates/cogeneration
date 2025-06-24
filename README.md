@@ -52,6 +52,12 @@ This project introduces several extensions over MultiFlow:
 `/cogeneration/config/dict_utils.py` - helpers for working with dicts
 
 `/cogeneration/data`
+`/cogeneration/data/tools`
+`/cogeneration/data/tools/abc.py` - Base classes for folding and inverse folding tools, `FoldingTool` and `InverseFoldingTool`
+`/cogeneration/data/tools/alphafold2.py` - `AlphaFold2Tool` wrapper to run AlphaFold2 using ColabFold in subprocess
+`/cogeneration/data/tools/boltz_runner.py` - `BoltzRunner` wrapper to run Boltz natively 
+`/cogeneration/data/tools/protein_mpnn_runner.py` -  `ProteinMPNNRunner` to run ProteinMPNN and LigandMPNN, in subprocess or natively
+`/cogeneration/data`
 `/cogeneration/data/all_atom.py` - mostly from Openfold. Frames / rigids -> atom14 and atom37 representations.
 `/cogeneration/data/const.py` - mostly from Openfold. sequence and structure and aatypes constants.
 `/cogeneration/data/data_transforms.py` - mostly from Openfold. Openfold data pipeline for getting rigid features, angles, etc.
@@ -61,7 +67,6 @@ This project introduces several extensions over MultiFlow:
 `/cogeneration/data/metrics.py` - helpers for computing metrics of samples
 `/cogeneration/data/noise_mask.py` - Utilities for masking and generating noise for each domain
 `/cogeneration/data/potentials.py` - Feynman-Kac Steering. Several `Potential` instances. `FKSTeeringCalculator` stateless class for computing potentials. `FKSteeringResambler` stateful class for initializing particles and resampling during inference.
-`cogeneration/data/protein_mpnn_runner.py` - `ProteinMPNNRunner` to run ProteinMPNN
 `/cogeneration/data/protein.py` - mostly from Openfold. `Protein` class for processing PDBs into a `Protein` `Chain`. 
 `/cogeneration/data/residue_constants.py` - mostly from Openfold. Atom types, residue constants, bond lengths, atom14 and atom37 representations and masks, etc.
 `/cogeneration/data/rigid.py` - mostly from Openfold. utilities for interacting with rigids, like centering and aligning.
@@ -78,6 +83,7 @@ This project introduces several extensions over MultiFlow:
 `/cogeneration/dataset/scripts/process_pdb_files.py` - process a set of PDB files into a metadata CSV and pre-processed pkls for each PDB file
 `/cogeneration/dataset/scripts/redesign_structures.py` - use ProteinMPNN to redesign structures in the dataset
 `/cogeneration/dataset/scripts/update_dataset_metadata.py` - update an existing metadata CSV with new metadata
+`/cogeneration/dataset`
 `/cogeneration/dataset/datasets.py` - `BaseDataset` and child class `PdbDataset` for loading Metadata CSV, redesigned structures, synthetic structures, and creating dataset. `ProcessedFiles` are loaded on the fly in `__get_item__`. `BatchFeaturizer` for generating `BatchFeatures` from a `ProcessedFile`.
 `/cogeneration/dataset/filterer.py` - `DatasetFilterer` class for filtering Metadata
 `/cogeneration/dataset/interaction.py` - `NonResidueInteractions` and `MultimerInteraction` classes for computing atom / backbone interactions and clashes.
@@ -102,6 +108,7 @@ This project introduces several extensions over MultiFlow:
 `/cogeneration/models/attention/transition.py` - MLP transition module
 `/cogeneration/models/attention/trianglar_attention.py`  - Adapted from Boltz, triangle attention 
 `/cogeneration/models/attention/trianglar_mult.py` - Adapted from Boltz, triangle attention 
+`/cogeneration/models`
 `/cogeneration/models/aa_pred.py` - Simple Sequence prediction network using linear layer / MLP
 `/cogeneration/models/bfactors.py` - Module for predicting B-factors
 `/cogeneration/models/confidence.py` - Module for predicting pLDDT (potentially PAE, PTM in the future?)
@@ -175,7 +182,7 @@ This should simplify install, testing, etc.
 }
 ```
 
-And benefits from the following works:
+And benefits from the following works, among many others:
 
 FoldFlow-2: https://github.com/DreamFold/FoldFlow
 FrameFlow: https://github.com/microsoft/protein-frame-flow

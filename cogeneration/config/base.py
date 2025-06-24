@@ -1216,7 +1216,7 @@ class InferenceConfig(BaseClassConfig):
 
 
 class ModelType(StrEnum):
-    """Supported ProteinMPNN model types."""
+    """Supported LigandMPNN model types."""
 
     PROTEIN_MPNN = "protein_mpnn"
     LIGAND_MPNN = "ligand_mpnn"
@@ -1261,19 +1261,74 @@ class ProteinMPNNRunnerConfig(BaseClassConfig):
 
 
 @dataclass
-class FoldingConfig(BaseClassConfig):
-    folding_model: str = "af2"  # "af2" or "boltz"  # TODO enum
-    # dedicated device for folding. decrement other devices by 1 if True
-    own_device: bool = False
-    pt_hub_dir: Path = PATH_PROJECT_ROOT / "cache" / "torch"
-    # uses LocalColabFold for folding locally
+class AlphaFold2Config(BaseClassConfig):
+    """Configuration for AlphaFold2 runner using ColabFold."""
+
+    # Path to ColabFold executable for local folding
     # https://github.com/YoshitakaMo/localcolabfold
-    # which is a variant of ColabFold
     # installation: https://bcrf.biochem.wisc.edu/2023/04/27/alphafold2-on-macintosh-m1/
     colabfold_path: Path = (
         PATH_PROJECT_ROOT.parent / "localcolabfold/colabfold-conda/bin/colabfold_batch"
     )
-    # ProteinMPNN configuration
+
+    seed: int = "${shared.seed}"
+
+
+# TODO(boltz) - update directories, standardize checkpoint path, etc
+
+
+@dataclass
+class BoltzConfig(BaseClassConfig):
+    """Configuration for Boltz-2 runner."""
+
+    # Model and checkpoint settings
+    # Path to Boltz-2 checkpoint. If None, downloads default.
+    checkpoint_path: Optional[str] = None
+    # Cache directory for model files. If None, uses default.
+    cache_dir: Path = Path("~/.boltz/cache").expanduser()
+    # Base directory for all outputs. If None, uses "./outputs".
+    outputs_path: Path = Path("./boltz")
+
+    # Inference parameters
+    # Whether to use potentials for steering during inference.
+    use_potentials: bool = True
+    # Step scale for diffusion sampling (temperature).
+    step_scale: float = 1.5
+    # Number of recycling steps during inference.
+    recycling_steps: int = 3
+    # Number of diffusion sampling steps.
+    sampling_steps: int = 200
+    # Number of diffusion samples to generate.
+    diffusion_samples: int = 1
+
+    # Hardware and output settings
+    # Device to run inference on ("auto", "cuda", "mps", "cpu"). "auto" selects cuda > mps > cpu in order of availability.
+    device: str = "auto"
+    accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'gpu'}"
+    # Output format for structures ("pdb", "mmcif").
+    output_format: str = "pdb"
+    # Training precision ("bf16-mixed", "32") otherwise inferred
+    precision: Optional[str] = None
+
+
+class FoldingModel(StrEnum):
+    """Supported folding models."""
+
+    AlphaFold2 = "alphafold2"
+    Boltz2 = "boltz2"
+
+
+@dataclass
+class FoldingConfig(BaseClassConfig):
+    folding_model: FoldingModel = FoldingModel.AlphaFold2
+
+    # dedicated device for folding. decrement other devices by 1 if True
+    # TODO improve device management across tools
+    own_device: bool = False
+
+    # Tools
+    alphafold: AlphaFold2Config = field(default_factory=AlphaFold2Config)
+    boltz: BoltzConfig = field(default_factory=BoltzConfig)
     protein_mpnn: ProteinMPNNRunnerConfig = field(
         default_factory=ProteinMPNNRunnerConfig
     )
@@ -1489,6 +1544,12 @@ class Config(BaseClassConfig):
 
         # skip animations, they are slow to generate
         raw_cfg.inference.write_animations = False
+
+        # Tools
+        raw_cfg.folding.boltz.outputs_path = str(tmp_path / "boltz")
+        raw_cfg.folding.boltz.recycling_steps = 1
+        raw_cfg.folding.boltz.sampling_steps = 10
+        raw_cfg.folding.boltz.diffusion_samples = 1
 
         return raw_cfg
 
