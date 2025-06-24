@@ -119,7 +119,3 @@ class AlphaFold2Tool(FoldingTool):
             )
 
         return pd.DataFrame(all_fold_metrics)
-
-    def set_device_id(self, device_id: int):
-        """Set the GPU device ID."""
-        self.device_id = device_id

@@ -7,23 +7,26 @@ It is based on MultiFlow, which applies flow matching across several domains:
 Translations are interpolated in Euclidean space, rotations are interpolated in SO(3), and the sequence with discrete flow matching.
 
 This project introduces several extensions over MultiFlow:
-- inpainting (conditional generation) given partial sequences / structures
-  - MultiFlow supports per-domain conditioning via seperate t (i.e. folding and inverse folding)
-- multimers support, enabling binder design
-- stochastic paths, for the structure and sequence, enabling e.g. conformation sampling and sequence redesign
-- Feynman-Kac steering for sequential monte-carlo sampling guided by potentials, defined only at inference time
-- support for existing protein language models (e.g. ESM) to get frozen embeddings
+- **Inpainting (conditional generation)** given partial sequences / structures
+  - MultiFlow only supports per-domain conditioning via seperate t (i.e. folding and inverse folding)
+- **Multimer** support, enabling binder design
+- **Stochastic paths**, for the structure and sequence, enabling e.g. conformation sampling and sequence redesign
+- **Feynman-Kac steering** for sequential monte-carlo sampling guided by potentials, defined only at inference time
+- **existing protein language models (e.g. ESM)** to get frozen embeddings, enriching the node and edge representations
   - particularly for sequence-conditioned tasks like inpainting
-- Improved sequence prediction / inverse folding, using a deeper sequence prediction network
-- torsion angle prediction for more accurate side chain placement
-- B-factor and pLDDT prediction, improving model understanding of flexible regions, and embedding structure experimental method
+- **Improved sequence prediction** and inverse folding, using a deeper sequence prediction network
+- **Torsion angle prediction** for more accurate side chain placement
+- **B-factor and pLDDT prediction**, improving model understanding of flexible regions, and embedding structure experimental method
 - additional losses (e.g. for atomic interactions, clashes)
-- data pipeline to generate or augment training data
-- Adds a trunk with choice of attention mechanisms, e.g. IPA, Pairformer (triangle attention)
-- Enables recyling through the trunk + IPA
-- CUDA optimizations, e.g. Flash Attention, Flash IPA, cuEquivariant triangle attention
+- Support for **LigandMPNN (in memory) for inverse folding** during validation / redesigning sequences
+- Support for **Boltz-2 (in memory) for structure prediction** or AlphaFold2 duiring validation / redesigning sequences
+- **Complete PDB processing data pipeline** to generate or augment training data, with several fields added to metadata
+  - Track information about chains, multimer interactions, presence of non-residues, etc.
+- Adds a trunk with **choice of attention mechanisms, e.g. IPA, Pairformer** (triangle attention)
+- Enables **recyling** through the trunk + IPA
+- **CUDA optimizations**, e.g. Flash Attention, Flash IPA, cuEquivariant triangle attention
 - many improvements to code base: typing, enums, documentation, tests, etc.
-- these new features and modules are optional - easily reverse compatible with MultiFlow, and public Multiflow weights
+- Many of these new features and modules are **optional - easily reverse compatible with MultiFlow**, and public Multiflow weights
 
 ## Installation, Training, and Sampling
 
@@ -98,6 +101,7 @@ See directions in [installation.md](docs/installation.md) for installation, trai
 `/cogeneration/dataset/test_utils.py` - Utilities for tests to construct mock features, datasets, dataloaders
 
 `/cogeneration/datasets` - Directory containing training and test data
+`/cogeneration/datasets/install.sh` - Script to download MultiFlow datasets
 
 `/cogeneration/models`
 `/cogeneration/models/attention`

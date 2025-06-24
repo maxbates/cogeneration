@@ -67,9 +67,9 @@ class FoldingValidator:
         )
 
         # Initialize folding tool
-        if self.cfg.folding_model == FoldingModel.AlphaFold2:
+        if self.cfg.folding_model == FoldingModel.alphafold2:
             self.folding_tool = AlphaFold2Tool(cfg=self.cfg.alphafold)
-        elif self.cfg.folding_model == FoldingModel.Boltz2:
+        elif self.cfg.folding_model == FoldingModel.boltz2:
             self.folding_tool = BoltzRunner(cfg=self.cfg.boltz)
         else:
             raise ValueError(f"Unsupported folding model: {self.cfg.folding_model}")

@@ -1302,8 +1302,6 @@ class BoltzConfig(BaseClassConfig):
     diffusion_samples: int = 1
 
     # Hardware and output settings
-    # Device to run inference on ("auto", "cuda", "mps", "cpu"). "auto" selects cuda > mps > cpu in order of availability.
-    device: str = "auto"
     accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'gpu'}"
     # Output format for structures ("pdb", "mmcif").
     output_format: str = "pdb"
@@ -1314,13 +1312,14 @@ class BoltzConfig(BaseClassConfig):
 class FoldingModel(StrEnum):
     """Supported folding models."""
 
-    AlphaFold2 = "alphafold2"
-    Boltz2 = "boltz2"
+    alphafold2 = "alphafold2"
+    boltz2 = "boltz2"
+    esmf = "esmf"  # ESMFold not actually supported, required by public Multiflow config
 
 
 @dataclass
 class FoldingConfig(BaseClassConfig):
-    folding_model: FoldingModel = FoldingModel.AlphaFold2
+    folding_model: FoldingModel = FoldingModel.boltz2
 
     # dedicated device for folding. decrement other devices by 1 if True
     # TODO improve device management across tools

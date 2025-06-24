@@ -897,6 +897,11 @@ restypes_with_x = restypes + ["X"]
 restype_order_with_x = {restype: i for i, restype in enumerate(restypes_with_x)}
 
 
+def aatypes_to_sequence(aatypes: np.ndarray) -> str:
+    """Convert a numpy array of aatypes to a sequence string."""
+    return "".join([restypes_with_x[aatype] for aatype in aatypes])
+
+
 def sequence_to_onehot(
     sequence: str, mapping: Mapping[str, int], map_unknown_to_x: bool = False
 ) -> np.ndarray:

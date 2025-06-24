@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 from typing import List
 
+import numpy as np
 import pytest
 import torch
 
@@ -16,6 +17,7 @@ from cogeneration.data.tools.boltz_runner import (
     BoltzPrediction,
     BoltzRunner,
 )
+from cogeneration.type.dataset import DatasetProteinColumn
 
 simple_sequence = "MKLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL"
 
@@ -30,8 +32,8 @@ class TestManifestBuilder:
 
     def test_init_with_target_dir(self, tmp_path):
         """Test ManifestBuilder initialization with custom target directory."""
-        builder = BoltzManifestBuilder(tmp_path)
-        assert builder.target_dir == Path(tmp_path)
+        builder = BoltzManifestBuilder(target_dir=tmp_path)
+        assert builder.target_dir == tmp_path
         assert builder.target_dir.exists()
 
     def test_init_without_target_dir(self):
@@ -230,10 +232,12 @@ class TestBoltzRunner:
     @pytest.mark.slow
     def test_single_sequence_prediction(self, mock_cfg, tmp_path):
         """Test that we can run a single sequence prediction."""
+        protein_id = "test_protein"
+
         # Create manifest with processed files using ManifestBuilder
-        builder = BoltzManifestBuilder(tmp_path)
+        builder = BoltzManifestBuilder(target_dir=tmp_path)
         manifest, processed_dir = builder.from_sequences(
-            [simple_sequence], ["test_protein"]
+            [simple_sequence], [protein_id]
         )
 
         predictor = BoltzRunner(cfg=mock_cfg.folding.boltz)
@@ -244,25 +248,40 @@ class TestBoltzRunner:
         protein_result = result[0]
         assert isinstance(protein_result, BoltzPrediction)
 
+        print(list(protein_result.output_dir.glob("*")))
+
+        # confirm namespaced by protein_id
+        assert protein_result.protein_id == protein_id
+        assert protein_result.output_dir.name == protein_id
+
+        # Confirm outputs exist
+        assert protein_result.path_pdb.exists()
+        assert protein_result.path_confidence_json.exists()
+        assert protein_result.path_plddt_npz.exists()
+
         # Test parsed_structure method
         parsed_file = protein_result.parsed_structure()
 
-        # Verify the structure has the expected shape
-        pos = parsed_file["atom_positions"]
+        # verify structure shape
+        pos = parsed_file[DatasetProteinColumn.atom_positions]
         assert pos.shape == (len(simple_sequence), 37, 3), (
             f"Expected pos.shape ({len(simple_sequence)}, 37, 3), " f"got {pos.shape}"
         )
 
-        # Also verify other expected fields are present
-        assert "aatype" in parsed_file
-        assert "atom_mask" in parsed_file
-        assert len(parsed_file["aatype"]) == len(simple_sequence)
+        # verify sequence
+        assert len(parsed_file[DatasetProteinColumn.aatype]) == len(simple_sequence)
+        assert (
+            residue_constants.aatypes_to_sequence(
+                parsed_file[DatasetProteinColumn.aatype]
+            )
+            == simple_sequence
+        )
 
     @pytest.mark.slow
     def test_multiple_sequence_prediction(self, mock_cfg, tmp_path):
         """Test that we can run multiple sequence prediction."""
         # Create manifest with processed files using ManifestBuilder
-        builder = BoltzManifestBuilder(tmp_path)
+        builder = BoltzManifestBuilder(target_dir=tmp_path)
         manifest, processed_dir = builder.from_sequences(
             multiple_sequences, ["protein1", "protein2"]
         )
@@ -273,11 +292,41 @@ class TestBoltzRunner:
         assert result is not None
         assert len(result) == 2
 
+    @pytest.mark.slow
+    def test_multimer_prediction(self, mock_cfg, tmp_path):
+        """Test that we can run a multimer prediction."""
+        protein_id = "test_multimer"
+        multimer_sequence = "MKALGL:ATYPRKDA"
+
+        # Create manifest with processed files using ManifestBuilder
+        builder = BoltzManifestBuilder(target_dir=tmp_path)
+        manifest, processed_dir = builder.from_sequences(
+            sequences=[multimer_sequence], protein_ids=[protein_id]
+        )
+
+        predictor = BoltzRunner(cfg=mock_cfg.folding.boltz)
+        result = predictor.predict(manifest, processed_dir=processed_dir)
+
+        protein_result = result[0]
+        assert isinstance(protein_result, BoltzPrediction)
+
+        parsed_file = protein_result.parsed_structure()
+
+        # Check that we have exactly 2 unique chain indices for the 2-chain multimer
+        unique_chains = np.unique(parsed_file[DatasetProteinColumn.chain_index])
+        assert (
+            len(unique_chains) == 2
+        ), f"Expected 2 chains, got {len(unique_chains)}: {unique_chains.tolist()}"
+
+        parsed_seq = residue_constants.aatypes_to_sequence(
+            parsed_file[DatasetProteinColumn.aatype]
+        )
+        assert parsed_seq == multimer_sequence.replace(":", "")
+
     def test_predict_without_processed_dir_raises_error(self, mock_cfg, tmp_path):
         """Test that predict without processed_dir raises error when processed files don't exist."""
-        # Create a manifest but don't provide processed files
         # Create manifest but delete the processed directory to simulate missing processed files
-        builder = BoltzManifestBuilder(tmp_path)
+        builder = BoltzManifestBuilder(target_dir=tmp_path)
         manifest, processed_dir = builder.from_sequences(
             multiple_sequences, ["protein1", "protein2"]
         )
@@ -291,23 +340,34 @@ class TestBoltzRunner:
 
     def test_boltz_prediction_dataclass(self, tmp_path):
         """Test BoltzPrediction dataclass functionality."""
-        output_dir = tmp_path
+        protein_id = "test_protein"
+        output_dir = tmp_path / protein_id
+
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         # Create some dummy files to test
-        pdb_path = output_dir / "test_protein.pdb"
+        pdb_path = output_dir / f"{protein_id}.pdb"
         pdb_path.write_text("dummy pdb content")
 
-        structure_npz_path = output_dir / "test_structure.npz"
+        structure_npz_path = output_dir / f"{protein_id}_structure.npz"
         structure_npz_path.write_text("dummy npz content")
 
+        plddt_npz_path = output_dir / f"{protein_id}_plddt.npz"
+        plddt_npz_path.write_text("dummy npz content")
+
+        confidence_json_path = output_dir / f"{protein_id}_confidence.json"
+        confidence_json_path.write_text("dummy json content")
+
         prediction = BoltzPrediction(
+            protein_id=protein_id,
+            output_dir=output_dir,
             path_pdb=pdb_path,
             path_structure_npz=structure_npz_path,
-            path_plddt_npz=None,
-            path_confidence_json=None,
+            path_plddt_npz=plddt_npz_path,
+            path_confidence_json=confidence_json_path,
         )
 
         assert prediction.path_pdb == pdb_path
         assert prediction.path_structure_npz == structure_npz_path
-        assert prediction.path_plddt_npz is None
-        assert prediction.path_confidence_json is None
+        assert prediction.path_plddt_npz == plddt_npz_path
+        assert prediction.path_confidence_json == confidence_json_path
