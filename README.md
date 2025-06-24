@@ -25,6 +25,10 @@ This project introduces several extensions over MultiFlow:
 - many improvements to code base: typing, enums, documentation, tests, etc.
 - these new features and modules are optional - easily reverse compatible with MultiFlow, and public Multiflow weights
 
+## Installation, Training, and Sampling
+
+See directions in [installation.md](docs/installation.md) for installation, training, and sampling.
+
 ## Project Conventions
 
 ### Code Style

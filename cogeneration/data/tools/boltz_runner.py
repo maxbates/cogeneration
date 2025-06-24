@@ -4,12 +4,6 @@ Boltz-2 structure prediction module.
 This module provides a BoltzRunner class that loads the Boltz-2 model once
 and allows for efficient repeated inference. It supports single-sequence mode
 (no templates, no MSA) with potentials support and batching.
-
-If encounter SSL issues downloading weights, try:
-```
-python -m pip install --upgrade certifi
-bash /Applications/Python\\ 3.12/Install\\ Certificates.command
-```
 """
 
 import json

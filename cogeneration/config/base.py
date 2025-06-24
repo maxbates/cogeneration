@@ -1282,10 +1282,10 @@ class BoltzConfig(BaseClassConfig):
     """Configuration for Boltz-2 runner."""
 
     # Model and checkpoint settings
-    # Path to Boltz-2 checkpoint. If None, downloads default.
-    checkpoint_path: Optional[str] = None
     # Cache directory for model files. If None, uses default.
     cache_dir: Path = Path("~/.boltz/cache").expanduser()
+    # Path to Boltz-2 checkpoint. If None, downloads default.
+    checkpoint_path: Optional[str] = None
     # Base directory for all outputs. If None, uses "./outputs".
     outputs_path: Path = Path("./boltz")
 
@@ -1546,7 +1546,7 @@ class Config(BaseClassConfig):
         raw_cfg.inference.write_animations = False
 
         # Tools
-        raw_cfg.folding.boltz.outputs_path = str(tmp_path / "boltz")
+        raw_cfg.folding.boltz.outputs_path = tmp_path / "boltz"
         raw_cfg.folding.boltz.recycling_steps = 1
         raw_cfg.folding.boltz.sampling_steps = 10
         raw_cfg.folding.boltz.diffusion_samples = 1

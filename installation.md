@@ -1,13 +1,13 @@
-Notes for getting set up on Lambda Labs machine:
+Notes for getting set up on local or remote machine:
 
-## Sync local to remote
+## (If Remote) sync local to remote
 
 set up ssh
 
 **Option 1: Using rsync (recommended):**
 ```bash
 # Sync from local to remote (run from local machine)
-rsync -avz --filter=':- .gitignore' --exclude='.git' ./ username@remote_host:~/cogeneration/
+rsync -avz --filter=':- .gitignore' --exclude='.git' ./ username@remote_host:~/projects/cogeneration/
 ```
 
 **Option 2: Using PyCharm:**
@@ -17,9 +17,7 @@ Set up PyCharm remote deployment to ensure all source files are copied to remote
 cd cogeneration
 ```
 
-## Install package + dependencies
-
-Install package
+## Install package
 
 **Option 1: CUDA installation (recommended for training on GPU machines):**
 ```
@@ -51,52 +49,58 @@ pip install flash-attn --no-build-isolation
 pip install -e .
 ```
 
-## Install data, tools
+## Install data, 3rd party tools
 
-install datasets
-```
-bash ./cogeneration/datasets/install.sh
-```
-
-for animations, install ffmpeg
-```
-sudo apt-get install ffmpeg
-```
-
-Install ProteinMPNN
+### Install ProteinMPNN / LigandMPNN
 
 ```bash
-# Clone ligandMPNN (for local) ProteinMPNN (for subprocess) to ~/tools directory
-mkdir -p ~/tools
-cd ~/tools
+# Clone ligandMPNN (for local) ProteinMPNN (for subprocess) to ~/projects directory as siblings of cogeneration
+mkdir -p ~/projects
+cd ~/projects
 git clone https://github.com/dauparas/ProteinMPNN.git
 git clone https://github.com/dauparas/LigandMPNN.git
 
 # Download ligandMPNN weights to run natively (much faster)
-wget -q https://files.ipd.uw.edu/pub/ligandmpnn/proteinmpnn_v_48_020.pt -O "~/tools/LigandMPNN/proteinmpnn_v_48_020.pt"
-wget -q https://files.ipd.uw.edu/pub/ligandmpnn/ligandmpnn_v_32_010_25.pt -O "~/tools/LigandMPNN/ligandmpnn_v_32_010_25.pt"
-wget -q https://files.ipd.uw.edu/pub/ligandmpnn/ligandmpnn_sc_v_32_002_16.pt -O "~/tools/LigandMPNN/ligandmpnn_sc_v_32_002_16.pt"
+wget -q https://files.ipd.uw.edu/pub/ligandmpnn/proteinmpnn_v_48_020.pt -O "~/projects/LigandMPNN/proteinmpnn_v_48_020.pt"
+wget -q https://files.ipd.uw.edu/pub/ligandmpnn/ligandmpnn_v_32_010_25.pt -O "~/projects/LigandMPNN/ligandmpnn_v_32_010_25.pt"
+wget -q https://files.ipd.uw.edu/pub/ligandmpnn/ligandmpnn_sc_v_32_002_16.pt -O "~/projects/LigandMPNN/ligandmpnn_sc_v_32_002_16.pt"
 
 # Install dependencies in current environment
 pip install prody pyparsing==3.1.1
 
 # Add to PATH
-echo 'export PATH="$HOME/tools/ProteinMPNN:$PATH"' >> ~/.bashrc
+echo 'export PATH="$HOME/projects/ProteinMPNN:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
-Install Colabfold using localcolabfold
+### Install Colabfold using localcolabfold
 
 ```bash
-# Install to ~/tools/localcolabfold
-cd ~/tools
+# Install to ~/projects/localcolabfold
+cd ~/projects
 wget https://raw.githubusercontent.com/YoshitakaMo/localcolabfold/main/install_colabbatch_linux.sh
 chmod +x install_colabbatch_linux.sh
 bash install_colabbatch_linux.sh
 
 # Add to PATH
-echo 'export PATH="$HOME/tools/localcolabfold/colabfold-conda/bin:$PATH"' >> ~/.bashrc
+echo 'export PATH="$HOME/projects/localcolabfold/colabfold-conda/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
+```
+
+### for animations, install ffmpeg
+
+Animations are enabled by default when trajectories are saved.
+
+```
+sudo apt-get install ffmpeg
+```
+
+### Install datasets
+
+Datasets are required for training and evaluation, or provide a base set of structures for inpainting.
+
+```
+bash ./cogeneration/datasets/install.sh
 ```
 
 ### Training
@@ -158,12 +162,11 @@ All configuration, including checkpoints, number of samples, lengths etc. are sp
 python cogeneration/scripts/predict.py --output_dir samples
 ```
 
-
 ## Data Pipeline
 
 If you want to download PDB and process (or reprocess) it to support new metadata or structure processing etc.
 
-Both are long running processes (~1 hr each) but support resuming. 
+Both are long running processes (>= 1 hr each) but support resuming. 
 
 ```
 python cogeneration/dataset/scripts/download_pdb.py --pdb_dir pdbs
@@ -187,4 +190,10 @@ If you still have an issue at run-time with torch scatter, install and build wit
 
 ```
 pip install torch-scatter -f https://data.pyg.org/whl/torch-2.4.1+cu124.html --no-cache-dir
+```
+
+If encounter SSL issues downloading weights, try:
+```
+python -m pip install --upgrade certifi
+bash /Applications/Python\\ 3.12/Install\\ Certificates.command
 ```
