@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment  # noqa
+from torch import nn
 
 from cogeneration.config.base import (
     InterpolantAATypesInterpolantTypeEnum,
@@ -33,7 +34,11 @@ from cogeneration.data.noise_mask import (
     uniform_categorical,
     uniform_so3,
 )
-from cogeneration.data.potentials import FKSteeringResampler
+from cogeneration.data.potentials import (
+    FKSteeringResampler,
+    FKSteeringTrajectory,
+    FKStepMetric,
+)
 from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
 from cogeneration.data.trajectory import SamplingStep, SamplingTrajectory
 from cogeneration.type.batch import BatchFeatures
@@ -92,7 +97,7 @@ class BatchTrueFeatures:
         )
 
 
-class Interpolant:
+class Interpolant(nn.Module):
     """
     Interpolant is responsible for generating noise, corrupting samples, and sampling from learned vector fields.
 
@@ -132,6 +137,7 @@ class Interpolant:
     """
 
     def __init__(self, cfg: InterpolantConfig):
+        super().__init__()
         self.cfg = cfg
 
         self.resampler = FKSteeringResampler(cfg=self.cfg.steering)
@@ -1283,7 +1289,7 @@ class Interpolant:
         t_1: float,  # [scalar Tensor]
         t_2: Optional[float],  # [scalar Tensor] None if final step
         stochasticity_scale: float = 1.0,
-    ) -> Tuple[NoisyFeatures, SamplingStep, SamplingStep]:
+    ) -> Tuple[NoisyFeatures, SamplingStep, SamplingStep, Optional[FKStepMetric]]:
         """
         Perform a single step of sampling, integrating from `t_1` toward `t_2`.
         Batch `_t` properties should be at `t_1`.
@@ -1472,6 +1478,7 @@ class Interpolant:
 
         # Feynman-Kac steering, if enabled.
         # TODO(FK) better expose metrics, to track in trajectory over time
+        # TODO(FK) Determine if we should expose model states for un-selected particles
         noisy_batch, resample_idx, step_metrics = self.resampler.on_step(
             step_idx=step_idx,
             batch=noisy_batch,
@@ -1483,7 +1490,7 @@ class Interpolant:
             model_pred = model_pred.select_batch_idx(resample_idx)
             protein_state = protein_state.select_batch_idx(resample_idx)
 
-        return noisy_batch, model_pred, protein_state
+        return noisy_batch, model_pred, protein_state, step_metrics
 
     def sample(
         self,
@@ -1509,7 +1516,7 @@ class Interpolant:
         # stochasticity must be enabled in cfg, this only scales it per domain
         stochasticity_scale: float = 1.0,
         structure_method: StructureExperimentalMethod = StructureExperimentalMethod.XRAY_DIFFRACTION,
-    ) -> Tuple[SamplingTrajectory, SamplingTrajectory]:
+    ) -> Tuple[SamplingTrajectory, SamplingTrajectory, FKSteeringTrajectory]:
         """
         Generate samples by interpolating towards model predictions.
 
@@ -1522,12 +1529,14 @@ class Interpolant:
         - saving each step of the trajectory (direct model output and integrated output)
         - special handling for the final timestep
 
-        Returns two trajectories:
+        Returns three trajectories:
         1) sample_trajectory / predicted states - sampled trajectory.
             Intermediate steps resulting from integration over vector fields. Fixed values set by mask.
             No logits, just the amino acids (integration with rate matrix yields discrete sequence).
         2) model_trajectory / clean states - model predictions
             Without masking or added noise. Does not involve integrating. Includes logits.
+        3) fk_trajectory - Feynman-Kac steering metrics trajectory
+            FK steering metrics for each resampling step, tracking energy, weights, and effective sample size.
 
         Note that while sampling operates on backbones, the emitted structures are all-atom (i.e. atom37).
 
@@ -1586,6 +1595,11 @@ class Interpolant:
             num_batch=num_batch,
             num_res=num_res,
             num_tokens=self.num_tokens,
+        )
+        # fk_trajectory tracks Feynman-Kac steering metrics over time
+        fk_trajectory = FKSteeringTrajectory(
+            num_batch=num_batch,
+            num_particles=self.cfg.steering.num_particles,
         )
 
         # for inference, all residues under consideration
@@ -1733,7 +1747,7 @@ class Interpolant:
                     raise ValueError(f"Unknown task {task}")
 
             # Take a single step, updating the batch in place
-            batch, model_step, sample_step = self.sample_single_step(
+            batch, model_step, sample_step, step_metrics = self.sample_single_step(
                 noisy_batch=batch,
                 true_feats=true_feats,
                 model=model,
@@ -1746,6 +1760,7 @@ class Interpolant:
 
             model_trajectory.append(model_step)
             sample_trajectory.append(sample_step)
+            fk_trajectory.append(step_metrics)
 
             # Update t_1 to t_2 for the next step
             t_1 = t_2
@@ -1760,7 +1775,7 @@ class Interpolant:
         batch[nbp.r3_t] = t
         batch[nbp.cat_t] = t
 
-        batch, model_step, sample_step = self.sample_single_step(
+        batch, model_step, sample_step, step_metrics = self.sample_single_step(
             noisy_batch=batch,
             true_feats=true_feats,
             model=model,
@@ -1773,13 +1788,16 @@ class Interpolant:
 
         model_trajectory.append(model_step)
         sample_trajectory.append(sample_step)
+        fk_trajectory.append(step_metrics)
 
         # If FK steering is enabled, pick the best particle per sample
-        # TODO(fksteering) - allow passing through all the particles. Ensure each is handled properly.
+        # TODO(fksteering) - allow passing through all the particles.
+        #   Ensure each is handled properly.
+        #   Right now we make some assumptions and build directory structure before calling sample().
         _, best_idx = self.resampler.best_particle_in_batch(batch=batch)
         if best_idx is not None:
             # Select the best particle for each sample
             model_trajectory = model_trajectory.select_batch_idx(best_idx)
             sample_trajectory = sample_trajectory.select_batch_idx(best_idx)
 
-        return sample_trajectory, model_trajectory
+        return sample_trajectory, model_trajectory, fk_trajectory

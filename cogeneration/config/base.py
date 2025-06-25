@@ -154,8 +154,9 @@ class ModelHyperParamsConfig(BaseClassConfig):
     pos_embed_max_len: int = 2048
     timestep_embed_size: int = 128
     # layers
-    trunk_num_layers: int = 8  # 0 to disable
-    ipa_num_layers: int = 6  # > 1
+    num_recycles: int = 3  # of trunk + IPA. 0 for single pass
+    trunk_num_layers: int = 4  # 0 to disable
+    ipa_num_layers: int = 4  # >= 1
     seq_trunk_num_layers: int = 4  # 0 to disable
 
     @classmethod
@@ -167,6 +168,7 @@ class ModelHyperParamsConfig(BaseClassConfig):
             pos_embed_size=4,
             timestep_embed_size=4,
             # small attention networks
+            num_recycles=0,
             trunk_num_layers=1,
             ipa_num_layers=1,
             seq_trunk_num_layers=1,
@@ -485,8 +487,7 @@ class ModelConfig(BaseClassConfig):
     predict_all_torsions: bool = True  # -> 7 angles: omega, phi, psi, chi1-chi4
 
     # Recycling - number of times to recycle through trunk and IPA trunk
-    # 0 = no recycling (single pass)
-    num_recycles: int = 3
+    num_recycles: int = "${model.hyper_params.num_recycles}"
 
     seq_trunk: ModelAttentionTrunkConfig = field(
         default_factory=lambda: ModelAttentionTrunkConfig(
@@ -1243,7 +1244,7 @@ class ProteinMPNNRunnerConfig(BaseClassConfig):
     # Native runner options
     use_native_runner: bool = True  # Use native runner instead of subprocess
     accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'gpu'}"
-    model_type: ModelType = ModelType.PROTEIN_MPNN
+    model_type: ModelType = ModelType.LIGAND_MPNN
     temperature: float = 0.1  # Sampling temperature
 
     # Advanced features from LigandMPNN
@@ -1499,8 +1500,6 @@ class Config(BaseClassConfig):
         raw_cfg.model.edge_features.feat_dim = 8
         # and smaller transformers
         raw_cfg.model.ipa.no_heads = 2
-        # no recycling
-        raw_cfg.model.num_recycles = 0
 
         # filter to small PDBs for faster model + sampling
         raw_cfg.dataset.debug_head_samples = 1000

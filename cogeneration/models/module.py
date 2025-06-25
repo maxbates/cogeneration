@@ -28,6 +28,7 @@ from cogeneration.data.folding_validation import (
 )
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import mask_blend_2d
+from cogeneration.data.potentials import FKSteeringTrajectory
 from cogeneration.data.trajectory_save import SavedTrajectory, save_trajectory
 from cogeneration.models.loss_calculator import (
     AuxiliaryMetrics,
@@ -402,7 +403,7 @@ class FlowModule(LightningModule):
 
         # Validation can run either unconditional generation, or inpainting
         self.interpolant.set_device(res_mask.device)
-        sample_traj, model_traj = self.interpolant.sample(
+        sample_traj, model_traj, fk_traj = self.interpolant.sample(
             num_batch,
             num_res,
             self.model,
@@ -447,6 +448,11 @@ class FlowModule(LightningModule):
                 else None
             )
 
+            # Extract FK steering trajectory for this batch member
+            sample_fk_traj = (
+                fk_traj.batch_sample_slice(i) if fk_traj.num_steps > 0 else None
+            )
+
             # Compute metrics, and inverse fold + fold the designed structure
             top_sample_metrics, saved_trajectory_files, saved_folding_validation = (
                 self.compute_sample_metrics(
@@ -468,6 +474,7 @@ class FlowModule(LightningModule):
                     write_sample_trajectories=False,  # don't write trajectories during validation (just structures)
                     write_animations=False,
                     n_inverse_folds=1,  # only one during validation
+                    fk_steering_traj=sample_fk_traj,
                 )
             )
 
@@ -646,7 +653,7 @@ class FlowModule(LightningModule):
             raise ValueError(f"Unknown task {task}")
 
         # Sample batch
-        sample_traj, model_traj = interpolant.sample(
+        sample_traj, model_traj, fk_traj = interpolant.sample(
             num_batch=num_batch,
             num_res=sample_length,
             model=self.model,
@@ -679,6 +686,12 @@ class FlowModule(LightningModule):
         all_top_sample_metrics = []
         for i, sample_id in zip(range(num_batch), sample_ids):
             sample_dir = sample_dirs[i]
+
+            # Extract FK steering trajectory for this batch member
+            sample_fk_traj = (
+                fk_traj.batch_sample_slice(i) if fk_traj.num_steps > 0 else None
+            )
+
             top_sample_metrics, _, _ = self.compute_sample_metrics(
                 sample_id=sample_id,
                 sample_dir=sample_dir,
@@ -688,6 +701,7 @@ class FlowModule(LightningModule):
                 model_structure_traj=model_bb_trajs[i],
                 model_aa_traj=model_aa_trajs[i],
                 model_logits_traj=model_logits_trajs[i],
+                fk_steering_traj=sample_fk_traj,
                 diffuse_mask=to_numpy(diffuse_mask[i]),
                 motif_mask=to_numpy(motif_mask[i]) if motif_mask is not None else None,
                 chain_idx=to_numpy(batch[bp.chain_idx][i]),
@@ -714,6 +728,7 @@ class FlowModule(LightningModule):
         model_structure_traj: npt.NDArray,
         model_aa_traj: npt.NDArray,
         model_logits_traj: npt.NDArray,
+        fk_steering_traj: Optional[FKSteeringTrajectory],
         diffuse_mask: npt.NDArray,
         motif_mask: Optional[npt.NDArray],  # if relevant
         chain_idx: npt.NDArray,
@@ -785,6 +800,7 @@ class FlowModule(LightningModule):
             sample_aa_traj=sample_aa_traj,
             model_aa_traj=model_aa_traj,
             model_logits_traj=model_logits_traj,
+            fk_steering_traj=fk_steering_traj,
             write_trajectories=write_sample_trajectories,
             write_animations=write_animations,
             animation_max_frames=animation_max_frames,

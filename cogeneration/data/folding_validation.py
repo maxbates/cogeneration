@@ -394,7 +394,10 @@ class FoldingValidator:
                 residue_index=res_idx,
             )
         )
+
         # TODO(inpainting) - calculate scaffold-specific metrics for secondary structure, clashes
+
+        # TODO(fksteering) - calculate FK steering metrics?
 
         # write top sample JSON
         top_sample_path = os.path.join(sample_dir, OutputFileName.top_sample_json)

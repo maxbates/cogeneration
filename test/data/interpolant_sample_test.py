@@ -86,7 +86,7 @@ class TestInterpolantSample:
                 torsions_1=batch[bp.torsions_1],
             )
 
-        sample_traj, model_traj = interpolant.sample(
+        sample_traj, model_traj, fk_traj = interpolant.sample(
             num_batch=B, num_res=N, model=model, task=task, **kwargs
         )
 
@@ -100,7 +100,7 @@ class TestInterpolantSample:
 
         assert model_traj.logits.shape == (B, T, N, num_tokens)
 
-        return sample_traj, model_traj
+        return sample_traj, model_traj, fk_traj
 
     @pytest.mark.parametrize(
         "task",
@@ -150,7 +150,7 @@ class TestInterpolantSample:
         cfg = mock_cfg_uninterpolated.interpolate()
 
         batch = next(iter(mock_pred_inpainting_dataloader))
-        sample_traj, model_traj = self._run_sample(
+        sample_traj, model_traj, fk_traj = self._run_sample(
             cfg=cfg, batch=batch, task=InferenceTask.inpainting
         )
 
@@ -198,6 +198,7 @@ class TestInterpolantSample:
         mock_pred_inpainting_dataloader,
     ):
         mock_cfg_uninterpolated.inference.interpolant.steering.num_particles = 3
+        mock_cfg_uninterpolated.inference.interpolant.steering.resampling_interval = 1
         cfg = mock_cfg_uninterpolated.interpolate()
 
         if task == InferenceTask.unconditional:
@@ -208,10 +209,38 @@ class TestInterpolantSample:
         batch = next(iter(dataloader))
         num_batch, num_res = batch[bp.res_mask].shape
 
-        sample_traj, model_traj = self._run_sample(cfg=cfg, batch=batch, task=task)
+        sample_traj, model_traj, fk_traj = self._run_sample(
+            cfg=cfg, batch=batch, task=task
+        )
 
         # particles downselected to one per sample
         final_state = sample_traj.steps[-1]
         assert final_state.structure.shape == (num_batch, num_res, 37, 3)
         final_pred = model_traj.steps[-1]
         assert final_pred.aatypes.shape == (num_batch, num_res)
+
+        # inspect fk_traj for FK steering properties
+        assert (
+            fk_traj is not None
+        ), "FK trajectory should be returned when FK steering is enabled"
+
+        # FK trajectory should contain intermediate particle states during steering
+        T = cfg.inference.interpolant.sampling.num_timesteps
+        num_particles = cfg.inference.interpolant.steering.num_particles
+        resampling_interval = cfg.inference.interpolant.steering.resampling_interval
+
+        assert resampling_interval == 1, "Resampling interval should be 1 for this test"
+        assert (
+            len(fk_traj.metrics) == T
+        ), "FK trajectory should have one step per sampling timestep"
+
+        step0 = fk_traj.metrics[0]
+        assert step0.energy is not None, "Energy should be computed for step 0"
+        assert step0.weights is not None, "Weights should be computed for step 0"
+        assert (
+            step0.effective_sample_size is not None
+        ), "Effective sample size should be computed for step 0"
+        assert step0.log_G is not None, "Log G should be computed for step 0"
+        assert (
+            step0.log_G_delta is not None
+        ), "Log G delta should be computed for step 0"

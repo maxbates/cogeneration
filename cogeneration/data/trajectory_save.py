@@ -16,6 +16,7 @@ from matplotlib.patches import Rectangle
 from matplotlib.text import Text
 from mpl_toolkits.mplot3d.art3d import Path3DCollection
 
+from cogeneration.data.potentials import FKSteeringTrajectory
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.type.metrics import OutputFileName
@@ -45,6 +46,7 @@ class SavedTrajectory:
     aa_traj_fasta_path: Optional[str] = None  # OutputFileName.aa_traj_fa
     logits_traj_path: Optional[str] = None  # OutputFileName.logits_traj_{gif/mp4}
     traj_panel_path: Optional[str] = None  # OutputFileName.traj_panel_{gif/mp4}
+    fk_steering_traj_path: Optional[str] = None  # OutputFileName.fk_steering_traj_png
 
 
 def _get_anim_writer() -> Tuple[str, matplotlib.animation.AbstractMovieWriter]:
@@ -588,6 +590,117 @@ def animate_trajectories(
     return anim_path
 
 
+def write_fk_steering_traj(
+    fk_steering_traj: FKSteeringTrajectory,
+    file_path: str,
+):
+    """
+    Write FK steering trajectory as a multi-panel plot showing particle metrics over time.
+
+    Args:
+        fk_steering_traj: FKSteeringTrajectory containing metrics for each step
+        file_path: Path to save the plot (PNG format)
+    """
+    assert (
+        fk_steering_traj.num_steps >= 1
+    ), "FK steering trajectory must have at least one step"
+
+    steps = [metric.step for metric in fk_steering_traj.metrics]
+    num_particles = fk_steering_traj.num_particles
+
+    # Prepare data arrays
+    energy = np.array(
+        [metric.energy for metric in fk_steering_traj.metrics]
+    )  # (num_steps, num_particles)
+    log_G = np.array([metric.log_G for metric in fk_steering_traj.metrics])
+    log_G_delta = np.array([metric.log_G_delta for metric in fk_steering_traj.metrics])
+    weights = np.array([metric.weights for metric in fk_steering_traj.metrics])
+    ess = np.array(
+        [metric.effective_sample_size for metric in fk_steering_traj.metrics]
+    )  # (num_steps,)
+
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle("FK Steering Trajectory", fontsize=14)
+
+    # Color palette for particles
+    colors = plt.cm.tab10(np.linspace(0, 1, num_particles))
+
+    # Plot 1: Energy
+    ax = axes[0, 0]
+    for i in range(num_particles):
+        ax.plot(
+            steps,
+            energy[:, i],
+            color=colors[i],
+            alpha=0.7,
+            linewidth=1.5,
+            label=f"Particle {i}" if i < 5 else None,
+        )  # Limit legend entries
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Energy")
+    ax.set_title("Energy per Particle")
+    ax.grid(True, alpha=0.3)
+    if num_particles <= 5:
+        ax.legend()
+
+    # Plot 2: Log G
+    ax = axes[0, 1]
+    for i in range(num_particles):
+        ax.plot(steps, log_G[:, i], color=colors[i], alpha=0.7, linewidth=1.5)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Log G")
+    ax.set_title("Log G per Particle")
+    ax.grid(True, alpha=0.3)
+
+    # Plot 3: Log G Delta
+    ax = axes[1, 0]
+    for i in range(num_particles):
+        ax.plot(steps, log_G_delta[:, i], color=colors[i], alpha=0.7, linewidth=1.5)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Log G Delta")
+    ax.set_title("Log G Delta per Particle")
+    ax.grid(True, alpha=0.3)
+
+    # Plot 4: Effective Sample Size and Weights
+    ax = axes[1, 1]
+
+    # Plot effective sample size as a bold line
+    ax.plot(
+        steps, ess, color="red", linewidth=3, label="Effective Sample Size", alpha=0.8
+    )
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Effective Sample Size", color="red")
+    ax.tick_params(axis="y", labelcolor="red")
+    ax.grid(True, alpha=0.3)
+
+    # Create second y-axis for weights
+    ax2 = ax.twinx()
+    for i in range(num_particles):
+        ax2.plot(
+            steps,
+            weights[:, i],
+            color=colors[i],
+            alpha=0.5,
+            linewidth=1,
+            linestyle="--",
+            label=f"Weight {i}" if i < 3 else None,
+        )
+    ax2.set_ylabel("Weights", color="blue")
+    ax2.tick_params(axis="y", labelcolor="blue")
+
+    # Combine legends
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2[:3], labels1 + labels2[:3], loc="upper right")
+
+    ax.set_title("Effective Sample Size & Weights")
+
+    plt.tight_layout()
+    plt.savefig(file_path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+
 def save_trajectory(
     sample_name: Union[int, str],
     sample_atom37: npt.NDArray,  # (N, 37, 3)
@@ -601,6 +714,7 @@ def save_trajectory(
     sample_aa_traj: Optional[npt.NDArray] = None,  # (noisy_T, N)
     model_aa_traj: Optional[npt.NDArray] = None,  # (clean_T, N)
     model_logits_traj: Optional[npt.NDArray] = None,  # (clean_T, N, S)
+    fk_steering_traj: Optional[FKSteeringTrajectory] = None,
     write_trajectories: bool = True,
     write_animations: bool = True,
     animation_max_frames: int = 50,
@@ -620,10 +734,10 @@ def save_trajectory(
         sample_aa_traj: [noisy_T, N] amino acids (0 - S inclusive where S = 20 or 21).
         model_aa_traj: [clean_T, N] amino acids (0 - S inclusive where S = 20 or 21).
         model_logits_traj: [clean_T, N, S] logits for each amino acid, from model
+        fk_steering_traj: Optional[FKSteeringTrajectory] FK steering trajectory for this batch member.
         write_trajectories: bool Whether to also write the PDB trajectories
         write_animations: bool Whether to create animation of the trajectory (slow, ~10-15s for 50 frames)
         animation_max_frames: int Max number of frames of all timesteps to include in animation.
-
     Returns:
         SavedTrajectory with paths to saved samples:
             sample_pdb_path: PDB file of final structure
@@ -720,6 +834,7 @@ def save_trajectory(
     aa_traj_fasta_path = None
     model_logits_traj_path = None
     traj_panel_path = None
+    fk_steering_traj_path = None
 
     # Write amino acids trajectory, if provided.
     if sample_aa_traj is not None:
@@ -751,6 +866,13 @@ def save_trajectory(
         )
         log_time("trajectory animation")
 
+    # TODO(fksteering) consider writing FK steering trajectory to animation? steps need to match up.
+    if fk_steering_traj is not None:
+        fk_steering_traj_path = os.path.join(
+            output_dir, OutputFileName.fk_steering_traj_png
+        )
+        write_fk_steering_traj(fk_steering_traj, file_path=fk_steering_traj_path)
+
     return SavedTrajectory(
         sample_pdb_path=sample_pdb_path,
         sample_pdb_backbone_path=sample_pdb_backbone_path,
@@ -759,4 +881,5 @@ def save_trajectory(
         aa_traj_fasta_path=aa_traj_fasta_path,
         logits_traj_path=model_logits_traj_path,
         traj_panel_path=traj_panel_path,
+        fk_steering_traj_path=fk_steering_traj_path,
     )

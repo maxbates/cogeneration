@@ -72,6 +72,10 @@ class Potential(ABC):
 
 @dataclass
 class FKStepMetric:
+    """
+    Metrics for each resampling step using FK steering. lists are len `num_batch` * `num_particles`
+    """
+
     step: int
     energy: List[float]
     log_G: List[float]
@@ -89,6 +93,70 @@ class FKStepMetric:
         Step {self.step} | ESS    = {self.effective_sample_size}
         Step {self.step} | keep   = {self.keep}
         """
+        )
+
+
+@dataclass
+class FKSteeringTrajectory:
+    """
+    A trajectory of Feynman-Kac steering metrics across sampling steps.
+
+    Stores FK steering metrics for each resampling step during inference,
+    allowing analysis of particle energy, weights, and effective sample size over time.
+    """
+
+    num_batch: int
+    num_particles: int
+    metrics: List[FKStepMetric] = field(default_factory=list)
+
+    def append(self, metric: Optional[FKStepMetric]):
+        """
+        Append an FK step metric. If metric is None (steering disabled), skip.
+        """
+        if metric is not None:
+            self.metrics.append(metric)
+
+    @property
+    def num_steps(self):
+        return len(self.metrics)
+
+    def batch_sample_slice(self, batch_idx: int) -> "FKSteeringTrajectory":
+        """
+        Extract FK steering trajectory for a specific batch member.
+
+        Args:
+            batch_idx: Index of the batch member (0-based, in original batch before particle expansion)
+
+        Returns:
+            FKSteeringTrajectory containing only metrics for the specified batch member's particles
+        """
+        if batch_idx >= self.num_batch:
+            raise ValueError(f"batch_idx {batch_idx} >= num_batch {self.num_batch}")
+
+        start_idx = batch_idx * self.num_particles
+        end_idx = start_idx + self.num_particles
+
+        sliced_metrics = []
+        for metric in self.metrics:
+            # weights is always a list of lists (one per batch member) when FK steering is enabled
+            # since resampling_weights has shape (num_batch, num_particles)
+            weights_slice = metric.weights[batch_idx]
+
+            sliced_metric = FKStepMetric(
+                step=metric.step,
+                energy=metric.energy[start_idx:end_idx],
+                log_G=metric.log_G[start_idx:end_idx],
+                log_G_delta=metric.log_G_delta[start_idx:end_idx],
+                weights=weights_slice,
+                effective_sample_size=metric.effective_sample_size,  # scalar, keep as-is
+                keep=metric.keep[start_idx:end_idx],
+            )
+            sliced_metrics.append(sliced_metric)
+
+        return FKSteeringTrajectory(
+            num_batch=1,
+            num_particles=self.num_particles,
+            metrics=sliced_metrics,
         )
 
 

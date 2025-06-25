@@ -102,6 +102,7 @@ class OutputFileName(StrEnum):
     logits_traj_mp4 = "logits_traj.mp4"
     traj_panel_gif = "traj_panel.gif"
     traj_panel_mp4 = "traj_panel.mp4"
+    fk_steering_traj_png = "fk_steering_traj.png"
 
     # folding validation
     sample_sequence_fa = "sample.fasta"
