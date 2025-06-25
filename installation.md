@@ -103,7 +103,26 @@ Datasets are required for training and evaluation, or provide a base set of stru
 bash ./cogeneration/datasets/install.sh
 ```
 
-### Training
+### To run Public Multiflow, download weights
+
+Using the `public_multiflow` config, the model will match the public MultiFlow model, and its weights can be used for inference / fine-tuning.
+
+```
+# Get multiflow weights
+wget https://zenodo.org/records/10714631/files/weights.tar.gz
+
+# Uncompress weights
+# creates a directory `weights` containing `config.yaml` and `last.ckpt`
+tar -xzf weights.tar.gz
+
+# move weights to `multiflow_weights` at project root (may need to adjust rel path here)
+mv weights multiflow_weights
+
+# Clean up weight tarball
+rm weights.tar.gz 
+```
+
+## Training
 
 setup wandb
 ```

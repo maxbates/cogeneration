@@ -4,7 +4,7 @@
 # TODO(dataset) - support downloading other metadata, e.g. Scope already processed
 # https://github.com/microsoft/protein-frame-flow/blob/20293ab04994a5bfe97f2d8cf8603a0b63af0609/metadata/scope_metadata.csv
 
-# Ensure we are in the directory containing this file
+# Ensure we are in the directory containing this file - we want to download datasets here.
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # Download datasets
@@ -21,12 +21,5 @@ tar -xzf synthetic_train_set.tar.gz -C train_set/
 mkdir test_set
 tar -xzf test_set.tar.gz -C test_set/
 
-# Get multiflow weights
-wget https://zenodo.org/records/10714631/files/weights.tar.gz
-
-# Uncompress weights
-# creates a directory `weights` containing `config.yaml` and `last.ckpt`
-tar -xzf weights.tar.gz
-
-# Clean up tarballs
-rm *.tar.gz
+# Clean up dataset tarballs
+rm real_train_set.tar.gz synthetic_train_set.tar.gz test_set.tar.gz
