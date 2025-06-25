@@ -8,9 +8,9 @@ and allows for efficient repeated inference. It supports single-sequence mode
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -25,6 +25,7 @@ from boltz.main import (
     PairformerArgsV2,
     download_boltz2,
     get_cache_path,
+    load_canonicals,
     process_input,
 )
 from boltz.model.models.boltz2 import Boltz2
@@ -32,7 +33,8 @@ from pytorch_lightning import Trainer
 
 from cogeneration.config.base import BoltzConfig
 from cogeneration.data import residue_constants
-from cogeneration.data.tools.abc import FoldingTool
+from cogeneration.data.const import CHAIN_BREAK_STR
+from cogeneration.data.tools.abc import FoldingTool, infer_device_id
 from cogeneration.dataset.process_pdb import pdb_path_pdb_name, process_pdb_file
 from cogeneration.type.dataset import DatasetProteinColumn, ProcessedFile
 from cogeneration.type.metrics import MetricName
@@ -244,6 +246,82 @@ class BoltzPredictionSet:
         return pd.DataFrame(rows)
 
 
+@dataclass(frozen=True, slots=True)
+class BoltzPaths:
+    """
+    Boltz file layout
+
+    cache_dir/
+    ├── mols/
+    ├── boltz2_conf.ckpt
+    └── boltz2_aff.ckpt
+
+    outputs_dir/
+    ├── processed/
+    │   ├── constraints/
+    │   ├── msa/
+    │   ├── mols/
+    │   ├── records/
+    │   ├── templates/
+    │   └── structures/
+    ├── msa/
+    ├── predictions/
+    └── logs/
+    """
+
+    cache_dir: Path
+    outputs_dir: Path
+
+    # derived paths
+    processed_dir: Path = field(init=False)
+    constraints_dir: Path = field(init=False)
+    msa_dir: Path = field(init=False)
+    mols_dir: Path = field(init=False)
+    records_dir: Path = field(init=False)
+    templates_dir: Path = field(init=False)
+    structures_dir: Path = field(init=False)
+    predictions_dir: Path = field(init=False)
+    logs_dir: Path = field(init=False)
+    processed_msa_dir: Path = field(init=False)
+    processed_mols_dir: Path = field(init=False)
+
+    def __post_init__(self) -> None:
+        outputs = Path(self.outputs_dir).expanduser().resolve()
+        cache = Path(self.cache_dir).expanduser().resolve()
+
+        # Make cache_dir accessible as a resolved Path
+        object.__setattr__(self, "cache_dir", cache)
+        object.__setattr__(self, "mols_dir", cache / "mols")
+
+        object.__setattr__(self, "processed_dir", outputs / "processed")
+        object.__setattr__(self, "constraints_dir", self.processed_dir / "constraints")
+        object.__setattr__(self, "msa_dir", outputs / "msa")
+        object.__setattr__(self, "records_dir", self.processed_dir / "records")
+        object.__setattr__(self, "templates_dir", self.processed_dir / "templates")
+        object.__setattr__(self, "structures_dir", self.processed_dir / "structures")
+        object.__setattr__(self, "predictions_dir", outputs / "predictions")
+        object.__setattr__(self, "logs_dir", outputs / "logs")
+        object.__setattr__(self, "processed_msa_dir", self.processed_dir / "msa")
+        object.__setattr__(self, "processed_mols_dir", self.processed_dir / "mols")
+
+    def mkdirs(self, exist_ok: bool = True) -> None:
+        for d in (
+            self.outputs_dir,
+            self.processed_dir,
+            self.constraints_dir,
+            self.msa_dir,
+            self.mols_dir,
+            self.records_dir,
+            self.templates_dir,
+            self.structures_dir,
+            self.predictions_dir,
+            self.logs_dir,
+            self.processed_msa_dir,
+            self.processed_mols_dir,
+        ):
+            d.mkdir(parents=True, exist_ok=exist_ok)
+
+
 class BoltzManifestBuilder:
     """
     Builder class for creating Boltz Manifest + Target objects from sequences.
@@ -258,46 +336,19 @@ class BoltzManifestBuilder:
     """
 
     # Class-level counter for globally unique MSA IDs
+    # TODO mutex to get id
     _msa_id_counter = -1
 
-    def __init__(self, target_dir: Optional[Union[str, Path]] = None):
+    def __init__(self, outputs_dir: Union[str, Path], cache_dir: Union[str, Path]):
         """
         Initialize ManifestBuilder.
 
         Args:
-            target_dir: Directory to write FASTA files and processed data.
-                       If None, uses "./outputs/targets".
+            outputs_dir: Directory to write FASTA files and processed data.
+            cache_dir: Directory containing Boltz models and mols.
         """
-        if target_dir is None:
-            self.target_dir = Path("./outputs/targets")
-        else:
-            self.target_dir = Path(target_dir)
-        self.target_dir.mkdir(parents=True, exist_ok=True)
-
-        # Create processed data directories (as expected by process_input)
-        self.processed_dir = self.target_dir / "processed"
-        self.records_dir = self.processed_dir / "records"
-        self.structure_dir = self.processed_dir / "structures"
-        self.processed_msa_dir = self.processed_dir / "msa"
-        self.processed_constraints_dir = self.processed_dir / "constraints"
-        self.processed_templates_dir = self.processed_dir / "templates"
-        self.processed_mols_dir = self.processed_dir / "mols"
-
-        # Create all necessary directories
-        for dir_path in [
-            self.records_dir,
-            self.structure_dir,
-            self.processed_msa_dir,
-            self.processed_constraints_dir,
-            self.processed_templates_dir,
-            self.processed_mols_dir,
-        ]:
-            dir_path.mkdir(parents=True, exist_ok=True)
-
-        # Create MSA directory if target_dir is provided
-        if self.target_dir:
-            self.msa_dir = self.target_dir / "msas"
-            self.msa_dir.mkdir(exist_ok=True)
+        self.paths = BoltzPaths(cache_dir=cache_dir, outputs_dir=outputs_dir)
+        self.paths.mkdirs()
 
     @classmethod
     def _get_next_msa_id(cls) -> int:
@@ -316,7 +367,10 @@ class BoltzManifestBuilder:
 
     def _parse_sequence_with_chain_breaks(self, seq: str) -> List[str]:
         """Parse a sequence string with ':' chain breaks into individual chain sequences."""
-        return [self._validate_sequence(chain_seq) for chain_seq in seq.split(":")]
+        return [
+            self._validate_sequence(chain_seq)
+            for chain_seq in seq.split(CHAIN_BREAK_STR)
+        ]
 
     def _write_fasta_file_and_msas(
         self,
@@ -330,7 +384,7 @@ class BoltzManifestBuilder:
 
         Returns the path to the written FASTA file.
         """
-        fasta_path = self.target_dir / f"{protein_id}.fasta"
+        fasta_path = self.paths.outputs_dir / f"{protein_id}.fasta"
 
         with open(fasta_path, "w") as f:
             for i, chain_seq in enumerate(chains):
@@ -358,9 +412,7 @@ class BoltzManifestBuilder:
         self,
         sequences: List[str],
         protein_ids: List[str],
-        ccd: Optional[Dict] = None,
-        mol_dir: Optional[Path] = None,
-    ) -> tuple[List[Record], Path]:
+    ) -> List[Record]:
         """
         Internal method to create Target objects from sequences using process_input.
         This creates all necessary files that Boltz expects during inference.
@@ -369,16 +421,7 @@ class BoltzManifestBuilder:
         if len(sequences) != len(protein_ids):
             raise ValueError("Number of sequences and protein IDs must match")
 
-        if ccd is None:
-            ccd = {}
-
-        if mol_dir is None:
-            # Use default cache directory
-            mol_dir = Path.home() / ".boltz" / "mols"
-            mol_dir.mkdir(parents=True, exist_ok=True)
-
-        msa_dir = self.target_dir / "msa"
-        msa_dir.mkdir(exist_ok=True)
+        ccd = load_canonicals(self.paths.mols_dir)
 
         records = []
         for seq, protein_id in zip(sequences, protein_ids):
@@ -387,7 +430,9 @@ class BoltzManifestBuilder:
 
             # Write FASTA file in Boltz format with MSA_IDs defined per chain
             fasta_path = self._write_fasta_file_and_msas(
-                protein_id=protein_id, chains=chain_sequences, msa_dir=msa_dir
+                protein_id=protein_id,
+                chains=chain_sequences,
+                msa_dir=self.paths.msa_dir,
             )
 
             # Use process_input to create all necessary files
@@ -395,23 +440,23 @@ class BoltzManifestBuilder:
                 process_input(
                     path=fasta_path,
                     ccd=ccd,
-                    msa_dir=msa_dir,
-                    mol_dir=mol_dir,
+                    msa_dir=self.paths.msa_dir,
+                    mol_dir=self.paths.mols_dir,
                     boltz2=True,
                     use_msa_server=False,
                     msa_server_url="",
                     msa_pairing_strategy="",
                     max_msa_seqs=0,
-                    processed_msa_dir=self.processed_msa_dir,
-                    processed_constraints_dir=self.processed_constraints_dir,
-                    processed_templates_dir=self.processed_templates_dir,
-                    processed_mols_dir=self.processed_mols_dir,
-                    structure_dir=self.structure_dir,
-                    records_dir=self.records_dir,
+                    processed_msa_dir=self.paths.processed_msa_dir,
+                    processed_constraints_dir=self.paths.constraints_dir,
+                    processed_templates_dir=self.paths.templates_dir,
+                    processed_mols_dir=self.paths.processed_mols_dir,
+                    structure_dir=self.paths.structures_dir,
+                    records_dir=self.paths.records_dir,
                 )
 
                 # Load the created record
-                record_path = self.records_dir / f"{protein_id}.json"
+                record_path = self.paths.records_dir / f"{protein_id}.json"
                 if not record_path.exists():
                     raise FileNotFoundError(f"Record file not created: {record_path}")
 
@@ -429,11 +474,11 @@ class BoltzManifestBuilder:
                     f"Failed to process sequence for {protein_id}: {e}"
                 ) from e
 
-        return records, self.processed_dir
+        return records
 
     def from_sequences(
         self, sequences: List[str], protein_ids: List[str] = None
-    ) -> tuple[Manifest, Path]:
+    ) -> Manifest:
         """
         Create processed input files from multiple sequences with optional chain breaks.
 
@@ -442,19 +487,19 @@ class BoltzManifestBuilder:
             protein_ids: Optional list of protein IDs. If None, uses "protein_0", etc.
 
         Returns:
-            Tuple of (Manifest object, processed_data_dir_path)
+            Manifest object
         """
-        records, processed_dir = self._create_targets_from_sequences(
-            sequences, protein_ids
+        records = self._create_targets_from_sequences(
+            sequences=sequences, protein_ids=protein_ids
         )
-        return Manifest(records=records), processed_dir
+        return Manifest(records=records)
 
     def from_batch(
         self,
         aatypes: torch.Tensor,
         chain_idx: torch.Tensor,
         protein_ids: List[str],
-    ) -> tuple[Manifest, Path]:
+    ) -> Manifest:
         """
         Create processed input files from batch tensors with chain indices.
 
@@ -464,7 +509,7 @@ class BoltzManifestBuilder:
             protein_ids: Optional list of protein IDs. If None, uses "protein_0", etc.
 
         Returns:
-            Tuple of (Manifest object, processed_data_dir_path)
+            Manifest object
 
         TODO should merge with AlphaFold function to create the same :-delimited multimer fasta
         """
@@ -502,7 +547,7 @@ class BoltzManifestBuilder:
             sorted_chains = [
                 chain_sequences[cid] for cid in sorted(chain_sequences.keys())
             ]
-            sequence_with_breaks = ":".join(sorted_chains)
+            sequence_with_breaks = CHAIN_BREAK_STR.join(sorted_chains)
             sequences_with_breaks.append(sequence_with_breaks)
 
         # Use from_sequences to create processed files
@@ -510,7 +555,7 @@ class BoltzManifestBuilder:
 
     def from_fasta(
         self, fasta_path: Union[str, Path], protein_ids: Optional[List[str]] = None
-    ) -> tuple[Manifest, Path]:
+    ) -> Manifest:
         """
         Create processed input files from a FASTA file.
 
@@ -519,7 +564,7 @@ class BoltzManifestBuilder:
             protein_ids: Optional list of protein IDs. If None, uses headers from FASTA.
 
         Returns:
-            Tuple of (Manifest object, processed_data_dir_path)
+            Manifest object
         """
         assert os.path.exists(fasta_path), f"Fasta path {fasta_path} does not exist"
 
@@ -586,34 +631,13 @@ class BoltzRunner(FoldingTool):
         """
         self.cfg = cfg
 
-        # Set up precision with fallback logic
-        if self.cfg.precision is None:
-            self.precision = "bf16-mixed" if torch.cuda.is_available() else "32"
-        else:
-            self.precision = self.cfg.precision
+        # Set up outputs directory using BoltzPaths
+        self.paths = BoltzPaths(
+            cache_dir=self.cfg.cache_dir, outputs_dir=self.cfg.outputs_path
+        )
+        self.paths.mkdirs()
 
-        # Set up cache directory
-        if self.cfg.cache_dir is None:
-            cache_dir = get_cache_path()
-        else:
-            cache_dir = self.cfg.cache_dir
-        self.cache_dir = Path(cache_dir).expanduser()
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-        # Set up outputs directory
-        if self.cfg.outputs_path is None:
-            outputs_path = "./outputs"
-        else:
-            outputs_path = self.cfg.outputs_path
-        self.outputs_path = Path(outputs_path).expanduser()
-        self.outputs_path.mkdir(parents=True, exist_ok=True)
-
-        # Set up checkpoint path
-        if self.cfg.checkpoint_path is None:
-            checkpoint_path = self.cache_dir / "boltz2_conf.ckpt"
-        else:
-            checkpoint_path = self.cfg.checkpoint_path
-        self.checkpoint_path = Path(checkpoint_path)
+        self.checkpoint_path = self.cfg.checkpoint_path
 
         # Initialize model and trainer to None before setting device
         self.model = None
@@ -621,6 +645,12 @@ class BoltzRunner(FoldingTool):
 
         # setup default device
         self.set_device_id(None)
+
+        # Set up precision with fallback logic
+        if self.cfg.precision is None:
+            self.precision = "bf16-mixed" if torch.cuda.is_available() else "32"
+        else:
+            self.precision = self.cfg.precision
 
         # Configure model parameters
         self.diffusion_params = Boltz2DiffusionParams()
@@ -640,19 +670,9 @@ class BoltzRunner(FoldingTool):
 
         # Model loaded in `predict` when first needed
 
-    def set_device_id(self, device_id: int):
+    def set_device_id(self, device_id: Optional[int] = None):
         """Set the device ID for the folding tool."""
-        if torch.cuda.is_available():
-            if device_id is None:
-                device = "cuda"
-            else:
-                device = f"cuda:{device_id}"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-
-        self.device = torch.device(device)
+        self.device = infer_device_id(device_id=device_id)
 
         if self.model is not None:
             self.model.to(self.device)
@@ -660,18 +680,23 @@ class BoltzRunner(FoldingTool):
         # TODO confirm trainer moved properly
         if self.trainer is not None:
             # Use string instead of device object for trainer accelerator
-            if device.startswith("cuda"):
+            if self.device.type == "cuda":
                 self.trainer.accelerator = "gpu"
-            elif device == "mps":
+            elif self.device.type == "mps":
                 self.trainer.accelerator = "mps"
             else:
                 self.trainer.accelerator = "cpu"
 
     def _download_model_if_needed(self):
-        """Download Boltz-2 model if not present in cache."""
-        model_path = self.cache_dir / "boltz2_conf.ckpt"
-        if not model_path.exists():
-            download_boltz2(self.cache_dir)
+        """Download Boltz-2 model, mols, etc if not present in cache_dir."""
+        # Create cache directory if needed
+        cache_dir = self.cfg.cache_dir
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        if not self.checkpoint_path.exists():
+            download_boltz2(cache_dir)
+            assert self.checkpoint_path.exists()
+            assert self.paths.mols_dir.exists()
 
     def _load_model(self):
         """Load the Boltz-2 model from checkpoint."""
@@ -700,7 +725,7 @@ class BoltzRunner(FoldingTool):
             map_location="cpu",
             diffusion_process_args=asdict(self.diffusion_params),
             ema=False,
-            use_trifast=self.device.type == "cuda",
+            use_trifast=getattr(torch.cuda, "is_available", lambda: False)(),
             pairformer_args=asdict(self.pairformer_args),
             msa_args=asdict(self.msa_args),
             steering_args=asdict(self.steering_args),
@@ -719,31 +744,22 @@ class BoltzRunner(FoldingTool):
     def predict(
         self,
         manifest: Manifest,
-        output_dir: Optional[Path] = None,
-        processed_dir: Optional[Path] = None,
     ) -> BoltzPredictionSet:
         """
         Fold structures from a manifest.
 
         Args:
             manifest: Input manifest containing records to fold.
-            output_dir: Output directory for results. If None, uses self.outputs_path.
-            processed_dir: Directory containing processed input files (structures, records, etc.).
-                          This should be the processed_dir returned by ManifestBuilder methods.
 
         Returns:
             BoltzPredictionSet containing BoltzPrediction objects for each protein in the manifest.
         """
 
-        if output_dir is None:
-            output_dir = self.outputs_path
-        else:
-            output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        self.paths.predictions_dir.mkdir(parents=True, exist_ok=True)
 
         # Require an empty output directory, so we can safely clean up outputs.
         for record in manifest.records:
-            protein_output_dir = output_dir / record.id
+            protein_output_dir = self.paths.predictions_dir / record.id
             if protein_output_dir.exists() and len(os.listdir(protein_output_dir)) > 0:
                 raise ValueError(
                     f"Output directory {protein_output_dir} is not empty. "
@@ -754,32 +770,13 @@ class BoltzRunner(FoldingTool):
         if self.model is None or self.trainer is None:
             self._load_model()
 
-        # Use provided processed_dir or default to ManifestBuilder processed directory
-        if processed_dir is None:
-            # Default to the standard ManifestBuilder processed directory
-            processed_path = Path("./outputs/targets/processed")
-            if not processed_path.exists():
-                raise ValueError(
-                    "processed_dir must be provided when processed files are not in default location. "
-                    "Use ManifestBuilder.from_sequences() or .from_batch() to create processed files, "
-                    "then pass the returned processed_dir to this method."
-                )
-        else:
-            processed_path = Path(processed_dir)
-
-        # Verify processed directory structure exists
-        required_subdirs = [
-            "records",
-            "structures",
-            "msa",
-            "constraints",
-            "templates",
-            "mols",
-        ]
-        for subdir in required_subdirs:
-            subdir_path = processed_path / subdir
-            if not subdir_path.exists():
-                raise FileNotFoundError(f"Missing required subdirectory: {subdir_path}")
+        # Use BoltzPaths processed directory
+        processed_path = self.paths.processed_dir
+        if not processed_path.exists():
+            raise ValueError(
+                "Processed files not found. "
+                "Use ManifestBuilder.from_sequences() or .from_batch() to create processed files first."
+            )
 
         # Verify record files exist
         records_dir = processed_path / "records"
@@ -792,33 +789,24 @@ class BoltzRunner(FoldingTool):
                 f"Missing record files in {records_dir}: {missing_files}"
             )
 
-        # Create MSA directory (empty for sequence-only prediction)
-        msa_dir = self.outputs_path / "msa"
-        msa_dir.mkdir(exist_ok=True)
-
-        # Ensure molecule directory exists (for CCD - Common Component Dictionary)
-        mol_dir = self.cache_dir / "mols"
-        mol_dir.mkdir(exist_ok=True)
-
         # Set up data module using processed data directories
         data_module = Boltz2InferenceDataModule(
             manifest=manifest,
-            # Point to structures directory where NPZ files are
-            target_dir=processed_path / "structures",
-            msa_dir=processed_path / "msa",
-            mol_dir=mol_dir,
+            target_dir=self.paths.structures_dir,
+            msa_dir=self.paths.processed_msa_dir,
+            mol_dir=self.paths.mols_dir,
             num_workers=1,
-            constraints_dir=processed_path / "constraints",
-            template_dir=processed_path / "templates",
-            extra_mols_dir=processed_path / "mols",
+            constraints_dir=self.paths.constraints_dir,
+            template_dir=self.paths.templates_dir,
+            extra_mols_dir=self.paths.processed_mols_dir,
             override_method=None,
             affinity=False,
         )
 
         # Set up writer
         writer = BoltzWriter(
-            data_dir=str(processed_path / "structures"),
-            output_dir=str(output_dir),
+            data_dir=str(self.paths.structures_dir),
+            output_dir=str(self.paths.predictions_dir),
             output_format=self.cfg.output_format,
             boltz2=True,
         )
@@ -836,7 +824,7 @@ class BoltzRunner(FoldingTool):
         # Create BoltzPrediction objects for each protein
         predictions = []
         for record in manifest.records:
-            protein_output_dir = output_dir / record.id
+            protein_output_dir = self.paths.predictions_dir / record.id
             prediction = BoltzPrediction.from_output_dir(protein_output_dir)
             # remove unnecesary outputs
             prediction.clean_output_dir()
@@ -855,11 +843,63 @@ class BoltzRunner(FoldingTool):
 
         Implements the FoldingTool interface.
         """
-        manifest_builder = BoltzManifestBuilder(target_dir=output_dir / "processed")
-        manifest, processed_dir = manifest_builder.from_fasta(fasta_path)
-
-        prediction_set = self.predict(
-            manifest=manifest, output_dir=output_dir, processed_dir=processed_dir
+        manifest_builder = BoltzManifestBuilder(
+            outputs_dir=self.paths.outputs_dir, cache_dir=self.paths.cache_dir
         )
+        manifest = manifest_builder.from_fasta(fasta_path=fasta_path)
+
+        prediction_set = self.predict(manifest=manifest)
+
+        # Copy results to the requested output directory if different from predictions_dir
+        if output_dir != self.paths.predictions_dir:
+            import shutil
+
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for prediction in prediction_set:
+                src_dir = prediction.output_dir
+                dst_dir = output_dir / prediction.protein_id
+                if dst_dir.exists():
+                    shutil.rmtree(dst_dir)
+                shutil.copytree(src_dir, dst_dir)
 
         return prediction_set.to_df()
+
+    def fold_sequences(
+        self,
+        sequences: List[str],
+        protein_ids: List[str],
+    ) -> BoltzPredictionSet:
+        """
+        Fold sequences from a list of sequences and protein IDs.
+        Specify chain breaks using CHAIN_BREAK_STR ':' in sequences.
+        """
+        manifest_builder = BoltzManifestBuilder(
+            outputs_dir=self.paths.outputs_dir, cache_dir=self.paths.cache_dir
+        )
+        manifest = manifest_builder.from_sequences(
+            sequences=sequences,
+            protein_ids=protein_ids,
+        )
+
+        return self.predict(manifest=manifest)
+
+    def fold_batch(
+        self,
+        aatypes: torch.Tensor,  # (B, N)
+        chain_idx: torch.Tensor,  # (B, N)
+        protein_ids: List[str],  # len == B
+    ) -> BoltzPredictionSet:
+        """
+        Fold sequences in a batch. Specify chain breaks in chain_idx.
+        Returns one prediction per sequence
+        """
+        manifest_builder = BoltzManifestBuilder(
+            outputs_dir=self.paths.outputs_dir, cache_dir=self.paths.cache_dir
+        )
+        manifest = manifest_builder.from_batch(
+            aatypes=aatypes,
+            chain_idx=chain_idx,
+            protein_ids=protein_ids,
+        )
+
+        return self.predict(manifest=manifest)

@@ -34,7 +34,7 @@ class FoldingTool(ABC):
         raise NotImplementedError("Subclasses must implement this method.")
 
     @abstractmethod
-    def set_device_id(self, device_id: int):
+    def set_device_id(self, device_id: Optional[int] = None):
         """Set the device ID for the folding tool."""
         raise NotImplementedError("Subclasses must implement this method.")
 
@@ -69,6 +69,20 @@ class InverseFoldingTool(ABC):
         raise NotImplementedError("Subclasses must implement this method.")
 
     @abstractmethod
-    def set_device_id(self, device_id: int):
+    def set_device_id(self, device_id: Optional[int] = None):
         """Set the device ID for the folding tool."""
         raise NotImplementedError("Subclasses must implement this method.")
+
+
+def infer_device_id(device_id: Optional[int] = None) -> torch.device:
+    if torch.cuda.is_available():
+        if device_id is None:
+            device = "cuda"
+        else:
+            device = f"cuda:{device_id}"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+
+    return torch.device(device)

@@ -12,6 +12,7 @@ import torch
 
 from cogeneration.config.base import BoltzConfig
 from cogeneration.data import residue_constants
+from cogeneration.data.const import CHAIN_BREAK_STR, aatype_to_seq
 from cogeneration.data.tools.boltz_runner import (
     BoltzManifestBuilder,
     BoltzPrediction,
@@ -30,67 +31,84 @@ multiple_sequences = [
 class TestManifestBuilder:
     """Test the ManifestBuilder class."""
 
-    def test_init_with_target_dir(self, tmp_path):
-        """Test ManifestBuilder initialization with custom target directory."""
-        builder = BoltzManifestBuilder(target_dir=tmp_path)
-        assert builder.target_dir == tmp_path
-        assert builder.target_dir.exists()
+    def test_init_with_outputs_dir(self, tmp_path, mock_cfg):
+        """Test ManifestBuilder initialization with custom outputs directory."""
+        builder = BoltzManifestBuilder(
+            outputs_dir=tmp_path, cache_dir=mock_cfg.folding.boltz.cache_dir
+        )
+        assert builder.paths.outputs_dir == tmp_path
+        assert builder.paths.processed_dir.exists()
 
-    def test_init_without_target_dir(self):
-        """Test ManifestBuilder initialization without target directory."""
-        builder = BoltzManifestBuilder()
-        assert builder.target_dir.exists()
-        assert builder.target_dir.name == "targets"
+    def test_init_with_outputs_dir_creates_structure(self, tmp_path, mock_cfg):
+        """Test ManifestBuilder initialization creates proper directory structure."""
+        builder = BoltzManifestBuilder(
+            outputs_dir=tmp_path, cache_dir=mock_cfg.folding.boltz.cache_dir
+        )
+        assert builder.paths.processed_dir.exists()
+        assert builder.paths.records_dir.exists()
+        assert builder.paths.structures_dir.exists()
 
-    def test_validate_sequence_valid(self):
+    def test_validate_sequence_valid(self, tmp_path, mock_cfg):
         """Test sequence validation with valid amino acids."""
-        builder = BoltzManifestBuilder()
+        builder = BoltzManifestBuilder(
+            outputs_dir=tmp_path, cache_dir=mock_cfg.folding.boltz.cache_dir
+        )
         seq = "ARNDCQEGHILKMFPSTWYV"
         result = builder._validate_sequence(seq)
         assert result == seq.upper()
 
-    def test_validate_sequence_with_x(self):
+    def test_validate_sequence_with_x(self, tmp_path, mock_cfg):
         """Test sequence validation with X (unknown)."""
-        builder = BoltzManifestBuilder()
+        builder = BoltzManifestBuilder(
+            outputs_dir=tmp_path, cache_dir=mock_cfg.folding.boltz.cache_dir
+        )
         seq = "ARNDX"
         result = builder._validate_sequence(seq)
         assert result == "ARNDX"
 
-    def test_validate_sequence_invalid(self):
+    def test_validate_sequence_invalid(self, tmp_path, mock_cfg):
         """Test sequence validation with invalid amino acids."""
-        builder = BoltzManifestBuilder()
+        builder = BoltzManifestBuilder(
+            outputs_dir=tmp_path, cache_dir=mock_cfg.folding.boltz.cache_dir
+        )
         with pytest.raises(ValueError, match="Invalid amino acids"):
             builder._validate_sequence("ARNDZ")
 
-    def test_parse_sequence_single_chain(self):
+    def test_parse_sequence_single_chain(self, tmp_path, mock_cfg):
         """Test parsing sequence without chain breaks."""
-        builder = BoltzManifestBuilder()
+        builder = BoltzManifestBuilder(
+            outputs_dir=tmp_path, cache_dir=mock_cfg.folding.boltz.cache_dir
+        )
         result = builder._parse_sequence_with_chain_breaks("MKLLLL")
         assert result == ["MKLLLL"]
 
-    def test_parse_sequence_multiple_chains(self):
+    def test_parse_sequence_multiple_chains(self, tmp_path, mock_cfg):
         """Test parsing sequence with chain breaks."""
-        builder = BoltzManifestBuilder()
+        builder = BoltzManifestBuilder(
+            outputs_dir=tmp_path, cache_dir=mock_cfg.folding.boltz.cache_dir
+        )
         result = builder._parse_sequence_with_chain_breaks("MKLLLL:ARNDCQ:PEPTIDE")
         assert result == ["MKLLLL", "ARNDCQ", "PEPTIDE"]
 
-    def test_from_sequences_single_protein(self, tmp_path):
+    def test_from_sequences_single_protein(self, tmp_path, mock_cfg):
         """Test ManifestBuilder with a single protein sequence."""
         sequences = ["MKLLLL"]
         protein_ids = ["protein_0"]
 
-        builder = BoltzManifestBuilder(target_dir=tmp_path)
-        manifest, processed_dir = builder.from_sequences(sequences, protein_ids)
+        builder = BoltzManifestBuilder(
+            outputs_dir=tmp_path, cache_dir=mock_cfg.folding.boltz.cache_dir
+        )
+        manifest = builder.from_sequences(sequences, protein_ids)
 
         # Validate manifest has 1 record
         assert len(manifest.records) == 1
 
         # Check FASTA file exists
-        fasta_path = Path(tmp_path) / "protein_0.fasta"
+        fasta_path = builder.paths.outputs_dir / "protein_0.fasta"
         assert fasta_path.exists()
 
         # Check MSA directory has correct number of files (1 chain = 1 MSA file)
-        msa_dir = Path(tmp_path) / "msa"
+        msa_dir = builder.paths.msa_dir
         msa_files = list(msa_dir.glob("*.csv"))
         assert len(msa_files) == 1
 
@@ -105,24 +123,26 @@ class TestManifestBuilder:
         assert key.lstrip("-").isdigit()  # Should be a negative integer
         assert sequence == "MKLLLL"
 
-    def test_from_sequences_multiple_proteins(self, tmp_path):
+    def test_from_sequences_multiple_proteins(self, tmp_path, mock_cfg):
         """Test ManifestBuilder with multiple protein sequences."""
         sequences = ["MKLLLL", "ARNDCE"]
         protein_ids = ["protein_0", "protein_1"]
 
-        builder = BoltzManifestBuilder(target_dir=tmp_path)
-        manifest, processed_dir = builder.from_sequences(sequences, protein_ids)
+        builder = BoltzManifestBuilder(
+            outputs_dir=tmp_path, cache_dir=mock_cfg.folding.boltz.cache_dir
+        )
+        manifest = builder.from_sequences(sequences, protein_ids)
 
         # Validate manifest has 2 records
         assert len(manifest.records) == 2
 
         # Check FASTA files exist
         for protein_id in protein_ids:
-            fasta_path = Path(tmp_path) / f"{protein_id}.fasta"
+            fasta_path = builder.paths.outputs_dir / f"{protein_id}.fasta"
             assert fasta_path.exists()
 
         # Check MSA directory has correct number of files (2 chains = 2 MSA files)
-        msa_dir = Path(tmp_path) / "msa"
+        msa_dir = builder.paths.msa_dir
         msa_files = list(msa_dir.glob("*.csv"))
         assert len(msa_files) == 2
 
@@ -138,23 +158,25 @@ class TestManifestBuilder:
             assert key.lstrip("-").isdigit()  # Should be a negative integer
             assert sequence in ["MKLLLL", "ARNDCE"]
 
-    def test_from_sequences_with_chain_breaks(self, tmp_path):
+    def test_from_sequences_with_chain_breaks(self, tmp_path, mock_cfg):
         """Test ManifestBuilder with chain breaks."""
         sequences = ["MKLLLL:ARNDCE"]  # Chain break indicated by ':'
         protein_ids = ["protein_0"]
 
-        builder = BoltzManifestBuilder(target_dir=tmp_path)
-        manifest, processed_dir = builder.from_sequences(sequences, protein_ids)
+        builder = BoltzManifestBuilder(
+            outputs_dir=tmp_path, cache_dir=mock_cfg.folding.boltz.cache_dir
+        )
+        manifest = builder.from_sequences(sequences, protein_ids)
 
         # Validate manifest has 1 record
         assert len(manifest.records) == 1
 
         # Check FASTA file exists
-        fasta_path = Path(tmp_path) / "protein_0.fasta"
+        fasta_path = builder.paths.outputs_dir / "protein_0.fasta"
         assert fasta_path.exists()
 
         # Check MSA directory has correct number of files (2 chains = 2 MSA files)
-        msa_dir = Path(tmp_path) / "msa"
+        msa_dir = builder.paths.msa_dir
         msa_files = list(msa_dir.glob("*.csv"))
         assert len(msa_files) == 2
 
@@ -175,30 +197,32 @@ class TestManifestBuilder:
         assert "MKLLLL" in sequences_found
         assert "ARNDCE" in sequences_found
 
-    def test_from_batch_simple(self, tmp_path):
+    def test_from_batch_simple(self, tmp_path, mock_cfg):
         """Test ManifestBuilder.from_batch with simple sequences."""
         batch = [
             {"sequence": "MKLLLL", "protein_id": "protein_0"},
             {"sequence": "ARNDCE", "protein_id": "protein_1"},
         ]
 
-        builder = BoltzManifestBuilder(target_dir=tmp_path)
+        builder = BoltzManifestBuilder(
+            outputs_dir=tmp_path, cache_dir=mock_cfg.folding.boltz.cache_dir
+        )
 
         # Convert to sequences for from_sequences (from_batch expects tensors)
         sequences = [item["sequence"] for item in batch]
         protein_ids = [item["protein_id"] for item in batch]
-        manifest, processed_dir = builder.from_sequences(sequences, protein_ids)
+        manifest = builder.from_sequences(sequences, protein_ids)
 
         # Validate manifest has 2 records
         assert len(manifest.records) == 2
 
         # Check FASTA files exist
         for item in batch:
-            fasta_path = Path(tmp_path) / f"{item['protein_id']}.fasta"
+            fasta_path = builder.paths.outputs_dir / f"{item['protein_id']}.fasta"
             assert fasta_path.exists()
 
         # Check MSA directory has correct number of files (2 proteins = 2 MSA files)
-        msa_dir = Path(tmp_path) / "msa"
+        msa_dir = builder.paths.msa_dir
         msa_files = list(msa_dir.glob("*.csv"))
         assert len(msa_files) == 2
 
@@ -230,18 +254,12 @@ class TestBoltzRunner:
         _ = BoltzRunner(cfg=mock_cfg.folding.boltz)
 
     @pytest.mark.slow
-    def test_single_sequence_prediction(self, mock_cfg, tmp_path):
+    def test_single_sequence_prediction(self, mock_cfg):
         """Test that we can run a single sequence prediction."""
         protein_id = "test_protein"
 
-        # Create manifest with processed files using ManifestBuilder
-        builder = BoltzManifestBuilder(target_dir=tmp_path)
-        manifest, processed_dir = builder.from_sequences(
-            [simple_sequence], [protein_id]
-        )
-
         predictor = BoltzRunner(cfg=mock_cfg.folding.boltz)
-        result = predictor.predict(manifest, processed_dir=processed_dir)
+        result = predictor.fold_sequences([simple_sequence], [protein_id])
 
         assert result is not None
         assert len(result) == 1
@@ -271,41 +289,26 @@ class TestBoltzRunner:
         # verify sequence
         assert len(parsed_file[DatasetProteinColumn.aatype]) == len(simple_sequence)
         assert (
-            residue_constants.aatypes_to_sequence(
-                parsed_file[DatasetProteinColumn.aatype]
-            )
-            == simple_sequence
+            aatype_to_seq(parsed_file[DatasetProteinColumn.aatype]) == simple_sequence
         )
 
     @pytest.mark.slow
-    def test_multiple_sequence_prediction(self, mock_cfg, tmp_path):
+    def test_multiple_sequence_prediction(self, mock_cfg):
         """Test that we can run multiple sequence prediction."""
-        # Create manifest with processed files using ManifestBuilder
-        builder = BoltzManifestBuilder(target_dir=tmp_path)
-        manifest, processed_dir = builder.from_sequences(
-            multiple_sequences, ["protein1", "protein2"]
-        )
-
         predictor = BoltzRunner(cfg=mock_cfg.folding.boltz)
-        result = predictor.predict(manifest, processed_dir=processed_dir)
+        result = predictor.fold_sequences(multiple_sequences, ["protein1", "protein2"])
 
         assert result is not None
         assert len(result) == 2
 
     @pytest.mark.slow
-    def test_multimer_prediction(self, mock_cfg, tmp_path):
+    def test_multimer_prediction(self, mock_cfg):
         """Test that we can run a multimer prediction."""
         protein_id = "test_multimer"
-        multimer_sequence = "MKALGL:ATYPRKDA"
-
-        # Create manifest with processed files using ManifestBuilder
-        builder = BoltzManifestBuilder(target_dir=tmp_path)
-        manifest, processed_dir = builder.from_sequences(
-            sequences=[multimer_sequence], protein_ids=[protein_id]
-        )
+        multimer_sequence = "MKALGL" + CHAIN_BREAK_STR + "ATYPRKDA"
 
         predictor = BoltzRunner(cfg=mock_cfg.folding.boltz)
-        result = predictor.predict(manifest, processed_dir=processed_dir)
+        result = predictor.fold_sequences([multimer_sequence], [protein_id])
 
         protein_result = result[0]
         assert isinstance(protein_result, BoltzPrediction)
@@ -318,26 +321,28 @@ class TestBoltzRunner:
             len(unique_chains) == 2
         ), f"Expected 2 chains, got {len(unique_chains)}: {unique_chains.tolist()}"
 
-        parsed_seq = residue_constants.aatypes_to_sequence(
-            parsed_file[DatasetProteinColumn.aatype]
-        )
-        assert parsed_seq == multimer_sequence.replace(":", "")
+        parsed_seq = aatype_to_seq(parsed_file[DatasetProteinColumn.aatype])
+        assert parsed_seq == multimer_sequence.replace(CHAIN_BREAK_STR, "")
 
-    def test_predict_without_processed_dir_raises_error(self, mock_cfg, tmp_path):
-        """Test that predict without processed_dir raises error when processed files don't exist."""
+    def test_predict_handles_missing_processed_files(self, mock_cfg, tmp_path):
+        """Test that predict raises error when processed files don't exist in the BoltzPaths structure."""
         # Create manifest but delete the processed directory to simulate missing processed files
-        builder = BoltzManifestBuilder(target_dir=tmp_path)
-        manifest, processed_dir = builder.from_sequences(
-            multiple_sequences, ["protein1", "protein2"]
+        builder = BoltzManifestBuilder(
+            outputs_dir=tmp_path, cache_dir=mock_cfg.folding.boltz.cache_dir
         )
+        manifest = builder.from_sequences(multiple_sequences, ["protein1", "protein2"])
 
         # Now remove the processed directory to simulate missing processed files
-        shutil.rmtree(processed_dir)
+        shutil.rmtree(builder.paths.processed_dir)
 
+        # Update the mock config to use the same tmp_path as outputs_path
+        mock_cfg.folding.boltz.outputs_path = tmp_path
         predictor = BoltzRunner(cfg=mock_cfg.folding.boltz)
-        with pytest.raises(FileNotFoundError, match="Missing required subdirectory"):
-            predictor.predict(manifest, processed_dir=processed_dir)
+        with pytest.raises(FileNotFoundError, match="Missing record files"):
+            predictor.predict(manifest)
 
+
+class TestBoltzPrediction:
     def test_boltz_prediction_dataclass(self, tmp_path):
         """Test BoltzPrediction dataclass functionality."""
         protein_id = "test_protein"

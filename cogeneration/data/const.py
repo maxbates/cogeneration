@@ -38,3 +38,6 @@ def aatype_to_seq(aatype):
 
 def seq_to_aatype(seq):
     return [residue_constants.restypes_with_x.index(x) for x in seq]
+
+
+CHAIN_BREAK_STR = ":"

@@ -11,6 +11,7 @@ import pandas as pd
 from Bio import SeqIO
 
 from cogeneration.config.base import AlphaFold2Config
+from cogeneration.data.const import CHAIN_BREAK_STR
 from cogeneration.data.tools.abc import FoldingDataFrame, FoldingTool
 from cogeneration.type.metrics import MetricName
 
@@ -38,8 +39,10 @@ class AlphaFold2Tool(FoldingTool):
             self.cfg.colabfold_path
         ), f"ColabFold path {self.cfg.colabfold_path} does not exist"
 
-    def set_device_id(self, device_id: int):
+    def set_device_id(self, device_id: Optional[int] = None):
         """Set the GPU device ID."""
+        if device_id is None:
+            device_id = 0
         self.device_id = device_id
 
     def fold_fasta(self, fasta_path: Path, output_dir: Path) -> FoldingDataFrame:
@@ -56,8 +59,26 @@ class AlphaFold2Tool(FoldingTool):
         ), f"Output folding directory {output_dir} is not empty"
         os.makedirs(output_dir, exist_ok=True)
 
-        # NOTE - public MultiFlow only runs model 4, but may want to consider running others.
-        # TODO(tools) - pass device
+        # If `af2_model_type` not clearly specified,
+        # inspect fasta to determine if multimer or not, looking for chain breaks.
+        if self.cfg.af2_model_type == "auto":
+            is_multimer = False
+            with open(fasta_path, "r") as f:
+                for line in f:
+                    if line.startswith(">"):
+                        continue
+                    if CHAIN_BREAK_STR in line:
+                        is_multimer = True
+                        break
+
+            af2_model_type = (
+                "alphafold2_ptm" if not is_multimer else "alphafold2_multimer_v3"
+            )
+        else:
+            af2_model_type = self.cfg.af2_model_type
+
+        # NOTE - public MultiFlow only runs model 4 for speed,
+        # but may want to support running others.
 
         af2_args = [
             str(self.cfg.colabfold_path),
@@ -74,7 +95,9 @@ class AlphaFold2Tool(FoldingTool):
             "--num-recycle",
             "3",
             "--model-type",
-            "alphafold2_ptm",
+            af2_model_type,
+            "--gpu-id",
+            str(self.device_id),
         ]
         process = subprocess.Popen(
             af2_args, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT

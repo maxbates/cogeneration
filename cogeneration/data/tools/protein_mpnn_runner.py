@@ -85,7 +85,12 @@ from Bio.SeqRecord import SeqRecord
 
 from cogeneration.config.base import ModelType, ProteinMPNNRunnerConfig
 from cogeneration.data import all_atom, residue_constants
-from cogeneration.data.tools.abc import InverseFoldingFasta, InverseFoldingTool
+from cogeneration.data.const import CHAIN_BREAK_STR
+from cogeneration.data.tools.abc import (
+    InverseFoldingFasta,
+    InverseFoldingTool,
+    infer_device_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -209,19 +214,9 @@ class ProteinMPNNRunner(InverseFoldingTool):
         """Public access to the device."""
         return self._device
 
-    def set_device_id(self, device_id: Optional[int]):
+    def set_device_id(self, device_id: Optional[int] = None):
         """Set the device ID"""
-        if torch.cuda.is_available():
-            if device_id is None:
-                device = "cuda"
-            else:
-                device = f"cuda:{device_id}"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-
-        self._device = torch.device(device)
+        self._device = infer_device_id(device_id=device_id)
 
         if self._model is not None:
             self._model.to(self._device)
@@ -1222,6 +1217,8 @@ class ProteinMPNNRunner(InverseFoldingTool):
         # atom37 format: [N, CA, C, O, CB, ...] - we need first 4
         X_backbone = atom37[:, :4, :]  # (N, 4, 3)
 
+        # TODO - support LigandMPNN, which expects a different dict
+
         protein_dict = {
             "coords": atom37,  # (N, 37, 3) - full atom coordinates
             "X": X_backbone,  # (N, 4, 3) - backbone coordinates for featurize
@@ -1495,11 +1492,11 @@ class ProteinMPNNRunner(InverseFoldingTool):
             for unique_chain_id in unique_chains:
                 chain_mask = chain_idx == unique_chain_id
                 seq_out_str += list(seq_np[chain_mask.cpu().numpy()])
-                seq_out_str += [":"]
+                seq_out_str += [CHAIN_BREAK_STR]
         else:
             # Fallback: treat all residues as single chain
             seq_out_str += list(seq_np)
-            seq_out_str += [":"]
+            seq_out_str += [CHAIN_BREAK_STR]
         seq_out_str = "".join(seq_out_str)[:-1]
 
         # Compute combined mask for ligand confidence
@@ -1560,11 +1557,11 @@ class ProteinMPNNRunner(InverseFoldingTool):
                     for unique_chain_id in unique_chains:
                         chain_mask = chain_idx == unique_chain_id
                         seq_out_str += list(seq_np[chain_mask.cpu().numpy()])
-                        seq_out_str += [":"]
+                        seq_out_str += [CHAIN_BREAK_STR]
                 else:
                     # Fallback: treat all residues as single chain
                     seq_out_str += list(seq_np)
-                    seq_out_str += [":"]
+                    seq_out_str += [CHAIN_BREAK_STR]
                 seq_out_str = "".join(seq_out_str)[:-1]
 
                 if ix == S_stack.shape[0] - 1:

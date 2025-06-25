@@ -1244,7 +1244,7 @@ class ProteinMPNNRunnerConfig(BaseClassConfig):
     # Native runner options
     use_native_runner: bool = True  # Use native runner instead of subprocess
     accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'gpu'}"
-    model_type: ModelType = ModelType.LIGAND_MPNN
+    model_type: ModelType = ModelType.PROTEIN_MPNN
     temperature: float = 0.1  # Sampling temperature
 
     # Advanced features from LigandMPNN
@@ -1271,23 +1271,26 @@ class AlphaFold2Config(BaseClassConfig):
     colabfold_path: Path = (
         PATH_PROJECT_ROOT.parent / "localcolabfold/colabfold-conda/bin/colabfold_batch"
     )
+    # recommended: "auto" picks "alphafold2_ptm" monomers, "alphafold2_multimer_v3" multimer
+    af2_model_type: str = "auto"
 
     seed: int = "${shared.seed}"
-
-
-# TODO(boltz) - update directories, standardize checkpoint path, etc
 
 
 @dataclass
 class BoltzConfig(BaseClassConfig):
     """Configuration for Boltz-2 runner."""
 
-    # Model and checkpoint settings
-    # Cache directory for model files. If None, uses default.
+    # Directory containing checkpoint, `mols`, etc.
     cache_dir: Path = Path("~/.boltz/cache").expanduser()
-    # Path to Boltz-2 checkpoint. If None, downloads default.
-    checkpoint_path: Optional[str] = None
-    # Base directory for all outputs. If None, uses "./outputs".
+    # Path to Boltz-2 checkpoint. Downloaded file name chosen by Boltz.
+    checkpoint_path: Path = Path("~/.boltz/cache/boltz2_conf.ckpt").expanduser()
+
+    # Inputs and outputs
+    # TODO(boltz) - update directories, standardize checkpoint path, etc (alphafold too)
+    #   better support re-runs, by making sure we have a unique path each time?
+    #   make `targets_dir` and `processed_dir` and `mols` explicit in config
+    # Base directory for all outputs
     outputs_path: Path = Path("./boltz")
 
     # Inference parameters
