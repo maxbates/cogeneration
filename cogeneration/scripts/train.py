@@ -77,9 +77,6 @@ class Experiment:
             self._train_device_ids = torch.multiprocessing.cpu_count() // 2
         else:
             total_devices = self.cfg.experiment.num_devices
-            if self.cfg.folding.own_device:
-                total_devices += 1
-
             device_ids = get_available_device(device_limit=total_devices)
 
             if self.cfg.folding.own_device:
@@ -88,11 +85,11 @@ class Experiment:
                 ), "Dedicated folding device requires at least 2 devices."
                 folding_device_id = device_ids[0]
                 self._train_device_ids = device_ids[1:]
-                log.info(f"Folding device id: {folding_device_id}")
             else:
                 folding_device_id = 0
                 self._train_device_ids = device_ids
 
+        log.info(f"Folding device id: {folding_device_id}")
         log.info(f"Training with devices: {self._train_device_ids}")
 
         # Module

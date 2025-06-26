@@ -1129,8 +1129,8 @@ class ExperimentConfig(BaseClassConfig):
     seed: int = "${shared.seed}"
     # debug True for local tensorboard logger, False to enable W&B, saving outputs etc
     debug: bool = False
-    # num GPU devices TODO(train) support more than one, esp for GPUs
-    num_devices: int = 1
+    # num GPU devices
+    num_devices: int = torch.cuda.device_count() if torch.cuda.is_available() else 1
     # checkpoint path, parent directory expected to contain `config.yaml`
     warm_start_ckpt: Optional[str] = None
     # override config with warm start config
@@ -1327,8 +1327,9 @@ class FoldingConfig(BaseClassConfig):
     folding_model: FoldingModel = FoldingModel.boltz2
 
     # dedicated device for folding. decrement other devices by 1 if True
-    # TODO improve device management across tools
-    own_device: bool = False
+    own_device: bool = (
+        True if torch.cuda.is_available() and torch.cuda.device_count() > 1 else False
+    )
 
     # Tools
     alphafold: AlphaFold2Config = field(default_factory=AlphaFold2Config)
