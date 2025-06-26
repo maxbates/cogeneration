@@ -4,6 +4,7 @@ Tests for ProteinMPNN runner module
 Note: lots of Claude generated code here.
 """
 
+import json
 import subprocess
 import tempfile
 import time
@@ -16,7 +17,7 @@ from Bio import SeqIO
 from omegaconf.errors import ValidationError
 
 from cogeneration.config.base import Config
-from cogeneration.data import all_atom, residue_constants
+from cogeneration.data import all_atom, const, residue_constants
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.tools.protein_mpnn_runner import (
     NativeMPNNResult,
@@ -24,7 +25,7 @@ from cogeneration.data.tools.protein_mpnn_runner import (
     ProteinMPNNRunnerPool,
 )
 from cogeneration.dataset.datasets import BatchFeaturizer
-from cogeneration.dataset.process_pdb import process_pdb_file
+from cogeneration.dataset.process_pdb import process_chain_feats, process_pdb_file
 from cogeneration.dataset.test_utils import create_pdb_batch, create_pdb_dataloader
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.dataset import MetadataColumn as mc
@@ -388,7 +389,6 @@ class TestProteinMPNNRunner:
         Test actual side chain packing execution (requires LigandMPNN installation).
         """
         # Configure for native mode with side chain packing
-
         mock_cfg_uninterpolated.folding.protein_mpnn.pack_side_chains = True
         mock_cfg_uninterpolated.folding.protein_mpnn.number_of_packs_per_design = 2
         mock_cfg_uninterpolated.folding.protein_mpnn.sc_num_denoising_steps = 2
@@ -399,87 +399,59 @@ class TestProteinMPNNRunner:
         output_dir = tmp_path
         runner = ProteinMPNNRunner(cfg.folding.protein_mpnn)
 
-        # Mock data_utils module to skip actual PDB parsing and model execution
-        mock_data_utils = MagicMock()
-        mock_data_utils.parse_PDB.return_value = (
-            {
-                "S": torch.tensor([0, 1, 2, 3, 4]),  # Mock sequence
-                "mask": torch.ones(5),
-                "R_idx": torch.arange(1, 6),
-                "chain_labels": torch.zeros(5),
-                "chain_letters": ["A"] * 5,
-                "_parsed_metadata": {
-                    "backbone": None,
-                    "other_atoms": None,
-                    "icodes": [],
-                },
-            },
-            None,  # backbone
-            None,  # other_atoms
-            [],  # icodes
-            None,  # something else
+        # Parse actual PDB file to get protein_dict
+        protein_dict = runner._parse_pdb_to_protein_dict(pdb_2qlw_path)
+
+        # Create mock inference result as NativeMPNNResult
+        num_res = len(protein_dict["S"])
+        device = runner.device
+        num_passes = 3
+        sequences_per_pass = 1
+
+        # Create tensors with correct shapes for NativeMPNNResult
+        # Expected shapes: (B, num_passes, sequences_per_pass, N, 21) for logits
+        #                   (B, num_passes, sequences_per_pass) for confidence
+        #                   (B, num_passes, sequences_per_pass, N) for sequences
+        mock_logits = torch.randn(
+            1, num_passes, sequences_per_pass, num_res, 21, device=device
+        )
+        mock_confidence = torch.rand(1, num_passes, sequences_per_pass, device=device)
+        mock_sequences = torch.randint(
+            0, 20, (1, num_passes, sequences_per_pass, num_res), device=device
         )
 
-        # Mock side chain packing utilities
-        mock_sc_utils = MagicMock()
-        mock_sc_utils.pack_side_chains.return_value = {
-            "X": torch.randn(1, 5, 37, 3),  # Mock packed coordinates
-            "X_m": torch.ones(1, 5, 37),  # Mock atom mask
-            "b_factors": torch.randn(1, 5, 37),  # Mock B-factors
-        }
+        mock_inference_result = NativeMPNNResult(
+            logits=mock_logits,
+            confidence_scores=mock_confidence,
+            sequences=mock_sequences,
+        )
 
-        # Mock data_utils.write_full_PDB to avoid actual file writing issues
-        mock_data_utils.write_full_PDB = MagicMock()
+        # Test side chain packing execution
+        runner._apply_side_chain_packing(
+            inference_result=mock_inference_result,
+            protein_dict=protein_dict,
+            output_dir=output_dir,
+            pdb_path=pdb_2qlw_path,
+            num_passes=num_passes,
+        )
 
-        # Patch the module loading to return our mocks
-        with patch.object(runner, "_load_ligandmpnn_module") as mock_load:
-            mock_load.side_effect = lambda name: (
-                mock_data_utils if name == "data_utils" else mock_sc_utils
-            )
+        # If we are on MPS, it will fail, because VonMises hard-codes cast to torch.double,
+        # and MPS doesnt support float64.
+        if torch.backends.mps.is_available():
+            pytest.skip("MPS not supported for side chain packing")
 
-            # Create mock inference result as NativeMPNNResult
-            mock_logits = torch.randn(3, 5, 21)
-            mock_confidence = torch.rand(3)
-            mock_sequences = torch.randint(0, 20, (3, 5))
-
-            mock_inference_result = NativeMPNNResult(
-                logits=mock_logits,
-                confidence_scores=mock_confidence,
-                _sequences=mock_sequences,
-            )
-
-            # Create mock protein_dict
-            mock_protein_dict = {
-                "S": torch.tensor([0, 1, 2, 3, 4]),
-                "R_idx": torch.arange(1, 6).unsqueeze(0),
-                "chain_letters": ["A"] * 5,
-                "_parsed_metadata": {
-                    "other_atoms": None,
-                    "icodes": [],
-                },
-            }
-
-            # Mock the side chain model
-            mock_model_sc = MagicMock()
-
-            # Test side chain packing execution
-            runner._apply_side_chain_packing(
-                inference_result=mock_inference_result,
-                protein_dict=mock_protein_dict,
-                model_sc=mock_model_sc,
-                output_dir=output_dir,
-                pdb_path=pdb_2qlw_path,
-                num_passes=3,
-            )
-
-            # Verify that side chain packing was called
-            assert mock_sc_utils.pack_side_chains.called
-            # Verify that PDB writing was attempted
-            assert mock_data_utils.write_full_PDB.called
+        # Verify that output files were created
+        packed_dir = output_dir / "packed"
+        output_files_exist = any(
+            packed_dir.glob(f"{pdb_2qlw_path.stem}_seq_*_pack_*.pdb")
+        )
+        assert (
+            output_files_exist
+        ), f"Expected at least one packed PDB file in {packed_dir}"
 
     @patch("subprocess.run")
     @patch("pathlib.Path.exists")
-    def test_run_subprocess_success(
+    def test_run_subprocess_mocked_success(
         self, mock_path_exists, mock_subprocess_run, mock_cfg, pdb_2qlw_path, tmp_path
     ):
         """Test successful subprocess execution"""
@@ -507,7 +479,7 @@ class TestProteinMPNNRunner:
         result_path = runner.inverse_fold_pdb_subprocess(
             pdb_path=pdb_2qlw_path,
             output_dir=output_dir,
-            diffuse_mask=torch.ones(200),  # 2qlw has 200 modeled residues
+            diffuse_mask=torch.ones(216),  # 2qlw has 216 modeled residues
             num_sequences=2,
             seed=123,
         )
@@ -519,7 +491,7 @@ class TestProteinMPNNRunner:
 
     @patch("subprocess.run")
     @patch("pathlib.Path.exists")
-    def test_run_subprocess_failure(
+    def test_run_subprocess_mocked_failure(
         self, mock_path_exists, mock_subprocess_run, mock_cfg, pdb_2qlw_path, tmp_path
     ):
         """Test subprocess execution failure"""
@@ -541,21 +513,7 @@ class TestProteinMPNNRunner:
             runner.inverse_fold_pdb_subprocess(
                 pdb_path=pdb_2qlw_path,
                 output_dir=output_dir,
-                diffuse_mask=torch.ones(200),  # 2qlw has 200 modeled residues
-            )
-
-    def test_run_subprocess_missing_device_id(self, mock_cfg, pdb_2qlw_path, tmp_path):
-        """Test that subprocess mode requires device_id"""
-        output_dir = tmp_path
-        runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
-
-        # The device_id parameter is no longer used in the subprocess method
-        # This test can be simplified to just test basic subprocess functionality
-        with pytest.raises(AssertionError):
-            runner.inverse_fold_pdb_subprocess(
-                pdb_path=pdb_2qlw_path,
-                output_dir=output_dir,
-                diffuse_mask=torch.ones(200),  # 2qlw has 200 modeled residues
+                diffuse_mask=torch.ones(216),  # 2qlw has 216 modeled residues
             )
 
     def test_run_native_real_execution(
@@ -575,7 +533,7 @@ class TestProteinMPNNRunner:
         result_path = runner.inverse_fold_pdb_native(
             pdb_path=pdb_2qlw_path,
             output_dir=output_dir,
-            diffuse_mask=torch.ones(200),  # 2qlw has 200 modeled residues
+            diffuse_mask=torch.ones(216),  # 2qlw has 216 modeled residues
             num_sequences=2,
             seed=123,
         )
@@ -1577,6 +1535,422 @@ class TestProteinMPNNRunner:
         assert not torch.allclose(
             result1.logits, result3.logits, atol=1e-3, rtol=1e-3
         ), "Logits should be different with different seed"
+
+    def test_diffuse_mask_respected_run_batch(
+        self, mock_cfg_uninterpolated, pdb_2qlw_path
+    ):
+        """Test that diffuse_mask=0 positions remain fixed in run_batch"""
+        cfg = mock_cfg_uninterpolated.interpolate()
+        runner = ProteinMPNNRunner(cfg.folding.protein_mpnn)
+
+        # Process actual PDB file to get real structure
+        batch = process_pdb_file(str(pdb_2qlw_path), "2qlw")
+        featurizer = BatchFeaturizer(
+            cfg=cfg.dataset, task=cfg.data.task, is_training=False
+        )
+        features = featurizer.featurize_processed_file(
+            processed_file=batch,
+            csv_row={
+                mc.pdb_name: "2qlw",
+                mc.processed_path: "",
+            },
+        )
+
+        # Extract structure and add batch dimension
+        trans = features[bp.trans_1].unsqueeze(0)  # (1, N, 3)
+        rotmats = features[bp.rotmats_1].unsqueeze(0)  # (1, N, 3, 3)
+        aatypes = features[bp.aatypes_1].unsqueeze(0)  # (1, N)
+        res_mask = features[bp.res_mask].unsqueeze(0)  # (1, N)
+        chain_idx = features[bp.chain_idx].unsqueeze(0)  # (1, N)
+
+        N = trans.shape[1]
+        original_aatypes = aatypes.clone()
+
+        # Create diffuse_mask with some fixed positions (diffuse_mask=0)
+        # Fix every 3rd position and a few specific positions
+        diffuse_mask = torch.ones_like(res_mask, dtype=torch.float)
+        diffuse_mask[0, ::3] = 0  # Fix every 3rd position
+        diffuse_mask[0, :5] = 0  # Fix first 5 positions
+        diffuse_mask[0, -3:] = 0  # Fix last 3 positions
+
+        num_fixed = (diffuse_mask == 0).sum().item()
+        print(f"Testing with {num_fixed} fixed positions out of {N} total")
+
+        # Run with multiple passes to increase chance of mutations
+        result = runner.run_batch(
+            trans=trans,
+            rotmats=rotmats,
+            aatypes=aatypes,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
+            chain_idx=chain_idx,
+            num_passes=3,
+            sequences_per_pass=2,
+            temperature=1.0,  # High temperature for more variation
+            seed=42,
+        )
+
+        # Check that fixed positions remain unchanged across all generated sequences
+        fixed_positions = (diffuse_mask == 0).squeeze(0)  # (N,)
+        original_fixed_aatypes = original_aatypes[0, fixed_positions]  # Fixed AA types
+
+        for pass_idx in range(result.sequences.shape[1]):
+            for seq_idx in range(result.sequences.shape[2]):
+                generated_sequence = result.sequences[0, pass_idx, seq_idx]  # (N,)
+                generated_fixed_aatypes = generated_sequence[fixed_positions]
+
+                # Move original_fixed_aatypes to same device as generated sequences for comparison
+                original_fixed_aatypes_device = original_fixed_aatypes.to(
+                    generated_fixed_aatypes.device
+                )
+
+                # All fixed positions should match original amino acids
+                assert torch.equal(
+                    original_fixed_aatypes_device, generated_fixed_aatypes
+                ), (
+                    f"Fixed positions were mutated in pass {pass_idx}, sequence {seq_idx}. "
+                    f"Original fixed AAs: {original_fixed_aatypes.tolist()}, "
+                    f"Generated fixed AAs: {generated_fixed_aatypes.tolist()}"
+                )
+
+        # Verify that at least some diffusable positions were actually changed
+        # (to ensure the model is working and we're not just getting back the input)
+        diffusable_positions = (diffuse_mask == 1).squeeze(0)  # (N,)
+        original_diffusable_aatypes = original_aatypes[0, diffusable_positions]
+
+        any_changes = False
+        for pass_idx in range(result.sequences.shape[1]):
+            for seq_idx in range(result.sequences.shape[2]):
+                generated_sequence = result.sequences[0, pass_idx, seq_idx]
+                generated_diffusable_aatypes = generated_sequence[diffusable_positions]
+
+                # Move to same device for comparison
+                original_diffusable_aatypes_device = original_diffusable_aatypes.to(
+                    generated_diffusable_aatypes.device
+                )
+
+                if not torch.equal(
+                    original_diffusable_aatypes_device, generated_diffusable_aatypes
+                ):
+                    any_changes = True
+                    break
+            if any_changes:
+                break
+
+        assert any_changes, (
+            "No changes detected in diffusable positions - "
+            "model may not be working properly or temperature too low"
+        )
+
+    def test_diffuse_mask_respected_inverse_fold_pdb_native(
+        self, mock_cfg_uninterpolated, pdb_2qlw_path, tmp_path
+    ):
+        """Test that diffuse_mask=0 positions remain fixed in inverse_fold_pdb_native"""
+        cfg = mock_cfg_uninterpolated.interpolate()
+        runner = ProteinMPNNRunner(cfg.folding.protein_mpnn)
+
+        # Get original sequence from PDB file using the same parsing that ProteinMPNN uses
+        protein_dict = runner._parse_pdb_to_protein_dict(pdb_2qlw_path)
+
+        # Get the actual length from the parsed protein structure using "S" field (amino acid indices)
+        N = len(protein_dict["S"])
+        print(f"Parsed protein structure length: {N}")
+
+        # Convert sequence indices to amino acid letters for comparison
+        # The protein_dict["S"] contains ProteinMPNN amino acid indices, need to convert to project format
+
+        # Load data_utils to get the conversion mappings
+        data_utils = runner._load_ligandmpnn_module("data_utils")
+
+        original_aatypes = []
+        for mpnn_aa_idx in protein_dict["S"]:
+            # Convert from ProteinMPNN index to amino acid letter
+            mpnn_aa_letter = data_utils.restype_int_to_str.get(int(mpnn_aa_idx), "A")
+            # Convert from amino acid letter to project index
+            project_idx = residue_constants.restype_order.get(
+                mpnn_aa_letter, 0
+            )  # Default to Alanine if not found
+            original_aatypes.append(project_idx)
+        original_aatypes = torch.tensor(original_aatypes)
+
+        # Create diffuse_mask with some fixed positions, matching the parsed structure length
+        diffuse_mask = torch.ones(N, dtype=torch.float)
+        # Fix just a few specific positions for easier debugging
+        diffuse_mask[0] = 0  # Fix first position
+        diffuse_mask[1] = 0  # Fix second position
+        diffuse_mask[2] = 0  # Fix third position
+        diffuse_mask[10] = 0  # Fix 11th position
+        diffuse_mask[20] = 0  # Fix 21st position
+
+        num_fixed = (diffuse_mask == 0).sum().item()
+        print(f"Testing PDB native with {num_fixed} fixed positions out of {N} total")
+
+        output_dir = tmp_path / "inverse_fold_test"
+
+        # Run inverse folding with fixed positions
+        result_fasta = runner.inverse_fold_pdb_native(
+            pdb_path=pdb_2qlw_path,
+            output_dir=output_dir,
+            diffuse_mask=diffuse_mask,
+            num_sequences=5,  # Generate multiple sequences
+            temperature=1.0,  # High temperature for variation
+            seed=42,
+        )
+
+        # Parse generated sequences from FASTA
+        generated_records = list(SeqIO.parse(result_fasta, "fasta"))
+        assert len(generated_records) >= 1, "Should generate at least one sequence"
+
+        # Convert original amino acid types to letters for comparison
+        original_aa_letters = [
+            residue_constants.restypes[aa] for aa in original_aatypes
+        ]
+        original_sequence = "".join(original_aa_letters)
+
+        # Check fixed positions in all generated sequences
+        fixed_positions = (diffuse_mask == 0).nonzero(as_tuple=True)[0].tolist()
+        original_fixed_letters = [original_sequence[pos] for pos in fixed_positions]
+
+        any_diffusable_changes = False
+
+        for i, record in enumerate(generated_records):
+            generated_sequence = str(record.seq)
+            # Remove chain break characters ('/' and ':') from the generated sequence
+            generated_sequence_clean = generated_sequence.replace("/", "").replace(
+                ":", ""
+            )
+            assert (
+                len(generated_sequence_clean) == N
+            ), f"Sequence {i} length mismatch: expected {N}, got {len(generated_sequence_clean)}"
+
+            # Map fixed positions accounting for chain break character
+            # The generated sequence has a chain break character at position 108 (after chain A)
+            # We need to adjust the position mapping for positions after the chain break
+            chain_letters = protein_dict["chain_letters"]
+            chain_a_length = sum(1 for c in chain_letters if c == "A")
+
+            adjusted_fixed_positions = []
+            for pos in fixed_positions:
+                if pos < chain_a_length:
+                    # Position is in chain A, no adjustment needed
+                    adjusted_fixed_positions.append(pos)
+                else:
+                    # Position is in chain B, need to account for the chain break character
+                    adjusted_fixed_positions.append(pos + 1)
+
+            generated_fixed_letters = [
+                generated_sequence[pos] for pos in adjusted_fixed_positions
+            ]
+            assert original_fixed_letters == generated_fixed_letters, (
+                f"Fixed positions were mutated in sequence {i} ({record.id}). "
+                f"Original fixed: {original_fixed_letters}, "
+                f"Generated fixed: {generated_fixed_letters}"
+            )
+
+            # Check for changes in diffusable positions (also accounting for chain break)
+            for pos in range(N):
+                if diffuse_mask[pos] == 1:
+                    if pos < chain_a_length:
+                        # Position is in chain A
+                        generated_pos = pos
+                    else:
+                        # Position is in chain B, account for chain break
+                        generated_pos = pos + 1
+
+                    if original_sequence[pos] != generated_sequence[generated_pos]:
+                        any_diffusable_changes = True
+                        break
+
+        # Verify that at least some diffusable positions were changed
+        assert any_diffusable_changes, (
+            "No changes detected in diffusable positions - "
+            "model may not be working properly or all sequences identical"
+        )
+
+    def test_diffuse_mask_respected_inverse_fold_pdb_subprocess(
+        self, mock_cfg_uninterpolated, pdb_2qlw_path, tmp_path
+    ):
+        """
+        diffuse_mask=0 positions are correctly converted to JSONL and respected by ProteinMPNN subprocess
+        requires ProteinMPNN installed
+        """
+
+        # Configure for subprocess mode
+        mock_cfg_uninterpolated.folding.protein_mpnn.use_native_runner = False
+        cfg = mock_cfg_uninterpolated.interpolate()
+        runner = ProteinMPNNRunner(cfg.folding.protein_mpnn)
+
+        # Get original sequence from PDB file to determine length
+        processed_file = process_pdb_file(str(pdb_2qlw_path), "2qlw")
+        chain_feats = process_chain_feats(
+            processed_file,
+            center=True,
+            trim_to_modeled_residues=True,
+            trim_chains_independently=True,
+        )
+        input_seq = const.aatype_to_seq(chain_feats["aatype"])
+        print(input_seq)
+
+        N = len(input_seq)
+
+        # Create diffuse_mask with some fixed positions, matching the parsed structure length
+        diffuse_mask = torch.ones(N, dtype=torch.float)
+        diffuse_mask[:12] = 0  # Fix first 12 positions
+        diffuse_mask[::6] = 0  # Fix every 6th position
+        diffuse_mask[-10:] = 0  # Fix last 10 positions
+
+        output_dir = tmp_path / "subprocess_test"
+        output_dir.mkdir()
+
+        # Run inverse folding with fixed positions
+        result_path = runner.inverse_fold_pdb_subprocess(
+            pdb_path=pdb_2qlw_path,
+            output_dir=output_dir,
+            diffuse_mask=diffuse_mask,
+            num_sequences=3,
+            temperature=1.0,
+            seed=42,
+        )
+
+        print("inverse fasta:", result_path)
+
+        # Verify the output path
+        expected_path = output_dir / f"{pdb_2qlw_path.stem}_sequences.fa"
+        assert result_path == expected_path
+        assert result_path.exists(), "Result FASTA file should exist"
+
+        # Check that the fixed_positions.jsonl file was created
+        fixed_positions_path = output_dir / "fixed_positions.jsonl"
+        assert (
+            fixed_positions_path.exists()
+        ), f"Fixed positions file should exist: {fixed_positions_path}"
+
+        # Read and verify the JSONL content
+        with open(fixed_positions_path, "r") as f:
+            fixed_residues_json = json.load(f)
+
+        # Verify the JSON structure
+        assert isinstance(
+            fixed_residues_json, dict
+        ), "Fixed residues should be a dictionary"
+        assert (
+            pdb_2qlw_path.stem in fixed_residues_json
+        ), f"Should have fixed positions for {pdb_2qlw_path.stem}"
+
+        # Verify the fixed positions matches diffuse_mask
+        fixed_residues_dict = fixed_residues_json[pdb_2qlw_path.stem]
+        expected_fixed_residues = {
+            "A": [],
+            "B": [],
+        }
+        current_chain = "A"
+        last_chain_idx = chain_feats["chain_index"][0]
+        chain_counter = 1
+        for i, (mask_val, chain_idx) in enumerate(
+            zip(diffuse_mask.tolist(), chain_feats["chain_index"])
+        ):
+            if chain_idx != last_chain_idx:
+                current_chain = "B"
+                chain_counter = 1
+            if mask_val == 0:
+                expected_fixed_residues[current_chain].append(chain_counter)
+            chain_counter += 1
+            last_chain_idx = chain_idx
+
+        assert (
+            fixed_residues_dict == expected_fixed_residues
+        ), f"Fixed residues mismatch. Expected: {expected_fixed_residues}, Got: {fixed_residues_dict}"
+
+        # Verify the generated sequences respect the fixed positions
+        generated_records = list(SeqIO.parse(result_path, "fasta"))
+        assert len(generated_records) >= 1, "Should generate at least one sequence"
+
+        # Confirm the fixed positions are not changed in the generated sequences
+        # Get the original sequence for comparison
+        original_sequence = input_seq
+
+        # Get fixed positions from the diffuse_mask
+        fixed_positions = (diffuse_mask == 0).nonzero(as_tuple=True)[0].tolist()
+        original_fixed_letters = [original_sequence[pos] for pos in fixed_positions]
+
+        # Filter out positions with 'X' (unknown amino acids) from fixed position validation
+        # 'X' characters represent unknown/ambiguous amino acids and should be allowed to change
+        valid_fixed_positions = []
+        valid_original_fixed_letters = []
+        for pos, letter in zip(fixed_positions, original_fixed_letters):
+            if letter != "X":
+                valid_fixed_positions.append(pos)
+                valid_original_fixed_letters.append(letter)
+
+        print(f"Original sequence: {original_sequence}")
+        print(f"All fixed positions: {fixed_positions}")
+        print(f"Valid fixed positions (excluding X): {valid_fixed_positions}")
+        print(f"Original fixed letters: {original_fixed_letters}")
+        print(f"Valid original fixed letters: {valid_original_fixed_letters}")
+
+        any_diffusable_changes = False
+
+        for i, record in enumerate(generated_records):
+            generated_sequence = str(record.seq)
+            print(f"Generated sequence {i} ({record.id}): {generated_sequence}")
+
+            # Remove chain break characters ('/' and ':') from the generated sequence
+            generated_sequence_clean = generated_sequence.replace("/", "").replace(
+                ":", ""
+            )
+            assert (
+                len(generated_sequence_clean) == N
+            ), f"Sequence {i} length mismatch: expected {N}, got {len(generated_sequence_clean)}"
+
+            # Check that fixed positions in the generated sequence match the original
+            # For subprocess mode, we need to account for chain break characters in the generated sequence
+            # The generated sequence may have chain break characters that need to be handled
+            chain_break_positions = []
+            for j, char in enumerate(generated_sequence):
+                if char in ["/", ":"]:
+                    chain_break_positions.append(j)
+
+            # Adjust valid fixed position indices to account for chain break characters
+            adjusted_valid_fixed_positions = []
+            for pos in valid_fixed_positions:
+                adjusted_pos = pos
+                # Add offset for each chain break character that comes before this position
+                for break_pos in chain_break_positions:
+                    if break_pos <= adjusted_pos:
+                        adjusted_pos += 1
+                adjusted_valid_fixed_positions.append(adjusted_pos)
+
+            # Extract the valid fixed letters from the generated sequence
+            generated_valid_fixed_letters = [
+                generated_sequence[pos] for pos in adjusted_valid_fixed_positions
+            ]
+
+            assert valid_original_fixed_letters == generated_valid_fixed_letters, (
+                f"Valid fixed positions were mutated in sequence {i} ({record.id}). "
+                f"Valid original fixed: {valid_original_fixed_letters}, "
+                f"Generated valid fixed: {generated_valid_fixed_letters}, "
+                f"Valid fixed positions: {valid_fixed_positions}, "
+                f"Adjusted valid positions: {adjusted_valid_fixed_positions}"
+            )
+
+            # Check for changes in diffusable positions (also accounting for chain break characters)
+            for pos in range(N):
+                if diffuse_mask[pos] == 1:
+                    # Adjust position for chain break characters
+                    adjusted_pos = pos
+                    for break_pos in chain_break_positions:
+                        if break_pos <= adjusted_pos:
+                            adjusted_pos += 1
+
+                    if original_sequence[pos] != generated_sequence[adjusted_pos]:
+                        any_diffusable_changes = True
+                        break
+
+        # Verify that at least some diffusable positions were changed
+        assert any_diffusable_changes, (
+            "No changes detected in diffusable positions - "
+            "model may not be working properly or all sequences identical"
+        )
 
 
 class TestProteinMPNNRunnerPool:

@@ -8,6 +8,7 @@ and allows for efficient repeated inference. It supports single-sequence mode
 
 import json
 import os
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Sequence, Union
@@ -336,8 +337,8 @@ class BoltzManifestBuilder:
     """
 
     # Class-level counter for globally unique MSA IDs
-    # TODO mutex to get id
     _msa_id_counter = -1
+    _msa_id_lock = threading.Lock()
 
     def __init__(self, outputs_dir: Union[str, Path], cache_dir: Union[str, Path]):
         """
@@ -353,9 +354,10 @@ class BoltzManifestBuilder:
     @classmethod
     def _get_next_msa_id(cls) -> int:
         """Get the next globally unique MSA ID (negative integer)."""
-        msa_id = cls._msa_id_counter
-        cls._msa_id_counter -= 1
-        return msa_id
+        with cls._msa_id_lock:
+            msa_id = cls._msa_id_counter
+            cls._msa_id_counter -= 1
+            return msa_id
 
     def _validate_sequence(self, seq: str) -> str:
         """Validate and clean a protein sequence."""

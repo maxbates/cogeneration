@@ -1253,6 +1253,7 @@ class ProteinMPNNRunnerConfig(BaseClassConfig):
     ligand_mpnn_use_side_chain_context: bool = False  # Use side chain context
 
     # Side chain packing
+    # does not work on MPS (requires VonMises sampling, which hard-codes torch.double cast)
     pack_side_chains: bool = False  # Enable side chain packing
     checkpoint_path_sc: Optional[Path] = None  # Side chain packer checkpoint
     number_of_packs_per_design: int = 1  # Number of packing samples

@@ -2,11 +2,11 @@
 Unified ProteinMPNN runner
 
 This module provides a unified interface for running ProteinMPNN inverse folding:
-`run_subprocess` (slow) - calls original ProteinMPNN run.py script for a PDB structure 
-`run_native` (fast) - loads LigandMPNN model (cached in runner) and runs on a PDB structure
-`run_batch` (fast) - on trans, rots, aatypes etc. tensors directly, bypassing PDB I/O overhead
+`inverse_fold_pdb_subprocess` (slow) - calls original ProteinMPNN run.py script for a PDB structure 
+`inverse_fold_pdb_native` (fast) - loads LigandMPNN model (cached in runner) and runs on a PDB structure
+`inverse_fold_batch` (fast) - on trans, rots, aatypes etc. tensors directly, bypassing PDB I/O overhead
 
-Note that LigandMPNN does not support batching, so `run_native` and `run_batch` have similar run times.
+Note that LigandMPNN does not support batching, so `inverse_fold_pdb_native` and `inverse_fold_batch` have similar run times.
 
 Running natively requires `LigandMPNN` is installed, and location specified in the config.
 
@@ -104,6 +104,9 @@ CogenLogits = torch.Tensor  # Logits in project's AlphaFold ordering (21,)
 
 MPNNProteinDict = Dict  # Dictionary containing protein structure data (coordinates, sequences, chains, etc.)
 
+# Global lock for thread-safe module loading
+_module_lock = threading.Lock()
+
 
 @dataclass
 class NativeMPNNResult:
@@ -111,37 +114,12 @@ class NativeMPNNResult:
     Result structure from native ProteinMPNN inference.
     This provides a consistent interface for ProteinMPNN results.
 
-    Note this struct is also being used for `MPNNLogits` and `MPNNSequences`,
-    conversions are handled by ProteinMPNNRunner (need access to data_utils).
+    All data is stored in project's AlphaFold ordering
     """
 
     logits: CogenLogits  # (B, num_passes, sequences_per_pass, N, 21)
     confidence_scores: torch.Tensor  # (B, num_passes, sequences_per_pass)
-    _sequences: Optional[CogenAATypes] = None  # (B, num_passes, sequences_per_pass, N)
-
-    @property
-    def sequences(self) -> CogenAATypes:
-        """
-        Generated amino acid sequences in project's AlphaFold ordering.
-
-        Computed on-demand from logits using argmax sampling.
-
-        Returns:
-            sequences: Amino acid sequences in project's AlphaFold ordering (B, num_passes, sequences_per_pass, N)
-        """
-        if self._sequences is None:
-            # Generate sequences from logits using argmax
-            self._sequences = torch.argmax(self.logits, dim=-1)
-        return self._sequences
-
-    def set_sequences(self, sequences: CogenAATypes) -> None:
-        """
-        Explicitly set the sequences (useful when sequences were generated via sampling).
-
-        Args:
-            sequences: Amino acid sequences in project's AlphaFold ordering (B, num_passes, sequences_per_pass, N)
-        """
-        self._sequences = sequences
+    sequences: CogenAATypes  # (B, num_passes, sequences_per_pass, N)
 
     @property
     def averaged_logits(self) -> CogenLogits:
@@ -167,18 +145,6 @@ class NativeMPNNResult:
         # Average across only the sequences_per_pass dimension
         return torch.mean(self.logits, dim=-3)
 
-    @property
-    def all_logits(self) -> CogenLogits:
-        """
-        All sequence logits (alias for logits property).
-
-        For compatibility with existing code.
-
-        Returns:
-            all_logits: All sequence logits (B, num_passes, sequences_per_pass, N, 21)
-        """
-        return self.logits
-
 
 class ProteinMPNNRunner(InverseFoldingTool):
     """
@@ -201,11 +167,14 @@ class ProteinMPNNRunner(InverseFoldingTool):
         Args:
             cfg: ProteinMPNN configuration object
         """
-        self.cfg = cfg  # TODO rename to cfg
+        self.cfg = cfg
         self._model = None
         self._model_sc = None  # Side chain packing model
         self._checkpoint_path = None
         self._ligandmpnn_modules = {}  # Cache for loaded modules
+
+        # Thread-safe lock for this instance
+        self._instance_lock = threading.Lock()
 
         self.set_device_id(None)
 
@@ -230,7 +199,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         Returns:
             conversion_map: Tensor of shape (21,) where conversion_map[mpnn_idx] = cogen_idx
-                           Index 20 handles X (unknown) amino acids by mapping to A (alanine)
+                           Index 20 handles X (unknown) amino acids by mapping to special token
         """
         data_utils = self._load_ligandmpnn_module("data_utils")
         conversion_map = torch.zeros(
@@ -240,15 +209,15 @@ class ProteinMPNNRunner(InverseFoldingTool):
         # Map each ProteinMPNN index to corresponding project index
         for mpnn_idx, aa_letter in data_utils.restype_int_to_str.items():
             if aa_letter == "X":
-                # Handle unknown amino acids by mapping to alanine (index 0 in project ordering)
-                conversion_map[mpnn_idx] = 0  # A = 0 in project ordering
+                # Map unknown amino acids to index 20 (unknown token in project)
+                conversion_map[mpnn_idx] = 20
             elif aa_letter in residue_constants.restype_order:
-                # Use standard 20 amino acid mapping (without X)
+                # Use standard 20 amino acid mapping
                 cogen_idx = residue_constants.restype_order[aa_letter]
                 conversion_map[mpnn_idx] = cogen_idx
             else:
-                # Fallback: map unknown amino acids to alanine
-                conversion_map[mpnn_idx] = 0  # A = 0 in project ordering
+                # Unknown amino acids map to index 20 (unknown token)
+                conversion_map[mpnn_idx] = 20
 
         return conversion_map
 
@@ -297,29 +266,27 @@ class ProteinMPNNRunner(InverseFoldingTool):
             # Single sequence logits (20 or 21,)
             for mpnn_idx in range(min(21, mpnn_logits.shape[0])):
                 cogen_idx = conversion_map[mpnn_idx]
-                cogen_logits[cogen_idx] += mpnn_logits[
-                    mpnn_idx
-                ]  # Use += to handle duplicate mappings (X->A)
+                cogen_logits[cogen_idx] = mpnn_logits[mpnn_idx]
         elif len(original_shape) == 2:
             # Batch of sequence logits (N, 20 or 21)
             for mpnn_idx in range(min(21, mpnn_logits.shape[1])):
                 cogen_idx = conversion_map[mpnn_idx]
-                cogen_logits[:, cogen_idx] += mpnn_logits[:, mpnn_idx]
+                cogen_logits[:, cogen_idx] = mpnn_logits[:, mpnn_idx]
         elif len(original_shape) == 3:
             # Batch of multiple sequence logits (B, N, 20 or 21) or (num_passes, N, 20 or 21)
             for mpnn_idx in range(min(21, mpnn_logits.shape[2])):
                 cogen_idx = conversion_map[mpnn_idx]
-                cogen_logits[:, :, cogen_idx] += mpnn_logits[:, :, mpnn_idx]
+                cogen_logits[:, :, cogen_idx] = mpnn_logits[:, :, mpnn_idx]
         elif len(original_shape) == 4:
             # Batch of multiple sequence logits (B, num_passes, N, 20 or 21)
             for mpnn_idx in range(min(21, mpnn_logits.shape[3])):
                 cogen_idx = conversion_map[mpnn_idx]
-                cogen_logits[:, :, :, cogen_idx] += mpnn_logits[:, :, :, mpnn_idx]
+                cogen_logits[:, :, :, cogen_idx] = mpnn_logits[:, :, :, mpnn_idx]
         elif len(original_shape) == 5:
             # Batch of multiple sequence logits (B, num_passes, sequences_per_pass, N, 20 or 21)
             for mpnn_idx in range(min(21, mpnn_logits.shape[4])):
                 cogen_idx = conversion_map[mpnn_idx]
-                cogen_logits[:, :, :, :, cogen_idx] += mpnn_logits[:, :, :, :, mpnn_idx]
+                cogen_logits[:, :, :, :, cogen_idx] = mpnn_logits[:, :, :, :, mpnn_idx]
         else:
             raise ValueError(f"Unsupported logits shape: {original_shape}")
 
@@ -347,18 +314,18 @@ class ProteinMPNNRunner(InverseFoldingTool):
         for aa in cogen_aatypes.flatten():
             aa_int = int(aa)
             if aa_int == 20:  # X (unknown) amino acid in project format
-                aa_letters.append("A")  # Convert X to A (alanine)
+                aa_letters.append("X")  # Keep as X
             elif aa_int in project_int_to_restype:
                 aa_letters.append(project_int_to_restype[aa_int])
             else:
-                aa_letters.append("A")  # Fallback to alanine for unknown indices
+                aa_letters.append("X")  # Unknown indices map to X
 
         # Convert amino acid letters to ProteinMPNN integers
         mpnn_aatypes_list = []
         for aa_letter in aa_letters:
             mpnn_int = data_utils.restype_str_to_int.get(
-                aa_letter, 0
-            )  # Default to A=0 if not found
+                aa_letter, data_utils.restype_str_to_int.get("X", 20)
+            )  # Default to X if not found
             mpnn_aatypes_list.append(mpnn_int)
 
         mpnn_aatypes = torch.tensor(
@@ -368,7 +335,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
     def _load_ligandmpnn_module(self, module_name: str):
         """
-        Load a LigandMPNN module using importlib without modifying sys.path.
+        Load a LigandMPNN module using importlib with thread-safety.
 
         Args:
             module_name: Name of the module to load (e.g., 'data_utils', 'model_utils')
@@ -376,40 +343,57 @@ class ProteinMPNNRunner(InverseFoldingTool):
         Returns:
             Loaded module
         """
-        if module_name in self._ligandmpnn_modules:
-            return self._ligandmpnn_modules[module_name]
+        # First check if module is already cached
+        with self._instance_lock:
+            if module_name in self._ligandmpnn_modules:
+                return self._ligandmpnn_modules[module_name]
 
-        ligandmpnn_path = self.cfg.ligand_mpnn_path
-        if not ligandmpnn_path.exists():
-            raise FileNotFoundError(f"LigandMPNN path not found: {ligandmpnn_path}")
+        # If not cached, load with global lock to prevent races
+        with _module_lock:
+            # Double-check after acquiring global lock
+            with self._instance_lock:
+                if module_name in self._ligandmpnn_modules:
+                    return self._ligandmpnn_modules[module_name]
 
-        module_file = ligandmpnn_path / f"{module_name}.py"
-        if not module_file.exists():
-            raise ImportError(f"Module {module_name}.py not found in {ligandmpnn_path}")
+            ligandmpnn_path = self.cfg.ligand_mpnn_path
+            if not ligandmpnn_path.exists():
+                raise FileNotFoundError(f"LigandMPNN path not found: {ligandmpnn_path}")
 
-        # Load module using importlib
-        spec = importlib.util.spec_from_file_location(module_name, module_file)
-        if spec is None or spec.loader is None:
-            raise ImportError(
-                f"Could not load spec for {module_name} from {module_file}"
-            )
+            module_file = ligandmpnn_path / f"{module_name}.py"
+            if not module_file.exists():
+                raise ImportError(
+                    f"Module {module_name}.py not found in {ligandmpnn_path}"
+                )
 
-        module = importlib.util.module_from_spec(spec)
+            # Load module using importlib
+            spec = importlib.util.spec_from_file_location(module_name, module_file)
+            if spec is None or spec.loader is None:
+                raise ImportError(
+                    f"Could not load spec for {module_name} from {module_file}"
+                )
 
-        # Add LigandMPNN path to sys.modules temporarily for relative imports
-        # but don't modify sys.path globally
-        old_path = sys.path[:]
-        try:
-            if str(ligandmpnn_path) not in sys.path:
-                sys.path.insert(0, str(ligandmpnn_path))
-            spec.loader.exec_module(module)
-        finally:
-            sys.path[:] = old_path
+            module = importlib.util.module_from_spec(spec)
 
-        # Cache the module
-        self._ligandmpnn_modules[module_name] = module
+            # Add LigandMPNN path to sys.path temporarily for relative imports
+            # Use proper exception handling to ensure cleanup
+            old_path = sys.path[:]
+            try:
+                if str(ligandmpnn_path) not in sys.path:
+                    sys.path.insert(0, str(ligandmpnn_path))
+                spec.loader.exec_module(module)
+            except Exception as e:
+                # Restore sys.path on any error
+                sys.path[:] = old_path
+                raise ImportError(f"Failed to load module {module_name}: {e}")
+            finally:
+                # Always restore sys.path
+                sys.path[:] = old_path
 
-        return module
+            # Cache the module
+            with self._instance_lock:
+                self._ligandmpnn_modules[module_name] = module
+
+            return module
 
     def _load_model(self) -> torch.nn.Module:
         """
@@ -694,9 +678,10 @@ class ProteinMPNNRunner(InverseFoldingTool):
                 continue
 
             # Rename to a cleaner and unique sequence id (assuming unique pdb_names)
+            # Also convert `/` style chain breaks to CHAIN_BREAK_STR
             new_id = f"{pdb_stem}_seq_{seq_counter}"
             new_record = SeqRecord(
-                seq=record.seq,
+                seq=record.seq.replace("/", CHAIN_BREAK_STR),
                 id=new_id,
                 description=f"ProteinMPNN generated sequence {seq_counter}",
             )
@@ -726,19 +711,15 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         Returns fasta output path.
         """
-        # Set defaults
-        num_sequences = num_sequences or self.cfg.seq_per_sample
-        seed = seed or self.cfg.pmpnn_seed
-        temperature = temperature or self.cfg.temperature
-
-        # TODO parse `diffuse_mask` into `chains_to_design` and `fixed_residues`
+        if num_sequences is None:
+            num_sequences = self.cfg.seq_per_sample
+        if seed is None:
+            seed = self.cfg.pmpnn_seed
+        if temperature is None:
+            temperature = self.cfg.temperature
 
         # Create output directory
         output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Load models
-        model = self._load_model()
-        model_sc = self._load_side_chain_model() if self.cfg.pack_side_chains else None
 
         logger.info(f"Running native ProteinMPNN on {pdb_path}")
 
@@ -748,37 +729,46 @@ class ProteinMPNNRunner(InverseFoldingTool):
         )
 
         # Prepare feature dictionary for inference
-        data_utils = self._load_ligandmpnn_module("data_utils")
-        feature_dict = data_utils.featurize(
-            protein_dict,
-            cutoff_for_score=self.cfg.ligand_mpnn_cutoff_for_score,
-            use_atom_context=True,
+        feature_dict = self._features_from_protein_dict(
+            protein_dict=protein_dict, diffuse_mask=diffuse_mask
         )
 
-        # Set up additional parameters
-        N = protein_dict["X"].shape[0]
-        bias_tensor = torch.zeros(1, N, 21, device=self._device)
-        omit_tensor = torch.zeros(1, N, 21, device=self._device)
-        feature_dict["bias"] = bias_tensor - 1e8 * omit_tensor
-
-        # Set up chain mask
-        if "chain_mask" in protein_dict:
-            feature_dict["chain_mask"] = protein_dict["chain_mask"].unsqueeze(0)
-        else:
-            feature_dict["chain_mask"] = torch.ones(1, N, device=self._device)
-
-        # Set up symmetry (none for now)
-        feature_dict["symmetry_residues"] = [[]]
-        feature_dict["symmetry_weights"] = [[]]
-
         # Run inference using shared method
-        inference_result = self._run_inference_on_protein_dict(
+        inference_result = self._run_inference_on_feature_dict(
             feature_dict=feature_dict,
             num_passes=num_sequences,
             sequences_per_pass=1,  # Set default for PDB-based methods
             temperature=temperature,
             seed=seed,
         )
+
+        # Manually enforce fixed positions if diffuse_mask was provided
+        if diffuse_mask is not None:
+            # Get original sequence from protein_dict for enforcement
+            original_aatypes_mpnn = protein_dict["S"]  # (N,) ProteinMPNN format
+
+            # Convert to project format and add batch dimension
+            original_aatypes_cogen = []
+            data_utils = self._load_ligandmpnn_module("data_utils")
+            for mpnn_aa_idx in original_aatypes_mpnn:
+                # Convert from ProteinMPNN index to amino acid letter
+                mpnn_aa_letter = data_utils.restype_int_to_str.get(
+                    int(mpnn_aa_idx), "A"
+                )
+                # Convert from amino acid letter to project index
+                project_idx = residue_constants.restype_order.get(mpnn_aa_letter, 0)
+                original_aatypes_cogen.append(project_idx)
+
+            original_aatypes_tensor = torch.tensor(original_aatypes_cogen).unsqueeze(
+                0
+            )  # (1, N)
+            diffuse_mask_batch = diffuse_mask.unsqueeze(0)  # (1, N)
+
+            inference_result = self._enforce_fixed_positions(
+                batch_result=inference_result,
+                original_aatypes=original_aatypes_tensor,
+                diffuse_mask=diffuse_mask_batch,
+            )
 
         # Save results to FASTA using shared method
         output_fasta = self._save_inference_results_to_fasta(
@@ -791,12 +781,11 @@ class ProteinMPNNRunner(InverseFoldingTool):
             num_passes=num_sequences,
         )
 
-        # Apply side chain packing if enabled and model is available
-        if self.cfg.pack_side_chains and model_sc is not None:
+        # Apply side chain packing if enabled
+        if self.cfg.pack_side_chains:
             self._apply_side_chain_packing(
                 inference_result=inference_result,
                 protein_dict=protein_dict,
-                model_sc=model_sc,
                 output_dir=output_dir,
                 pdb_path=pdb_path,
                 num_passes=num_sequences,
@@ -827,31 +816,38 @@ class ProteinMPNNRunner(InverseFoldingTool):
         # Validate inputs
         assert pdb_path.exists(), f"PDB path does not exist: {pdb_path}"
 
-        # Set defaults
-        num_sequences = num_sequences or self.cfg.seq_per_sample
-        seed = seed or self.cfg.pmpnn_seed
-        temperature = temperature or self.cfg.temperature
+        if num_sequences is None:
+            num_sequences = self.cfg.seq_per_sample
+        if seed is None:
+            # seed is actually required for CLI, don't allow None
+            seed = self.cfg.pmpnn_seed or 0
+        if temperature is None:
+            temperature = self.cfg.temperature
 
         # Create output directory
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # TODO - parse `diffuse_mask` into `chains_to_design` and `fixed_residues`
-        chains_to_design = None
-        fixed_residues = None
+        # Parse PDB to get protein_dict for chain information
+        protein_dict = self._parse_pdb_to_protein_dict(pdb_path)
+
+        # Parse diffuse_mask for fixed residues
+        fixed_residues_json = self._diffuse_mask_to_json(
+            diffuse_mask=diffuse_mask,
+            protein_dict=protein_dict,
+            pdb_name=pdb_path.stem,
+        )
 
         # Copy PDB to output directory
         pdb_copy_path = output_dir / pdb_path.name
         shutil.copy2(pdb_path, pdb_copy_path)
 
         # Construct ProteinMPNN command
-        run_script = self.cfg.protein_mpnn_path / "run.py"
-        assert run_script.exists(), f"ProteinMPNN run.py not found: {run_script}"
+        run_script = self.cfg.protein_mpnn_path / "protein_mpnn_run.py"
+        assert run_script.exists(), f"ProteinMPNN script not found: {run_script}"
 
         cmd = [
             "python",
             str(run_script),
-            "--model_type",
-            self.cfg.model_type,
             "--pdb_path",
             str(pdb_copy_path),
             "--out_folder",
@@ -866,21 +862,27 @@ class ProteinMPNNRunner(InverseFoldingTool):
             "1",
         ]
 
-        # Add additional arguments
-        if chains_to_design is not None:
-            cmd.extend(["--pdb_path_chains", ",".join(chains_to_design)])
-
         # fixed positions requires jsonl file
-        if fixed_residues is not None:
+        if fixed_residues_json is not None:
             fixed_positions_path = output_dir / "fixed_positions.jsonl"
             with open(fixed_positions_path, "w") as f:
-                json.dump(fixed_residues, f)
-            cmd.extend(["--fixed_positions", str(fixed_positions_path)])
+                json.dump(fixed_residues_json, f)
+            cmd.extend(["--fixed_positions_jsonl", str(fixed_positions_path)])
 
         logger.info(f"Running ProteinMPNN subprocess: {' '.join(cmd)}")
 
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = "0"  # Set to GPU 0 by default
+        # Set CUDA_VISIBLE_DEVICES based on the configured device, defaulting to 0
+        if self._device.type == "cuda":
+            device_index = (
+                self._device.index
+                if (self._device is not None and self._device.index is not None)
+                else 0
+            )
+            env["CUDA_VISIBLE_DEVICES"] = str(device_index)
+        elif "CUDA_VISIBLE_DEVICES" not in env:
+            # Only set default if not already specified in environment
+            env["CUDA_VISIBLE_DEVICES"] = "0"
 
         # Execute command
         try:
@@ -931,6 +933,15 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         return processed_fasta
 
+    @staticmethod
+    def move_tensor_to_device(
+        tensor: torch.Tensor, device: torch.device
+    ) -> torch.Tensor:
+        """Move tensor to the given device with MPS float64 compatibility."""
+        if device.type == "mps" and tensor.dtype == torch.float64:
+            tensor = tensor.float()
+        return tensor.to(device)
+
     def _protein_dict_from_batch(
         self,
         trans: torch.Tensor,  # (B, N, 3)
@@ -947,23 +958,16 @@ class ProteinMPNNRunner(InverseFoldingTool):
         to ProteinMPNN-compatible protein dictionaries for inference.
         """
 
-        # Move all input tensors to the runner's device and handle MPS compatibility
-        def move_tensor_to_device(tensor: torch.Tensor) -> torch.Tensor:
-            """Move tensor to runner's device with MPS float64 compatibility."""
-            if self._device.type == "mps" and tensor.dtype == torch.float64:
-                tensor = tensor.float()
-            return tensor.to(self._device)
-
-        trans = move_tensor_to_device(trans)
-        rotmats = move_tensor_to_device(rotmats)
-        aatypes = move_tensor_to_device(aatypes)
-        res_mask = move_tensor_to_device(res_mask)
+        trans = self.move_tensor_to_device(trans, self._device)
+        rotmats = self.move_tensor_to_device(rotmats, self._device)
+        aatypes = self.move_tensor_to_device(aatypes, self._device)
+        res_mask = self.move_tensor_to_device(res_mask, self._device)
 
         if torsions is not None:
-            torsions = move_tensor_to_device(torsions)
+            torsions = self.move_tensor_to_device(torsions, self._device)
 
         if chain_idx is not None:
-            chain_idx = move_tensor_to_device(chain_idx)
+            chain_idx = self.move_tensor_to_device(chain_idx, self._device)
         else:
             chain_idx = torch.ones_like(res_mask)
 
@@ -1015,14 +1019,10 @@ class ProteinMPNNRunner(InverseFoldingTool):
         if not self.cfg.use_native_runner:
             raise ValueError("run_batch only supports native runner mode")
 
-        # Set defaults
-        temperature = temperature or self.cfg.temperature
-        seed = seed or self.cfg.pmpnn_seed
-
-        # TODO parse `diffuse_mask` into `chains_to_design` and `fixed_residues`
-
-        # Load model
-        model = self._load_model()
+        if temperature is None:
+            temperature = self.cfg.temperature
+        if seed is None:
+            seed = self.cfg.pmpnn_seed
 
         # Create protein dictionaries from batch data
         protein_dicts = self._protein_dict_from_batch(
@@ -1034,70 +1034,31 @@ class ProteinMPNNRunner(InverseFoldingTool):
             torsions=torsions,
         )
 
-        # Prepare batch feature dictionary for efficient inference
-        data_utils = self._load_ligandmpnn_module("data_utils")
-        B = len(protein_dicts)
-        N = protein_dicts[0]["X"].shape[0]  # Assume all structures have same length
+        # Create feature dictionaries for each protein structure
+        feature_dicts = []
+        for i, protein_dict in enumerate(protein_dicts):
+            # Extract the diffuse_mask for this specific structure
+            if diffuse_mask.dim() == 2:  # (B, N)
+                structure_diffuse_mask = diffuse_mask[i]  # (N,)
+            else:  # (N,) - single structure case
+                structure_diffuse_mask = diffuse_mask
 
-        # Stack all protein features into batch tensors
-        batch_X = torch.stack(
-            [pdict["X"] for pdict in protein_dicts], dim=0
-        )  # (B, N, 4, 3)
-        batch_mask = torch.stack(
-            [pdict["mask"] for pdict in protein_dicts], dim=0
-        )  # (B, N)
-        batch_chain_mask = torch.stack(
-            [pdict["chain_mask"] for pdict in protein_dicts], dim=0
-        )  # (B, N)
+            feature_dict = self._features_from_protein_dict(
+                protein_dict=protein_dict, diffuse_mask=structure_diffuse_mask
+            )
+            feature_dicts.append(feature_dict)
 
-        # Create a representative protein_dict for featurization
-        # We'll use the first structure as template and then replace with batch data
-        representative_dict = protein_dicts[0].copy()
-        feature_dict = data_utils.featurize(
-            representative_dict,
-            cutoff_for_score=self.cfg.ligand_mpnn_cutoff_for_score,
-            use_atom_context=True,
-        )
-
-        # Replace single-structure features with batch features
-        feature_dict["X"] = batch_X
-        feature_dict["mask"] = batch_mask
-        feature_dict["chain_mask"] = batch_chain_mask
-
-        # Set up batch bias and omit tensors
-        bias_tensor = torch.zeros(B, N, 21, device=self._device)
-        omit_tensor = torch.zeros(B, N, 21, device=self._device)
-        feature_dict["bias"] = bias_tensor - 1e8 * omit_tensor
-
-        # Set up symmetry (none for now)
-        feature_dict["symmetry_residues"] = [[]]
-        feature_dict["symmetry_weights"] = [[]]
-
-        # Run inference on the batch feature dictionary
-        batch_result = self._run_inference_on_protein_dict(
-            feature_dict=feature_dict,
+        # Run inference on all feature dictionaries
+        batch_result = self._run_inference_on_feature_dicts(
+            feature_dicts=feature_dicts,
             num_passes=num_passes,
             sequences_per_pass=sequences_per_pass,
             temperature=temperature,
             seed=seed,
         )
 
-        # Extract results
-        logits = batch_result.logits  # (B, num_passes, sequences_per_pass, N, 21)
-        confidence_scores = (
-            batch_result.confidence_scores
-        )  # (B, num_passes, sequences_per_pass, N)
-        sequences = batch_result.sequences  # (B, num_passes, sequences_per_pass, N)
-
-        # Convert from MPNN format to Cogen format
-        logits = self._convert_mpnn_logits_to_cogen(logits)
-        sequences = self._convert_mpnn_sequences_to_cogen(sequences)
-
-        return NativeMPNNResult(
-            logits=logits,
-            confidence_scores=confidence_scores,
-            _sequences=sequences,
-        )
+        # batch_result is already in Cogen format from the inference functions
+        return batch_result
 
     def _create_protein_dict_from_frames(
         self,
@@ -1217,7 +1178,11 @@ class ProteinMPNNRunner(InverseFoldingTool):
         # atom37 format: [N, CA, C, O, CB, ...] - we need first 4
         X_backbone = atom37[:, :4, :]  # (N, 4, 3)
 
-        # TODO - support LigandMPNN, which expects a different dict
+        if self.cfg.model_type == ModelType.LIGAND_MPNN:
+            # TODO - support LigandMPNN style protein_dict, probably not very different.
+            raise NotImplementedError(
+                "running LigandMPNN model natively not yet supported (req different input dict)"
+            )
 
         protein_dict = {
             "coords": atom37,  # (N, 37, 3) - full atom coordinates
@@ -1238,7 +1203,151 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         return protein_dict
 
-    def _run_inference_on_protein_dict(
+    def _diffuse_mask_to_json(
+        self,
+        diffuse_mask: torch.Tensor,
+        protein_dict: Optional[MPNNProteinDict] = None,
+        pdb_name: str = "protein",
+    ) -> Optional[Dict]:
+        """
+        Convert a diffuse_mask to the `fixed_residues` json dictionary
+        expected by ProteinMPNN.  0 -> fixed.
+
+        Returns
+            ``None`` if every residue is designable, otherwise a mapping
+            ``{pdb_name: { chain_letter : [1-indexed positions] }}`` identifying the fixed
+            residues for each chain.
+        """
+        if diffuse_mask is None:
+            return None
+
+        # Accept (N,) or (B, N). For batched inputs we take the first (and only relevant)
+        # row because this function is called once per structure.
+        if diffuse_mask.dim() == 2:
+            diffuse_mask = diffuse_mask[0]
+        elif diffuse_mask.dim() != 1:
+            logger.warning(
+                f"Unsupported diffuse_mask shape: {tuple(diffuse_mask.shape)}. Expected (N,) or (1, N)."
+            )
+            return None
+
+        N = diffuse_mask.shape[0]
+
+        # Early-exit if all residues are diffused (nothing to fix)
+        if torch.all(diffuse_mask == 1):
+            return None
+
+        # Determine chain letters for each residue
+        if protein_dict is not None and "chain_letters" in protein_dict:
+            # Stored as a list[str] with length N
+            chain_letters = list(protein_dict["chain_letters"])
+        elif protein_dict is not None and "chain_idx" in protein_dict:
+            # Derive chain letters from numerical chain indices (1,2,3,...) → A,B,C...
+            chain_idx_tensor = protein_dict["chain_idx"].detach().cpu()
+            unique_chain_ids = torch.unique(chain_idx_tensor, sorted=True)
+            idx_to_letter = {
+                int(cid): chr(ord("A") + i) for i, cid in enumerate(unique_chain_ids)
+            }
+            chain_letters = [idx_to_letter[int(cid)] for cid in chain_idx_tensor]
+        else:
+            # Fallback – assume single chain "A"
+            chain_letters = ["A"] * N
+
+        if len(chain_letters) != N:
+            raise ValueError(
+                f"diffuse_mask and chain_letters mismatch. Expected {N} chain letters, got {len(chain_letters)}"
+            )
+
+        # Build `fixed_residues = { chain_id: [residue_positions] }` dict, 1-indexed
+        fixed_residues: Dict[str, List[int]] = {}
+
+        # Count residues within each chain and track fixed positions
+        chain_counters = {}
+        for i, (mask_val, chain_id) in enumerate(
+            zip(diffuse_mask.tolist(), chain_letters)
+        ):
+            if chain_id not in chain_counters:
+                chain_counters[chain_id] = 0
+            chain_counters[chain_id] += 1
+
+            if mask_val == 0:  # Fixed position
+                fixed_residues.setdefault(chain_id, []).append(chain_counters[chain_id])
+
+        # (already checked for all-diffuse case above but just in case)
+        if len(fixed_residues) == 0:
+            return None
+
+        # Return as a single-element dict with the PDB name as the key
+        return {pdb_name: fixed_residues}
+
+    def _features_from_protein_dict(
+        self, protein_dict: MPNNProteinDict, diffuse_mask: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Create feature dictionary from protein dictionary.
+
+        This method handles the common featurization logic shared between
+        inverse_fold_pdb_native and run_batch.
+
+        Args:
+            protein_dict: Dictionary containing protein structure data
+            diffuse_mask: Mask indicating which positions should be designed (1) vs fixed (0)
+
+        Returns:
+            Feature dictionary ready for ProteinMPNN inference
+        """
+        # Get sequence length
+        N = protein_dict["X"].shape[0]
+
+        # Convert diffuse_mask to chain_mask for ProteinMPNN
+        # diffuse_mask semantics: 1 = design, 0 = fix
+        # chain_mask semantics: 1 = design, 0 = fix (same as diffuse_mask)
+        if diffuse_mask is not None:
+            # Handle both (N,) and (B, N) shapes, taking first batch element if needed
+            if diffuse_mask.dim() == 2:
+                diffuse_mask_1d = diffuse_mask[0]  # Take first batch element
+            else:
+                diffuse_mask_1d = diffuse_mask
+
+            # Ensure diffuse_mask has correct length
+            if diffuse_mask_1d.shape[0] != N:
+                raise ValueError(
+                    f"diffuse_mask length {diffuse_mask_1d.shape[0]} does not match "
+                    f"protein sequence length {N}"
+                )
+
+            # Convert to chain_mask format (move to device, no batch dimension yet)
+            chain_mask = diffuse_mask_1d.float().to(self._device)  # (N,)
+        else:
+            # If no diffuse_mask provided, design all positions
+            chain_mask = torch.ones(N, device=self._device)
+
+        # Set chain_mask in protein_dict BEFORE calling featurize
+        # This is critical because featurize() expects chain_mask in the input_dict
+        protein_dict["chain_mask"] = chain_mask
+
+        # Load required module
+        data_utils = self._load_ligandmpnn_module("data_utils")
+
+        # Run featurization - this will add batch dimension to chain_mask
+        feature_dict = data_utils.featurize(
+            protein_dict,
+            cutoff_for_score=self.cfg.ligand_mpnn_cutoff_for_score,
+            use_atom_context=True,
+        )
+
+        # Set up bias and omit tensors
+        bias_tensor = torch.zeros(1, N, 21, device=self._device)
+        omit_tensor = torch.zeros(1, N, 21, device=self._device)
+        feature_dict["bias"] = bias_tensor - 1e8 * omit_tensor
+
+        # Set up symmetry (none for now)
+        feature_dict["symmetry_residues"] = [[]]
+        feature_dict["symmetry_weights"] = [[]]
+
+        return feature_dict
+
+    def _run_inference_on_feature_dict(
         self,
         feature_dict: Dict[str, torch.Tensor],
         num_passes: int,
@@ -1246,131 +1355,185 @@ class ProteinMPNNRunner(InverseFoldingTool):
         temperature: float = 1.0,
         seed: Optional[int] = None,
     ) -> NativeMPNNResult:
-        """Run inference on a protein feature dictionary.
+        """Run inference on a single protein feature dictionary.
 
         Args:
-            feature_dict: Dictionary containing protein features
+            feature_dict: Dictionary containing protein features for ONE structure
             num_passes: Number of sampling passes to perform
             sequences_per_pass: Number of sequences to generate per pass
             temperature: Sampling temperature
             seed: Random seed for reproducibility
 
         Returns:
-            NativeMPNNResult containing logits, sequences, and confidence scores
+            NativeMPNNResult containing logits, sequences, and confidence scores with batch size 1
         """
-        B = feature_dict["mask"].shape[0]  # batch size (number of structures)
+        # Assert that this is a single structure (batch size 1)
+        assert (
+            feature_dict["mask"].shape[0] == 1
+        ), f"Expected batch size 1, got {feature_dict['mask'].shape[0]}"
+
+        # Load model if needed
+        if self._model is None:
+            self._load_model()
+
         N = feature_dict["mask"].shape[1]  # sequence length
 
-        # Process each structure individually but use efficient batching for sequences_per_pass
-        all_logits = []
-        all_sequences = []
-        all_confidence_scores = []
+        struct_logits = []
+        struct_sequences = []
+        struct_confidence_scores = []
 
-        for struct_idx in range(B):
-            # Extract single structure features
-            single_feature_dict = {}
-            for key, value in feature_dict.items():
-                if (
-                    isinstance(value, torch.Tensor)
-                    and len(value.shape) > 0
-                    and value.shape[0] == B
-                ):
-                    # Extract single structure from batch
-                    single_feature_dict[key] = value[
-                        struct_idx : struct_idx + 1
-                    ]  # Keep batch dim of 1
-                else:
-                    # Non-batched features (like symmetry lists)
-                    single_feature_dict[key] = value
+        for pass_idx in range(num_passes):
+            # Set seed first for reproducible results
+            if seed is not None:
+                torch.manual_seed(seed + pass_idx)
 
-            struct_logits = []
-            struct_sequences = []
-            struct_confidence_scores = []
+            # Set up feature dict for this pass with batch_size for parallel generation
+            pass_feature_dict = feature_dict.copy()
+            pass_feature_dict["batch_size"] = sequences_per_pass
+            pass_feature_dict["temperature"] = temperature
 
-            for pass_idx in range(num_passes):
-                # Set seed first for reproducible results
-                if seed is not None:
-                    torch.manual_seed(seed + struct_idx * num_passes + pass_idx)
+            # Move all tensors to the correct device before inference
+            for k, v in pass_feature_dict.items():
+                if torch.is_tensor(v):
+                    pass_feature_dict[k] = v.to(self._device)
 
-                # Set up feature dict for this pass with batch_size for parallel generation
-                pass_feature_dict = single_feature_dict.copy()
-                pass_feature_dict["batch_size"] = sequences_per_pass
-                pass_feature_dict["temperature"] = temperature
+            # Generate random tensor for decoding order (required by LigandMPNN)
+            pass_feature_dict["randn"] = torch.randn(
+                [sequences_per_pass, N], device=self._device
+            )
 
-                # Generate random tensor for decoding order (required by LigandMPNN)
-                pass_feature_dict["randn"] = torch.randn(
-                    [sequences_per_pass, N], device=self._device
-                )
+            # Run model inference - the model will handle batching internally
+            # by repeating input tensors sequences_per_pass times
+            with torch.no_grad():
+                sample_dict = self._model.sample(pass_feature_dict)
 
-                # Run model inference - the model will handle batching internally
-                # by repeating input tensors sequences_per_pass times
-                with torch.no_grad():
-                    sample_dict = self._model.sample(pass_feature_dict)
+            # Extract results - shape will be (sequences_per_pass, N) due to internal batching
+            pass_logits = sample_dict["log_probs"]  # (sequences_per_pass, N, 21)
+            pass_sequences = sample_dict["S"]  # (sequences_per_pass, N)
+            pass_sampling_probs = sample_dict[
+                "sampling_probs"
+            ]  # (sequences_per_pass, N, 20)
 
-                # Extract results - shape will be (sequences_per_pass, N) due to internal batching
-                pass_logits = sample_dict["log_probs"]  # (sequences_per_pass, N, 21)
-                pass_sequences = sample_dict["S"]  # (sequences_per_pass, N)
-                pass_sampling_probs = sample_dict[
-                    "sampling_probs"
-                ]  # (sequences_per_pass, N, 20)
+            # Compute confidence scores (mean probability of sampled amino acids)
+            # Convert sequences to one-hot for indexing into sampling probabilities
+            seq_one_hot = torch.nn.functional.one_hot(
+                pass_sequences, num_classes=20
+            ).float()
+            # Sum over amino acid dimension to get per-position confidence
+            confidence = torch.sum(
+                pass_sampling_probs * seq_one_hot, dim=-1
+            )  # (sequences_per_pass, N)
 
-                # Compute confidence scores (mean probability of sampled amino acids)
-                # Convert sequences to one-hot for indexing into sampling probabilities
-                seq_one_hot = torch.nn.functional.one_hot(
-                    pass_sequences, num_classes=20
-                ).float()
-                # Sum over amino acid dimension to get per-position confidence
-                confidence = torch.sum(
-                    pass_sampling_probs * seq_one_hot, dim=-1
-                )  # (sequences_per_pass, N)
+            # Aggregate to per-sequence confidence by taking mean across positions
+            confidence_per_seq = torch.mean(confidence, dim=-1)  # (sequences_per_pass,)
 
-                # Aggregate to per-sequence confidence by taking mean across positions
-                confidence_per_seq = torch.mean(
-                    confidence, dim=-1
-                )  # (sequences_per_pass,)
+            struct_logits.append(pass_logits)
+            struct_sequences.append(pass_sequences)
+            struct_confidence_scores.append(confidence_per_seq)
 
-                struct_logits.append(pass_logits)
-                struct_sequences.append(pass_sequences)
-                struct_confidence_scores.append(confidence_per_seq)
+        # Stack results from all passes
+        # Final shapes: (num_passes, sequences_per_pass, N, ...)
+        struct_logits = torch.stack(
+            struct_logits, dim=0
+        )  # (num_passes, sequences_per_pass, N, 21)
+        struct_sequences = torch.stack(
+            struct_sequences, dim=0
+        )  # (num_passes, sequences_per_pass, N)
+        struct_confidence_scores = torch.stack(
+            struct_confidence_scores, dim=0
+        )  # (num_passes, sequences_per_pass)
 
-            # Stack results from all passes for this structure
-            # Final shapes: (num_passes, sequences_per_pass, N, ...)
-            struct_logits = torch.stack(
-                struct_logits, dim=0
-            )  # (num_passes, sequences_per_pass, N, 21)
-            struct_sequences = torch.stack(
-                struct_sequences, dim=0
-            )  # (num_passes, sequences_per_pass, N)
-            struct_confidence_scores = torch.stack(
-                struct_confidence_scores, dim=0
-            )  # (num_passes, sequences_per_pass)
+        # Add batch dimension of 1 to match expected output format
+        struct_logits = struct_logits.unsqueeze(
+            0
+        )  # (1, num_passes, sequences_per_pass, N, 21)
+        struct_sequences = struct_sequences.unsqueeze(
+            0
+        )  # (1, num_passes, sequences_per_pass, N)
+        struct_confidence_scores = struct_confidence_scores.unsqueeze(
+            0
+        )  # (1, num_passes, sequences_per_pass)
 
-            all_logits.append(struct_logits)
-            all_sequences.append(struct_sequences)
-            all_confidence_scores.append(struct_confidence_scores)
+        # Convert from MPNN format to Cogen format
+        cogen_logits = self._convert_mpnn_logits_to_cogen(struct_logits)
+        cogen_sequences = self._convert_mpnn_sequences_to_cogen(struct_sequences)
+
+        total_sequences = num_passes * sequences_per_pass
+        logger.info(
+            f"Successfully generated {total_sequences} sequences for 1 structure"
+        )
+
+        # Create and return result with batch size 1 in Cogen format
+        result = NativeMPNNResult(
+            logits=cogen_logits,  # (1, num_passes, sequences_per_pass, N, 21)
+            confidence_scores=struct_confidence_scores,  # (1, num_passes, sequences_per_pass)
+            sequences=cogen_sequences,  # (1, num_passes, sequences_per_pass, N)
+        )
+
+        return result
+
+    def _run_inference_on_feature_dicts(
+        self,
+        feature_dicts: List[Dict[str, torch.Tensor]],
+        num_passes: int,
+        sequences_per_pass: int,
+        temperature: float = 1.0,
+        seed: Optional[int] = None,
+    ) -> NativeMPNNResult:
+        """Run inference on multiple protein feature dictionaries.
+
+        Args:
+            feature_dicts: List of feature dictionaries, one per structure
+            num_passes: Number of sampling passes to perform
+            sequences_per_pass: Number of sequences to generate per pass
+            temperature: Sampling temperature
+            seed: Random seed for reproducibility
+
+        Returns:
+            NativeMPNNResult containing stacked logits, sequences, and confidence scores
+        """
+        B = len(feature_dicts)
+        if B == 0:
+            raise ValueError("feature_dicts cannot be empty")
+
+        # Run inference on each feature dict individually
+        all_results = []
+        for struct_idx, feature_dict in enumerate(feature_dicts):
+            # Set structure-specific seed
+            struct_seed = (
+                seed + ((num_passes + 1) * struct_idx) if seed is not None else None
+            )
+
+            result = self._run_inference_on_feature_dict(
+                feature_dict=feature_dict,
+                num_passes=num_passes,
+                sequences_per_pass=sequences_per_pass,
+                temperature=temperature,
+                seed=struct_seed,
+            )
+            all_results.append(result)
 
         # Stack results from all structures
-        # Final shapes: (B, num_passes, sequences_per_pass, N, ...)
-        all_logits = torch.stack(
-            all_logits, dim=0
+        all_logits = torch.cat(
+            [result.logits for result in all_results], dim=0
         )  # (B, num_passes, sequences_per_pass, N, 21)
-        all_sequences = torch.stack(
-            all_sequences, dim=0
-        )  # (B, num_passes, sequences_per_pass, N)
-        all_confidence_scores = torch.stack(
-            all_confidence_scores, dim=0
+        all_confidence_scores = torch.cat(
+            [result.confidence_scores for result in all_results], dim=0
         )  # (B, num_passes, sequences_per_pass)
+        all_sequences = torch.cat(
+            [result.sequences for result in all_results], dim=0
+        )  # (B, num_passes, sequences_per_pass, N)
 
         total_sequences = B * num_passes * sequences_per_pass
         logger.info(
             f"Successfully generated {total_sequences} sequences across {B} structures"
         )
 
-        # Create and return result with proper shapes
+        # Create and return stacked result
         result = NativeMPNNResult(
             logits=all_logits,  # (B, num_passes, sequences_per_pass, N, 21)
             confidence_scores=all_confidence_scores,  # (B, num_passes, sequences_per_pass)
-            _sequences=all_sequences,  # (B, num_passes, sequences_per_pass, N)
+            sequences=all_sequences,  # (B, num_passes, sequences_per_pass, N)
         )
 
         return result
@@ -1442,6 +1605,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
     ) -> Path:
         """
         Save inference results to FASTA file.
+        `inference_result` should be for a single structure, i.e. (1, num_passes, sequences_per_pass, N)
 
         This method handles the FASTA output generation that's common
         between different inference methods.
@@ -1449,27 +1613,38 @@ class ProteinMPNNRunner(InverseFoldingTool):
         # Load required module
         data_utils = self._load_ligandmpnn_module("data_utils")
 
-        # Extract results from first batch element (B=1 for single structure)
-        # Shape: (num_passes, sequences_per_pass, L) -> flatten to (num_passes*sequences_per_pass, L)
-        S_stack = inference_result.sequences[0].view(
+        # Verify we're processing a single protein structure (batch size 1)
+        assert (
+            inference_result.sequences.shape[0] == 1
+        ), f"Expected batch size 1, got {inference_result.sequences.shape[0]}"
+
+        # Extract all generated sequences for the single protein structure
+        # Values are Cogen format
+        # Shape: (1, num_passes, sequences_per_pass, L) -> flatten to (num_passes*sequences_per_pass, L)
+        cogen_aatypes_stack = inference_result.sequences[0].view(
             -1, inference_result.sequences.shape[-1]
-        )  # (num_passes*sequences_per_pass, L)
+        )
+        # (num_passes*sequences_per_pass, L, 21)
         log_probs_stack = inference_result.logits[0].view(
             -1, inference_result.logits.shape[-2], inference_result.logits.shape[-1]
-        )  # (num_passes*sequences_per_pass, L, 21)
-        confidence_scores = inference_result.confidence_scores[0].view(
-            -1
-        )  # (num_passes*sequences_per_pass,)
+        )
+        # (num_passes*sequences_per_pass,)
+        confidence_scores = inference_result.confidence_scores[0].view(-1)
 
         # Create additional derived results for compatibility
         # Compute sequence recovery
-        feature_dict_mask = torch.ones(1, S_stack.shape[1], device=self._device)
-        chain_mask = torch.ones(1, S_stack.shape[1], device=self._device)
+        feature_dict_mask = torch.ones(
+            1, cogen_aatypes_stack.shape[1], device=self._device
+        )
+        chain_mask = torch.ones(1, cogen_aatypes_stack.shape[1], device=self._device)
         rec_mask = feature_dict_mask * chain_mask
-        rec_stack = data_utils.get_seq_rec(S_stack[:1], S_stack, rec_mask)
+        rec_stack = data_utils.get_seq_rec(
+            cogen_aatypes_stack[:1], cogen_aatypes_stack, rec_mask
+        )
 
         # Get native sequence from protein_dict
         if "S" in protein_dict:
+            # protein_dict["S"] is in MPNN format, so use MPNN conversion
             native_seq = "".join(
                 [
                     data_utils.restype_int_to_str[AA]
@@ -1477,9 +1652,12 @@ class ProteinMPNNRunner(InverseFoldingTool):
                 ]
             )
         else:
-            # Fallback: use first generated sequence
+            # Fallback: use first generated sequence (already in Cogen format)
             native_seq = "".join(
-                [data_utils.restype_int_to_str[AA] for AA in S_stack[0].cpu().numpy()]
+                [
+                    residue_constants.restypes[AA]
+                    for AA in cogen_aatypes_stack[0].cpu().numpy()
+                ]
             )
 
         seq_np = np.array(list(native_seq))
@@ -1515,7 +1693,8 @@ class ProteinMPNNRunner(InverseFoldingTool):
         name = pdb_path.stem
         output_fasta = output_dir / f"{name}.fa"
 
-        logger.info(f"Saving {num_passes} sequences to {output_fasta}")
+        total_sequences = cogen_aatypes_stack.shape[0]
+        logger.info(f"Saving {total_sequences} sequences to {output_fasta}")
 
         with open(output_fasta, "w") as f:
             # Write header
@@ -1530,7 +1709,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
             )
 
             # Write sequences
-            for ix in range(S_stack.shape[0]):
+            for ix in range(cogen_aatypes_stack.shape[0]):
                 ix_suffix = ix + 1
                 seq_rec_print = np.format_float_positional(
                     rec_stack[ix].cpu().numpy(), unique=False, precision=4
@@ -1539,10 +1718,11 @@ class ProteinMPNNRunner(InverseFoldingTool):
                     confidence_scores[ix].cpu().numpy(), unique=False, precision=4
                 )
 
+                # Convert from Cogen format amino acid types to amino acid letters
                 seq = "".join(
                     [
-                        data_utils.restype_int_to_str[AA]
-                        for AA in S_stack[ix].cpu().numpy()
+                        residue_constants.restypes[AA]
+                        for AA in cogen_aatypes_stack[ix].cpu().numpy()
                     ]
                 )
 
@@ -1564,7 +1744,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
                     seq_out_str += [CHAIN_BREAK_STR]
                 seq_out_str = "".join(seq_out_str)[:-1]
 
-                if ix == S_stack.shape[0] - 1:
+                if ix == cogen_aatypes_stack.shape[0] - 1:
                     # Final line without newline
                     f.write(
                         f">{name}, id={ix_suffix}, T={temperature}, seed={seed}, "
@@ -1584,7 +1764,6 @@ class ProteinMPNNRunner(InverseFoldingTool):
         self,
         inference_result: NativeMPNNResult,
         protein_dict: MPNNProteinDict,
-        model_sc: torch.nn.Module,
         output_dir: Path,
         pdb_path: Path,
         num_passes: int,
@@ -1592,10 +1771,15 @@ class ProteinMPNNRunner(InverseFoldingTool):
         """
         Apply side chain packing to generated sequences.
 
-        This method handles side chain packing that's common between
-        different inference methods.
+        NOTE - will fail on MPS due to float64 tensors (VonMises used under the hood).
         """
         logger.info("Applying side chain packing...")
+
+        # Load side chain model if needed
+        model_sc = self._load_side_chain_model()
+        if model_sc is None:
+            logger.warning("Side chain packing requested but model could not be loaded")
+            return
 
         # Import required functions for side chain packing
         try:
@@ -1608,10 +1792,15 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         # Extract results
         # Flatten the sequences from (num_passes, sequences_per_pass, N) to (num_passes*sequences_per_pass, N)
-        S_stack = inference_result.sequences[0].view(
+        # Note: inference_result.sequences is in Cogen format (AlphaFold ordering)
+        cogen_aatypes_stack = inference_result.sequences[0].view(
             -1, inference_result.sequences.shape[-1]
-        )  # (num_passes*sequences_per_pass, N)
-        total_sequences = S_stack.shape[0]
+        )  # (num_passes*sequences_per_pass, N) - Cogen format amino acid types
+        total_sequences = cogen_aatypes_stack.shape[0]
+
+        # Convert Cogen format sequences to MPNN format for side chain packing
+        # ProteinMPNN side chain functions expect MPNN format sequences
+        mpnn_aatypes_stack = self._convert_cogen_aatypes_to_mpnn(cogen_aatypes_stack)
 
         # Get metadata from parsing
         parsed_metadata = protein_dict.get("_parsed_metadata", {})
@@ -1625,7 +1814,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
             cutoff_for_score=8.0,
             use_atom_context=True,  # Use atom context for side chain packing
             number_of_ligand_atoms=16,
-            model_type="ligand_mpnn",
+            model_type=ModelType.LIGAND_MPNN,
         )
 
         # Create lists to store packed results
@@ -1657,8 +1846,13 @@ class ProteinMPNNRunner(InverseFoldingTool):
                         logger.debug(f"Could not expand dimension for key {k}: {e}")
                         pass
 
-            # Set the sequence for this iteration
-            sc_feature_dict["S"] = S_stack[seq_idx : seq_idx + 1]
+            # Move to device, handle MPS compatibility
+            for k, v in sc_feature_dict.items():
+                if isinstance(v, torch.Tensor):
+                    sc_feature_dict[k] = self.move_tensor_to_device(v, self.device)
+
+            # Set the sequence for this iteration (use MPNN format for ProteinMPNN functions)
+            sc_feature_dict["S"] = mpnn_aatypes_stack[seq_idx : seq_idx + 1]
 
             # Pack side chains multiple times as configured
             sequence_packed_structures = []
@@ -1709,6 +1903,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
                     try:
                         # Write full PDB with side chains
+                        # Use MPNN format sequences for ProteinMPNN's write_full_PDB function
                         data_utils.write_full_PDB(
                             str(packed_pdb_path),
                             pack_info["X"][0].numpy(),
@@ -1716,7 +1911,9 @@ class ProteinMPNNRunner(InverseFoldingTool):
                             pack_info["b_factors"][0].numpy(),
                             protein_dict["R_idx"][0].cpu().numpy(),
                             protein_dict["chain_letters"],
-                            S_stack[seq_idx].cpu().numpy(),
+                            mpnn_aatypes_stack[seq_idx]
+                            .cpu()
+                            .numpy(),  # Use MPNN format sequences
                             other_atoms=other_atoms,
                             icodes=icodes,
                         )
@@ -1752,7 +1949,6 @@ class ProteinMPNNRunner(InverseFoldingTool):
         """
         # Load required modules for mapping
         data_utils = self._load_ligandmpnn_module("data_utils")
-        from cogeneration.data import residue_constants
 
         # Create mapping from MPNN int -> Cogen int
         mpnn_int_to_str = data_utils.restype_int_to_str
@@ -1778,9 +1974,9 @@ class ProteinMPNNRunner(InverseFoldingTool):
                 conversion_map[mpnn_int] = 0
 
         # Handle any indices beyond the standard 20 amino acids (e.g., index 20 or higher)
-        # These are likely special tokens or unknown amino acids, map them to alanine (A=0)
+        # These are likely special tokens or unknown amino acids, map them to unknown (X=20)
         for idx in range(20, conversion_size):
-            conversion_map[idx] = 0  # Map to alanine (A=0 in Cogen format)
+            conversion_map[idx] = 20  # Map to unknown (X=20 in Cogen format)
 
         # Apply conversion
         cogen_sequences = conversion_map[mpnn_sequences]
@@ -1796,6 +1992,66 @@ class ProteinMPNNRunner(InverseFoldingTool):
         if hasattr(self, "_device"):
             if torch.cuda.is_available() and str(self._device).startswith("cuda"):
                 torch.cuda.empty_cache()
+
+    def _enforce_fixed_positions(
+        self,
+        batch_result: NativeMPNNResult,
+        original_aatypes: torch.Tensor,  # (B, N) in Cogen format
+        diffuse_mask: torch.Tensor,  # (B, N)
+    ) -> NativeMPNNResult:
+        """
+        WORKAROUND: Manually enforce fixed positions since LigandMPNN doesn't respect fixed_residues.
+
+        Args:
+            batch_result: Result from LigandMPNN inference
+            original_aatypes: Original amino acid types in Cogen format (B, N)
+            diffuse_mask: Diffuse mask where 0=fixed, 1=diffusable (B, N)
+
+        Returns:
+            Modified result with fixed positions restored to original values
+        """
+        B, num_passes, sequences_per_pass, N = batch_result.sequences.shape
+
+        # Create a copy of the sequences to modify
+        fixed_sequences = batch_result.sequences.clone()
+
+        # Process each structure in the batch
+        for b in range(B):
+            # Get the diffuse mask for this structure
+            if diffuse_mask.dim() == 2:
+                structure_diffuse_mask = diffuse_mask[b]  # (N,)
+            else:
+                structure_diffuse_mask = diffuse_mask  # (N,) - single structure case
+
+            # Find fixed positions (where diffuse_mask == 0)
+            fixed_positions = structure_diffuse_mask == 0  # (N,) boolean mask
+
+            if torch.any(fixed_positions):
+                # Get original amino acids at fixed positions
+                original_fixed_aas = original_aatypes[
+                    b, fixed_positions
+                ]  # (num_fixed,)
+
+                # For all passes and sequences, restore fixed positions to original values
+                for pass_idx in range(num_passes):
+                    for seq_idx in range(sequences_per_pass):
+                        # Move original amino acids to same device as sequences
+                        original_fixed_aas_device = original_fixed_aas.to(
+                            fixed_sequences.device
+                        )
+                        # Restore fixed positions
+                        fixed_sequences[b, pass_idx, seq_idx, fixed_positions] = (
+                            original_fixed_aas_device
+                        )
+
+        # Create new result with fixed sequences
+        result = NativeMPNNResult(
+            logits=batch_result.logits,  # Keep original logits
+            confidence_scores=batch_result.confidence_scores,  # Keep original confidence
+            sequences=fixed_sequences,  # Use fixed sequences
+        )
+
+        return result
 
 
 class ProteinMPNNRunnerPool:
@@ -2083,12 +2339,7 @@ class ProteinMPNNRunnerPool:
 
             all_logits.append(result.logits)
             all_confidence_scores.append(result.confidence_scores)
-
-            # Get sequences (computed on demand if needed)
-            if result._sequences is not None:
-                all_sequences.append(result._sequences)
-            else:
-                all_sequences.append(result.sequences)
+            all_sequences.append(result.sequences)
 
         # Concatenate along batch dimension
         collated_logits = torch.cat(
@@ -2104,7 +2355,7 @@ class ProteinMPNNRunnerPool:
         return NativeMPNNResult(
             logits=collated_logits,
             confidence_scores=collated_confidence,
-            _sequences=collated_sequences,
+            sequences=collated_sequences,
         )
 
     def _get_runner(self) -> ProteinMPNNRunner:

@@ -11,3 +11,4 @@ multiflow_weights
 multiflow_weights_mapped
 boltz
 *.egg-info
+.cursor

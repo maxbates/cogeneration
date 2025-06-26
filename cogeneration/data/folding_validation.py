@@ -233,10 +233,18 @@ class FoldingValidator:
                 lambda seq: _calc_seq_recovery(ref_seq, _seq_str_to_np(seq)),
             )
 
+        # TODO(inpainting) - pass consistent `diffuse_mask` for inverse folding and metric calculation
+        #  (e.g. ignore fixed residues in sequence conservation --
+        #   where appropriate! May want to calculate both recovery whole structure / scaffold-only)
+        # TODO(inpainting-fixed) - support pass fixed residues to ProteinMPNN
+        #    However, for inpainting, likely want to pass an empty mask,
+        #    since some of the metrics check for sequence conservation of motifs.
+        inverse_fold_diffuse_mask = np.ones_like(diffuse_mask)
+
         # Run inverse folding
         inverse_folded_fasta_path = self.inverse_fold_pdb(
             pdb_path=pred_pdb_path,
-            diffuse_mask=diffuse_mask,
+            diffuse_mask=inverse_fold_diffuse_mask,
             output_dir=inverse_folding_dir,
             num_sequences=n_inverse_folds,
         )
@@ -566,11 +574,6 @@ class FoldingValidator:
         Generates and returns a fasta of inverse folded sequences using ProteinMPNN.
         The number of sequences is determined by cfg.
         """
-        # TODO(inpainting-fixed) - support pass fixed residues to ProteinMPNN
-        #    However, for inpainting, likely want to pass an empty mask,
-        #    since some of the metrics check for sequence conservation of motifs.
-        # assert diffuse_mask is None or (diffuse_mask == 1.0).all()
-
         assert os.path.exists(pdb_path), f"PDB path {pdb_path} does not exist"
 
         uncompressed_pdb_path, is_temp_file = get_uncompressed_pdb_path(str(pdb_path))
