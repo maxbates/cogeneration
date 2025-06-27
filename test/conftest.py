@@ -35,6 +35,12 @@ from cogeneration.type.task import DataTask, InferenceTask
 logging.basicConfig(level=logging.DEBUG)
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')"
+    )
+
+
 @pytest.fixture
 def public_weights_path() -> Path:
     """

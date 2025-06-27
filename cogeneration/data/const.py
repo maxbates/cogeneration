@@ -32,8 +32,20 @@ MASK_TOKEN_INDEX = residue_constants.restypes_with_x.index("X")  # := 20
 CA_IDX = residue_constants.atom_order["CA"]
 
 
-def aatype_to_seq(aatype):
-    return "".join([residue_constants.restypes_with_x[x] for x in aatype])
+def aatype_to_seq(aatype, chain_idx=None):
+    if chain_idx is None:
+        return "".join([residue_constants.restypes_with_x[x] for x in aatype])
+
+    # Otherwise, include chain breaks where `chain_idx` changes
+    seq = ""
+    last_chain_id = None
+    for aa, chain_id in zip(aatype, chain_idx):
+        if chain_id != last_chain_id and last_chain_id is not None:
+            seq += CHAIN_BREAK_STR
+        seq += residue_constants.restypes_with_x[aa]
+        last_chain_id = chain_id
+
+    return seq
 
 
 def seq_to_aatype(seq):

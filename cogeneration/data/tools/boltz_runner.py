@@ -8,14 +8,21 @@ and allows for efficient repeated inference. It supports single-sequence mode
 
 import json
 import os
+import shutil
+import subprocess
 import threading
+import time
+import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
 import torch
+from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
 from boltz.data.types import Input, Manifest, Record, Target
 from boltz.data.write.writer import BoltzWriter
@@ -34,8 +41,8 @@ from pytorch_lightning import Trainer
 
 from cogeneration.config.base import BoltzConfig
 from cogeneration.data import residue_constants
-from cogeneration.data.const import CHAIN_BREAK_STR
-from cogeneration.data.tools.abc import FoldingTool, infer_device_id
+from cogeneration.data.const import CHAIN_BREAK_STR, aatype_to_seq
+from cogeneration.data.tools.abc import FoldingDataFrame, FoldingTool, infer_device_id
 from cogeneration.dataset.process_pdb import pdb_path_pdb_name, process_pdb_file
 from cogeneration.type.dataset import DatasetProteinColumn, ProcessedFile
 from cogeneration.type.metrics import MetricName
@@ -176,9 +183,10 @@ class BoltzPrediction:
         """
         processed_file = self.parsed_structure()
 
-        aatype = processed_file[DatasetProteinColumn.aatype]
-        # Convert aatype indices to sequence string
-        sequence = "".join([residue_constants.restypes_with_x[aa] for aa in aatype])
+        sequence = aatype_to_seq(
+            aatype=processed_file[DatasetProteinColumn.aatype],
+            chain_idx=processed_file[DatasetProteinColumn.chain_index],
+        )
 
         return sequence
 
@@ -258,6 +266,7 @@ class BoltzPaths:
     └── boltz2_aff.ckpt
 
     outputs_dir/
+    ├── {id}.fasta        (generated input, Boltz-formatted FASTA)
     ├── processed/
     │   ├── constraints/
     │   ├── msa/
@@ -265,8 +274,8 @@ class BoltzPaths:
     │   ├── records/
     │   ├── templates/
     │   └── structures/
-    ├── msa/
-    ├── predictions/
+    ├── msa/              (dummy MSAs)
+    ├── predictions/      (generated structures)
     └── logs/
     """
 
@@ -374,39 +383,65 @@ class BoltzManifestBuilder:
             for chain_seq in seq.split(CHAIN_BREAK_STR)
         ]
 
+    def _write_dummy_chain_msa(
+        self, chain_seq: str, msa_dir: Optional[Path] = None
+    ) -> Path:
+        """
+        Write a dummy MSA file for a single chain.
+        """
+        assert (
+            CHAIN_BREAK_STR not in chain_seq
+        ), f"Chain sequence {chain_seq} contains chain breaks"
+
+        if msa_dir is None:
+            msa_dir = self.paths.msa_dir
+
+        # Create unique MSA_ID for this chain
+        msa_taxonomy_id = self._get_next_msa_id()
+
+        msa_filename = f"{msa_taxonomy_id}.csv"
+        msa_path = msa_dir / msa_filename
+        msa_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write dummy MSA with just the target sequence using MSA_ID
+        with open(msa_path, "w") as msa_f:
+            msa_f.write("key,sequence\n")
+            msa_f.write(f"{msa_taxonomy_id},{chain_seq}\n")
+
+        return msa_path
+
     def _write_fasta_file_and_msas(
         self,
         protein_id: str,
-        chains: List[str],
-        msa_dir: Path,
+        seq: str,
+        fasta_dir: Optional[Path] = None,
+        msa_dir: Optional[Path] = None,
     ) -> Path:
         """
         Write FASTA file in Boltz format with proper headers for process_input.
-        Creates dummy MSA files for single-sequence mode with unique UUID-based MSA_ID per chain.
+        Creates dummy MSA files for single-sequence mode with unique MSA_ID per chain.
 
-        Returns the path to the written FASTA file.
+        Returns the path to the written FASTA file in Boltz format.
+
+        Format: >CHAIN_ID|ENTITY_TYPE|MSA_PATH
+        Example: >A|protein|1.csv
         """
-        fasta_path = self.paths.outputs_dir / f"{protein_id}.fasta"
+        if fasta_dir is None:
+            fasta_dir = self.paths.outputs_dir
+        if msa_dir is None:
+            msa_dir = self.paths.msa_dir
+
+        fasta_path = fasta_dir / f"{protein_id}.fasta"
+
+        chain_sequences = self._parse_sequence_with_chain_breaks(seq)
 
         with open(fasta_path, "w") as f:
-            for i, chain_seq in enumerate(chains):
+            for i, chain_seq in enumerate(chain_sequences):
                 chain_name = chr(ord("A") + i)  # A, B, C, etc.
-
-                # Create unique MSA_ID for this chain
-                msa_taxonomy_id = self._get_next_msa_id()
-
-                # Create dummy MSA file for this chain using the MSA_ID as filename
-                msa_filename = f"{msa_taxonomy_id}.csv"  # Use MSA_ID as filename
-                msa_path = msa_dir / msa_filename
-                msa_path.parent.mkdir(parents=True, exist_ok=True)
-
-                # Write dummy MSA with just the target sequence using MSA_ID
-                with open(msa_path, "w") as msa_f:
-                    msa_f.write("key,sequence\n")
-                    msa_f.write(f"{msa_taxonomy_id},{chain_seq}\n")
-
-                # Format: >CHAIN_ID|ENTITY_TYPE|MSA_PATH
-                f.write(f">{chain_name}|protein|{msa_path}\n{chain_seq}\n")
+                chain_msa_path = self._write_dummy_chain_msa(
+                    chain_seq=chain_seq, msa_dir=msa_dir
+                )
+                f.write(f">{chain_name}|protein|{chain_msa_path}\n{chain_seq}\n")
 
         return fasta_path
 
@@ -427,14 +462,10 @@ class BoltzManifestBuilder:
 
         records = []
         for seq, protein_id in zip(sequences, protein_ids):
-            # Parse chain breaks
-            chain_sequences = self._parse_sequence_with_chain_breaks(seq)
-
-            # Write FASTA file in Boltz format with MSA_IDs defined per chain
+            # Write FASTA file in Boltz format with dummy MSAs
             fasta_path = self._write_fasta_file_and_msas(
                 protein_id=protein_id,
-                chains=chain_sequences,
-                msa_dir=self.paths.msa_dir,
+                seq=seq,
             )
 
             # Use process_input to create all necessary files
@@ -512,8 +543,6 @@ class BoltzManifestBuilder:
 
         Returns:
             Manifest object
-
-        TODO should merge with AlphaFold function to create the same :-delimited multimer fasta
         """
         B, N = aatypes.shape
         if chain_idx.shape != (B, N):
@@ -553,7 +582,21 @@ class BoltzManifestBuilder:
             sequences_with_breaks.append(sequence_with_breaks)
 
         # Use from_sequences to create processed files
-        return self.from_sequences(sequences_with_breaks, protein_ids)
+        return self.from_sequences(
+            sequences=sequences_with_breaks, protein_ids=protein_ids
+        )
+
+    def _parse_fasta_records(self, fasta_path: Path) -> List[SeqRecord]:
+        """
+        Parse a FASTA file into a list of SeqRecord objects.
+        """
+        assert fasta_path.exists(), f"Fasta path {fasta_path} does not exist"
+
+        records = list(SeqIO.parse(fasta_path, "fasta"))
+        if not records:
+            raise ValueError(f"No sequences found in FASTA file: {fasta_path}")
+
+        return records
 
     def from_fasta(
         self, fasta_path: Union[str, Path], protein_ids: Optional[List[str]] = None
@@ -568,50 +611,62 @@ class BoltzManifestBuilder:
         Returns:
             Manifest object
         """
-        assert os.path.exists(fasta_path), f"Fasta path {fasta_path} does not exist"
-
         fasta_path = Path(fasta_path)
+        seq_records = self._parse_fasta_records(fasta_path=fasta_path)
+        sequences = [str(seq_record.seq) for seq_record in seq_records]
 
-        # Parse FASTA file to get sequences
-        sequences = []
-        headers = []
+        if protein_ids is not None:
+            assert len(seq_records) == len(
+                protein_ids
+            ), f"Number of protein IDs must match number of sequences in FASTA"
+        else:
+            # Require ids are unique
+            protein_ids = [record.id for record in seq_records]
+            assert len(set(protein_ids)) == len(
+                protein_ids
+            ), f"Fasta file {fasta_path} has duplicate protein ids"
 
-        with open(fasta_path, "r") as f:
-            current_seq = ""
-            current_header = None
+        return self.from_sequences(sequences=sequences, protein_ids=protein_ids)
 
-            for line in f:
-                line = line.strip()
-                if line.startswith(">"):
-                    # Save previous sequence if exists
-                    if current_header is not None and current_seq:
-                        sequences.append(current_seq)
-                        headers.append(current_header)
+    def prepare_fasta_for_cli(self, fasta_path: Union[str, Path]) -> Path:
+        """
+        Create a CLI-ready FASTA file with proper Boltz format and dummy MSA files.
+        Creates a separate directory containing only FASTA files (as required by Boltz CLI).
+        MSA files are placed in a sibling directory to avoid CLI directory scanning issues.
 
-                    # Start new sequence
-                    current_header = line[1:]  # Remove '>' prefix
-                    current_seq = ""
-                elif line:
-                    current_seq += line
+        Args:
+            fasta_path: Path to input FASTA file
 
-            # Save last sequence
-            if current_header is not None and current_seq:
-                sequences.append(current_seq)
-                headers.append(current_header)
+        Returns:
+            Path to directory containing only Boltz-formatted FASTA files (for CLI)
+        """
+        seq_records = self._parse_fasta_records(fasta_path=fasta_path)
 
-        if not sequences:
-            raise ValueError(f"No sequences found in FASTA file: {fasta_path}")
+        # Require ids are unique
+        assert len(set(seq_record.id for seq_record in seq_records)) == len(
+            seq_records
+        ), f"Fasta file {fasta_path} has duplicate protein ids"
 
-        # Use provided protein_ids or default to FASTA headers
-        if protein_ids is None:
-            protein_ids = headers
-        elif len(protein_ids) != len(sequences):
-            raise ValueError(
-                "Number of protein IDs must match number of sequences in FASTA"
+        # Create a separate directory for just the FASTA files (CLI requirement)
+        fasta_only_dir = self.paths.outputs_dir / "fasta"
+        fasta_only_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create MSA directory as sibling to avoid Boltz CLI directory scanning issues
+        cli_msa_dir = self.paths.outputs_dir / "msa"
+        cli_msa_dir.mkdir(parents=True, exist_ok=True)
+
+        # For each sequence, write a FASTA file in Boltz format with dummy MSAs
+        for seq_record in seq_records:
+            protein_id = seq_record.id
+            sequence = str(seq_record.seq)
+            fasta_path = self._write_fasta_file_and_msas(
+                protein_id=protein_id,
+                seq=sequence,
+                fasta_dir=fasta_only_dir,
+                msa_dir=cli_msa_dir,
             )
 
-        # Use from_sequences to create processed files
-        return self.from_sequences(sequences, protein_ids)
+        return fasta_only_dir
 
 
 class BoltzRunner(FoldingTool):
@@ -633,11 +688,11 @@ class BoltzRunner(FoldingTool):
         """
         self.cfg = cfg
 
-        # Set up outputs directory using BoltzPaths
-        self.paths = BoltzPaths(
+        # Set up default paths using BoltzPaths
+        self.default_paths = BoltzPaths(
             cache_dir=self.cfg.cache_dir, outputs_dir=self.cfg.outputs_path
         )
-        self.paths.mkdirs()
+        self.default_paths.mkdirs()
 
         self.checkpoint_path = self.cfg.checkpoint_path
 
@@ -698,7 +753,7 @@ class BoltzRunner(FoldingTool):
         if not self.checkpoint_path.exists():
             download_boltz2(cache_dir)
             assert self.checkpoint_path.exists()
-            assert self.paths.mols_dir.exists()
+            assert self.default_paths.mols_dir.exists()
 
     def _load_model(self):
         """Load the Boltz-2 model from checkpoint."""
@@ -743,25 +798,43 @@ class BoltzRunner(FoldingTool):
             enable_progress_bar=False,
         )
 
+    def _get_manifest_builder(
+        self, output_dir: Optional[Path] = None
+    ) -> BoltzManifestBuilder:
+        """
+        Get a manifest builder for the current paths.
+        """
+        # Create an isolated outputs_dir with a timestamp + UUID
+        if output_dir is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            uuid_str = str(uuid.uuid4())
+            output_dir = self.default_paths.outputs_dir / f"{timestamp}_{uuid_str}"
+
+        return BoltzManifestBuilder(
+            outputs_dir=output_dir, cache_dir=self.default_paths.cache_dir
+        )
+
     def predict(
         self,
         manifest: Manifest,
+        paths: BoltzPaths,
     ) -> BoltzPredictionSet:
         """
         Fold structures from a manifest.
 
         Args:
             manifest: Input manifest containing records to fold.
+            paths: BoltzPaths defining all paths for this run.
 
         Returns:
             BoltzPredictionSet containing BoltzPrediction objects for each protein in the manifest.
         """
 
-        self.paths.predictions_dir.mkdir(parents=True, exist_ok=True)
+        paths.predictions_dir.mkdir(parents=True, exist_ok=True)
 
         # Require an empty output directory, so we can safely clean up outputs.
         for record in manifest.records:
-            protein_output_dir = self.paths.predictions_dir / record.id
+            protein_output_dir = paths.predictions_dir / record.id
             if protein_output_dir.exists() and len(os.listdir(protein_output_dir)) > 0:
                 raise ValueError(
                     f"Output directory {protein_output_dir} is not empty. "
@@ -773,7 +846,7 @@ class BoltzRunner(FoldingTool):
             self._load_model()
 
         # Use BoltzPaths processed directory
-        processed_path = self.paths.processed_dir
+        processed_path = paths.processed_dir
         if not processed_path.exists():
             raise ValueError(
                 "Processed files not found. "
@@ -794,21 +867,21 @@ class BoltzRunner(FoldingTool):
         # Set up data module using processed data directories
         data_module = Boltz2InferenceDataModule(
             manifest=manifest,
-            target_dir=self.paths.structures_dir,
-            msa_dir=self.paths.processed_msa_dir,
-            mol_dir=self.paths.mols_dir,
+            target_dir=paths.structures_dir,
+            msa_dir=paths.processed_msa_dir,
+            mol_dir=paths.mols_dir,
             num_workers=1,
-            constraints_dir=self.paths.constraints_dir,
-            template_dir=self.paths.templates_dir,
-            extra_mols_dir=self.paths.processed_mols_dir,
+            constraints_dir=paths.constraints_dir,
+            template_dir=paths.templates_dir,
+            extra_mols_dir=paths.processed_mols_dir,
             override_method=None,
             affinity=False,
         )
 
         # Set up writer
         writer = BoltzWriter(
-            data_dir=str(self.paths.structures_dir),
-            output_dir=str(self.paths.predictions_dir),
+            data_dir=str(paths.structures_dir),
+            output_dir=str(paths.predictions_dir),
             output_format=self.cfg.output_format,
             boltz2=True,
         )
@@ -826,7 +899,7 @@ class BoltzRunner(FoldingTool):
         # Create BoltzPrediction objects for each protein
         predictions = []
         for record in manifest.records:
-            protein_output_dir = self.paths.predictions_dir / record.id
+            protein_output_dir = paths.predictions_dir / record.id
             prediction = BoltzPrediction.from_output_dir(protein_output_dir)
             # remove unnecesary outputs
             prediction.clean_output_dir()
@@ -838,33 +911,131 @@ class BoltzRunner(FoldingTool):
         self,
         fasta_path: Path,
         output_dir: Path,
-    ) -> pd.DataFrame:
+    ) -> FoldingDataFrame:
         """
         Fold a protein sequence from a FASTA file and save the results to an output directory.
         Each fasta entry should be an entry in the DataFrame.
 
         Implements the FoldingTool interface.
         """
-        manifest_builder = BoltzManifestBuilder(
-            outputs_dir=self.paths.outputs_dir, cache_dir=self.paths.cache_dir
-        )
+        if self.cfg.run_native:
+            return self.fold_fasta_native(fasta_path=fasta_path, output_dir=output_dir)
+        else:
+            return self.fold_fasta_subprocess(
+                fasta_path=fasta_path, output_dir=output_dir
+            )
+
+    def fold_fasta_native(
+        self,
+        fasta_path: Path,
+        output_dir: Path,
+    ) -> FoldingDataFrame:
+        """
+        Using in-memory model, fold a protein sequence from a FASTA file.
+        Each fasta entry should be an entry in the DataFrame.
+
+        Implements the FoldingTool interface.
+        """
+        manifest_builder = self._get_manifest_builder(output_dir=output_dir)
         manifest = manifest_builder.from_fasta(fasta_path=fasta_path)
 
-        prediction_set = self.predict(manifest=manifest)
-
-        # Copy results to the requested output directory if different from predictions_dir
-        if output_dir != self.paths.predictions_dir:
-            import shutil
-
-            output_dir.mkdir(parents=True, exist_ok=True)
-            for prediction in prediction_set:
-                src_dir = prediction.output_dir
-                dst_dir = output_dir / prediction.protein_id
-                if dst_dir.exists():
-                    shutil.rmtree(dst_dir)
-                shutil.copytree(src_dir, dst_dir)
+        prediction_set = self.predict(manifest=manifest, paths=manifest_builder.paths)
 
         return prediction_set.to_df()
+
+    def fold_fasta_subprocess(
+        self,
+        fasta_path: Path,
+        output_dir: Path,
+    ) -> FoldingDataFrame:
+        """
+        Using Boltz CLI as a subprocess, fold a protein sequence from a FASTA file.
+        Each fasta entry should be an entry in the DataFrame.
+
+        This method calls `boltz predict` as a CLI command instead of using the Python API.
+        Useful for simpler execution or when the Python API has issues.
+
+        Creates dummy MSA files for single-sequence mode, similar to the Python API.
+
+        Note CLI Boltz outputs results to `outputs_dir/boltz_results_<input_dir>`
+
+        Args:
+            fasta_path: Path to the FASTA file containing sequences to fold.
+            output_dir: Directory to save the prediction results.
+
+        Returns:
+            DataFrame with columns: header, sequence, folded_pdb_path, plddt_mean
+        """
+        # Ensure model is downloaded
+        self._download_model_if_needed()
+
+        # Use ManifestBuilder to prepare FASTA with MSA files
+        manifest_builder = self._get_manifest_builder(output_dir=output_dir)
+
+        # Get Boltz-formatted FASTA with dummy MSAs
+        fasta_dir = manifest_builder.prepare_fasta_for_cli(fasta_path=fasta_path)
+
+        # Build the CLI command
+        cmd = [
+            "boltz",
+            "predict",
+            str(fasta_dir),
+            "--cache",
+            str(self.cfg.cache_dir),
+            "--out_dir",
+            str(output_dir),
+            "--output_format",
+            "pdb",
+            # config parameters
+            "--sampling_steps",
+            str(self.cfg.sampling_steps),
+            "--diffusion_samples",
+            str(self.cfg.diffusion_samples),
+            "--recycling_steps",
+            str(self.cfg.recycling_steps),
+            "--step_scale",
+            str(self.cfg.step_scale),
+        ]
+
+        # Run the CLI command
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"Boltz CLI command failed with return code {e.returncode}.\n"
+                f"Command: {' '.join(cmd)}\n"
+                f"stdout: {e.stdout}\n"
+                f"stderr: {e.stderr}"
+            ) from e
+
+        # Parse CLI output and create BoltzPrediction objects
+        predictions = []
+        boltz_results_dirs = list(output_dir.glob("boltz_results_*"))
+        if not boltz_results_dirs:
+            raise RuntimeError(
+                f"No boltz_results_* directory found in output directory: {output_dir}"
+            )
+
+        # Process all boltz_results_* directories to handle multiple sequences
+        for boltz_results_dir in boltz_results_dirs:
+            predictions_dir = boltz_results_dir / "predictions"
+            if not predictions_dir.exists():
+                continue
+
+            # Each sequence gets its own subdirectory in predictions/
+            for item in predictions_dir.iterdir():
+                if item.is_dir():
+                    try:
+                        predictions.append(BoltzPrediction.from_output_dir(item))
+                    except (FileNotFoundError, AssertionError):
+                        continue
+
+        if not predictions:
+            raise RuntimeError(
+                f"No valid predictions found in output directory: {output_dir}"
+            )
+
+        return BoltzPredictionSet(predictions).to_df()
 
     def fold_sequences(
         self,
@@ -875,15 +1046,13 @@ class BoltzRunner(FoldingTool):
         Fold sequences from a list of sequences and protein IDs.
         Specify chain breaks using CHAIN_BREAK_STR ':' in sequences.
         """
-        manifest_builder = BoltzManifestBuilder(
-            outputs_dir=self.paths.outputs_dir, cache_dir=self.paths.cache_dir
-        )
+        manifest_builder = self._get_manifest_builder(output_dir=None)
         manifest = manifest_builder.from_sequences(
             sequences=sequences,
             protein_ids=protein_ids,
         )
 
-        return self.predict(manifest=manifest)
+        return self.predict(manifest=manifest, paths=manifest_builder.paths)
 
     def fold_batch(
         self,
@@ -895,13 +1064,11 @@ class BoltzRunner(FoldingTool):
         Fold sequences in a batch. Specify chain breaks in chain_idx.
         Returns one prediction per sequence
         """
-        manifest_builder = BoltzManifestBuilder(
-            outputs_dir=self.paths.outputs_dir, cache_dir=self.paths.cache_dir
-        )
+        manifest_builder = self._get_manifest_builder(output_dir=None)
         manifest = manifest_builder.from_batch(
             aatypes=aatypes,
             chain_idx=chain_idx,
             protein_ids=protein_ids,
         )
 
-        return self.predict(manifest=manifest)
+        return self.predict(manifest=manifest, paths=manifest_builder.paths)

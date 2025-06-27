@@ -19,6 +19,7 @@ from cogeneration.data.tools.boltz_runner import (
     BoltzRunner,
 )
 from cogeneration.type.dataset import DatasetProteinColumn
+from cogeneration.type.metrics import MetricName
 
 simple_sequence = "MKLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL"
 
@@ -339,7 +340,79 @@ class TestBoltzRunner:
         mock_cfg.folding.boltz.outputs_path = tmp_path
         predictor = BoltzRunner(cfg=mock_cfg.folding.boltz)
         with pytest.raises(FileNotFoundError, match="Missing record files"):
-            predictor.predict(manifest)
+            predictor.predict(manifest, paths=builder.paths)
+
+    @pytest.mark.slow
+    def test_fold_fasta_subprocess(self, mock_cfg, tmp_path):
+        """Test that fold_fasta_subprocess correctly handles multiple sequences including chain breaks."""
+        # Create a temporary FASTA file with multiple sequences, including one with chain break
+        fasta_path = tmp_path / "test_input.fasta"
+
+        single_chain_seq = "MKLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL"
+        multimer_seq = f"MKALGLTSRQWERTASDFGHIKLACVWNM{CHAIN_BREAK_STR}ATYPRKDAWERTYVIAPLKIHGFDSACVWNM"
+
+        fasta_content = (
+            ">single_chain\n"
+            f"{single_chain_seq}\n"
+            ">multimer_protein\n"
+            f"{multimer_seq}\n"
+        )
+        fasta_path.write_text(fasta_content)
+
+        # Create output directory
+        output_dir = tmp_path / "subprocess_output"
+
+        # Run fold_fasta_subprocess
+        predictor = BoltzRunner(cfg=mock_cfg.folding.boltz)
+
+        result_df = predictor.fold_fasta_subprocess(
+            fasta_path=fasta_path, output_dir=output_dir
+        )
+
+        print(output_dir)
+        print(result_df)
+
+        # Validate the output DataFrame
+        assert result_df is not None
+        assert len(result_df) == 2
+
+        # Check expected columns exist
+        expected_columns = [
+            MetricName.header,
+            MetricName.sequence,
+            MetricName.folded_pdb_path,
+            MetricName.plddt_mean,
+        ]
+        for col in expected_columns:
+            assert col in result_df.columns
+
+        # Check the row data
+        row = result_df.iloc[0]
+        assert row["header"] == "single_chain"  # CLI uses filename as protein ID
+        assert row["sequence"] == single_chain_seq
+        assert row["folded_path"] is not None
+        assert Path(row["folded_path"]).exists()
+        assert row["plddt_mean"] is not None
+        assert isinstance(row["plddt_mean"], (int, float))
+
+        # Check the multimer row
+        row = result_df.iloc[1]
+        assert row["header"] == "multimer_protein"
+        assert row["sequence"] == multimer_seq
+        assert row["folded_path"] is not None
+        assert Path(row["folded_path"]).exists()
+
+        # Check 2 fasta files were created
+        fasta_dir = output_dir / "fasta"
+        fasta_files = list(fasta_dir.glob("*.fasta"))
+        assert (
+            len(fasta_files) == 2
+        ), f"Expected 2 FASTA files, found {len(fasta_files)}"
+
+        # Check that 3 MSA files were created (one single, 2 for multimer)
+        msa_dir = output_dir / "msa"
+        msa_files = list(msa_dir.glob("*.csv"))
+        assert len(msa_files) == 3, f"Expected 2 MSA files, found {len(msa_files)}"
 
 
 class TestBoltzPrediction:

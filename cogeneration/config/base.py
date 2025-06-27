@@ -1282,6 +1282,9 @@ class AlphaFold2Config(BaseClassConfig):
 class BoltzConfig(BaseClassConfig):
     """Configuration for Boltz-2 runner."""
 
+    # Prefer running in memory vs using subprocess and CLI API
+    run_native: bool = True
+
     # Directory containing checkpoint, `mols`, etc.
     cache_dir: Path = Path("~/.boltz/cache").expanduser()
     # Path to Boltz-2 checkpoint. Downloaded file name chosen by Boltz.
