@@ -388,19 +388,21 @@ class TestBoltzRunner:
 
         # Check the row data
         row = result_df.iloc[0]
-        assert row["header"] == "single_chain"  # CLI uses filename as protein ID
-        assert row["sequence"] == single_chain_seq
-        assert row["folded_path"] is not None
-        assert Path(row["folded_path"]).exists()
-        assert row["plddt_mean"] is not None
-        assert isinstance(row["plddt_mean"], (int, float))
+        assert (
+            row[MetricName.header] == "single_chain"
+        )  # CLI uses filename as protein ID
+        assert row[MetricName.sequence] == single_chain_seq
+        assert row[MetricName.folded_pdb_path] is not None
+        assert Path(row[MetricName.folded_pdb_path]).exists()
+        assert row[MetricName.plddt_mean] is not None
+        assert isinstance(row[MetricName.plddt_mean], (int, float))
 
         # Check the multimer row
         row = result_df.iloc[1]
-        assert row["header"] == "multimer_protein"
-        assert row["sequence"] == multimer_seq
-        assert row["folded_path"] is not None
-        assert Path(row["folded_path"]).exists()
+        assert row[MetricName.header] == "multimer_protein"
+        assert row[MetricName.sequence] == multimer_seq
+        assert row[MetricName.folded_pdb_path] is not None
+        assert Path(row[MetricName.folded_pdb_path]).exists()
 
         # Check 2 fasta files were created
         fasta_dir = output_dir / "fasta"

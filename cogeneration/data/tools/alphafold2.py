@@ -96,17 +96,24 @@ class AlphaFold2Tool(FoldingTool):
             "3",
             "--model-type",
             af2_model_type,
-            "--gpu-id",
-            str(self.device_id),
         ]
-        process = subprocess.Popen(
-            af2_args, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT
-        )
-        code = process.wait()
-        if code != 0:
-            raise RuntimeError(
-                f"AlphaFold2 run.py failed with code {code}. Args: {' '.join(af2_args)}"
+
+        # clone environment, specifying GPUs
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
+
+        # Run the CLI command
+        try:
+            subprocess.run(
+                af2_args, check=True, capture_output=True, text=True, env=env
             )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"AlphaFold2 CLI command failed with return code {e.returncode}.\n"
+                f"Command: {' '.join(af2_args)}\n"
+                f"stdout: {e.stdout}\n"
+                f"stderr: {e.stderr}"
+            ) from e
 
         fasta_seqs = SeqIO.to_dict(SeqIO.parse(fasta_path, "fasta"))
         all_af2_files = glob.glob(os.path.join(output_dir, "*"))
