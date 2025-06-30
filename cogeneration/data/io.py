@@ -1,3 +1,4 @@
+import gzip
 import io
 import json
 import os
@@ -22,29 +23,64 @@ class CPU_Unpickler(pickle.Unpickler):
             return super().find_class(module, name)
 
 
-def write_pkl(save_path: str, pkl_data: Any, create_dir: bool = False, use_torch=False):
-    """Serialize data into a pickle file."""
+def optimize_data_types(data: dict) -> dict:
+    """Optimize data types for storage efficiency by converting float64 to float32."""
+    optimized = {}
+
+    for key, value in data.items():
+        if isinstance(value, np.ndarray) and value.dtype == np.float64:
+            optimized[key] = value.astype(np.float32)
+        else:
+            optimized[key] = value
+
+    return optimized
+
+
+def write_pkl(
+    save_path: str,
+    pkl_data: Any,
+    create_dir: bool = False,
+    use_torch=False,
+    optimize_dtypes: bool = True,
+):
+    """Serialize data into a pickle file. Uses compression if path contains '.gz'."""
     if create_dir:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    # Optimize data types if requested and data is a dict
+    if optimize_dtypes and isinstance(pkl_data, dict):
+        pkl_data = optimize_data_types(pkl_data)
+
     if use_torch:
         torch.save(pkl_data, save_path, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+    elif ".gz" in save_path:
+        with gzip.open(save_path, "wb", compresslevel=6) as handle:
+            pickle.dump(pkl_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
     else:
         with open(save_path, "wb") as handle:
             pickle.dump(pkl_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def read_pkl(read_path: str, verbose=True, use_torch=False, map_location=None):
-    """Read data from a pickle file."""
+    """Read data from a pickle file. Handles both compressed and uncompressed files."""
     try:
         if use_torch:
             return torch.load(read_path, map_location=map_location)
+        elif ".gz" in read_path:
+            with gzip.open(read_path, "rb") as handle:
+                return pickle.load(handle)
         else:
             with open(read_path, "rb") as handle:
                 return pickle.load(handle)
     except Exception as e:
         try:
-            with open(read_path, "rb") as handle:
-                return CPU_Unpickler(handle).load()
+            # Try the CPU unpickler fallback
+            if ".gz" in read_path:
+                with gzip.open(read_path, "rb") as handle:
+                    return CPU_Unpickler(handle).load()
+            else:
+                with open(read_path, "rb") as handle:
+                    return CPU_Unpickler(handle).load()
         except Exception as e2:
             if verbose:
                 print(

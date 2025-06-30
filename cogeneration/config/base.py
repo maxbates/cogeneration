@@ -798,7 +798,7 @@ class DatasetFilterConfig(BaseClassConfig):
     # minimum percent of known and modelable residues in the structure of total sequence.
     max_percent_residues_unknown: float = 0.5  # 0.5 in public MultiFlow
     # pLDDT filter for synthetic structures
-    min_plddt: float = 0.7
+    min_plddt: float = 0.8
     # PDB date filter, converted to `pd.datetime`
     min_date: Optional[str] = None
     max_date: Optional[str] = None
@@ -840,7 +840,9 @@ class DatasetFilterConfig(BaseClassConfig):
             max_coil_percent=1,
             rog_quantile=1,
             max_percent_residues_unknown=0.75,
-            min_plddt=0.4,
+            min_date=None,
+            max_date=None,
+            min_plddt=0.5,
             oligomeric=None,
             num_chains=None,
         )
@@ -1552,6 +1554,7 @@ class Config(BaseClassConfig):
 
         # set output directories to temp paths
         raw_cfg.experiment.checkpointer.dirpath = str(tmp_path / "ckpt")
+        raw_cfg.experiment.checkpointer.saved_ckpt_dir = str(tmp_path / "ckpt")
         raw_cfg.inference.predict_dir = str(tmp_path / "inference")
 
         # disable multiple particles / steering

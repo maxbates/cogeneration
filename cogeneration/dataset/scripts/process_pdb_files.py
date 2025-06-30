@@ -274,6 +274,21 @@ def main(args: Args):
             logging.error(f"Unknown error for {metadata_row[MetadataColumn.raw_path]}")
             pbar.write(f"Unknown error for {metadata_row[MetadataColumn.raw_path]}")
 
+    def print_write_dir_size(directory_path: str) -> float:
+        """Calculate the total size of a directory in GB."""
+        num_files = 0
+        total_size = 0
+        for dirpath, dirnames, filenames in os.walk(directory_path):
+            for filename in filenames:
+                file_path = os.path.join(dirpath, filename)
+                if os.path.exists(file_path):
+                    total_size += os.path.getsize(file_path)
+                    num_files += 1
+        gb = total_size / (1024**3)
+        print(f"write_dir {directory_path} size: {gb:.2f} GB, {num_files} files")
+
+    print_write_dir_size(write_dir)
+
     # Series
     processed_count = 0
     if args.num_processes == 1 or args.debug:
@@ -283,13 +298,15 @@ def main(args: Args):
                 write_dir=write_dir,
                 delete_original=args.delete_original,
                 verbose=args.verbose,
-                max_combined_length=DatasetFilterer.cfg.max_num_res,
+                max_combined_length=dataset_filterer.cfg.max_num_res,
             )
             handle_result(metadata_row, error_msg)
             pbar.update(1)
 
     # Parallel
     else:
+        print(f"Processing {len(all_paths)} files with {args.num_processes} processes")
+
         with ProcessPoolExecutor(max_workers=args.num_processes) as executor:
             future_to_path = {
                 executor.submit(
@@ -298,7 +315,7 @@ def main(args: Args):
                     write_dir=write_dir,
                     delete_original=args.delete_original,
                     verbose=args.verbose,
-                    max_combined_length=DatasetFilterer.cfg.max_num_res,
+                    max_combined_length=dataset_filterer.cfg.max_num_res,
                 ): raw_pdb_path
                 for raw_pdb_path in all_paths
             }
@@ -311,17 +328,12 @@ def main(args: Args):
     pbar.close()
     csv_file.close()
 
-    # determine total count and file size of all processed files
+    # print final stats
     total_done = existing_processed_files + processed_count
-    total_size = 0
-    for dirpath, dirnames, filenames in os.walk(write_dir):
-        for filename in filenames:
-            file_path = os.path.join(dirpath, filename)
-            total_size += os.path.getsize(file_path)
     print(
         f"Finished processing {processed_count} structures -> {total_done} of {total_num_files} files"
     )
-    print(f"Total size of processed files: {total_size / (1024 * 1024 * 1024):.2f} GB")
+    print_write_dir_size(write_dir)
 
     print(f"Metadata written to {metadata_path}")
     print(f"Errors tracked in {error_log_path}")

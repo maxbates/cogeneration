@@ -509,7 +509,7 @@ def _process_pdb(
 
         # Save pkl after processing is successful
         if write_dir is not None:
-            processed_path = os.path.join(write_dir, f"{pdb_name}.pkl")
+            processed_path = os.path.join(write_dir, f"{pdb_name}.pkl.gz")  # compressed
             metadata[mc.processed_path] = os.path.abspath(processed_path)
             write_pkl(processed_path, complex_feats)
         else:
@@ -525,8 +525,6 @@ def _process_pdb(
         # If we created a temp file, remove it
         if is_temp_file:
             os.remove(uncompressed_pdb_path)
-
-        logging.error(f"Error processing PDB file {pdb_file_path}: {e}")
 
         # re-raise original exception
         raise e
@@ -597,6 +595,7 @@ def read_processed_file(
 ) -> ProcessedFile:
     """
     Loads a processed PDB pkl from `process_pdb_file` and yields a ProcessedFile.
+    Automatically handles both compressed (.pkl.gz) and uncompressed (.pkl) files.
     """
     processed_feats = read_pkl(processed_file_path)
     processed_file = process_chain_feats(
