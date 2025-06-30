@@ -40,6 +40,9 @@ class NodeFeatureNet(nn.Module):
             )
             embed_size += self.cfg.c_pos_emb
 
+        if self.cfg.embed_hotspots:
+            embed_size += 1  # binary hot spot indicator
+
         if self.cfg.use_mlp:
             self.linear = nn.Sequential(
                 nn.Linear(embed_size, self.cfg.c_s),
@@ -73,6 +76,7 @@ class NodeFeatureNet(nn.Module):
         aatypes_sc: torch.Tensor,  # (B, N, aatype_pred_num_tokens)
         torsions_t: torch.Tensor,  # (B, N, 7, 2)
         structure_method: torch.Tensor,  # (B, 1)
+        hot_spots_mask: torch.Tensor,  # (B, N)
     ):
         pos_emb = get_index_embedding(
             res_index,
@@ -117,5 +121,8 @@ class NodeFeatureNet(nn.Module):
             input_feats.append(
                 self.structural_method_embedding(method_feature)
             )  # (B, N, c_pos_emb)
+
+        if self.cfg.embed_hotspots:
+            input_feats.append(hot_spots_mask.float().unsqueeze(-1))  # (B, N, 1)
 
         return self.linear(torch.cat(input_feats, dim=-1))

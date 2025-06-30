@@ -218,6 +218,8 @@ class ModelNodeFeaturesConfig(BaseClassConfig):
     embed_torsions: bool = True
     # embed_structural_method: whether to embed structure experimental method
     embed_structural_method: bool = True
+    # embed_hotspots: whether to embed hot spot indicators
+    embed_hotspots: bool = True
     # use_mlp: whether to use MLP for embedding, otherwise linear layer
     use_mlp: bool = True
 
@@ -869,6 +871,25 @@ class DatasetInpaintingMotifStrategy(StrEnum):
 
 
 @dataclass
+class DatasetHotspotsConfig(BaseClassConfig):
+    """
+    Configuration for hot spots sampling and processing
+    """
+
+    # Percentage of time to include no hot spots
+    no_hotspots_prob: float = 0.0
+
+    # Downsampling
+    # Minimum number of hot spots to consider in a structure
+    min_hotspots_threshold: int = 1
+    # Percentage of hot spots to sample when enabled
+    min_hotspot_fraction: float = 0.05
+    max_hotspot_fraction: float = 0.25
+    # Hot spot selection strategy
+    prioritize_high_interaction: bool = True  # TODO remove
+
+
+@dataclass
 class DatasetInpaintingConfig(BaseClassConfig):
     """
     Configuration for generating motifs / scaffolding
@@ -987,6 +1008,9 @@ class DatasetConfig(BaseClassConfig):
     # Scaffolding / inpainting parameters
     inpainting: DatasetInpaintingConfig = field(default_factory=DatasetInpaintingConfig)
 
+    # Hot spots
+    hotspots: DatasetHotspotsConfig = field(default_factory=DatasetHotspotsConfig)
+
     # Filtering
     filter: DatasetFilterConfig = field(default_factory=DatasetFilterConfig)
 
@@ -1047,6 +1071,8 @@ class ExperimentTrainingConfig(BaseClassConfig):
     aux_bfactor_loss_weight: float = 1e-3
     # pLDDT confidence (comparing pred to GT structure)
     aux_plddt_loss_weight: float = 1e-3
+    # hot spots inter-chain contact loss
+    aux_hot_spots_loss_weight: float = 0.05
 
 
 @dataclass
@@ -1576,8 +1602,7 @@ class Config(BaseClassConfig):
         raw_cfg.model.hyper_params = ModelHyperParamsConfig.public_multiflow()
         # disable ESM combiner
         raw_cfg.model.esm_combiner.enabled = False
-        # disable method embedding, b-factor, confidence prediction
-        raw_cfg.model.node_features.embed_structural_method = False
+        # disable b-factor, confidence prediction
         raw_cfg.model.bfactor.enabled = False
         raw_cfg.model.plddt.enabled = False
         # Use simple aa_pred_net from public MultiFlow
@@ -1596,7 +1621,9 @@ class Config(BaseClassConfig):
         # Don't predict torsion angles
         raw_cfg.model.predict_psi_torsions = False
         raw_cfg.model.predict_all_torsions = False
-        # positional embeddings
+        # restrict embeddings, which positional embeddings
+        raw_cfg.model.node_features.embed_structural_method = False
+        raw_cfg.model.node_features.embed_hotspots = False
         raw_cfg.model.node_features.embed_chain = False
         raw_cfg.model.node_features.embed_torsions = False
         raw_cfg.model.edge_features.embed_chain = False

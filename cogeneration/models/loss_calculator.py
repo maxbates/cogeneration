@@ -7,6 +7,7 @@ import torch
 from cogeneration.config.base import Config
 from cogeneration.data import all_atom, so3_utils
 from cogeneration.data.data_transforms import common_torsion_mask
+from cogeneration.dataset.interaction import DIST_INTERACTION_BACKBONE
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import ModelPrediction
 from cogeneration.type.batch import NoisyBatchProp as nbp
@@ -601,6 +602,87 @@ class BatchLossCalculator:
 
         return loss
 
+    def loss_hot_spots(self, contact_dist_ang: Optional[float] = None) -> torch.Tensor:
+        """
+        Hot spot loss encourages residues marked as hot spots to be in contact across chains.
+        Each hot spot residue should have at least one residue from another chain within contact distance.
+        Only applied to multimer structures with hot spots defined.
+        """
+        # Default loss threshold is slightly higher than what is marked as an interaction
+        if contact_dist_ang is None:
+            contact_dist_ang = DIST_INTERACTION_BACKBONE + 0.5
+
+        # Skip if no hot spots marked
+        if bp.hot_spots not in self.batch:
+            return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+        hot_spots_mask = self.batch[bp.hot_spots]  # (B, N)
+        hot_spots_present = hot_spots_mask.sum(-1) > 0  # (B,)
+        if not hot_spots_present.any():
+            return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+
+        # Only apply to multimers
+        chain_idx = self.batch[bp.chain_idx]  # (B, N)
+        multi_chain_mask = chain_idx.max(-1).values != chain_idx.min(-1).values  # (B,)
+        if not multi_chain_mask.any():
+            return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+
+        # Calculate pairwise distances
+        pred_ca_positions = self.pred_bb_atoms[:, :, 1, :]  # (B, N, 3) - CA atoms
+        pairwise_ca = pred_ca_positions.unsqueeze(2) - pred_ca_positions.unsqueeze(
+            1
+        )  # (B, N, N, 3)
+        pairwise_dists = torch.norm(pairwise_ca, dim=-1)  # (B, N, N)
+
+        # Mask for inter-chain residue pairs
+        chain_i = chain_idx.unsqueeze(2)  # (B, N, 1)
+        chain_j = chain_idx.unsqueeze(1)  # (B, 1, N)
+        inter_chain = chain_i != chain_j  # (B, N, N)
+
+        # Valid residue pairs (both residues must be valid)
+        res_i_mask = self.loss_mask.unsqueeze(2)  # (B, N, 1)
+        res_j_mask = self.loss_mask.unsqueeze(1)  # (B, 1, N)
+        valid_pairs = res_i_mask & res_j_mask  # (B, N, N)
+
+        # Mask for valid inter-chain pairs
+        valid_inter_chain = inter_chain & valid_pairs  # (B, N, N)
+
+        # For each hot spot residue, find minimum distance to any residue on another chain
+        # Set distances to invalid pairs to a large value so they don't affect the min
+        masked_dists = pairwise_dists.clone()
+        masked_dists[~valid_inter_chain] = float("inf")
+
+        # Find minimum distance to any other-chain residue for each residue
+        min_inter_chain_dist, _ = masked_dists.min(dim=2)  # (B, N)
+
+        # Only consider hot spot residues for loss
+        hot_spot_min_dists = min_inter_chain_dist * hot_spots_mask.float()  # (B, N)
+
+        # Apply relu loss: penalize when minimum distance exceeds contact threshold
+        # Replace inf values (no valid inter-chain residues) with contact_dist_ang to avoid large losses
+        hot_spot_min_dists = torch.where(
+            torch.isinf(hot_spot_min_dists),
+            torch.tensor(contact_dist_ang, device=hot_spot_min_dists.device),
+            hot_spot_min_dists,
+        )
+
+        contact_loss = torch.relu(hot_spot_min_dists - contact_dist_ang)  # (B, N)
+        contact_loss = contact_loss.clamp(max=10.0)  # cap distance
+
+        # Only apply loss to actual hot spots
+        hot_spot_loss = contact_loss * hot_spots_mask.float()  # (B, N)
+
+        # Sum over hot spots and normalize by number of hot spots
+        loss_per_batch = hot_spot_loss.sum(dim=1)  # (B,)
+        num_hot_spots = hot_spots_mask.float().sum(dim=1).clamp_min(1.0)  # (B,)
+        loss_per_batch = loss_per_batch / num_hot_spots  # (B,)
+
+        # Only apply to relevant batches
+        loss_per_batch = (
+            loss_per_batch * hot_spots_present.float() * multi_chain_mask.float()
+        )
+
+        return loss_per_batch
+
     def calculate(self) -> Tuple[TrainingLosses, AuxiliaryMetrics]:
         """Calculate losses for the batch."""
         loss_trans = self.loss_trans()
@@ -613,6 +695,7 @@ class BatchLossCalculator:
         loss_multimer_clash = self.loss_multimer_clash()
         loss_bfactor = self.loss_bfactor()
         loss_plddt = self.loss_plddt()
+        loss_hot_spots = self.loss_hot_spots()
 
         # scale losses by cfg weights
         loss_trans = loss_trans * self.train_cfg.translation_loss_weight
@@ -631,6 +714,7 @@ class BatchLossCalculator:
         )
         loss_bfactor = loss_bfactor * self.train_cfg.aux_bfactor_loss_weight
         loss_plddt = loss_plddt * self.train_cfg.aux_plddt_loss_weight
+        loss_hot_spots = loss_hot_spots * self.train_cfg.aux_hot_spots_loss_weight
 
         # auxiliary loss
         loss_auxiliary = (
@@ -640,6 +724,7 @@ class BatchLossCalculator:
             + loss_multimer_interface
             + loss_bfactor
             + loss_plddt
+            + loss_hot_spots
         )
         loss_auxiliary *= self.train_cfg.aux_loss_weight
 

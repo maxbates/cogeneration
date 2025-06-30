@@ -109,6 +109,7 @@ class FlowModel(nn.Module):
         trans_sc = batch[nbp.trans_sc]
         aatypes_sc = batch[nbp.aatypes_sc]
         structure_method = batch[bp.structure_method]
+        hot_spots_mask = batch[bp.hot_spots]
 
         init_rigids_ang = create_rigid(rots=rotmats_t, trans=trans_t)
         init_rigids_nm = rigids_ang_to_nm(init_rigids_ang)
@@ -126,6 +127,7 @@ class FlowModel(nn.Module):
             aatypes_sc=aatypes_sc,
             torsions_t=torsions_t,
             structure_method=structure_method,
+            hot_spots_mask=hot_spots_mask,
         )
         init_edge_embed = self.edge_feature_net(
             node_embed=init_node_embed,

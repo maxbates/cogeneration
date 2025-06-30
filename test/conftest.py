@@ -18,7 +18,12 @@ from cogeneration.config.base import PATH_PUBLIC_WEIGHTS, Config, InferenceSampl
 from cogeneration.data import all_atom
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restypes_with_x
-from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingDataset
+from cogeneration.dataset.datasets import (
+    BatchFeaturizer,
+    DatasetConstructor,
+    LengthSamplingDataset,
+)
+from cogeneration.dataset.process_pdb import process_chain_feats, process_pdb_file
 from cogeneration.dataset.protein_dataloader import ProteinData
 from cogeneration.dataset.test_utils import (
     MockDataloader,
@@ -29,6 +34,7 @@ from cogeneration.dataset.test_utils import (
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
 from cogeneration.type.batch import BatchProp as bp
+from cogeneration.type.dataset import MetadataColumn
 from cogeneration.type.metrics import MetricName
 from cogeneration.type.task import DataTask, InferenceTask
 
@@ -420,3 +426,30 @@ def pdb_2qlw_path():
     - glycine starts at position -1 in each chain
     """
     return Path(__file__).parent / "dataset" / "2qlw.pdb"
+
+
+@pytest.fixture
+def pdb_2qlw_processed_feats(pdb_2qlw_path, mock_cfg):
+    """Generate features from the 2QLW PDB file. Note includes centering, chain randomization, etc."""
+    processed_file = process_pdb_file(str(pdb_2qlw_path), "2qlw")
+    processed_file = process_chain_feats(
+        processed_file,
+        center=True,
+        trim_to_modeled_residues=True,
+        trim_chains_independently=True,
+    )
+
+    featurizer = BatchFeaturizer(
+        cfg=mock_cfg.dataset,
+        task=DataTask.hallucination,
+        is_training=False,
+    )
+    features = featurizer.featurize_processed_file(
+        processed_file=processed_file,
+        csv_row={
+            MetadataColumn.pdb_name: "2qlw",
+            MetadataColumn.processed_path: "",
+        },
+    )
+
+    return features

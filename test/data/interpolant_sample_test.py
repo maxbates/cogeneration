@@ -65,6 +65,7 @@ class TestInterpolantSample:
             motif_mask=batch.get(bp.motif_mask, None),
             chain_idx=batch[bp.chain_idx],
             res_idx=batch[bp.res_idx],
+            hot_spots=batch.get(bp.hot_spots, None),
         )
         if task == InferenceTask.unconditional:
             pass

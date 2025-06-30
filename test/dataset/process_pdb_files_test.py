@@ -40,6 +40,8 @@ class TestProcessPDBFiles:
         )
         assert metadata is not None
 
+        print(metadata[mc.processed_path])
+
         # check written file exists
         pkl = read_pkl(metadata[mc.processed_path])
 
@@ -54,6 +56,16 @@ class TestProcessPDBFiles:
         # with open(pdb_path, "w") as f:
         #     f.write(to_pdb(protein))
         # print(pdb_path)
+
+        # `residue_index` preserves actual residue indices
+        assert pkl[dpc.residue_index][0] == -1
+        assert pkl[dpc.residue_index][-1] == 1127
+        # `chain_index` not reindexed
+        assert pkl[dpc.chain_index][0] == 26  # "A"
+
+        # aatypes ints
+        assert pkl[dpc.aatype][0] == 7  # GLY
+        assert pkl[dpc.aatype][-1] == 20  # UNK
 
         # check metadata
         assert metadata[mc.resolution] == 1.6

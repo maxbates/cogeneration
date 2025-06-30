@@ -14,12 +14,14 @@ from torch.utils.data import Dataset
 from cogeneration.config.base import (
     Config,
     DatasetConfig,
+    DatasetHotspotsConfig,
     DatasetTrimMethod,
     InferenceSamplesConfig,
 )
 from cogeneration.data import data_transforms, rigid_utils
 from cogeneration.data.const import seq_to_aatype
 from cogeneration.data.noise_mask import mask_blend_2d
+from cogeneration.data.protein import chain_str_to_int
 from cogeneration.dataset.filterer import DatasetFilterer
 from cogeneration.dataset.motif_factory import (
     ChainBreak,
@@ -231,6 +233,80 @@ class BatchFeaturizer:
 
         return new_feats
 
+    def hot_spots_define(
+        self,
+        feats: BatchFeatures,
+        hot_spots_str: Optional[str],
+        downsample: bool,
+    ) -> torch.Tensor:
+        """
+        Define hot spots mask from metadata and current feature indices.
+
+        Args:
+            feats: BatchFeatures containing chain_idx and res_idx
+            hot_spots_str: string defining hot spots, in format "<chain_id>:<res_index>:<num_interactions>,..." e.g. "A:10:2,"
+            downsample: Whether to apply subsampling during training
+
+        Returns:
+            Hot spots mask tensor
+        """
+        hot_spots_mask = torch.zeros_like(feats[bp.res_mask]).int()
+
+        if hot_spots_str is None or hot_spots_str == "":
+            return hot_spots_mask
+
+        # Disabled some fraction of the time during training
+        if downsample and random.random() < self.cfg.hotspots.no_hotspots_prob:
+            return torch.zeros_like(feats[bp.res_mask]).int()
+
+        # Disabled if not multimer
+        if feats[bp.chain_idx].unique().numel() <= 1:
+            return torch.zeros_like(feats[bp.res_mask]).int()
+
+        # parse hot spots string
+        hot_spots = []
+        for item in hot_spots_str.split(","):
+            if ":" in item:
+                chain_id, res_index, num_interactions = item.split(":")
+                hot_spots.append(
+                    (chain_str_to_int(chain_id), int(res_index), int(num_interactions))
+                )
+
+        # Map hot spots to current feature indices
+        for hot_chain_id, hot_res_index, num_interactions in hot_spots:
+            mask = (feats[bp.chain_idx] == hot_chain_id) & (
+                feats[bp.res_idx] == hot_res_index
+            )
+            hot_spots_mask[mask] = 1
+
+        # Ignore hot spots not in res_mask
+        hot_spots_mask = hot_spots_mask * feats[bp.res_mask]
+
+        # Apply subsampling during training if requested
+        if downsample and len(hot_spots) >= self.cfg.hotspots.min_hotspots_threshold:
+            # Subsample hot spots
+            num_hot_spots = hot_spots_mask.sum().item()
+            if num_hot_spots > 0:
+                target_fraction = random.uniform(
+                    self.cfg.hotspots.min_hotspot_fraction,
+                    self.cfg.hotspots.max_hotspot_fraction,
+                )
+                target_count = max(1, int(num_hot_spots * target_fraction))
+
+                # Get indices of hot spots
+                hot_indices = torch.where(hot_spots_mask == 1)[0]
+
+                # Randomly sample subset
+                if len(hot_indices) > target_count:
+                    sampled_indices = hot_indices[
+                        torch.randperm(len(hot_indices))[:target_count]
+                    ]
+                    new_mask = torch.zeros_like(feats[bp.res_mask]).int()
+                    new_mask[sampled_indices] = 1
+                    hot_spots_mask = new_mask
+
+        return hot_spots_mask
+
     @staticmethod
     def batch_features_from_processed_file(
         processed_file: ProcessedFile,
@@ -243,8 +319,11 @@ class BatchFeaturizer:
         Keep as a static method so easy to construct direct batch features from ProcessedFile.
 
         Does not support inpainting and motif mask generation.
-        Defaults to `diffuse_mask` of all ones.
+        Defaults to `diffuse_mask` of all ones, hot spots all zeros.
         Does not center, re-index, randomize, etc.
+
+        Note that actual batch items are further processed in `featurize_processed_file`.
+        This function is static; that function is stochastic.
         """
 
         # Check the sequence
@@ -322,6 +401,9 @@ class BatchFeaturizer:
         # Default diffuse mask is all ones
         diffuse_mask = torch.ones_like(res_mask).int()
 
+        # Default hot spots mask is all zeros
+        hot_spots_mask = torch.zeros_like(res_mask).int()
+
         feats: BatchFeatures = {
             bp.res_mask: res_mask,
             bp.aatypes_1: aatypes_1,
@@ -335,6 +417,7 @@ class BatchFeaturizer:
             bp.structure_method: method_feature,
             bp.diffuse_mask: diffuse_mask,
             bp.plddt_mask: plddt_mask,
+            bp.hot_spots: hot_spots_mask,
             # Pass through relevant data from CSV
             bp.pdb_name: csv_row.get(mc.pdb_name, ""),
         }
@@ -375,6 +458,14 @@ class BatchFeaturizer:
             csv_row=csv_row,
             cfg=self.cfg,
             processed_file_path=csv_row[mc.processed_path],
+        )
+
+        # Define subsampled hot spots for multimers
+        # TODO - consider how this works with chain down selection, e.g. drop interacting chain...
+        feats[bp.hot_spots] = self.hot_spots_define(
+            feats=feats,
+            hot_spots_str=csv_row.get(mc.hot_spots, None),
+            downsample=self.is_training,
         )
 
         # Update `diffuse_mask` and `motif_mask` depending on task

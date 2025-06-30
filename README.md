@@ -9,7 +9,7 @@ Translations are interpolated in Euclidean space, rotations are interpolated in 
 This project introduces several extensions over MultiFlow:
 - **Inpainting (conditional generation)** given partial sequences / structures
   - MultiFlow only supports per-domain conditioning via seperate t (i.e. folding and inverse folding)
-- **Multimer** support, enabling binder design
+- **Multimer** support, enabling binder design, and specifying RFDiffusion style **hot spot** residues
 - **Stochastic paths**, for the structure and sequence, enabling e.g. conformation sampling and sequence redesign
 - **Feynman-Kac steering** for sequential monte-carlo sampling guided by potentials, defined only at inference time
 - **existing protein language models (e.g. ESM)** to get frozen embeddings, enriching the node and edge representations

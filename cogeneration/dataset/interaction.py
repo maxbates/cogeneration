@@ -33,7 +33,7 @@ RESIDUE_CONTACT_THRESHOLD = 3  # interacts with >=3 distinct residues
 LARGE_MOLECULE_ATOM_THRESHOLD = 10  # DNA, fatty acids, small peptides etc.
 
 
-@dataclass
+@dataclass(frozen=True)
 class ChainAtom:
     """struct for atoms in a (non-residue or residue) chain"""
 
@@ -45,9 +45,9 @@ class ChainAtom:
     coord: npt.NDArray
 
     def __post_init__(self):
-        # cleanup
-        self.atom_name = self.atom_name.strip().upper()
-        self.atom_element = self.atom_element.strip().upper()
+        # ensure clean names
+        assert self.atom_name == self.atom_name.strip().upper()
+        assert self.atom_element == self.atom_element.strip().upper()
 
     @property
     def is_metal(self) -> bool:
@@ -65,7 +65,7 @@ class ChainAtom:
         return hash((self.chain_id, self.res_index, self.atom_index, self.atom_name))
 
 
-@dataclass
+@dataclass(frozen=True)
 class Interaction:
     """struct for interactions between two chains"""
 
@@ -260,6 +260,40 @@ class MultimerInteractions:
             for interaction in self.unique_backbone_interactions
         }
 
+    def grouped_backbone_interactions(self) -> Dict[Tuple[int, int], Set[Interaction]]:
+        """
+        Group backbone interactions by residue.
+        Returns {(chain_id, res_index): set(interactions)}
+        """
+        grouped_interactions = {}
+        for interaction in self.unique_backbone_interactions:
+            if interaction.is_clash:
+                continue
+            if not interaction.is_backbone:
+                continue
+            if interaction.chain_id > interaction.other_id:
+                continue
+
+            key = (interaction.chain_id, interaction.chain_res_index)
+            res_interactions = grouped_interactions.get(key, set())
+            res_interactions.add(interaction)
+            grouped_interactions[key] = res_interactions
+
+        return grouped_interactions
+
+    def serialize_hot_spots(self) -> str:
+        """
+        Serialize hot spot residues (backbone interactions) to a string.
+        Format: "<chain_id>:<res_index>:<num_interactions>,..."
+        """
+        return ",".join(
+            f"{chain_id}:{res_index}:{len(interaction_set)}"
+            for (
+                chain_id,
+                res_index,
+            ), interaction_set in self.grouped_backbone_interactions().items()
+        )
+
     def serialize_chain_interactions(self) -> str:
         """
         Serialize chain interactions to a string.
@@ -339,6 +373,8 @@ class MultimerInteractions:
         metadata[mc.num_backbone_interactions] = len(self.unique_backbone_interactions)
         metadata[mc.num_backbone_res_interacting] = len(self.backbone_res_interacting)
         # metadata[dc.num_atom_interactions] = len(self.atom_interactions)
+        # Hot spots
+        metadata[mc.hot_spots] = self.serialize_hot_spots()
 
         potential_clashes = self.potential_chain_clashes(backbone_only=True)
         metadata[mc.chain_clashes] = ",".join(
@@ -350,7 +386,7 @@ class MultimerInteractions:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class AtomInteraction(Interaction):
     """struct for interactions between a ChainAtom and an atom in another chain"""
 
@@ -507,8 +543,8 @@ class NonResidueInteractions:
                             chain_id=chain_id,
                             res_index=res_idx,
                             atom_index=atom_idx,
-                            atom_name=atom.name,
-                            atom_element=atom.element,
+                            atom_name=atom.name.strip().upper(),
+                            atom_element=atom.element.strip().upper(),
                             coord=atom.coord,
                         )
                     )

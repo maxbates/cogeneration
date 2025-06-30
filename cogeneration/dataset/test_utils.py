@@ -38,6 +38,7 @@ def mock_feats(
     feats[bp.structure_method] = StructureExperimentalMethod.default_tensor_feat()
     feats[bp.res_plddt] = ((torch.rand(N) + 0.3) * 100.0).clamp(0, 100).float()
     feats[bp.plddt_mask] = feats[bp.res_bfactor] > 60.0
+    feats[bp.hot_spots] = torch.zeros(N).int()
 
     if task == DataTask.inpainting:
         # set a motif_mask where some middle portion of the protein is scaffolded
@@ -232,3 +233,33 @@ def create_pdb_noisy_batch(
     interpolant = Interpolant(cfg=cfg.interpolant)
     noisy_feats = interpolant.corrupt_batch(raw_feats, task=cfg.data.task)
     return noisy_feats
+
+
+def create_single_item_batch(batch_item: BatchFeatures) -> BatchFeatures:
+    """
+    Creates a single-item batch from a single batch item.
+
+    Args:
+        batch_item: Single batch item (BatchFeatures)
+
+    Returns:
+        Single-item batch (BatchFeatures) with batch dimension added
+    """
+
+    # Create a simple dataset that returns the single item
+    class SingleItemDataset(Dataset):
+        def __init__(self, item):
+            self.item = item
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, idx):
+            return self.item
+
+    # Create dataloader and get the batch
+    dataset = SingleItemDataset(batch_item)
+    dataloader = DataLoader(dataset, batch_size=1, num_workers=0)
+    batch = next(iter(dataloader))
+
+    return batch

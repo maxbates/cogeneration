@@ -2,6 +2,7 @@ from typing import Dict, Union
 
 import torch
 
+from cogeneration.config.base import Config
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.type.str_enum import StrEnum
 from cogeneration.type.structure import StructureExperimentalMethod
@@ -33,6 +34,9 @@ class BatchProp(StrEnum):
     motif_mask = "motif_mask"  # (B, N) [inpainting only] mask for fixed motif residue
     plddt_mask = (
         "plddt_mask"  # (B, N) pLDDT mask for synthetic structures, 1 if >= threshold
+    )
+    hot_spots = (
+        "hot_spots"  # (B, N) hot spot mask, 1 for interacting residues across chains
     )
     # metadata
     pdb_name = "pdb_name"  # (B) source PDB id string/int
@@ -120,6 +124,7 @@ def empty_feats(N: int, task: DataTask = DataTask.hallucination) -> BatchFeature
         BatchProp.res_plddt: torch.full((N,), 100.0),
         BatchProp.diffuse_mask: torch.ones(N).int(),
         BatchProp.plddt_mask: torch.ones(N).int(),
+        BatchProp.hot_spots: torch.zeros(N).int(),  # default no hot spots
         BatchProp.pdb_name: "",
         BatchProp.csv_idx: torch.tensor([1], dtype=torch.long),
         BatchProp.structure_method: StructureExperimentalMethod.default_tensor_feat(),
@@ -130,3 +135,28 @@ def empty_feats(N: int, task: DataTask = DataTask.hallucination) -> BatchFeature
         feats[BatchProp.motif_mask] = torch.zeros(N).int()
 
     return feats
+
+
+def feats_to_prediction(
+    batch: BatchFeatures,
+    cfg: Config,
+) -> ModelPrediction:
+    """
+    Convert batch features to model prediction.
+    """
+    pred: ModelPrediction = {
+        PredBatchProp.pred_trans: batch[BatchProp.trans_1],
+        PredBatchProp.pred_rotmats: batch[BatchProp.rotmats_1],
+        PredBatchProp.pred_torsions: batch[BatchProp.torsions_1],
+        PredBatchProp.pred_bfactor: batch[BatchProp.res_bfactor],
+        PredBatchProp.pred_lddt: batch[BatchProp.res_plddt],
+        PredBatchProp.pred_logits: torch.nn.functional.one_hot(
+            batch[BatchProp.aatypes_1],
+            num_classes=cfg.model.hyper_params.aa_num_tokens,
+        ).float(),
+        PredBatchProp.pred_aatypes: batch[BatchProp.aatypes_1],
+        PredBatchProp.node_embed: None,
+        PredBatchProp.edge_embed: None,
+    }
+
+    return pred
