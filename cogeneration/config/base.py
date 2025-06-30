@@ -696,6 +696,11 @@ class InterpolantSteeringConfig:
     chain_break_allowed_backbone_dist: float = 4.0  # ideal is ~3.8Å
     chain_break_maximum_backbone_dist: float = 12.0  # clamp
 
+    # hot spot potential parameters
+    hot_spot_scale: float = 1.0
+    hot_spot_contact_distance_ang: float = 6.5
+    hot_spot_max_distance_penalty: float = 10.0
+
 
 @dataclass
 class InterpolantConfig(BaseClassConfig):

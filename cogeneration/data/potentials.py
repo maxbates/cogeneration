@@ -8,6 +8,7 @@ import torch
 
 from cogeneration.config.base import InterpolantSteeringConfig
 from cogeneration.data.trajectory import SamplingStep
+from cogeneration.dataset.interaction import DIST_INTERACTION_BACKBONE
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyFeatures
 
@@ -207,6 +208,114 @@ class ChainBreakPotential(Potential):
 
 
 @dataclass
+class HotSpotPotential(Potential):
+    """
+    Potential that encourages residues marked as hot spots to be in contact across chains.
+    Each hot spot residue should have at least one residue from another chain within contact distance.
+    Only applied to multimer structures with hot spots defined.
+
+    TODO - this is basically the same as the `LossCalculator.loss_hot_spots`, should de-duplicate.
+    """
+
+    contact_distance_ang: float = DIST_INTERACTION_BACKBONE + 0.5
+    max_distance_penalty: float = (
+        10.0  # maximum distance penalty, beyond contact_distance threshold
+    )
+
+    def compute_energy(
+        self,
+        batch: NoisyFeatures,
+        model_pred: SamplingStep,
+        protein_pred: SamplingStep,
+        protein_state: SamplingStep,
+    ) -> torch.Tensor:
+        num_batch, num_res = batch[bp.res_idx].size()  # (B, N)
+        device = batch[bp.res_idx].device
+
+        # Skip if no hot spots marked
+        if bp.hot_spots not in batch:
+            return torch.zeros(num_batch, device=device)
+
+        hot_spots_mask = batch[bp.hot_spots].bool()  # (B, N) - convert to bool
+        hot_spots_present = hot_spots_mask.sum(-1) > 0  # (B,)
+        if not hot_spots_present.any():
+            return torch.zeros(num_batch, device=device)
+
+        # Only apply to multimers
+        chain_idx = batch[bp.chain_idx]  # (B, N)
+        multi_chain_mask = chain_idx.max(-1).values != chain_idx.min(-1).values  # (B,)
+        if not multi_chain_mask.any():
+            return torch.zeros(num_batch, device=device)
+
+        # Use frame translations
+        pred_trans = protein_pred.trans  # (B, N, 3)
+
+        # Calculate pairwise distances between CA atoms
+        pairwise_ca = pred_trans.unsqueeze(2) - pred_trans.unsqueeze(1)  # (B, N, N, 3)
+        pairwise_dists = torch.norm(pairwise_ca, dim=-1)  # (B, N, N)
+
+        # Mask for inter-chain residue pairs
+        chain_i = chain_idx.unsqueeze(2)  # (B, N, 1)
+        chain_j = chain_idx.unsqueeze(1)  # (B, 1, N)
+        inter_chain = chain_i != chain_j  # (B, N, N)
+
+        # Valid residue pairs (both residues must be valid)
+        res_mask = batch[bp.res_mask].bool()  # (B, N) - convert to bool
+        res_i_mask = res_mask.unsqueeze(2)  # (B, N, 1)
+        res_j_mask = res_mask.unsqueeze(1)  # (B, 1, N)
+        valid_pairs = res_i_mask & res_j_mask  # (B, N, N)
+
+        # Mask for valid inter-chain pairs
+        valid_inter_chain = inter_chain & valid_pairs  # (B, N, N)
+
+        # For each hot spot residue, find minimum distance to any residue on another chain
+        # Set distances to invalid pairs to a large value so they don't affect the min
+        masked_dists = pairwise_dists.clone()
+        masked_dists[~valid_inter_chain] = float("inf")
+
+        # Find minimum distance to any other-chain residue for each residue
+        min_inter_chain_dist, _ = masked_dists.min(dim=2)  # (B, N)
+
+        # Only consider hot spot residues for energy calculation
+        hot_spot_min_dists = min_inter_chain_dist * hot_spots_mask.float()  # (B, N)
+
+        # Replace inf values (no valid inter-chain residues) with contact distance to avoid large energies
+        hot_spot_min_dists = torch.where(
+            torch.isinf(hot_spot_min_dists),
+            torch.tensor(self.contact_distance_ang, device=device),
+            hot_spot_min_dists,
+        )
+
+        # Apply relu penalty: penalize when minimum distance exceeds contact threshold
+        contact_penalty = torch.relu(
+            hot_spot_min_dists - self.contact_distance_ang
+        )  # (B, N)
+        contact_penalty = contact_penalty.clamp(
+            max=self.max_distance_penalty
+        )  # cap distance
+
+        # Only apply penalty to actual hot spots
+        hot_spot_penalties = contact_penalty * hot_spots_mask.float()  # (B, N)
+
+        # Sum over hot spots and normalize by number of hot spots
+        penalty_per_batch = hot_spot_penalties.sum(dim=1)  # (B,)
+        num_hot_spots = hot_spots_mask.float().sum(dim=1).clamp_min(1.0)  # (B,)
+        penalty_per_batch = penalty_per_batch / num_hot_spots  # (B,)
+
+        # Only apply to relevant batches
+        penalty_per_batch = (
+            penalty_per_batch * hot_spots_present.float() * multi_chain_mask.float()
+        )
+
+        # Normalize energy to [0, 1] range
+        # Energy should be 0 when contacts are satisfied, 1 when maximally violated
+        energy = penalty_per_batch / self.max_distance_penalty
+        energy = energy.clamp(min=0.0, max=1.0)
+
+        return energy
+
+
+@dataclass
 class FKSteeringCalculator:
     """
     Helper to implement Feynman-Kac steering potentials for inference.
@@ -239,6 +348,11 @@ class FKSteeringCalculator:
                 scale=cfg.chain_break_scale,
                 allowed_backbone_dist=cfg.chain_break_allowed_backbone_dist,
                 maximum_backbone_dist=cfg.chain_break_maximum_backbone_dist,
+            ),
+            HotSpotPotential(
+                scale=cfg.hot_spot_scale,
+                contact_distance_ang=cfg.hot_spot_contact_distance_ang,
+                max_distance_penalty=cfg.hot_spot_max_distance_penalty,
             ),
         ]
 
