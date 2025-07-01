@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 from cogeneration.config.base import DatasetConfig, DatasetFilterConfig
@@ -10,6 +11,7 @@ from cogeneration.data.io import read_pkl
 from cogeneration.data.residue_constants import unk_restype_index
 from cogeneration.dataset.datasets import BaseDataset
 from cogeneration.dataset.process_pdb import (
+    DataError,
     process_pdb_with_metadata,
     read_processed_file,
     trim_chain_feats_to_modeled_residues,
@@ -239,3 +241,52 @@ class TestProcessPDBFiles:
         assert (
             unk_run(trimmed_not_independently[dpc.aatype]) > 20
         ), f"expected long runs of UNK (between chains)"
+
+    def test_chain_ids_functionality(self, tmp_path, pdb_8y2h_path):
+        """Test that processing with multiple chain IDs works correctly."""
+        # First process all chains to get baseline
+        metadata_all, processed_all = process_pdb_with_metadata(
+            pdb_file_path=str(pdb_8y2h_path.absolute()),
+            write_dir=str(tmp_path),
+        )
+        all_chain_ids = np.unique(processed_all[dpc.chain_index])
+
+        # Process subset of chains using chain_ids parameter
+        subset_chain_ids = ["A", "B"]  # Only process first two chains
+        metadata_subset, processed_subset = process_pdb_with_metadata(
+            pdb_file_path=str(pdb_8y2h_path.absolute()),
+            write_dir=str(tmp_path),
+            chain_ids=subset_chain_ids,
+            pdb_name="8y2h_subset",
+        )
+
+        # Check that only specified chains are present
+        subset_chain_indices = np.unique(processed_subset[dpc.chain_index])
+        assert (
+            len(subset_chain_indices) == 2
+        ), f"Expected 2 chains, got {len(subset_chain_indices)}"
+
+        # Check that fewer residues are processed
+        assert len(processed_subset[dpc.aatype]) < len(processed_all[dpc.aatype])
+        assert metadata_subset[mc.num_chains] < metadata_all[mc.num_chains]
+
+    def test_chain_ids_error_handling(self, tmp_path, pdb_2pdz_path):
+        """Test error handling for chain_ids functionality."""
+        # Test that specifying both chain_id and chain_ids raises an error
+        with pytest.raises(
+            ValueError, match="Cannot specify both chain_id and chain_ids"
+        ):
+            process_pdb_with_metadata(
+                pdb_file_path=str(pdb_2pdz_path.absolute()),
+                write_dir=str(tmp_path),
+                chain_id="A",
+                chain_ids=["A"],
+            )
+
+        # Test that requesting non-existent chains raises an error
+        with pytest.raises(DataError, match="not found"):
+            process_pdb_with_metadata(
+                pdb_file_path=str(pdb_2pdz_path.absolute()),
+                write_dir=str(tmp_path),
+                chain_ids=["Z"],  # non-existent chain
+            )

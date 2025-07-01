@@ -308,25 +308,27 @@ def process_chain_feats(
 
 def pdb_structure_to_chain_feats(
     structure: Structure,
-    chain_id: Optional[str] = None,
+    chain_ids: Optional[List[str]] = None,
 ) -> List[ChainFeatures]:
     """
     Convert PDB structure to collection of individual chains as ChainFeatures
-    Optionally limit to `chain_id`.
+    Optionally limit to `chain_ids`.
     """
     struct_chains = {}
     # Take first occurrence of each chain id
     # Handles trajectories by taking the first frame (assumes chain id preserved across frames)
     for chain in structure.get_chains():
-        _chain_id = chain.id.upper()
-        if _chain_id not in struct_chains:
-            struct_chains[_chain_id] = chain
+        cid = chain.id.upper()
+        if cid not in struct_chains:
+            struct_chains[cid] = chain
 
-    # Limit to `chain_id` if specified
-    if chain_id is not None:
-        if chain_id not in struct_chains:
-            raise DataError(f"Chain {chain_id} not found in {structure.id}")
-        struct_chains = {chain_id: struct_chains[chain_id]}
+    # Limit to `chain_ids` if specified
+    if chain_ids is not None:
+        chain_ids_upper = [cid.upper() for cid in chain_ids]
+        missing_chains = set(chain_ids_upper) - set(struct_chains.keys())
+        if missing_chains:
+            raise DataError(f"Chain(s) {missing_chains} not found in {structure.id}")
+        struct_chains = {cid: struct_chains[cid] for cid in chain_ids_upper}
 
     # struct_feats are individual chains, can be concat to complex_feats
     struct_feats: List[ChainFeatures] = []
@@ -356,7 +358,7 @@ def pdb_structure_to_chain_feats(
 
 def _process_pdb(
     pdb_file_path: str,
-    chain_id: Optional[str] = None,
+    chain_ids: Optional[List[str]] = None,
     pdb_name: Optional[str] = None,
     scale_factor: float = 1.0,
     write_dir: Optional[str] = None,
@@ -370,7 +372,7 @@ def _process_pdb(
     and so we have a unified function for processing the file and generating the metadata.
 
     If `write_dir` is provided, saves `ProcessedFile` pickle to `{write_dir}/{pdb_name}.pkl`.
-    If `chain_id` is provided, only that chain is processed.
+    If `chain_ids` is provided, only those chains are processed.
     `pdb_name` if provided is used for metadata and written file name.
 
     During processing, we track and write `dpc.modeled_idx`.
@@ -387,7 +389,7 @@ def _process_pdb(
         parser = PDB.PDBParser(QUIET=True)
         structure = parser.get_structure(pdb_name, uncompressed_pdb_path)
 
-        struct_feats = pdb_structure_to_chain_feats(structure, chain_id=chain_id)
+        struct_feats = pdb_structure_to_chain_feats(structure, chain_ids=chain_ids)
 
         if len(struct_feats) == 0:
             raise DataError(f"No valid chains found")
@@ -408,9 +410,10 @@ def _process_pdb(
         # Determine modeled residues.
         complex_feats[dpc.modeled_idx] = determine_modeled_residues(complex_feats)
         if len(complex_feats[dpc.modeled_idx]) == 0:
-            raise DataError(
-                f"No modeled residues found in {pdb_name} {'chain ' + chain_id if chain_id is not None else ''}"
+            chain_desc = (
+                f"chains {','.join(chain_ids)}" if chain_ids is not None else ""
             )
+            raise DataError(f"No modeled residues found in {pdb_name} {chain_desc}")
 
         # Generate metadata file
         metadata: MetadataCSVRow = {}
@@ -564,7 +567,8 @@ def process_pdb_file(
     pdb_file_path: str,
     pdb_name: str,
     write_dir: Optional[str] = None,
-    chain_id: Optional[str] = None,
+    chain_ids: Optional[List[str]] = None,
+    chain_id: Optional[str] = None,  # backwards compatibility
     scale_factor: float = 1.0,
     max_combined_length: int = 8192,
 ) -> ProcessedFile:
@@ -572,14 +576,21 @@ def process_pdb_file(
     Process PDB file into concatenated chain features `ProcessedFile`.
 
     If `write_dir` is provided, saves ProcessedFile pickle to `{write_dir}/{pdb_name}.pkl`.
-    If `chain_id` is provided, only that chain is processed.
+    If `chain_ids` is provided, only those chains are processed.
+    If `chain_id` is provided, only that chain is processed (backwards compatibility).
     `pdb_name` if provided is used for metadata and written file name.
 
     Raises DataError if a known filtering rule is hit. All other errors propogated.
     """
+    # Handle backwards compatibility
+    if chain_id is not None and chain_ids is not None:
+        raise ValueError("Cannot specify both chain_id and chain_ids")
+    if chain_id is not None:
+        chain_ids = [chain_id]
+
     _, processed_file = _process_pdb(
         pdb_file_path=pdb_file_path,
-        chain_id=chain_id,
+        chain_ids=chain_ids,
         pdb_name=pdb_name,
         scale_factor=scale_factor,
         write_dir=write_dir,
@@ -592,7 +603,8 @@ def process_pdb_file(
 def process_pdb_with_metadata(
     pdb_file_path: str,
     write_dir: Optional[str] = None,
-    chain_id: Optional[str] = None,
+    chain_ids: Optional[List[str]] = None,
+    chain_id: Optional[str] = None,  # backwards compatibility
     pdb_name: Optional[str] = None,
     scale_factor: float = 1.0,
     max_combined_length: int = 8192,
@@ -601,14 +613,21 @@ def process_pdb_with_metadata(
     Process PDB file into concatenated chain features `ProcessedFile` and metadata `MetadataCSVRow`.
 
     If `write_dir` is provided, saves ProcessedFile pickle to `{write_dir}/{pdb_name}.pkl`.
-    If `chain_id` is provided, only that chain is processed.
+    If `chain_ids` is provided, only those chains are processed.
+    If `chain_id` is provided, only that chain is processed (backwards compatibility).
     `pdb_name` if provided is used for metadata and written file name.
 
     Raises DataError if a known filtering rule is hit. All other errors propogated.
     """
+    # Handle backwards compatibility
+    if chain_id is not None and chain_ids is not None:
+        raise ValueError("Cannot specify both chain_id and chain_ids")
+    if chain_id is not None:
+        chain_ids = [chain_id]
+
     return _process_pdb(
         pdb_file_path=pdb_file_path,
-        chain_id=chain_id,
+        chain_ids=chain_ids,
         pdb_name=pdb_name,
         scale_factor=scale_factor,
         write_dir=write_dir,
