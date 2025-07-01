@@ -396,7 +396,7 @@ class ModelESMCombinerConfig(BaseClassConfig):
     # Whether ESM is enabled. If so, representations will be combined.
     enabled: bool = True
     # only get single rep, which can use speed up e.g. using flash attention
-    only_single: bool = False
+    only_single: bool = True
     # which ESM model size to use
     esm_model_key: ModelESMKey = ModelESMKey.esm2_t30_150M_UR50D
     # dims coming from simple node/edge networks
