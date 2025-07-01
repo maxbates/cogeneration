@@ -429,6 +429,24 @@ def pdb_2qlw_path():
 
 
 @pytest.fixture
+def pdb_2pdz_path():
+    """
+    https://www2.rcsb.org/structure/2PDZ
+    Trajectory with 15 models
+    """
+    return Path(__file__).parent / "dataset" / "2pdz.pdb"
+
+
+@pytest.fixture
+def pdb_8y2h_path():
+    """
+    https://www2.rcsb.org/structure/8Y2H
+    Big tetramer, with 2 little hooks
+    """
+    return Path(__file__).parent / "dataset" / "8y2h.pdb"
+
+
+@pytest.fixture
 def pdb_2qlw_processed_feats(pdb_2qlw_path, mock_cfg):
     """Generate features from the 2QLW PDB file. Note includes centering, chain randomization, etc."""
     processed_file = process_pdb_file(str(pdb_2qlw_path), "2qlw")

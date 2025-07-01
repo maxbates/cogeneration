@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 
 from cogeneration.config.base import DatasetConfig, DatasetFilterConfig
 from cogeneration.data.io import read_pkl
@@ -109,13 +110,28 @@ class TestProcessPDBFiles:
             len(extra_keys) == 0 and len(missing_keys) == 0
         ), f"Extra keys: {extra_keys}, Missing keys: {missing_keys}"
 
-    def test_parsing_processed_file(self, tmp_path, pdb_2qlw_path):
+    def test_parsing_2qlw(self, tmp_path, pdb_2qlw_path):
         metadata, _ = process_pdb_with_metadata(
             pdb_file_path=str(pdb_2qlw_path.absolute()),
             write_dir=str(tmp_path),
         )
         # Test can load and process
         _ = read_processed_file(processed_file_path=metadata[mc.processed_path])
+
+    def test_parsing_8y2h(self, tmp_path, pdb_8y2h_path):
+        metadata, processed_file = process_pdb_with_metadata(
+            pdb_file_path=str(pdb_8y2h_path.absolute()),
+            write_dir=str(tmp_path),
+        )
+        assert len(np.unique(processed_file[dpc.chain_index])) == 8
+
+    def test_parsing_2pdz(self, tmp_path, pdb_2pdz_path):
+        metadata, processed_file = process_pdb_with_metadata(
+            pdb_file_path=str(pdb_2pdz_path.absolute()),
+            write_dir=str(tmp_path),
+        )
+        assert len(processed_file[dpc.chain_index]) == 91
+        assert len(np.unique(processed_file[dpc.chain_index])) == 2
 
     def test_dataset_using_processed_file(self, tmp_path, pdb_2qlw_path):
         metadata, _ = process_pdb_with_metadata(

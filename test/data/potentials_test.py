@@ -51,10 +51,19 @@ def _make_batch_and_step(
     batch = next(iter(dataloader))
 
     if multimer:
+        # Find where second chain starts (first position where chain_idx changes from 1 to 2)
+        chain_idx = batch[bp.chain_idx]  # (B, N)
+        chain_1_start = None
+        for i in range(N):
+            if chain_idx[0, i] == 2:  # Chain 2 (1-indexed)
+                chain_1_start = i
+                break
+        assert chain_1_start is not None, "Could not find chain 1 start position"
+
         # Set up hot spots: first residue of each chain
         hot_spots = torch.zeros(B, N)
         hot_spots[:, 0] = 1  # First residue of chain 0
-        hot_spots[:, N // 2] = 1  # First residue of chain 1
+        hot_spots[:, chain_1_start] = 1  # First residue of chain 1
         batch[bp.hot_spots] = hot_spots
 
         # Set up translations for multimer
@@ -62,22 +71,24 @@ def _make_batch_and_step(
             # Place hot spots close together (within contact distance)
             trans = torch.zeros(B, N, 3)
             # Chain 0 residues
-            trans[:, : N // 2, 0] = torch.arange(N // 2).float() * 3.8  # Normal spacing
+            trans[:, :chain_1_start, 0] = (
+                torch.arange(chain_1_start).float() * 3.8
+            )  # Normal spacing
             # Chain 1 residues - start close to chain 0's first residue
-            trans[:, N // 2 :, 0] = (
-                torch.arange(N // 2).float() * 3.8 + 5.0
+            trans[:, chain_1_start:, 0] = (
+                torch.arange(N - chain_1_start).float() * 3.8 + 5.0
             )  # Close contact
-            trans[:, N // 2 :, 1] = 2.0  # Slight y offset
+            trans[:, chain_1_start:, 1] = 2.0  # Slight y offset
         else:
             # Place hot spots far apart (beyond contact distance)
             trans = torch.zeros(B, N, 3)
             # Chain 0 residues
-            trans[:, : N // 2, 0] = torch.arange(N // 2).float() * 3.8
+            trans[:, :chain_1_start, 0] = torch.arange(chain_1_start).float() * 3.8
             # Chain 1 residues - start far from chain 0
-            trans[:, N // 2 :, 0] = (
-                torch.arange(N // 2).float() * 3.8 + 20.0
+            trans[:, chain_1_start:, 0] = (
+                torch.arange(N - chain_1_start).float() * 3.8 + 20.0
             )  # Far apart
-            trans[:, N // 2 :, 1] = 10.0  # Large y offset
+            trans[:, chain_1_start:, 1] = 10.0  # Large y offset
 
         batch[nbp.trans_t] = trans
     else:

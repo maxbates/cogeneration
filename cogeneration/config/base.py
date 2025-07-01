@@ -837,7 +837,7 @@ class DatasetFilterConfig(BaseClassConfig):
         return cls(
             max_num_res=8192,
             min_num_res=8,
-            max_coil_percent=1,
+            max_coil_percent=0.99,
             rog_quantile=1,
             max_percent_residues_unknown=0.75,
             min_date=None,

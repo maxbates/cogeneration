@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Dict
 
 import numpy as np
 import pandas as pd
@@ -12,6 +12,7 @@ from cogeneration.config.base import (
     DatasetFilterConfig,
     DatasetTrimMethod,
 )
+from cogeneration.dataset.process_pdb import DataError
 from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.dataset import MetadataCSVRow, MetadataDataFrame
 
@@ -158,29 +159,46 @@ class DatasetFilterer:
 
         return df
 
+    @property
+    def all_filters(
+        self,
+    ) -> Dict[str, Callable[[MetadataDataFrame], MetadataDataFrame]]:
+        return {
+            "date": self._date_filter,
+            "oligomeric": self._oligomeric_filter,
+            "num_chains": self._num_chains_filter,
+            "length": self._length_filter,
+            "max_percent_unknown": self._max_percent_unknown_filter,
+            "max_coil": self._max_coil_filter,
+            "rog": self._rog_filter,
+            "plddt": self._plddt_filter,
+        }
+
     def filter_metadata(self, raw_csv: MetadataDataFrame) -> MetadataDataFrame:
         """
         Filter a metadata CSV according to DatasetConfig.
         """
         df = raw_csv.copy()
-        df = self._date_filter(df)
-        df = self._oligomeric_filter(df)
-        df = self._num_chains_filter(df)
-        df = self._length_filter(df)
-        df = self._max_percent_unknown_filter(df)
-        df = self._max_coil_filter(df)
-        df = self._rog_filter(df)
-        df = self._plddt_filter(df)
+
+        for filter_name, filter_fn in self.all_filters.items():
+            df = filter_fn(df)
 
         return df.sort_values(by=self.modeled_length_col, ascending=False)
 
-    def check_row(self, csv_row: MetadataCSVRow) -> bool:
+    def check_row(self, csv_row: MetadataCSVRow):
         """
-        Check if a single row of metadata passes the filter criteria.
+        Check if a single row of metadata passes the filter criteria. Raises DataError if fails.
         """
         prev_disabled = self._log.disabled
         self._log.disabled = True
+
         try:
-            return len(self.filter_metadata(pd.DataFrame([csv_row]))) == 1
+            df = pd.DataFrame([csv_row])
+            for filter_name, filter_fn in self.all_filters.items():
+                if len(filter_fn(df)) == 0:
+                    raise DataError(f"Failed {filter_name} filter")
+        except DataError as e:
+            self._log.disabled = prev_disabled
+            raise e
         finally:
             self._log.disabled = prev_disabled

@@ -115,7 +115,7 @@ def safe_process_pdb(
     try:
         # if greater than 7 MB, skip
         if os.stat(raw_pdb_path).st_size > 7 * 1024 * 1024:
-            return None, f"{raw_pdb_path} | Skipped: file size > 5 MB"
+            return None, f"{raw_pdb_path} | Skipped: file size > 7 MB"
 
         metadata, _ = process_pdb_with_metadata(
             pdb_file_path=raw_pdb_path,
@@ -178,7 +178,9 @@ def main(args: Args):
     existing_metadata_columns = None
     existing_processed_files = 0
     if os.path.exists(metadata_path):
-        print(f"Found existing metadata file at {metadata_path}, checking...")
+        print(
+            f"Found existing metadata file at {metadata_path}, checking format + existing files..."
+        )
         existing_metadata_df = pd.read_csv(metadata_path)
 
         missing_columns = set(MetadataColumn).difference(existing_metadata_df.columns)
@@ -253,13 +255,24 @@ def main(args: Args):
         # Processed successfully
         if metadata_row is not None and error_msg is None:
             # Filter out bad structures
-            if not dataset_filterer.check_row(csv_row=metadata_row):
-                error_msg = f"{metadata_row[MetadataColumn.raw_path]} | filtered by DatasetFilterer."
+            try:
+                dataset_filterer.check_row(csv_row=metadata_row)
+            except DataError as e:
+                error_msg = f"{metadata_row[MetadataColumn.raw_path]} | Filtered | {e}"
                 logging.error(error_msg)
                 pbar.write(error_msg)
+
                 # Original file already deleted, but delete the processed file
                 if args.delete_original:
                     os.remove(metadata_row[MetadataColumn.processed_path])
+
+                return
+            except Exception as e:
+                error_msg = (
+                    f"{metadata_row[MetadataColumn.raw_path]} |  🔴 Filter Error | {e}"
+                )
+                logging.error(error_msg)
+                pbar.write(error_msg)
                 return
 
             # Otherwise, valid! Write metadata row to CSV

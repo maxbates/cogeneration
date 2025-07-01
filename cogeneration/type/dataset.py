@@ -23,6 +23,8 @@ class MetadataColumn(StrEnum):
     oligomeric_count = "oligomeric_count"
     # per-unique seq details
     oligomeric_detail = "oligomeric_detail"
+    # (new) number of unique sequences
+    num_unique_seqs = "num_unique_seqs"
     # (new) residue chain lengths, "<chain_id>:<num_res>,..." format
     chain_lengths = "chain_lengths"
     # (new) residue chain lengths, "<chain_id>:<num_modeled_residues>,..." format
@@ -39,10 +41,13 @@ class MetadataColumn(StrEnum):
     modeled_seq_len = "modeled_seq_len"
     # (new) modeled residues, chains independently trimmed
     modeled_indep_seq_len = "modeled_indep_seq_len"
-    # (new) mean pLDDT of all atoms
+    # (new) mean pLDDT of all atoms, if synthetic else 100
     mean_plddt_all_atom = "mean_plddt_all_atom"
-    # (new) mean pLDDT of modeled backbone atoms
+    # (new) mean pLDDT of modeled backbone atoms, if synthetic else 100
     mean_plddt_modeled_bb = "mean_plddt_modeled_bb"
+
+    # trajectory metadata
+    num_frames = "num_frames"
 
     # secondary structure stats
     coil_percent = "coil_percent"

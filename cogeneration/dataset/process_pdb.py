@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 import mdtraj as md
 import numpy as np
+import torch
 import tree
 from Bio import PDB
 from Bio.PDB.Structure import Structure
@@ -313,7 +314,13 @@ def pdb_structure_to_chain_feats(
     Convert PDB structure to collection of individual chains as ChainFeatures
     Optionally limit to `chain_id`.
     """
-    struct_chains = {chain.id.upper(): chain for chain in structure.get_chains()}
+    struct_chains = {}
+    # Take first occurrence of each chain id
+    # Handles trajectories by taking the first frame (assumes chain id preserved across frames)
+    for chain in structure.get_chains():
+        _chain_id = chain.id.upper()
+        if _chain_id not in struct_chains:
+            struct_chains[_chain_id] = chain
 
     # Limit to `chain_id` if specified
     if chain_id is not None:
@@ -381,6 +388,7 @@ def _process_pdb(
         structure = parser.get_structure(pdb_name, uncompressed_pdb_path)
 
         struct_feats = pdb_structure_to_chain_feats(structure, chain_id=chain_id)
+
         if len(struct_feats) == 0:
             raise DataError(f"No valid chains found")
 
@@ -413,9 +421,10 @@ def _process_pdb(
             # structure metadata
             metadata[mc.resolution] = structure.header.get("resolution")
             metadata[mc.date] = extract_structure_date(structure=structure)
-            metadata[mc.structure_method] = StructureExperimentalMethod.from_structure(
+            structure_method = StructureExperimentalMethod.from_structure(
                 structure=structure
             )
+            metadata[mc.structure_method] = structure_method
 
             # Track total sequence length
             metadata[mc.seq_len] = len(complex_feats[dpc.aatype])
@@ -438,12 +447,13 @@ def _process_pdb(
 
             # Track quaternary / oligomeric information
             metadata[mc.num_chains] = len(struct_feats)
-            metadata[mc.num_all_chains] = len([c for c in structure.get_chains()])
+            metadata[mc.num_all_chains] = len(set(c.id for c in structure.get_chains()))
             metadata[mc.oligomeric_count] = _oligomeric_count(struct_feats)
             metadata[mc.oligomeric_detail] = _oligomeric_detail(struct_feats)
             uniq_seqs = set(
                 [tuple(chain_feats[dpc.aatype]) for chain_feats in struct_feats]
             )
+            metadata[mc.num_unique_seqs] = len(uniq_seqs)
             if len(uniq_seqs) == 1:
                 metadata[mc.quaternary_category] = "homomer"
             else:
@@ -457,8 +467,12 @@ def _process_pdb(
                 struct_feats, modeled_only=True
             )
 
-            # quality information
-            plddts = complex_feats[dpc.b_factors]
+            # pLDDT only present in synthetic structures.
+            # Experimental ones have B-factors. We just set those to 100.0.
+            if StructureExperimentalMethod.is_experimental(structure_method):
+                plddts = np.full_like(complex_feats[dpc.b_factors], 100.0)
+            else:
+                plddts = complex_feats[dpc.b_factors]
             metadata[mc.mean_plddt_all_atom] = float(np.mean(plddts))
             metadata[mc.mean_plddt_modeled_bb] = float(
                 np.mean(plddts[:, :3][modeled_idx])
@@ -475,16 +489,32 @@ def _process_pdb(
             except Exception as e:
                 raise DataError(f"Mdtraj failed with error {e}")
 
-            # use denom `metadata[dc.modeled_seq_len]` to match public MultiFlow
-            # though if use chain-independent filtering, values almost certainly higher.
+            # track number of frames if trajectory
+            metadata[mc.num_frames] = traj.n_frames
+
+            # Secondary structure stats
+            # Uses only the first frame `[0]` if there are multiple (since it used for the structure).
+            secondary_structure = pdb_ss[0]
+
+            # If no chains were dropped, shapes should match: limit to modeled residues.
+            # This is unlike MultiFlow, which only considers over modeled residues.
+            if secondary_structure.shape[0] == complex_feats[dpc.bb_mask].shape[0]:
+                secondary_structure = secondary_structure[
+                    complex_feats[dpc.bb_mask].astype(bool)
+                ]
+                secondary_structure_denom = np.sum(complex_feats[dpc.bb_mask])
+            # If chains were dropped (no residues), skip the mask. More likely to drop due to high coil percent.
+            else:
+                secondary_structure_denom = secondary_structure.shape[0]
+
             metadata[mc.coil_percent] = (
-                np.sum(pdb_ss == "C") / metadata[mc.modeled_seq_len]
+                np.sum(secondary_structure == "C") / secondary_structure_denom
             )
             metadata[mc.helix_percent] = (
-                np.sum(pdb_ss == "H") / metadata[mc.modeled_seq_len]
+                np.sum(secondary_structure == "H") / secondary_structure_denom
             )
             metadata[mc.strand_percent] = (
-                np.sum(pdb_ss == "E") / metadata[mc.modeled_seq_len]
+                np.sum(secondary_structure == "E") / secondary_structure_denom
             )
             metadata[mc.radius_gyration] = pdb_rg[0]
 
