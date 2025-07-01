@@ -21,6 +21,7 @@ This project introduces several extensions over MultiFlow:
 - Support for **LigandMPNN (in memory) for inverse folding** during validation / redesigning sequences
 - Support for **Boltz-2 (in memory) for structure prediction** or AlphaFold2 duiring validation / redesigning sequences
 - **Complete PDB processing data pipeline** to generate or augment training data, with several fields added to metadata
+  - Scripts to download and process **AlphaFold Database**
   - Track information about chains, multimer interactions, presence of non-residues, etc.
 - Adds a trunk with **choice of attention mechanisms, e.g. IPA, Pairformer** (triangle attention)
 - Enables **recyling** through the trunk + IPA
@@ -31,6 +32,111 @@ This project introduces several extensions over MultiFlow:
 ## Installation, Training, and Sampling
 
 See directions in [installation.md](docs/installation.md) for installation, training, and sampling.
+
+## Project Structure
+
+```
+cogeneration/ - main directory containing all source code
+├── config/
+│   ├── base.py - project configuration. Hydra dataclasses + enums. Base class `Config`, many subclasses
+│   ├── curriculum.py - `Curriculum` class for serial training on different configurations
+│   └── dict_utils.py - dictionary utilities
+├── data/
+│   ├── tools/
+│   │   ├── abc.py - base classes `FoldingTool` and `InverseFoldingTool`
+│   │   ├── alphafold2.py - `AlphaFold2Tool` wrapper for ColabFold. subprocess only
+│   │   ├── boltz_runner.py - `BoltzRunner` wrapper for Boltz2. subprocess / native.
+│   │   └── protein_mpnn_runner.py - `ProteinMPNNRunner` for ProteinMPNN and LigandMPNN. subprocess / native.
+│   ├── all_atom.py - (~Openfold) frames/rigids to atom14 and atom37 representations
+│   ├── const.py - (~Openfold) sequence, structure and amino acid constants
+│   ├── data_transforms.py - (~Openfold)data pipeline for rigid features and angles
+│   ├── folding_validation.py - `FoldingValidator` for sample assessment and metrics, runs folding / inverse folding.
+│   ├── interpolant.py - Big file. `Interpolant` class with `corrupt_batch()` and `sample()` methods. core training and sampling. 
+│   ├── io.py - save/load utilities for pkl and json
+│   ├── metrics.py - sample metrics computation
+│   ├── noise_mask.py - masking and noise generation utilities
+│   ├── potentials.py - Feynman-Kac steering. `Potential`, `FKSTeeringCalculator`, `FKSteeringResampler` classes
+│   ├── protein.py - (~Openfold) `Protein` class for PDB processing into `Chain` objects
+│   ├── residue_constants.py - (~Openfold)atom types, residue constants, bond lengths, representations and masks
+│   ├── rigid.py - (~Openfold) rigid utilities for centering and alignment
+│   ├── rigid_utils.py - (~Openfold) `Rotation` and `Rigid` classes, quaternion utilities
+│   ├── so3_utils.py - (~Openfold) SO(3) sampling and interpolation
+│   ├── superimposition.py - (~Openfold) structure superimposition and tm_score computation
+│   ├── tensor_utils.py - (~Openfold) tensor manipulation utilities
+│   ├── trajectory.py - `SamplingStep` and `SamplingTrajectory` classes for model predictions
+│   └── trajectory_save.py - trajectory plotting and `save_trajectory()` function
+├── dataset/
+│   ├── scripts/ - data downloading and processing scripts
+│   │   ├── download_alphafold.py - AlphaFold PDB database download (SwissProt proteins)
+│   │   ├── download_pdb.py - PDB database download
+│   │   ├── process_pdb_files.py - PDB to Metadata CSV and pkl ProcessedFiles
+│   │   ├── redesign_structures.py - ProteinMPNN structure redesign
+│   │   └── update_dataset_metadata.py - metadata CSV updates (~deprecated)
+│   ├── datasets.py - `BaseDataset` and `PdbDataset` classes. `BatchFeaturizer` for `BatchFeatures`
+│   ├── filterer.py - `DatasetFilterer` for dataset filtering using metadata
+│   ├── interaction.py - `NonResidueInteractions` and `MultimerInteraction` for computing interactions + clashes
+│   ├── mmcif_parsing.py - mmCIF file parsing utilities
+│   ├── motif_factory.py - `MotifFactory` for motif and scaffold generation (inpainting)
+│   ├── process_pdb.py - PDB parsing to `ProcessedFile` and `MetadataCSVRow`
+│   ├── protein_downloader.py - dataloader with DDP and `LengthBatcher`
+│   └── test_utils.py - test utilities for mock features and datasets
+├── datasets/ - training and test data directory
+│   └── install.sh - MultiFlow dataset download script
+├── models/
+│   ├── attention/
+│   │   ├── attention_pair_bias.py - (~Boltz) `AttentionPairBias` module 
+│   │   ├── attention_trunk.py - `AttentionTrunk` switch module
+│   │   ├── double_attention_pair.py - hacky cheaper triangle attention alternative
+│   │   ├── dropout.py - (~Boltz) dropout module
+│   │   ├── ipa_attention.py - `AttentionIPATrunk` module
+│   │   ├── ipa_flash.py - FlashIPA wrapper
+│   │   ├── ipa_pytorch.py - (~Openfold) IPA submodules
+│   │   ├── pairformer.py - (~Boltz) `Pairformer` block and `NoSeq` variant
+│   │   ├── transition.py - MLP transition module
+│   │   ├── triangular_attention.py - (~Boltz) triangle attention module
+│   │   └── triangular_mult.py - (~Boltz) triangle multiplication module
+│   ├── aa_pred.py - simple MLP sequence prediction network
+│   ├── bfactors.py - B-factor prediction module
+│   ├── confidence.py - pLDDT prediction module
+│   ├── edge_feature_net.py - edge feature embedding network
+│   ├── embed.py - position, time, distrogram embeddings
+│   ├── esm_combiner.py - ESM embedding combination module
+│   ├── esm_frozen.py - frozen ESM model for embeddings using FAPLM
+│   ├── loss_calculator.py - `BatchLossCalculator` for losses and metrics
+│   ├── model.py - complete PyTorch model
+│   ├── module.py - Lightning module for training/validation/prediction
+│   └── node_feature_net.py - initial node feature representation network
+├── scripts/
+│   ├── predict.py - inference script using `EvalRunner`
+│   ├── train.py - training script using `Experiment`
+│   ├── utils.py - GPU utilities and timing
+│   └── utils_ddp.py - distributed data parallel helpers, Mac support
+└── type/ - enums, type aliases, structs
+    ├── batch.py - batch property enums: `BatchProp`, `NoisyBatchProp`, `PredBatchProp`
+    ├── dataset.py - dataset enums: `MetadataColumn`, `RedesignColumn`, `DatasetProteinColumn`
+    ├── embed.py - `PositionalEmbeddingMethod` enum
+    ├── metrics.py - `MetricName` and `OutputFileName` enums
+    ├── str_enum.py - base `StrEnum` class
+    ├── structure.py - `StructureExperimentalMethod` enum
+    └── task.py - `DataTask` and `InferenceTask` enums
+
+doc/ - documentation and feature specs
+
+test/ - unit tests (run with `pytest`)
+```
+
+### Ignored Directories
+
+There are several directories that should be ignored:
+```
+.cache
+ckpt
+/inference_outputs
+/lightning_logs
+/multiflow_weights
+/venv
+/wandb
+```
 
 ## Project Conventions
 
@@ -48,116 +154,6 @@ See directions in [installation.md](docs/installation.md) for installation, trai
 - Tests are in `/test`
 - Test by running `pytest`
 - Test directory structure should ~ match the `/cogeneration` directory structure, with `_test.py` suffix.
-
-## Project Structure
-
-`/cogeneration` - the main directory for the project, containing all source code.
-
-`/cogeneration/config/`
-`/cogeneration/config/base.py` - contains the all configuration for the project, specified using Hydra dataclasses and enums. The base class is `Config` and there are many subclasses.
-`/cogeneration/config/curriculum.py` - defines a Curriculum class to serially train the model on different configurations.
-`/cogeneration/config/dict_utils.py` - helpers for working with dicts
-
-`/cogeneration/data`
-`/cogeneration/data/tools`
-`/cogeneration/data/tools/abc.py` - Base classes for folding and inverse folding tools, `FoldingTool` and `InverseFoldingTool`
-`/cogeneration/data/tools/alphafold2.py` - `AlphaFold2Tool` wrapper to run AlphaFold2 using ColabFold in subprocess
-`/cogeneration/data/tools/boltz_runner.py` - `BoltzRunner` wrapper to run Boltz natively 
-`/cogeneration/data/tools/protein_mpnn_runner.py` -  `ProteinMPNNRunner` to run ProteinMPNN and LigandMPNN, in subprocess or natively
-`/cogeneration/data`
-`/cogeneration/data/all_atom.py` - mostly from Openfold. Frames / rigids -> atom14 and atom37 representations.
-`/cogeneration/data/const.py` - mostly from Openfold. sequence and structure and aatypes constants.
-`/cogeneration/data/data_transforms.py` - mostly from Openfold. Openfold data pipeline for getting rigid features, angles, etc.
-`/cogeneration/data/folding_validation.py` - `FoldingValidator` class to assess samples, inverse fold with ProteinMPNN, fold with ColabFold (AlphaFold2), and compute metrics
-`/cogeneration/data/interpolant.py` - Large file, work horse for training and sampling. `Interpolant` class for corrupting batches during training (`Interpolant.corrupt_batch()`) and sampling from the model (`Interpolant.sample()`). Many utilities for sampling from the source distributions, and Euler-Maruyama integration across each domain.
-`/cogeneration/data/io.py` - utilities for saving/loading pkl, json.
-`/cogeneration/data/metrics.py` - helpers for computing metrics of samples
-`/cogeneration/data/noise_mask.py` - Utilities for masking and generating noise for each domain
-`/cogeneration/data/potentials.py` - Feynman-Kac Steering. Several `Potential` instances. `FKSTeeringCalculator` stateless class for computing potentials. `FKSteeringResambler` stateful class for initializing particles and resampling during inference.
-`/cogeneration/data/protein.py` - mostly from Openfold. `Protein` class for processing PDBs into a `Protein` `Chain`. 
-`/cogeneration/data/residue_constants.py` - mostly from Openfold. Atom types, residue constants, bond lengths, atom14 and atom37 representations and masks, etc.
-`/cogeneration/data/rigid.py` - mostly from Openfold. utilities for interacting with rigids, like centering and aligning.
-`/cogeneration/data/rigid_utils.py` - largely from Openfold. `Rotation` and `Rigid` classes, utilities for working with quaternions.
-`/cogeneration/data/so3_utils.py` - largely from Openfold. SO(3) sampling and interpolation utilities.
-`/cogeneration/data/superimposition.py` - mostly from Openfold. Superimposition and tm_score to compare protein structures.
-`/cogeneration/data/tensor_utils.py` - mostly from Openfold. utilities for working with tensors.
-`/cogeneration/data/trajectory.py` - `SamplingStep` and `SamplingTrajectory` classes for capturing model predictions and protein intermediate states
-`/cogeneration/data/trajectory_save.py` - plotting utilities for sampled trajectories, `save_trajectory()` for writing relevant files.
-
-`/cogeneration/dataset`
-`/cogeneration/dataset/scripts` - scripts for downloading and processing data, mostly PDBs.
-`/cogeneration/dataset/scripts/download_pdb.py` - Download PDB database
-`/cogeneration/dataset/scripts/process_pdb_files.py` - process a set of PDB files into a metadata CSV and pre-processed pkls for each PDB file
-`/cogeneration/dataset/scripts/redesign_structures.py` - use ProteinMPNN to redesign structures in the dataset
-`/cogeneration/dataset/scripts/update_dataset_metadata.py` - update an existing metadata CSV with new metadata
-`/cogeneration/dataset`
-`/cogeneration/dataset/datasets.py` - `BaseDataset` and child class `PdbDataset` for loading Metadata CSV, redesigned structures, synthetic structures, and creating dataset. `ProcessedFiles` are loaded on the fly in `__get_item__`. `BatchFeaturizer` for generating `BatchFeatures` from a `ProcessedFile`.
-`/cogeneration/dataset/filterer.py` - `DatasetFilterer` class for filtering Metadata
-`/cogeneration/dataset/interaction.py` - `NonResidueInteractions` and `MultimerInteraction` classes for computing atom / backbone interactions and clashes.
-`/cogeneration/dataset/mmcif_parsing.py` - utils for parsing mmCIF files
-`/cogeneration/dataset/motif_factory.py` - `MotifFactory` class for generating motifs and scaffolds, several strategies for picking motif regions.
-`/cogeneration/dataset/process_pdb.py` - parsing PDBs into `ProcessedFile` and `MetadataCSVRow` instances, loading a `ProcessedFile` from file.
-`/cogeneration/dataset/protein_downloader.py` - Dataloader using DDP and `LengthBatcher`
-`/cogeneration/dataset/test_utils.py` - Utilities for tests to construct mock features, datasets, dataloaders
-
-`/cogeneration/datasets` - Directory containing training and test data
-`/cogeneration/datasets/install.sh` - Script to download MultiFlow datasets
-
-`/cogeneration/models`
-`/cogeneration/models/attention`
-`/cogeneration/models/attention/attention_pair_bias.py` - Adapted from Boltz, `AttentionPairBias` module
-`/cogeneration/models/attention/attention_trunk.py` - `AttentionTrunk` switch module, to create attention trunks
-`/cogeneration/models/attention/double_attention_pair.py` - Double Attention pair, hacky triangle attention alternative
-`/cogeneration/models/attention/dropout.py` - Adapted from Boltz, Dropout module
-`/cogeneration/models/attention/ipa_attention.py` - AttentionIPATrunk module
-`/cogeneration/models/attention/ipa_flash.py` - FlashIPA wrapper 
-`/cogeneration/models/attention/ipa_pytorch.py` - Mostly from Openfold, IPA submodules
-`/cogeneration/models/attention/pairformer.py` - Adapted from Boltz, Pairformer block / module, and `NoSeq` variant.
-`/cogeneration/models/attention/transition.py` - MLP transition module
-`/cogeneration/models/attention/trianglar_attention.py`  - Adapted from Boltz, triangle attention 
-`/cogeneration/models/attention/trianglar_mult.py` - Adapted from Boltz, triangle attention 
-`/cogeneration/models`
-`/cogeneration/models/aa_pred.py` - Simple Sequence prediction network using linear layer / MLP
-`/cogeneration/models/bfactors.py` - Module for predicting B-factors
-`/cogeneration/models/confidence.py` - Module for predicting pLDDT (potentially PAE, PTM in the future?)
-`/cogeneration/models/edge_feature_net.py` - Simple network for embedding edge features / pair representations. Embed edges using distrogram, plus self-conditioned dist, chain, masks etc.
-`/cogeneration/models/embed.py` - Embedding utilites for positions, time, distrogram
-`/cogeneration/models/esm_combiner.py` - Module which combines initial node and edge embeddings with ESM single and pair embeddings
-`/cogeneration/models/esm_frozen.py` - Frozen ESM model for ESM single and pair embeddings
-`/cogeneration/models/loss_calculator.py` - class `BatchLossCalculator` which computes losses and serializes them into `TrainingLosses` and `AuxiliaryMetrics`.
-`/cogeneration/models/model.py` - complete Pytorch model
-`/cogeneration/models/module.py` - Lightning Module which defines losses, training + validation + prediction steps
-`/cogeneration/models/node_feature_net.py` - Simple network for initial representation of structure, sequence, masks, positional embeddings, time embeddings.
-
-`/cogeneration/scripts`
-`/cogeneration/scripts/predict.py` - script for inference / sampling, as an `EvalRunner`
-`/cogeneration/scripts/train.py` - script for training the model, as an `Experiment`
-`/cogeneration/scripts/utils.py` - GPU utilities, timing, etc.
-`/cogeneration/scripts/utils_ddp.py` - Helpers for setting up distributed data parallel, Mac-friendly. 
-
-`/cogeneration/type` - enums, type aliases, structs
-`/cogeneration/type/batch.py` - defines enums `BatchProp` for properties from metadata / input structure and sequence, `NoisyBatchProp` for corrupted batch, `PredBatchProp` for model outputs, and util `empty_feats` for generating empty batch
-`/cogeneration/type/dataset.py` - defines enums `MetadataColumn` for columns in Metadata CSV, `RedesignColumn` for redesign metadata, `DatasetProteinColumn` for fields of a `Protein` or `ProcessedFile`, `DatasetTransformColumn` for fields generated by OpenFold transforms
-`/cogeneration/type/embed.py` - embedding types `PositionalEmbeddingMethod`
-`/cogeneration/type/metrics.py` - `MetricName` enum defines sampling metrics calculated, `OutputFileName` defines files written by sampling + metrics
-`/cogeneration/type/str_enum.py` - base class `StrEnum` for enums
-`/cogeneration/type/structure.py` - `StructureExperimentalMethod` enum and parsing PDB for experimental method
-`/cogeneration/type/task.py` - `DataTask` (training task) and  `InferenceTask` (sampling task) enums
-
-`/doc` contains documentation, including some feature specs.
-
-`/test` contains unit tests for the project. All tests are run using `pytest`. The structure roughly matches `/cogeneration` and test files are suffixed with `_test.py`.
-
-### Ignored Directories
-
-There are several directories that should be ignored:
-`.cache`
-`ckpt`
-`/inference_outputs`
-`/lightning_logs`
-`/multiflow_weights`
-`/venv`
-`/wandb`
 
 ## Attribution
 
