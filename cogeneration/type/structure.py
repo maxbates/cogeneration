@@ -158,6 +158,11 @@ class StructureExperimentalMethod(StrEnum):
         """
         header: Mapping[str, str] = getattr(structure, "header", {})
 
+        # Check for AlphaFold prediction
+        name = (header.get("name") or header.get("title") or "").upper()
+        if name and "ALPHAFOLD" in name and "PREDICTION" in name:
+            return cls.AFDB
+
         # PDBParser sets 'structure_method', MMCIFParser may set 'experiment_method'
         raw: str = (
             header.get("structure_method") or header.get("experiment_method") or ""

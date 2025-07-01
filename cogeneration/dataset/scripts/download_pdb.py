@@ -46,7 +46,7 @@ class Args:
             "--pdb_dir",
             help="Local directory for downloaded PDB files",
             type=str,
-            default=os.path.join(os.path.expanduser("~"), "rcsb_pdb", "raw"),
+            default=os.path.join(os.path.expanduser("~"), "pdb", "rcsb", "raw"),
         )
         parser.add_argument(
             "--target_path",

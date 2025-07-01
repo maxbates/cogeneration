@@ -3,6 +3,8 @@
 """
 Script to preprocessing PDB files, generating metadata file and pkls expected by DataLoader.
 Supports partial processing and restarts and appending metadata, if has the same fields.
+
+Pass `--alphafold` to use default AlphaFold directory structure and metadata file naming.
 """
 
 import argparse
@@ -45,6 +47,7 @@ class Args:
     debug: bool = False
     max_structures: int = -1
     verbose: bool = False
+    alphafold: bool = False
 
     def __post_init__(self):
         os.makedirs(self.write_dir, exist_ok=True)
@@ -58,16 +61,21 @@ class Args:
     def from_parser(cls):
         parser = argparse.ArgumentParser(description="PDB processing script.")
         parser.add_argument(
+            "--alphafold",
+            help="Use AlphaFold directory structure and metadata naming.",
+            action="store_true",
+        )
+        parser.add_argument(
             "--pdb_dir",
             help="Path to directory with PDB files.",
             type=str,
-            default=os.path.join(os.path.expanduser("~"), "rcsb_pdb", "raw"),
+            default=None,  # Will be set based on --alphafold flag
         )
         parser.add_argument(
             "--write_dir",
             help="Path to write results to.",
             type=str,
-            default=os.path.join(os.path.expanduser("~"), "rcsb_pdb", "processed"),
+            default=None,  # Will be set based on --alphafold flag
         )
         parser.add_argument(
             "--num_processes",
@@ -94,6 +102,27 @@ class Args:
         )
         args = parser.parse_args()
 
+        # Set default paths based on alphafold flag
+        if args.pdb_dir is None:
+            if args.alphafold:
+                args.pdb_dir = os.path.join(
+                    os.path.expanduser("~"), "pdb", "alphafold", "raw"
+                )
+            else:
+                args.pdb_dir = os.path.join(
+                    os.path.expanduser("~"), "pdb", "rcsb", "raw"
+                )
+
+        if args.write_dir is None:
+            if args.alphafold:
+                args.write_dir = os.path.join(
+                    os.path.expanduser("~"), "pdb", "alphafold", "processed"
+                )
+            else:
+                args.write_dir = os.path.join(
+                    os.path.expanduser("~"), "pdb", "rcsb", "processed"
+                )
+
         return cls(
             pdb_dir=args.pdb_dir,
             num_processes=args.num_processes,
@@ -102,6 +131,7 @@ class Args:
             debug=args.debug,
             max_structures=args.max_structures,
             verbose=args.verbose,
+            alphafold=args.alphafold,
         )
 
 
@@ -154,11 +184,15 @@ def main(args: Args):
         filemode="a",
     )
 
-    # support divided directories and compressed files (e.g. `07/107L.ent.gz`)
+    # support divided directories and compressed files (e.g. `07/107L.ent.gz`, `AF-P12345-F1-model_v4.pdb.gz`)
     all_paths = []
     for root, _, files in os.walk(args.pdb_dir):
         for file_name in files:
-            if file_name.endswith(".ent.gz") or file_name.endswith(".pdb"):
+            if (
+                file_name.endswith(".ent.gz")
+                or file_name.endswith(".pdb")
+                or file_name.endswith(".pdb.gz")
+            ):
                 all_paths.append(os.path.join(root, file_name))
     os.makedirs(write_dir, exist_ok=True)
     total_num_files = len(all_paths)
@@ -166,9 +200,11 @@ def main(args: Args):
 
     # Determine metadata file path
     if args.debug:
-        metadata_file_name = "metadata_debug.csv"
+        metadata_file_name = (
+            "metadata_af2_debug.csv" if args.alphafold else "metadata_debug.csv"
+        )
     else:
-        metadata_file_name = "metadata.csv"
+        metadata_file_name = "metadata_af2.csv" if args.alphafold else "metadata.csv"
     metadata_path = os.path.join(write_dir, metadata_file_name)
     print(f"Metadata will be written to {metadata_path}")
 
@@ -182,6 +218,11 @@ def main(args: Args):
             f"Found existing metadata file at {metadata_path}, checking format + existing files..."
         )
         existing_metadata_df = pd.read_csv(metadata_path)
+
+        if len(existing_metadata_df) == 0:
+            raise Exception(
+                f"⚠️ Existing Metadata file @ {metadata_path} is empty. Remove it."
+            )
 
         missing_columns = set(MetadataColumn).difference(existing_metadata_df.columns)
         extra_columns = set(existing_metadata_df.columns).difference(MetadataColumn)

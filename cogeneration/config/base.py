@@ -795,7 +795,7 @@ class DatasetFilterConfig(BaseClassConfig):
     max_coil_percent: float = 0.667  # 0.5 in public MultiFlow
     # radius of gyration quantile
     rog_quantile: float = 0.96
-    # minimum percent of known and modelable residues in the structure of total sequence.
+    # max percent of unknown residues in the structure of total sequence
     max_percent_residues_unknown: float = 0.5  # 0.5 in public MultiFlow
     # pLDDT filter for synthetic structures
     min_plddt: float = 0.8
@@ -835,7 +835,7 @@ class DatasetFilterConfig(BaseClassConfig):
     def lenient(cls) -> "DatasetFilterConfig":
         """Lenient configuration for filtering during processing"""
         return cls(
-            max_num_res=8192,
+            max_num_res=16384,
             min_num_res=8,
             max_coil_percent=0.99,
             rog_quantile=1,

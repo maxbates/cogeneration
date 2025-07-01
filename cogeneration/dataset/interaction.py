@@ -9,6 +9,7 @@ from numpy import typing as npt
 from scipy.spatial import cKDTree
 from scipy.spatial.distance import cdist
 
+from cogeneration.data.const import INT_TO_CHAIN
 from cogeneration.data.protein import chain_str_to_int
 from cogeneration.data.residue_constants import (
     atom_order,
@@ -287,7 +288,7 @@ class MultimerInteractions:
         Format: "<chain_id>:<res_index>:<num_interactions>,..."
         """
         return ",".join(
-            f"{chain_id}:{res_index}:{len(interaction_set)}"
+            f"{INT_TO_CHAIN[chain_id]}:{res_index}:{len(interaction_set)}"
             for (
                 chain_id,
                 res_index,
@@ -319,7 +320,7 @@ class MultimerInteractions:
 
         # format as "<chain_a>:<chain_b>:<num_bb_res_xing_a>:<num_bb_res_xing_b>,...."
         return ",".join(
-            f"{chain_a}:{chain_b}:{len(set_a)}:{len(set_b)}"
+            f"{INT_TO_CHAIN[chain_a]}:{INT_TO_CHAIN[chain_b]}:{len(set_a)}:{len(set_b)}"
             for (chain_a, chain_b), (set_a, set_b) in chain_chain_counts.items()
         )
 
@@ -377,8 +378,9 @@ class MultimerInteractions:
         metadata[mc.hot_spots] = self.serialize_hot_spots()
 
         potential_clashes = self.potential_chain_clashes(backbone_only=True)
+        # serialize chain clashes
         metadata[mc.chain_clashes] = ",".join(
-            f"{chain_clash.chain_id}:{chain_clash.other_id}:{len(chain_clash.residue_pairs)}"
+            f"{INT_TO_CHAIN[chain_clash.chain_id]}:{INT_TO_CHAIN[chain_clash.other_id]}:{len(chain_clash.residue_pairs)}"
             for chain_clash in potential_clashes
         )
         metadata[mc.num_chains_clashing] = len(

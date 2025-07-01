@@ -14,7 +14,7 @@ from Bio import PDB
 from Bio.PDB.Structure import Structure
 from numpy import typing as npt
 
-from cogeneration.data.const import CA_IDX
+from cogeneration.data.const import CA_IDX, INT_TO_CHAIN
 from cogeneration.data.io import read_pkl, write_pkl
 from cogeneration.data.protein import chain_str_to_int, process_chain
 from cogeneration.data.residue_constants import unk_restype_index
@@ -44,11 +44,17 @@ def pdb_path_pdb_name(pdb_path: str) -> str:
     """
     # Remove the directory and file extension
     pdb_name = os.path.basename(pdb_path).upper()
-    pdb_name = pdb_name.replace(".ENT.GZ", "")
-    pdb_name = pdb_name.replace(".PDB", "")
-    # remove leading pdb e.g. `pdb0000.ent.gz`
-    if pdb_name.startswith("PDB"):
+
+    # for compressed PDBs, remove leading pdb e.g. `pdb0000.ent.gz`
+    if pdb_name.startswith("PDB") and pdb_name.endswith(".ENT.GZ"):
         pdb_name = pdb_name[3:]
+
+    pdb_name = pdb_name.replace(".ENT.GZ", "")
+    pdb_name = pdb_name.replace(".PDB.GZ", "")
+    pdb_name = pdb_name.replace(".PDB", "")
+
+    # No special handling for AlphaFold names, keep as is
+
     return pdb_name
 
 
@@ -60,7 +66,7 @@ def get_uncompressed_pdb_path(
 
     TODO(dataset) consider moving to context handler to close file more easily.
     """
-    is_compressed = file_path.endswith(".ent.gz")
+    is_compressed = file_path.endswith(".ent.gz") or file_path.endswith(".pdb.gz")
 
     if is_compressed:
         pdb_name = pdb_path_pdb_name(file_path)
@@ -156,7 +162,10 @@ def _chain_lengths(
         counts[chain_id] = len(seq)
 
     return ",".join(
-        [f"{chain_id}:{count}" for chain_id, count in sorted(counts.items())]
+        [
+            f"{INT_TO_CHAIN[chain_id]}:{count}"
+            for chain_id, count in sorted(counts.items())
+        ]
     )
 
 
