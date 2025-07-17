@@ -156,6 +156,12 @@ ckpt
 - Test by running `pytest`
 - Test directory structure should ~ match the `/cogeneration` directory structure, with `_test.py` suffix.
 
+## License
+
+This project is licensed under the Creative Commons Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0). This means you are free to share and adapt the material for non-commercial purposes, but you must give appropriate attribution and cannot use it for commercial purposes.
+
+See the [LICENSE.md](LICENSE.md) file for full details.
+
 ## Attribution
 
 This project is based on MultiFlow:
