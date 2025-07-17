@@ -21,7 +21,7 @@ This project introduces several extensions over MultiFlow:
 - Support for **LigandMPNN (in memory) for inverse folding** during validation / redesigning sequences
 - Support for **Boltz-2 (in memory) for structure prediction** or AlphaFold2 duiring validation / redesigning sequences
 - **Complete PDB processing data pipeline** to generate or augment training data, with several fields added to metadata
-  - Scripts to download and process **AlphaFold Database**
+  - Scripts to download and process **AlphaFold Database** (by default, only part of it)
   - Track information about chains, multimer interactions, presence of non-residues, etc.
 - Adds a trunk with **choice of attention mechanisms, e.g. IPA, Pairformer** (triangle attention)
 - Enables **recyling** through the trunk + IPA
@@ -67,6 +67,7 @@ cogeneration/ - main directory containing all source code
 │   └── trajectory_save.py - trajectory plotting and `save_trajectory()` function
 ├── dataset/
 │   ├── scripts/ - data downloading and processing scripts
+│   │   ├── cluster_pdbs.py - Generate `foldseek` clusters for downloaded PDB data
 │   │   ├── download_alphafold.py - AlphaFold PDB database download (SwissProt proteins)
 │   │   ├── download_pdb.py - PDB database download
 │   │   ├── process_pdb_files.py - PDB to Metadata CSV and pkl ProcessedFiles

@@ -185,12 +185,18 @@ python cogeneration/scripts/predict.py --output_dir samples
 
 If you want to download PDB and process (or reprocess) it to support new metadata or structure processing etc.
 
-Both are long running processes (>= 1 hr each) but support resuming. 
+These long running processes (>= 1 hr each) but some (PDB, processing) support resuming. 
+
+Using the default paths, which install into `~/pdb`:
 
 ```
-python cogeneration/dataset/scripts/download_pdb.py --pdb_dir pdbs
+python cogeneration/dataset/scripts/download_pdb.py
+python cogeneration/dataset/scripts/process_pdb_files.py 
 
-python cogeneration/dataset/scripts/process_pdb_files.py --pdb_dir pdbs --output_dir processed_pdbs
+python cogeneration/dataset/scripts/download_alphafold.py
+python cogeneration/dataset/scripts/process_pdb_files.py --alphafold
+
+python cogeneration/dataset/scripts/cluster_pdbs.py
 ```
 
 #### Inverse Fold to Redesign Structures

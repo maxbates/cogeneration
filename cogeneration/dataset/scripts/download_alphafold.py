@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Download AlphaFold PDB tarball from EBI and extract to local directory.
+Download AlphaFold PDB tarball for SwissProt from EBI and extract to local directory.
 Only extracts .pdb.gz files, skipping .cif.gz files.
 """
 

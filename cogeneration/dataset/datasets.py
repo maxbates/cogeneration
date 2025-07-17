@@ -596,37 +596,12 @@ class BaseDataset(Dataset):
             is_training=self.is_training,
         )
 
-        # Process structures and clusters
+        # Process metadata
         self.raw_csv = read_metadata_file(
             metadata_path=self.cfg.csv_path,
             max_rows=cfg.debug_head_samples,
         )
         self._log.debug(f"Loaded {len(self.raw_csv)} examples from {self.cfg.csv_path}")
-
-        # Initial filtering
-        dataset_filterer = DatasetFilterer(
-            cfg=cfg.filter,
-            modeled_trim_method=cfg.modeled_trim_method,
-        )
-        metadata_csv = dataset_filterer.filter_metadata(self.raw_csv)
-
-        # Concat redesigned data, if provided
-        if self.cfg.use_redesigned:
-            assert os.path.exists(
-                self.cfg.redesigned_csv_path
-            ), f"Redesigned CSV path {self.cfg.redesigned_csv_path} does not exist"
-
-            self.redesigned_csv = pd.read_csv(self.cfg.redesigned_csv_path)
-            metadata_csv = metadata_csv.merge(
-                self.redesigned_csv,
-                left_on=mc.pdb_name,
-                right_on=RedesignColumn.example,
-            )
-            # Filter out examples with high RMSD
-            metadata_csv = metadata_csv[
-                metadata_csv[RedesignColumn.best_rmsd]
-                < self.cfg.redesigned_rmsd_threshold
-            ]
 
         # Add cluster information
         if self.cfg.cluster_path is not None:
@@ -690,20 +665,31 @@ class BaseDataset(Dataset):
             # concat synthetic data to metadata_csv
             metadata_csv = pd.concat([metadata_csv, self.synthetic_csv])
 
-        # We just use the synthetic and re-designed data as is without additional filtering.
-        # Some filtering would be difficult, e.g. because designed structures/sequences may have
-        # values like pLDDT assigned by the tool that generated them.
-        # Also, presumably the synthetic data is generated from already-filtered structures/sequences.
+        # Filter structures, and synthetic structures.
+        dataset_filterer = DatasetFilterer(
+            cfg=cfg.filter,
+            modeled_trim_method=cfg.modeled_trim_method,
+        )
+        metadata_csv = dataset_filterer.filter_metadata(self.raw_csv)
 
-        # TODO(dataset) support augmenting dataset:
-        #   multimers: chain selections
-        #     based on MetadataColumn.chain_interactions
-        #   too long: crop to target length
-        #     for single chains, simply crop
-        #     for multiple chains, select interacting chains and trim non-interacting positions
-        #
-        #   Likely makes sense to augment MotifFactory to support these sorts of things,
-        #     and reuse some of the motif selection logic.
+        # Concat redesigned data, if provided.
+        # Redesigned data is not filtered except for RMSD requirement.
+        if self.cfg.use_redesigned:
+            assert os.path.exists(
+                self.cfg.redesigned_csv_path
+            ), f"Redesigned CSV path {self.cfg.redesigned_csv_path} does not exist"
+
+            self.redesigned_csv = pd.read_csv(self.cfg.redesigned_csv_path)
+            metadata_csv = metadata_csv.merge(
+                self.redesigned_csv,
+                left_on=mc.pdb_name,
+                right_on=RedesignColumn.example,
+            )
+            # Filter out examples with high RMSD
+            metadata_csv = metadata_csv[
+                metadata_csv[RedesignColumn.best_rmsd]
+                < self.cfg.redesigned_rmsd_threshold
+            ]
 
         self._create_split(metadata_csv)
 

@@ -154,7 +154,7 @@ class ModelHyperParamsConfig(BaseClassConfig):
     pos_embed_max_len: int = 2048
     timestep_embed_size: int = 128
     # layers
-    num_recycles: int = 3  # of trunk + IPA. 0 for single pass
+    num_recycles: int = 2  # of trunk + IPA. 0 for single pass
     trunk_num_layers: int = 4  # 0 to disable
     ipa_num_layers: int = 4  # >= 1
     seq_trunk_num_layers: int = 4  # 0 to disable
