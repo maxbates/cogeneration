@@ -603,6 +603,8 @@ class BaseDataset(Dataset):
         )
         self._log.debug(f"Loaded {len(self.raw_csv)} examples from {self.cfg.csv_path}")
 
+        metadata_csv = self.raw_csv.copy()
+
         # Add cluster information
         if self.cfg.cluster_path is not None:
             assert os.path.exists(
@@ -670,7 +672,7 @@ class BaseDataset(Dataset):
             cfg=cfg.filter,
             modeled_trim_method=cfg.modeled_trim_method,
         )
-        metadata_csv = dataset_filterer.filter_metadata(self.raw_csv)
+        metadata_csv = dataset_filterer.filter_metadata(metadata_csv)
 
         # Concat redesigned data, if provided.
         # Redesigned data is not filtered except for RMSD requirement.

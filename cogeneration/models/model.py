@@ -7,7 +7,7 @@ from cogeneration.models.aa_pred import AminoAcidNOOPNet, AminoAcidPredictionNet
 from cogeneration.models.attention.attention_trunk import AttentionTrunk
 from cogeneration.models.attention.ipa_attention import AttentionIPATrunk
 from cogeneration.models.bfactors import BFactorModule
-from cogeneration.models.confidence import PLDDTModule
+from cogeneration.models.confidence import PAEModule, PLDDTModule
 from cogeneration.models.edge_feature_net import EdgeFeatureNet
 from cogeneration.models.esm_combiner import ESMCombinerNetwork
 from cogeneration.models.node_feature_net import NodeFeatureNet
@@ -64,6 +64,8 @@ class FlowModel(nn.Module):
             self.bfactor_net = BFactorModule(cfg=cfg.bfactor)
         if self.cfg.plddt.enabled:
             self.plddt_net = PLDDTModule(cfg=cfg.plddt)
+        if self.cfg.pae.enabled:
+            self.pae_net = PAEModule(cfg=cfg.pae)
 
         # Seq trunk
         if self.cfg.seq_trunk.enabled:
@@ -205,6 +207,17 @@ class FlowModel(nn.Module):
         if self.cfg.plddt.enabled:
             pred_lddt = self.plddt_net(node_embed=node_embed)
 
+        # PAE, pTM, iPTM
+        pred_pae = None
+        pred_ptm = None
+        pred_iptm = None
+        if self.cfg.pae.enabled:
+            pred_pae, pred_ptm, pred_iptm = self.pae_net(
+                pair_embed=edge_embed,
+                chain_idx=chain_index,
+                mask=res_mask,
+            )
+
         # Seq trunk
         if self.cfg.seq_trunk.enabled:
             node_embed, edge_embed = self.seq_trunk(
@@ -238,8 +251,12 @@ class FlowModel(nn.Module):
             pbp.pred_torsions: pred_torsions,
             pbp.pred_logits: pred_logits,
             pbp.pred_aatypes: pred_aatypes,
+            # confidence
             pbp.pred_bfactor: pred_bfactor,
             pbp.pred_lddt: pred_lddt,
+            pbp.pred_pae: pred_pae,
+            pbp.pred_ptm: pred_ptm,
+            pbp.pred_iptm: pred_iptm,
             # other model outputs
             pbp.node_embed: node_embed,
             pbp.edge_embed: edge_embed,

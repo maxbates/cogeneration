@@ -457,6 +457,15 @@ class ModelPLDDTConfig(BaseClassConfig):
 
 
 @dataclass
+class ModelPAEConfig(BaseClassConfig):
+    """PAE prediction configuration."""
+
+    enabled: bool = True
+    c_z: int = "${model.hyper_params.edge_embed_size}"
+    num_bins: int = 64
+
+
+@dataclass
 class ModelConfig(BaseClassConfig):
     hyper_params: ModelHyperParamsConfig = field(default_factory=ModelHyperParamsConfig)
     node_features: ModelNodeFeaturesConfig = field(
@@ -479,9 +488,10 @@ class ModelConfig(BaseClassConfig):
     )
     ipa: ModelIPAConfig = field(default_factory=ModelIPAConfig)
 
-    # B-factors, confidence (pLDDT)
+    # B-factors, confidence (pLDDT, PAE)
     bfactor: ModelBFactorConfig = field(default_factory=ModelBFactorConfig)
     plddt: ModelPLDDTConfig = field(default_factory=ModelPLDDTConfig)
+    pae: ModelPAEConfig = field(default_factory=ModelPAEConfig)
 
     # Predict torsion angles. Model outputs (B, N, K, 2) depending on K predicted.
     # These torsions are then filled to (B, N, 7, 2) by interpolant.
@@ -503,7 +513,7 @@ class ModelConfig(BaseClassConfig):
         )
     )
 
-    # sequence prediction, default is simple aa_pred matching MultiFlow
+    # sequence prediction
     sequence_pred_type: ModelSequencePredictionEnum = (
         ModelSequencePredictionEnum.aa_pred
     )
@@ -1069,7 +1079,8 @@ class ExperimentTrainingConfig(BaseClassConfig):
     # atom positions, num atoms dep on angles modeled (0=3, 1=5, 7=14)
     aux_bb_atom_loss_weight: float = 0.25
     # backbone pairwise distances
-    aux_bb_pair_loss_weight: float = 0.25
+    aux_bb_pair_loss_weight_local: float = 0.25
+    aux_bb_pair_loss_weight_global: float = 0.15
     # multimer interchain contacts
     aux_multimer_interface_loss_weight: float = 0.25
     # multimer interchain clashes
@@ -1078,6 +1089,8 @@ class ExperimentTrainingConfig(BaseClassConfig):
     aux_bfactor_loss_weight: float = 1e-3
     # pLDDT confidence (comparing pred to GT structure)
     aux_plddt_loss_weight: float = 1e-3
+    # Predicted aligned error (PAE) confidence
+    aux_pae_loss_weight: float = 1e-3
     # hot spots inter-chain contact loss
     aux_hot_spots_loss_weight: float = 0.05
 
@@ -1613,6 +1626,7 @@ class Config(BaseClassConfig):
         # disable b-factor, confidence prediction
         raw_cfg.model.bfactor.enabled = False
         raw_cfg.model.plddt.enabled = False
+        raw_cfg.model.pae.enabled = False
         # Use simple aa_pred_net from public MultiFlow
         raw_cfg.model.sequence_pred_type = ModelSequencePredictionEnum.aa_pred
         # disable recycling

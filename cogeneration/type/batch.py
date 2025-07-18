@@ -79,10 +79,15 @@ class PredBatchProp(StrEnum):
     pred_trans = "pred_trans"  # (B, N, 3)
     pred_rotmats = "pred_rotmats"  # (B, N, 3, 3)
     pred_torsions = "pred_torsions"  # Optional (B, N, K, 2), K=1 (psi) or K=7 (all)
-    pred_bfactor = "pred_bfactor"  # (B, N, num_bins) b-factor logits
-    pred_lddt = "pred_lddt"  # (B, N, num_bins) pLDDT logits
     pred_logits = "pred_logits"  # (B, N, S) where S=21 if masking else S=20
     pred_aatypes = "pred_aatypes"  # (B, N)
+
+    # confidence
+    pred_bfactor = "pred_bfactor"  # (B, N, num_bins) b-factor logits
+    pred_lddt = "pred_lddt"  # (B, N, num_bins) pLDDT logits
+    pred_pae = "pred_pae"  # (B, N, N, num_bins) PAE logits
+    pred_ptm = "pred_ptm"  # (B,) predicted TM-score
+    pred_iptm = "pred_iptm"  # (B,) interface TM-score
 
     # other model outputs
     node_embed = "node_embed"  # (B, N, c_s)
@@ -150,6 +155,9 @@ def feats_to_prediction(
         PredBatchProp.pred_torsions: batch[BatchProp.torsions_1],
         PredBatchProp.pred_bfactor: batch[BatchProp.res_bfactor],
         PredBatchProp.pred_lddt: batch[BatchProp.res_plddt],
+        PredBatchProp.pred_pae: None,
+        PredBatchProp.pred_ptm: None,
+        PredBatchProp.pred_iptm: None,
         PredBatchProp.pred_logits: torch.nn.functional.one_hot(
             batch[BatchProp.aatypes_1],
             num_classes=cfg.model.hyper_params.aa_num_tokens,

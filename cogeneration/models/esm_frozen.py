@@ -412,7 +412,8 @@ class FrozenEsmModel(nn.Module):
             self._previous_call = {
                 "inputs": sequence_data.aa_sequence.clone().detach(),
                 "outputs": tree.map_structure(
-                    lambda x: x.clone().detach(), (single_repns, pair_repns)
+                    lambda x: x.clone().detach() if x is not None else None,
+                    (single_repns, pair_repns),
                 ),
             }
 

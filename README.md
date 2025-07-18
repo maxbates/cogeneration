@@ -16,7 +16,7 @@ This project introduces several extensions over MultiFlow:
   - particularly for sequence-conditioned tasks like inpainting
 - **Improved sequence prediction** and inverse folding, using a deeper sequence prediction network
 - **Torsion angle prediction** for more accurate side chain placement
-- **B-factor and pLDDT prediction**, improving model understanding of flexible regions, and embedding structure experimental method
+- **B-factor and confidence (pLDDT, PTM, iPTM) prediction**, improving model understanding of flexible regions, and embedding structure experimental method
 - additional losses (e.g. for atomic interactions, clashes)
 - Support for **LigandMPNN (in memory) for inverse folding** during validation / redesigning sequences
 - Support for **Boltz-2 (in memory) for structure prediction** or AlphaFold2 duiring validation / redesigning sequences
@@ -27,7 +27,7 @@ This project introduces several extensions over MultiFlow:
 - Enables **recyling** through the trunk + IPA
 - **CUDA optimizations**, e.g. Flash Attention, Flash IPA, cuEquivariant triangle attention
 - many improvements to code base: typing, enums, documentation, tests, etc.
-- Many of these new features and modules are **optional - easily reverse compatible with MultiFlow**, and public Multiflow weights
+- Many of these **new features and modules are optional, i.e. easily reverse compatible with MultiFlow**, and can use public Multiflow weights
 
 ## Installation, Training, and Sampling
 
@@ -98,7 +98,7 @@ cogeneration/ - main directory containing all source code
 │   │   └── triangular_mult.py - (~Boltz) triangle multiplication module
 │   ├── aa_pred.py - simple MLP sequence prediction network
 │   ├── bfactors.py - B-factor prediction module
-│   ├── confidence.py - pLDDT prediction module
+│   ├── confidence.py - pLDDT, PAE, PTM, iPTM prediction modules
 │   ├── edge_feature_net.py - edge feature embedding network
 │   ├── embed.py - position, time, distrogram embeddings
 │   ├── esm_combiner.py - ESM embedding combination module

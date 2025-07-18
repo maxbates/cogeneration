@@ -8,6 +8,7 @@ from cogeneration.config.base import Config
 from cogeneration.data import all_atom, so3_utils
 from cogeneration.data.data_transforms import common_torsion_mask
 from cogeneration.dataset.interaction import DIST_INTERACTION_BACKBONE
+from cogeneration.models.confidence import tm_function
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import ModelPrediction
 from cogeneration.type.batch import NoisyBatchProp as nbp
@@ -38,22 +39,30 @@ class AuxiliaryMetrics:
     batch_rot_loss: torch.Tensor
     batch_trans_loss: torch.Tensor
     batch_atom_loss: torch.Tensor
-    batch_dist_mat_loss: torch.Tensor
+    batch_dist_mat_loss_local: torch.Tensor
+    batch_dist_mat_loss_global: torch.Tensor
     batch_torsions_loss: torch.Tensor
     batch_multimer_interface_loss: torch.Tensor
     batch_multimer_clash_loss: torch.Tensor
     batch_bfactor_loss: torch.Tensor
     batch_plddt_loss: torch.Tensor
+    batch_pae_loss: torch.Tensor
+    batch_ptm_loss: torch.Tensor
+    batch_iptm_loss: torch.Tensor
     train_loss: torch.Tensor
     rots_vf_loss: torch.Tensor
     trans_loss: torch.Tensor
     atom_loss: torch.Tensor
-    dist_mat_loss: torch.Tensor
+    dist_mat_loss_local: torch.Tensor
+    dist_mat_loss_global: torch.Tensor
     torsions_loss: torch.Tensor
     multimer_interface_loss: torch.Tensor
     multimer_clash_loss: torch.Tensor
     bfactor_loss: torch.Tensor
     plddt_loss: torch.Tensor
+    pae_loss: torch.Tensor
+    ptm_loss: torch.Tensor
+    iptm_loss: torch.Tensor
     loss_denom_num_res: torch.Tensor
     examples_per_step: torch.Tensor
     res_length: torch.Tensor
@@ -70,6 +79,7 @@ class TrainingLosses:
     aatypes_loss: torch.Tensor
     bfactor_loss: torch.Tensor  # optional
     plddt_loss: torch.Tensor  # optional
+    pae_loss: torch.Tensor  # optional
     train_loss: torch.Tensor  # aggregated loss
 
     def items(self):
@@ -371,13 +381,14 @@ class BatchLossCalculator:
         return bb_atom_loss
 
     def loss_bb_pairwise_dist(
-        self, proximity_threshold_ang: float = 6.0
+        self, proximity_threshold_ang: float = 7.0, ca_only: bool = True
     ) -> torch.Tensor:
-        # Pairwise distance loss
+        """Pairwise distance loss"""
         num_batch = self.num_batch
         num_res = self.num_res
+
         # only consider backbone atoms for pairwise distances
-        n_bb_atoms = 3
+        n_bb_atoms = 1 if ca_only else 3
 
         gt_bb_atoms = self.gt.bb_atoms[..., :n_bb_atoms, :]
         pred_bb_atoms = self.pred_bb_atoms[..., :n_bb_atoms, :]
@@ -683,6 +694,111 @@ class BatchLossCalculator:
 
         return loss_per_batch
 
+    def loss_pae(self) -> torch.Tensor:
+        """Cross-entropy on Predicted Aligned Error bins."""
+        pae_logits = self.pred.get(pbp.pred_pae, None)
+        if pae_logits is None:
+            return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+
+        num_bins = pae_logits.shape[-1]
+        pred_trans = self.pred[pbp.pred_trans]
+        pred_rots = self.pred[pbp.pred_rotmats]
+        true_trans = self.gt.trans_1
+        true_rots = self.gt.rotmats_1
+
+        # transform to global frame
+        x_local = torch.zeros(3, device=pred_trans.device)
+        p_pred = (pred_rots @ x_local) + pred_trans  # (B, N, 3)
+        p_true = (true_rots @ x_local) + true_trans  # (B, N, 3)
+
+        # align pred-i onto true-i
+        A = true_rots @ pred_rots.transpose(-1, -2)  # (B, N, 3, 3)
+        b = true_trans - (A @ pred_trans.unsqueeze(-1)).squeeze(-1)  # (B, N, 3)
+
+        # place residue-j in aligned frame-i
+        p_pred_ij = torch.einsum("bnrc,bjc->bnjr", A, p_pred) + b.unsqueeze(
+            2
+        )  # (B, N, N, 3)
+        pae = (p_pred_ij - p_true.unsqueeze(1)).norm(dim=-1)  # (B, N, N)
+
+        # PAE clamped at 32Å
+        pae = pae.clamp(max=32.0 - 1e-3)  # (B, N, N)
+
+        # discretise into bins -> logits
+        bin_width = 32.0 / num_bins
+        target_bins = (pae / bin_width).long()
+        target_logits = torch.nn.functional.one_hot(
+            target_bins, num_classes=num_bins
+        ).float()
+
+        # CE loss, exclude self-pairs
+        logp = torch.nn.functional.log_softmax(pae_logits.float(), dim=-1)
+        pair_mask = self.loss_mask.unsqueeze(2) & self.loss_mask.unsqueeze(1)
+        eye = torch.eye(
+            self.num_res, device=pae_logits.device, dtype=torch.bool
+        ).unsqueeze(0)
+        pair_mask &= ~eye
+        pair_mask_f = pair_mask.float()
+        ce = -(target_logits * logp).sum(-1)
+        denom = pair_mask_f.sum((1, 2)) + 1e-5
+        loss = (ce * pair_mask_f).sum((1, 2)) / denom
+        return loss
+
+    def loss_ptm(self) -> torch.Tensor:
+        """L1 loss on the predicted TM-score (pTM) head."""
+        ptm_pred = self.pred.get(pbp.pred_ptm, None)
+        if ptm_pred is None:
+            return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+
+        chain_idx = self.batch[bp.chain_idx]
+        mask = self.loss_mask
+        ptm_gt, _ = self._tm_scores_gt(chain_idx, mask)
+
+        return (ptm_pred - ptm_gt).abs()
+
+    def loss_iptm(self) -> torch.Tensor:
+        """L1 loss on the predicted interface TM-score (iPTM) head."""
+        iptm_pred = self.pred.get(pbp.pred_iptm, None)
+        pae_logits = self.pred.get(pbp.pred_pae, None)
+        if iptm_pred is None or pae_logits is None:
+            return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+
+        chain_idx = self.batch[bp.chain_idx]
+        mask = self.loss_mask
+        _, iptm_gt = self._tm_scores_gt(chain_idx=chain_idx, mask=mask)
+        loss = (iptm_pred - iptm_gt).abs()
+        return loss
+
+    def _tm_scores_gt(self, chain_idx: torch.Tensor, mask: torch.Tensor):
+        """Ground-truth pTM / iPTM computed using true vs predicted coordinates.
+
+        Returns
+        -------
+        ptm_gt  : (B,) best-residue pTM
+        iptm_gt : (B,) best-residue inter-chain TM
+        """
+        # Pair-wise Ca distance error
+        pae = (
+            torch.cdist(self.pred[pbp.pred_trans], self.pred[pbp.pred_trans])
+            - torch.cdist(self.gt.trans_1, self.gt.trans_1)
+        ).abs()  # (B, N, N)
+
+        n_res = mask.sum(dim=-1, keepdim=False)  # (B,)
+        tm_val = tm_function(pae, n_res)  # (B, N, N)
+
+        pair_mask = mask.unsqueeze(2) * mask.unsqueeze(1)  # valid pairs
+
+        # pTM (best-residue over all pairs)
+        per_res_ptm = (tm_val * pair_mask).sum(-1) / (pair_mask.sum(-1) + 1e-8)
+        ptm = per_res_ptm.max(dim=-1).values  # (B,)
+
+        # iPTM (best-residue, inter-chain only)
+        inter_mask = pair_mask * (chain_idx.unsqueeze(1) != chain_idx.unsqueeze(2))
+        per_res_iptm = (tm_val * inter_mask).sum(-1) / (inter_mask.sum(-1) + 1e-8)
+        iptm = per_res_iptm.max(dim=-1).values  # (B,)
+
+        return ptm, iptm
+
     def calculate(self) -> Tuple[TrainingLosses, AuxiliaryMetrics]:
         """Calculate losses for the batch."""
         loss_trans = self.loss_trans()
@@ -690,12 +806,20 @@ class BatchLossCalculator:
         loss_torsions = self.loss_torsions()
         loss_aatypes_ce = self.loss_aatypes_ce()
         loss_atom_positions = self.loss_atom_positions(n_bb_atoms=self.n_atoms_modeled)
-        loss_pairwise_dist = self.loss_bb_pairwise_dist()
+        loss_pairwise_dist_local = self.loss_bb_pairwise_dist(
+            proximity_threshold_ang=7.0, ca_only=False
+        )  # neighbors
+        loss_pairwise_dist_global = self.loss_bb_pairwise_dist(
+            proximity_threshold_ang=32.0, ca_only=True
+        )  # ~ PDE loss
         loss_multimer_interface = self.loss_multimer_interface()
         loss_multimer_clash = self.loss_multimer_clash()
         loss_bfactor = self.loss_bfactor()
         loss_plddt = self.loss_plddt()
         loss_hot_spots = self.loss_hot_spots()
+        loss_pae = self.loss_pae()
+        loss_ptm = self.loss_ptm()  # deterministic from PAE, just compute + track
+        loss_iptm = self.loss_iptm()  # deterministic from PAE, just compute + track
 
         # scale losses by cfg weights
         loss_trans = loss_trans * self.train_cfg.translation_loss_weight
@@ -705,7 +829,12 @@ class BatchLossCalculator:
         loss_atom_positions = (
             loss_atom_positions * self.train_cfg.aux_bb_atom_loss_weight
         )
-        loss_pairwise_dist = loss_pairwise_dist * self.train_cfg.aux_bb_pair_loss_weight
+        loss_pairwise_dist_local = (
+            loss_pairwise_dist_local * self.train_cfg.aux_bb_pair_loss_weight_local
+        )
+        loss_pairwise_dist_global = (
+            loss_pairwise_dist_global * self.train_cfg.aux_bb_pair_loss_weight_global
+        )
         loss_multimer_interface = (
             loss_multimer_interface * self.train_cfg.aux_multimer_interface_loss_weight
         )
@@ -714,16 +843,19 @@ class BatchLossCalculator:
         )
         loss_bfactor = loss_bfactor * self.train_cfg.aux_bfactor_loss_weight
         loss_plddt = loss_plddt * self.train_cfg.aux_plddt_loss_weight
+        loss_pae = loss_pae * self.train_cfg.aux_pae_loss_weight
         loss_hot_spots = loss_hot_spots * self.train_cfg.aux_hot_spots_loss_weight
 
         # auxiliary loss
         loss_auxiliary = (
             loss_atom_positions
-            + loss_pairwise_dist
+            + loss_pairwise_dist_local
+            + loss_pairwise_dist_global
             + loss_multimer_clash
             + loss_multimer_interface
             + loss_bfactor
             + loss_plddt
+            + loss_pae
             + loss_hot_spots
         )
         loss_auxiliary *= self.train_cfg.aux_loss_weight
@@ -748,22 +880,30 @@ class BatchLossCalculator:
             batch_rot_loss=loss_rot_vf,
             batch_trans_loss=loss_trans,
             batch_atom_loss=loss_atom_positions,
-            batch_dist_mat_loss=loss_pairwise_dist,
+            batch_dist_mat_loss_local=loss_pairwise_dist_local,
+            batch_dist_mat_loss_global=loss_pairwise_dist_global,
             batch_torsions_loss=loss_torsions,
             batch_multimer_interface_loss=loss_multimer_interface,
             batch_multimer_clash_loss=loss_multimer_clash,
             batch_bfactor_loss=loss_bfactor,
             batch_plddt_loss=loss_plddt,
+            batch_pae_loss=loss_pae,
+            batch_ptm_loss=loss_ptm,
+            batch_iptm_loss=loss_iptm,
             train_loss=self.normalize_loss(loss_total),
             rots_vf_loss=self.normalize_loss(loss_rot_vf),
             trans_loss=self.normalize_loss(loss_trans),
             atom_loss=self.normalize_loss(loss_atom_positions),
-            dist_mat_loss=self.normalize_loss(loss_pairwise_dist),
+            dist_mat_loss_local=self.normalize_loss(loss_pairwise_dist_local),
+            dist_mat_loss_global=self.normalize_loss(loss_pairwise_dist_global),
             torsions_loss=self.normalize_loss(loss_torsions),
             multimer_interface_loss=self.normalize_loss(loss_multimer_interface),
             multimer_clash_loss=self.normalize_loss(loss_multimer_clash),
             bfactor_loss=self.normalize_loss(loss_bfactor),
             plddt_loss=self.normalize_loss(loss_plddt),
+            pae_loss=self.normalize_loss(loss_pae),
+            ptm_loss=self.normalize_loss(loss_ptm),
+            iptm_loss=self.normalize_loss(loss_iptm),
             loss_denom_num_res=self.loss_denom_num_res,
             examples_per_step=torch.tensor(self.num_batch),
             res_length=torch.mean(torch.sum(self.batch[bp.res_mask], dim=-1).float()),
@@ -777,6 +917,7 @@ class BatchLossCalculator:
             aatypes_loss=loss_aatypes_ce,
             bfactor_loss=loss_bfactor,
             plddt_loss=loss_plddt,
+            pae_loss=loss_pae,
             train_loss=loss_total,
         )
 
