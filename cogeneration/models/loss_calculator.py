@@ -49,6 +49,8 @@ class AuxiliaryMetrics:
     batch_pae_loss: torch.Tensor
     batch_ptm_loss: torch.Tensor
     batch_iptm_loss: torch.Tensor
+    batch_hot_spots_loss: torch.Tensor
+    batch_contact_conditioning_loss: torch.Tensor
     train_loss: torch.Tensor
     rots_vf_loss: torch.Tensor
     trans_loss: torch.Tensor
@@ -63,6 +65,8 @@ class AuxiliaryMetrics:
     pae_loss: torch.Tensor
     ptm_loss: torch.Tensor
     iptm_loss: torch.Tensor
+    hot_spots_loss: torch.Tensor
+    contact_conditioning_loss: torch.Tensor
     loss_denom_num_res: torch.Tensor
     examples_per_step: torch.Tensor
     res_length: torch.Tensor
@@ -80,6 +84,8 @@ class TrainingLosses:
     bfactor_loss: torch.Tensor  # optional
     plddt_loss: torch.Tensor  # optional
     pae_loss: torch.Tensor  # optional
+    hot_spots_loss: torch.Tensor  # optional
+    contact_conditioning_loss: torch.Tensor  # optional
     train_loss: torch.Tensor  # aggregated loss
 
     def items(self):
@@ -694,6 +700,91 @@ class BatchLossCalculator:
 
         return loss_per_batch
 
+    def loss_contact_conditioning(self) -> torch.Tensor:
+        """
+        Contact conditioning loss encourages adherence to contact conditioning constraints.
+        Uses ReLU penalty for distances that exceed the defined contact thresholds.
+        Normalizes energy over the number of defined contacts.
+        Ignores contacts in motifs and upweights inter-chain contacts.
+        """
+        # TODO(conditioning): consider up-weighting distant contacts
+        # Upweight inter-chain contacts
+        inter_chain_weight = 2.0
+        # Cap distance penalty
+        max_distance_penalty = 10.0
+
+        # Skip if no contact conditioning defined
+        if bp.contact_conditioning not in self.batch:
+            return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+
+        contact_conditioning = self.batch[bp.contact_conditioning]  # (B, N, N)
+        contact_mask = contact_conditioning > 0  # (B, N, N) - only defined contacts
+
+        # Skip if no contacts are defined
+        if not contact_mask.any():
+            return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+
+        # Use predicted translations (CA positions)
+        pred_trans = self.pred[pbp.pred_trans]  # (B, N, 3)
+
+        # Calculate pairwise distances
+        pairwise_dists = torch.norm(
+            pred_trans.unsqueeze(2) - pred_trans.unsqueeze(1), dim=-1
+        )  # (B, N, N)
+
+        # Apply ReLU penalty: penalize when actual distance exceeds target distance
+        excess_distances = torch.relu(
+            pairwise_dists - contact_conditioning
+        )  # (B, N, N)
+        excess_distances = excess_distances.clamp(max=max_distance_penalty)
+
+        # Apply loss mask to valid residue pairs
+        res_i_mask = self.loss_mask.unsqueeze(2)  # (B, N, 1)
+        res_j_mask = self.loss_mask.unsqueeze(1)  # (B, 1, N)
+        valid_pairs = res_i_mask & res_j_mask  # (B, N, N)
+
+        # Only apply penalty to defined contacts with valid residues
+        contact_penalties = (
+            excess_distances * contact_mask.float() * valid_pairs.float()
+        )  # (B, N, N)
+
+        # Ignore contacts in motifs, if defined (for inpainting)
+        if (
+            bp.motif_mask in self.batch
+            and self.batch[bp.motif_mask] is not None
+            and self.batch[bp.motif_mask].sum() > 0
+        ):
+            motif_mask = self.batch[bp.motif_mask]  # (B, N)
+            # Create motif edge mask: both residues must NOT be in motifs
+            motif_edge_mask = (~motif_mask.bool()).unsqueeze(2) & (
+                ~motif_mask.bool()
+            ).unsqueeze(1)
+            contact_penalties = contact_penalties * motif_edge_mask.float()
+
+        # Upweight inter-chain contacts
+        if inter_chain_weight != 1.0:
+            chain_idx = self.batch[bp.chain_idx]  # (B, N)
+            chain_i = chain_idx.unsqueeze(2)  # (B, N, 1)
+            chain_j = chain_idx.unsqueeze(1)  # (B, 1, N)
+            inter_chain_mask = chain_i != chain_j  # (B, N, N)
+
+            # Apply inter-chain weighting
+            contact_weights = torch.ones_like(contact_penalties)
+            contact_weights = torch.where(
+                inter_chain_mask & contact_mask & valid_pairs,
+                inter_chain_weight,
+                contact_weights,
+            )
+            contact_penalties = contact_penalties * contact_weights
+
+        # Sum penalties and normalize by number of valid defined contacts
+        penalty_per_batch = contact_penalties.sum(dim=(1, 2))  # (B,)
+        valid_contact_mask = contact_mask.float() * valid_pairs.float()  # (B, N, N)
+        num_contacts = valid_contact_mask.sum(dim=(1, 2)).clamp_min(1.0)  # (B,)
+        loss_per_batch = penalty_per_batch / num_contacts  # (B,)
+
+        return loss_per_batch
+
     def loss_pae(self) -> torch.Tensor:
         """Cross-entropy on Predicted Aligned Error bins."""
         pae_logits = self.pred.get(pbp.pred_pae, None)
@@ -817,6 +908,7 @@ class BatchLossCalculator:
         loss_bfactor = self.loss_bfactor()
         loss_plddt = self.loss_plddt()
         loss_hot_spots = self.loss_hot_spots()
+        loss_contact_conditioning = self.loss_contact_conditioning()
         loss_pae = self.loss_pae()
         loss_ptm = self.loss_ptm()  # deterministic from PAE, just compute + track
         loss_iptm = self.loss_iptm()  # deterministic from PAE, just compute + track
@@ -845,6 +937,10 @@ class BatchLossCalculator:
         loss_plddt = loss_plddt * self.train_cfg.aux_plddt_loss_weight
         loss_pae = loss_pae * self.train_cfg.aux_pae_loss_weight
         loss_hot_spots = loss_hot_spots * self.train_cfg.aux_hot_spots_loss_weight
+        loss_contact_conditioning = (
+            loss_contact_conditioning
+            * self.train_cfg.aux_contact_conditioning_loss_weight
+        )
 
         # auxiliary loss
         loss_auxiliary = (
@@ -857,6 +953,7 @@ class BatchLossCalculator:
             + loss_plddt
             + loss_pae
             + loss_hot_spots
+            + loss_contact_conditioning
         )
         loss_auxiliary *= self.train_cfg.aux_loss_weight
 
@@ -890,6 +987,8 @@ class BatchLossCalculator:
             batch_pae_loss=loss_pae,
             batch_ptm_loss=loss_ptm,
             batch_iptm_loss=loss_iptm,
+            batch_hot_spots_loss=loss_hot_spots,
+            batch_contact_conditioning_loss=loss_contact_conditioning,
             train_loss=self.normalize_loss(loss_total),
             rots_vf_loss=self.normalize_loss(loss_rot_vf),
             trans_loss=self.normalize_loss(loss_trans),
@@ -904,6 +1003,8 @@ class BatchLossCalculator:
             pae_loss=self.normalize_loss(loss_pae),
             ptm_loss=self.normalize_loss(loss_ptm),
             iptm_loss=self.normalize_loss(loss_iptm),
+            hot_spots_loss=self.normalize_loss(loss_hot_spots),
+            contact_conditioning_loss=self.normalize_loss(loss_contact_conditioning),
             loss_denom_num_res=self.loss_denom_num_res,
             examples_per_step=torch.tensor(self.num_batch),
             res_length=torch.mean(torch.sum(self.batch[bp.res_mask], dim=-1).float()),
@@ -918,6 +1019,8 @@ class BatchLossCalculator:
             bfactor_loss=loss_bfactor,
             plddt_loss=loss_plddt,
             pae_loss=loss_pae,
+            hot_spots_loss=loss_hot_spots,
+            contact_conditioning_loss=loss_contact_conditioning,
             train_loss=loss_total,
         )
 

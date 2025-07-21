@@ -12,14 +12,14 @@ from cogeneration.type.task import DataTask
 class BatchProp(StrEnum):
     """
     Enum of batch properties.
-    "_1" properties @ time == 1 the original data.
     """
 
-    # ground truth properties
+    # ground truth properties (i.e. `_1`)
     aatypes_1 = "aatypes_1"  # (B, N) amino acid sequence, as ints (0-20, 20 for UNK)
     trans_1 = "trans_1"  # (B, N, 3) frame translations
     rotmats_1 = "rotmats_1"  # (B, N, 3, 3) frame rotations
     torsions_1 = "torsion_angles_sin_cos_1"  # (B, N, 7, 2)
+
     # structure metadata
     chain_idx = "chain_idx"  # (B, N) chain index (chains are shuffled, 1-indexed)
     res_idx = "res_idx"  # (B, N) residue index (residues are re-numbered contiguously 1-indexed)
@@ -27,7 +27,8 @@ class BatchProp(StrEnum):
     res_plddt = (
         "res_plddt"  # (B, N) pLDDT scores, iff from predicted structure, else 100.0
     )
-    structure_method = "structure_method"  # (B, 1) StructureExperimentalMethod
+    structure_method = "structure_method"  # (B,) StructureExperimentalMethod
+
     # masks
     res_mask = "res_mask"  # (B, N) residues under consideration (uses `dpc.bb_mask`)
     diffuse_mask = "diffuse_mask"  # (B, N) hallucination mask, residue positions that are corrupted/sampled
@@ -35,12 +36,17 @@ class BatchProp(StrEnum):
     plddt_mask = (
         "plddt_mask"  # (B, N) pLDDT mask for synthetic structures, 1 if >= threshold
     )
+
+    # conditioning
     hot_spots = (
         "hot_spots"  # (B, N) hot spot mask, 1 for interacting residues across chains
     )
+    contact_conditioning = "contact_conditioning"  # Optional (B, N, N) contact conditioning matrix, dist threshold
+
     # metadata
     pdb_name = "pdb_name"  # (B) source PDB id string/int
     csv_idx = "csv_idx"  # (B) index of the protein in the csv file, for debugging
+
     # inference only
     sample_id = "sample_id"  # (B) [inference only] sample id
 
@@ -48,6 +54,7 @@ class BatchProp(StrEnum):
 # datum level metadata, i.e. `(B)` rather than `(B, N)`, and non-tensors
 METADATA_BATCH_PROPS = [
     BatchProp.pdb_name,
+    BatchProp.structure_method,
     BatchProp.csv_idx,
     BatchProp.sample_id,
 ]
@@ -113,9 +120,11 @@ ModelPrediction = Dict[PredBatchProp, TensorFeat]
 def empty_feats(N: int, task: DataTask = DataTask.hallucination) -> BatchFeatures:
     """
     Create empty features for a protein of length N.
+
+    It is important that the dtypes match those output by BaseDataset items.
     """
     feats = {
-        BatchProp.res_mask: torch.ones(N),
+        BatchProp.res_mask: torch.ones(N).int(),
         # assume masking interpolant
         BatchProp.aatypes_1: (torch.ones(N) * MASK_TOKEN_INDEX).long(),
         BatchProp.trans_1: torch.zeros(N, 3),
@@ -125,11 +134,12 @@ def empty_feats(N: int, task: DataTask = DataTask.hallucination) -> BatchFeature
         ),
         BatchProp.chain_idx: torch.ones(N),
         BatchProp.res_idx: torch.arange(1, N + 1),
-        BatchProp.res_bfactor: torch.full((N,), 0.0),
-        BatchProp.res_plddt: torch.full((N,), 100.0),
+        BatchProp.res_bfactor: torch.full((N,), 0.0).float(),
+        BatchProp.res_plddt: torch.full((N,), 100.0).float(),
         BatchProp.diffuse_mask: torch.ones(N).int(),
         BatchProp.plddt_mask: torch.ones(N).int(),
-        BatchProp.hot_spots: torch.zeros(N).int(),  # default no hot spots
+        BatchProp.hot_spots: torch.zeros(N).int(),
+        BatchProp.contact_conditioning: torch.zeros(N, N).float(),
         BatchProp.pdb_name: "",
         BatchProp.csv_idx: torch.tensor([1], dtype=torch.long),
         BatchProp.structure_method: StructureExperimentalMethod.default_tensor_feat(),

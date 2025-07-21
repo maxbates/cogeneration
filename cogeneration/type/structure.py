@@ -70,7 +70,7 @@ class StructureExperimentalMethod(StrEnum):
 
     @staticmethod
     def to_tensor(value: "StructureExperimentalMethod") -> torch.Tensor:
-        """Return StructureExperimentalMethod enum as int."""
+        """Return StructureExperimentalMethod enum as long."""
         return torch.tensor(
             [StructureExperimentalMethod.to_int(value)], dtype=torch.long
         )

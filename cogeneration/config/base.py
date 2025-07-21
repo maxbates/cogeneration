@@ -225,12 +225,28 @@ class ModelNodeFeaturesConfig(BaseClassConfig):
 
 
 @dataclass
-class ModelEdgeFeaturesConfig(BaseClassConfig):
+class ModelContactConditioningConfig(BaseClassConfig):
     """
-    Edge features (structure, residue distances / orientations)
+    Contact conditioning config, in edge feature net
     """
 
-    single_bias_transition_n: int = 2  # DROP
+    enabled: bool = True
+    # pair_dim: dimension of pair embeddings
+    pair_dim: int = "${model.hyper_params.edge_embed_size}"
+    # fourier_dim: number of dimensions for Fourier embedding
+    fourier_dim: int = 16
+
+    # distances are used to scale thresholds for embedding
+    dist_min: float = "${dataset.contact_conditioning.dist_minimum_ang}"
+    dist_max: float = "${dataset.contact_conditioning.dist_maximum_ang}"
+
+
+@dataclass
+class ModelEdgeFeaturesConfig(BaseClassConfig):
+    """
+    Edge features (structure, residue distances / orientations, contact conditioning)
+    """
+
     # c_s: node embedding size (an input to edge network)
     c_s: int = "${model.hyper_params.node_embed_size}"
     # c_p: output embedding size + MLP width
@@ -250,6 +266,10 @@ class ModelEdgeFeaturesConfig(BaseClassConfig):
     embed_chain: bool = True
     # embed_diffuse_mask: whether to embed diffuse mask. important esp. for `scaffolding` task.
     embed_diffuse_mask: bool = True
+
+    contact_conditioning: ModelContactConditioningConfig = field(
+        default_factory=ModelContactConditioningConfig
+    )
 
 
 @dataclass
@@ -711,6 +731,15 @@ class InterpolantSteeringConfig:
     hot_spot_contact_distance_ang: float = 6.5
     hot_spot_max_distance_penalty: float = 10.0
 
+    # contact conditioning potential parameters
+    contact_conditioning_scale: float = 1.0
+    contact_conditioning_inter_chain_weight: float = (
+        2.0  # upweight inter-chain contacts
+    )
+    contact_conditioning_max_distance_penalty: float = (
+        10.0  # maximum penalty for distance violations
+    )
+
 
 @dataclass
 class InterpolantConfig(BaseClassConfig):
@@ -829,6 +858,7 @@ class DatasetFilterConfig(BaseClassConfig):
     def multimeric(cls) -> "DatasetFilterConfig":
         """Factory for multimeric configuration"""
         return cls(
+            max_num_res=1024,
             oligomeric=None,
             num_chains=None,
             # skip monomers
@@ -894,7 +924,7 @@ class DatasetHotspotsConfig(BaseClassConfig):
     """
 
     # Percentage of time to include no hot spots
-    no_hotspots_prob: float = 0.0
+    no_hotspots_prob: float = 0.5
 
     # Downsampling
     # Minimum number of hot spots to consider in a structure
@@ -904,6 +934,31 @@ class DatasetHotspotsConfig(BaseClassConfig):
     max_hotspot_fraction: float = 0.25
     # Hot spot selection strategy
     prioritize_high_interaction: bool = True  # TODO remove
+
+
+@dataclass
+class DatasetContactConditioningConfig(BaseClassConfig):
+    """
+    Configuration for contact conditioning
+    """
+
+    # Percent of time to not include contact conditioning matrix
+    conditioning_prob_disabled: float = 0.25
+    # Percent of time to include contact conditioning matrix for motifs
+    conditioning_prob_motif_only: float = 0.5
+    # Percent of time to include inter-chain contact constraint in multimers
+    include_inter_chain_prob: float = 0.5
+    # Percent of time to downsample inter-chain contacts to just a few
+    downsample_inter_chain_prob: float = 0.5
+    downsample_inter_chain_min_contacts: int = 1
+    downsample_inter_chain_max_contacts: int = 20
+    # Minimum number of residues between motifs
+    min_res_gap: int = 7
+    # Distance thresholds
+    dist_minimum_ang: float = 4.0
+    dist_maximum_ang: float = 20.0
+    # small noise to modulate threshold during training
+    dist_noise_ang: float = 0.1
 
 
 @dataclass
@@ -1025,8 +1080,11 @@ class DatasetConfig(BaseClassConfig):
     # Scaffolding / inpainting parameters
     inpainting: DatasetInpaintingConfig = field(default_factory=DatasetInpaintingConfig)
 
-    # Hot spots
+    # Conditioning
     hotspots: DatasetHotspotsConfig = field(default_factory=DatasetHotspotsConfig)
+    contact_conditioning: DatasetContactConditioningConfig = field(
+        default_factory=DatasetContactConditioningConfig
+    )
 
     # Filtering
     filter: DatasetFilterConfig = field(default_factory=DatasetFilterConfig)
@@ -1093,6 +1151,8 @@ class ExperimentTrainingConfig(BaseClassConfig):
     aux_pae_loss_weight: float = 1e-3
     # hot spots inter-chain contact loss
     aux_hot_spots_loss_weight: float = 0.05
+    # contact conditioning constraint loss
+    aux_contact_conditioning_loss_weight: float = 0.1
 
 
 @dataclass
@@ -1621,6 +1681,8 @@ class Config(BaseClassConfig):
         # Model
         # Use public MultiFlow model size hyperparameters
         raw_cfg.model.hyper_params = ModelHyperParamsConfig.public_multiflow()
+        # disable contact conditioning
+        raw_cfg.model.edge_features.contact_conditioning.enabled = False
         # disable ESM combiner
         raw_cfg.model.esm_combiner.enabled = False
         # disable b-factor, confidence prediction

@@ -7,6 +7,7 @@ import torch
 from cogeneration.config.base import InterpolantSteeringConfig
 from cogeneration.data.potentials import (
     ChainBreakPotential,
+    ContactConditioningPotential,
     FKSteeringCalculator,
     FKSteeringResampler,
     HotSpotPotential,
@@ -41,6 +42,8 @@ def _make_batch_and_step(
     assert N % 2 == 0, "N must be even"  # for multimer split
     assert N >= 20, "N must be at least 20"  # for chain breaks
 
+    res_dist = 3.8
+
     dataloader = MockDataloader(
         sample_lengths=[N] * B,
         task=DataTask.inpainting,
@@ -72,21 +75,21 @@ def _make_batch_and_step(
             trans = torch.zeros(B, N, 3)
             # Chain 0 residues
             trans[:, :chain_1_start, 0] = (
-                torch.arange(chain_1_start).float() * 3.8
+                torch.arange(chain_1_start).float() * res_dist
             )  # Normal spacing
             # Chain 1 residues - start close to chain 0's first residue
             trans[:, chain_1_start:, 0] = (
-                torch.arange(N - chain_1_start).float() * 3.8 + 5.0
+                torch.arange(N - chain_1_start).float() * res_dist + 5.0
             )  # Close contact
             trans[:, chain_1_start:, 1] = 2.0  # Slight y offset
         else:
             # Place hot spots far apart (beyond contact distance)
             trans = torch.zeros(B, N, 3)
             # Chain 0 residues
-            trans[:, :chain_1_start, 0] = torch.arange(chain_1_start).float() * 3.8
+            trans[:, :chain_1_start, 0] = torch.arange(chain_1_start).float() * res_dist
             # Chain 1 residues - start far from chain 0
             trans[:, chain_1_start:, 0] = (
-                torch.arange(N - chain_1_start).float() * 3.8 + 20.0
+                torch.arange(N - chain_1_start).float() * res_dist + 20.0
             )  # Far apart
             trans[:, chain_1_start:, 1] = 10.0  # Large y offset
 
@@ -96,7 +99,7 @@ def _make_batch_and_step(
         # translations are lines on z axis, res are 3.8 angstroms apart:
         # if `with_break` second half shifted by +10
         line1 = torch.cat(
-            [torch.zeros(N, 2), torch.arange(N).unsqueeze(1).float() * 3.8], dim=-1
+            [torch.zeros(N, 2), torch.arange(N).unsqueeze(1).float() * res_dist], dim=-1
         )  # (N, 3)
         trans = line1.clone()
         if with_break:
@@ -206,6 +209,141 @@ class TestHotSpotPotential:
         )
 
         assert E.item() == 0.0, f"Expected zero energy for single chain, got {E.item()}"
+
+
+class TestContactConditioningPotential:
+    def test_no_contacts_defined(self):
+        """Test that potential returns zero energy when no contacts are defined."""
+        batch, step = _make_batch_and_step(B=1, N=30, multimer=False)
+
+        # No contact conditioning defined (default is zeros)
+        potential = ContactConditioningPotential()
+        E = potential.compute_energy(
+            batch=batch,
+            model_pred=step,
+            protein_pred=step,
+            protein_state=step,
+        )
+
+        assert E.item() == 0.0, f"Expected zero energy with no contacts, got {E.item()}"
+
+    def test_contacts_satisfied(self):
+        """Test that potential returns low energy when contacts are satisfied."""
+        batch, step = _make_batch_and_step(B=1, N=30, multimer=False)
+
+        # Define contact conditioning matrix with tight constraints that should be satisfied
+        # (since structure is linear with 3.8 spacing)
+        contact_conditioning = torch.zeros(1, 30, 30)
+        contact_conditioning[0, 0, 1] = 3.8  # expect ~3.8A contact
+        contact_conditioning[0, 1, 2] = 3.8  # expect ~3.8A contact
+        batch[bp.contact_conditioning] = contact_conditioning
+
+        potential = ContactConditioningPotential()
+        E = potential.compute_energy(
+            batch=batch,
+            model_pred=step,
+            protein_pred=step,
+            protein_state=step,
+        )
+
+        # Should be very low energy since contacts are satisfied
+        assert (
+            E.item() < 0.1
+        ), f"Expected low energy with satisfied contacts, got {E.item()}"
+
+    @pytest.mark.parametrize("dist", [2.0, 3.8, 10.0])
+    def test_contacts_violated(self, dist):
+        """Test that potential returns high energy when contacts are violated."""
+        batch, step = _make_batch_and_step(B=1, N=30, multimer=False)
+
+        # force no motif mask, so all residues considered for loss
+        if bp.motif_mask in batch:
+            del batch[bp.motif_mask]
+
+        # Define contact conditioning matrix with tight constraints that will be violated
+        contact_conditioning = torch.zeros(1, 30, 30)
+        contact_conditioning[0, 0, 1] = dist  # expect dist but actual is ~3.8A
+        contact_conditioning[0, 1, 0] = dist  # make symmetric
+        contact_conditioning[0, 1, 2] = dist  # expect dist but actual is ~3.8A
+        contact_conditioning[0, 2, 1] = dist  # make symmetric
+        batch[bp.contact_conditioning] = contact_conditioning
+
+        potential = ContactConditioningPotential()
+        E = potential.compute_energy(
+            batch=batch,
+            model_pred=step,
+            protein_pred=step,
+            protein_state=step,
+        )
+
+        # Should be high energy since contacts are violated
+        if dist == 3.8:
+            assert (
+                E.item() == 0.0
+            ), f"Expected zero energy with violated contacts, got {E.item()}"
+        else:
+            assert (
+                E.item() > 0.05
+            ), f"Expected high energy with violated contacts, got {E.item()} @ dist={dist}"
+
+    def test_inter_chain_weighting(self):
+        """Test that inter-chain contacts are upweighted."""
+        batch, step = _make_batch_and_step(B=1, N=30, multimer=True)
+
+        # Remove motif mask to avoid interference
+        if bp.motif_mask in batch:
+            del batch[bp.motif_mask]
+
+        # Find where chain 2 starts
+        chain_idx = batch[bp.chain_idx]  # (B, N)
+        chain_2_start = None
+        for i in range(30):
+            if chain_idx[0, i] == 2:  # Chain 2 (1-indexed)
+                chain_2_start = i
+                break
+        assert chain_2_start is not None, "Could not find chain 2 start position"
+
+        # Define contact conditioning matrix with inter-chain contact
+        contact_conditioning = torch.zeros(1, 30, 30)
+
+        # Use residue 0 (chain 1) and chain_2_start (chain 2) for inter-chain contact
+        actual_dist = torch.norm(
+            step.trans[0, 0, :] - step.trans[0, chain_2_start, :]
+        ).item()
+        target_dist = actual_dist - 2.0  # Set target to be 2.0A less than actual
+
+        # Residue 0 (chain 1) to chain_2_start (chain 2) - should be upweighted
+        contact_conditioning[0, 0, chain_2_start] = (
+            target_dist  # moderate constraint that will be violated
+        )
+        contact_conditioning[0, chain_2_start, 0] = target_dist  # make matrix symmetric
+        batch[bp.contact_conditioning] = contact_conditioning
+
+        # Test with default inter-chain weight
+        potential_weighted = ContactConditioningPotential(inter_chain_weight=2.0)
+        E_weighted = potential_weighted.compute_energy(
+            batch=batch,
+            model_pred=step,
+            protein_pred=step,
+            protein_state=step,
+        )
+
+        # Test with no inter-chain weight
+        potential_unweighted = ContactConditioningPotential(inter_chain_weight=1.0)
+        E_unweighted = potential_unweighted.compute_energy(
+            batch=batch,
+            model_pred=step,
+            protein_pred=step,
+            protein_state=step,
+        )
+
+        # Both should have non-zero energy, and weighted should be higher
+        assert (
+            E_unweighted.item() > 0
+        ), f"Expected non-zero energy for unweighted, got {E_unweighted.item()}"
+        assert (
+            E_weighted.item() > E_unweighted.item()
+        ), f"Expected higher energy with inter-chain weighting: {E_weighted.item()} vs {E_unweighted.item()}"
 
 
 class TestFKSteeringCalculator:

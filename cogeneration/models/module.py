@@ -418,6 +418,7 @@ class FlowModule(LightningModule):
             aatypes_1=batch[bp.aatypes_1],
             torsions_1=batch[bp.torsions_1],
             hot_spots=batch.get(bp.hot_spots, None),
+            contact_conditioning=batch.get(bp.contact_conditioning, None),
         )
 
         bb_trajs = to_numpy(sample_traj.structure)
@@ -668,6 +669,7 @@ class FlowModule(LightningModule):
             torsions_1=torsions_1,
             aatypes_1=aatypes_1,
             hot_spots=batch.get(bp.hot_spots, None),
+            contact_conditioning=batch.get(bp.contact_conditioning, None),
         )
 
         model_bb_trajs = to_numpy(model_traj.structure)

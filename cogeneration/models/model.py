@@ -112,6 +112,7 @@ class FlowModel(nn.Module):
         aatypes_sc = batch[nbp.aatypes_sc]
         structure_method = batch[bp.structure_method]
         hot_spots_mask = batch[bp.hot_spots]
+        contact_conditioning = batch.get(bp.contact_conditioning, None)
 
         init_rigids_ang = create_rigid(rots=rotmats_t, trans=trans_t)
         init_rigids_nm = rigids_ang_to_nm(init_rigids_ang)
@@ -138,6 +139,7 @@ class FlowModel(nn.Module):
             edge_mask=edge_mask,
             diffuse_mask=embed_diffuse_mask,
             chain_index=chain_index,
+            contact_conditioning=contact_conditioning,
         )
 
         # Optionally run ESM + combine with node and edge embeddings

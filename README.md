@@ -11,6 +11,7 @@ This project introduces several extensions over MultiFlow:
   - MultiFlow only supports per-domain conditioning via seperate t (i.e. folding and inverse folding)
 - **Multimer** support, enabling binder design, and specifying RFDiffusion style **hot spot** residues
 - **Stochastic paths**, for the structure and sequence, enabling e.g. conformation sampling and sequence redesign
+- **2D constraints** to guide structure, e.g. of a binder
 - **Feynman-Kac steering** for sequential monte-carlo sampling guided by potentials, defined only at inference time
 - **existing protein language models (e.g. ESM)** to get frozen embeddings, enriching the node and edge representations
   - particularly for sequence-conditioned tasks like inpainting
@@ -73,6 +74,7 @@ cogeneration/ - main directory containing all source code
 │   │   ├── process_pdb_files.py - PDB to Metadata CSV and pkl ProcessedFiles
 │   │   ├── redesign_structures.py - ProteinMPNN structure redesign
 │   │   └── update_dataset_metadata.py - metadata CSV updates (~deprecated)
+│   ├── contacts.py - utils to generate 2D contact constraints
 │   ├── datasets.py - `BaseDataset` and `PdbDataset` classes. `BatchFeaturizer` for `BatchFeatures`
 │   ├── filterer.py - `DatasetFilterer` for dataset filtering using metadata
 │   ├── interaction.py - `NonResidueInteractions` and `MultimerInteraction` for computing interactions + clashes
@@ -99,8 +101,9 @@ cogeneration/ - main directory containing all source code
 │   ├── aa_pred.py - simple MLP sequence prediction network
 │   ├── bfactors.py - B-factor prediction module
 │   ├── confidence.py - pLDDT, PAE, PTM, iPTM prediction modules
+│   ├── contact_conditioning.py - 2D contact constaints / conditioning
 │   ├── edge_feature_net.py - edge feature embedding network
-│   ├── embed.py - position, time, distrogram embeddings
+│   ├── embed.py - position, time, distrogram, fourier embeddings
 │   ├── esm_combiner.py - ESM embedding combination module
 │   ├── esm_frozen.py - frozen ESM model for embeddings using FAPLM
 │   ├── loss_calculator.py - `BatchLossCalculator` for losses and metrics

@@ -1,14 +1,14 @@
 import pytest
 import torch
 
-from cogeneration.config.base import Config
+from cogeneration.config.base import Config, DatasetFilterConfig
 from cogeneration.data.interpolant import Interpolant
-from cogeneration.dataset.test_utils import mock_feats
+from cogeneration.dataset.test_utils import create_pdb_batch, mock_feats
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
 from cogeneration.type.batch import PredBatchProp as pbp
-from cogeneration.type.task import InferenceTask
+from cogeneration.type.task import DataTask, InferenceTask
 
 
 class TestInterpolantSample:
@@ -139,6 +139,44 @@ class TestInterpolantSample:
 
         batch = next(iter(dataloader))
         self._run_sample(cfg=cfg, batch=batch, task=task)
+
+    def test_sampling_conditioning(
+        self,
+        mock_cfg_uninterpolated,
+    ):
+        mock_cfg_uninterpolated.data.task = DataTask.inpainting
+        mock_cfg_uninterpolated.inference.task = InferenceTask.inpainting
+        mock_cfg_uninterpolated.dataset.filter = DatasetFilterConfig.multimeric()
+        mock_cfg_uninterpolated.dataset.hotspots.no_hotspots_prob = 0.0
+        mock_cfg_uninterpolated.dataset.contact_conditioning.conditioning_prob_disabled = (
+            0.0
+        )
+        mock_cfg_uninterpolated.dataset.contact_conditioning.include_inter_chain_prob = (
+            1.0
+        )
+        mock_cfg_uninterpolated.dataset.contact_conditioning.downsample_inter_chain_prob = (
+            0.0
+        )
+        cfg = mock_cfg_uninterpolated.interpolate()
+
+        interpolant = Interpolant(cfg.interpolant)
+        batch = create_pdb_batch(cfg)
+        batch = interpolant.corrupt_batch(batch, DataTask.inpainting)
+
+        # confirm multimers, 1-indexed
+        assert batch[bp.chain_idx].min() == 1
+        assert batch[bp.chain_idx].float().mean() > 1.1
+
+        # Note - if the input structure doesn't have any contacts, no conditioning will be defined.
+        # We assume that the input structure has contacts.
+        assert (
+            batch[bp.contact_conditioning] is not None
+        ), "Contact conditioning should be present"
+        assert (
+            batch[bp.contact_conditioning].sum() > 0
+        ), "Contact conditioning should be non-zero"
+
+        self._run_sample(cfg=cfg, batch=batch, task=InferenceTask.inpainting)
 
     def test_inpainting_preserves_motif_in_sampling(
         self, mock_cfg_uninterpolated, mock_pred_inpainting_dataloader

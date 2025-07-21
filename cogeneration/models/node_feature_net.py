@@ -40,6 +40,7 @@ class NodeFeatureNet(nn.Module):
             )
             embed_size += self.cfg.c_pos_emb
 
+        # TODO consider modulating node embed with hotspots (like 2d constraints) rather than concat + embedding
         if self.cfg.embed_hotspots:
             embed_size += 1  # binary hot spot indicator
 

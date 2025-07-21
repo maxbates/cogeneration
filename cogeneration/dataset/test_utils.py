@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, Dataset
 from cogeneration.config.base import Config
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import uniform_so3
+from cogeneration.dataset.contacts import get_contact_conditioning_matrix
 from cogeneration.dataset.datasets import DatasetConstructor
 from cogeneration.dataset.protein_dataloader import LengthBatcher
 from cogeneration.type.batch import BatchFeatures
@@ -40,15 +41,6 @@ def mock_feats(
     feats[bp.plddt_mask] = feats[bp.res_bfactor] > 60.0
     feats[bp.hot_spots] = torch.zeros(N).int()
 
-    if task == DataTask.inpainting:
-        # set a motif_mask where some middle portion of the protein is scaffolded
-        feats[bp.motif_mask] = torch.ones(N).int()
-        feats[bp.motif_mask][slice(*sorted(torch.randint(0, N, (2,))))] = 0
-
-    # metadata
-    feats[bp.pdb_name] = f"test_{idx}"
-    feats[bp.csv_idx] = torch.tensor([0])
-
     # index
     feats[bp.chain_idx] = torch.ones(N)  # 1-indexed
     feats[bp.res_idx] = torch.arange(1, N + 1)  # 1-indexed
@@ -57,6 +49,22 @@ def mock_feats(
         chain_break = np.random.randint(3, N - 3)
         feats[bp.chain_idx][chain_break:] = 2
         feats[bp.res_idx][chain_break:] = feats[bp.res_idx][chain_break:] - chain_break
+
+    if task == DataTask.inpainting:
+        # set a motif_mask where some middle portion of the protein is scaffolded
+        feats[bp.motif_mask] = torch.ones(N).int()
+        feats[bp.motif_mask][slice(*sorted(torch.randint(0, N, (2,))))] = 0
+
+        feats[bp.contact_conditioning] = get_contact_conditioning_matrix(
+            feats[bp.trans_1],
+            res_mask=feats[bp.res_mask],
+            chain_idx=feats[bp.chain_idx],
+            motif_mask=feats.get(bp.motif_mask, None),
+        )
+
+    # metadata
+    feats[bp.pdb_name] = f"test_{idx}"
+    feats[bp.csv_idx] = torch.tensor([0])
 
     # inference-only feats  # TODO(mock) remove, dedicated mock function
     feats[bp.sample_id] = f"test_{idx}"

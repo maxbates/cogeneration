@@ -22,6 +22,7 @@ from cogeneration.data import data_transforms, rigid_utils
 from cogeneration.data.const import seq_to_aatype
 from cogeneration.data.noise_mask import mask_blend_2d
 from cogeneration.data.protein import chain_str_to_int
+from cogeneration.dataset.contacts import get_contact_conditioning_matrix
 from cogeneration.dataset.filterer import DatasetFilterer
 from cogeneration.dataset.motif_factory import (
     ChainBreak,
@@ -151,12 +152,16 @@ class BatchFeaturizer:
         Preserves the feats in motifs, and masks them in scaffolds, and extends scaffolds to target length.
         i.e. has the effect of masking `trans_1`, `rotmats_1`, `aatypes_1` etc. in scaffolds.
 
-        Resets `chain_idx` to match Segments provided. Expected to reset indices after calling this function.
+        Resets `chain_idx` to match Segments provided.
+        Expected to reset indices after calling this function, though they should be valid.
         """
-        new_total_length = sum([seg.length for seg in segments])
-        new_feats = empty_feats(N=new_total_length, task=DataTask.inpainting)
+        N_old = feats[bp.res_mask].shape[0]
+        device = feats[bp.res_mask].device
+        N_new = sum([seg.length for seg in segments])
 
-        # copy over metadata features from original
+        new_feats = empty_feats(N=N_new, task=DataTask.inpainting)
+
+        # copy over 0D metadata features from original
         for prop in METADATA_BATCH_PROPS:
             if prop in feats:
                 new_feats[prop] = feats[prop]
@@ -171,15 +176,23 @@ class BatchFeaturizer:
         #    `ChainBreak` specify the beginning of a new chain, i.e. `chain_idx+1`
         #   `res_idx` != (1) or (2) if there is a chain break.
         #
-        # We'll manually track `chain_idx` and increment when we encounter `ChainBreak`.
-        # After building up the features, can re-index which will use the new `chain_idx`.
+        # We'll iterate through the segments, and build up a mapping from old to new indices.
+        # Some fields we'll set explicitly while looping through segments, like `diffuse_mask` / `motif_mask`.
+        # We'll manually track `chain_idx` / `res_idx`, and increment / reset when we encounter `ChainBreak`.
 
+        # track old -> new indices, for re-mapping 1D and 2D features
+        # -1 for scaffold / dropped positions
+        old_to_new = torch.full(
+            (N_old,), fill_value=-1, device=device, dtype=torch.long
+        )
+        # track residues in motifs
+        motif_old_idx = []
+        # track cursor position in `new_feats`
+        new_feats_start = 0
         # track current chain (1-indexed)
         current_chain_idx = 1
         # track res_idx (1-indexed per chain)
         current_res_idx = 1
-        # track position in `new_feats`
-        new_feats_start = 0
 
         for segment in segments:
             # chain break only bumps `current_chain_idx`.
@@ -194,16 +207,15 @@ class BatchFeaturizer:
             ns, ne = new_feats_start, new_feats_start + l
 
             if isinstance(segment, Motif):
-                # Motifs mostly preserve data
-                for prop in list(new_feats.keys()):
-                    if prop in METADATA_BATCH_PROPS or prop not in feats:
-                        continue
-                    new_feats[prop][ns:ne] = feats[prop][os:oe]
+                # Motifs mostly preserve data; track indices.
+                motif_range = torch.arange(os, oe, device=device)
+                motif_old_idx.append(motif_range)
+                old_to_new[motif_range] = torch.arange(ns, ne, device=device)
 
                 # mark motif
                 new_feats[bp.motif_mask][ns:ne] = 1
                 # mark diffusable for inpainting with guidance
-                # TODO(inpainting-fixed) mark fixed
+                # TODO(inpainting-fixed) mark fixed (and ensure translations etc. fixed)
                 new_feats[bp.diffuse_mask][ns:ne] = 1
                 # enforce idx
                 new_feats[bp.chain_idx][ns:ne] = current_chain_idx
@@ -212,7 +224,7 @@ class BatchFeaturizer:
                 )
 
             elif isinstance(segment, Scaffold):
-                # Scaffolds mostly retain default `empty_feats` values.
+                # Scaffolds mostly retain default `empty_feats` values; don't track.
 
                 # mark scaffold
                 new_feats[bp.motif_mask][ns:ne] = 0
@@ -231,13 +243,61 @@ class BatchFeaturizer:
             new_feats_start += segment.length
             current_res_idx += segment.length
 
+        # No motifs, nothing to map
+        if len(motif_old_idx) == 0:
+            return new_feats
+
+        # Flatten motif mappings
+        motif_old_idx = torch.cat(motif_old_idx)
+        motif_new_idx = old_to_new[motif_old_idx]
+
+        # Map features using new indices
+        for prop in list(new_feats.keys()):
+            # skip metadata / undefined features
+            if prop in METADATA_BATCH_PROPS or prop not in feats:
+                continue
+
+            # skip features we have already handled
+            if (
+                prop == bp.motif_mask
+                or prop == bp.diffuse_mask
+                or prop == bp.chain_idx
+                or prop == bp.res_idx
+            ):
+                continue
+
+            if feats[prop] is None:
+                raise ValueError(f"Feature {prop} is None")
+            if prop not in new_feats:
+                raise ValueError(f"Feature {prop} not in new_feats")
+
+            # Handle motif 2D features specially, i.e. pairwise contact conditioning features
+            if prop == bp.contact_conditioning:
+                cc_motifs = feats[bp.contact_conditioning][
+                    motif_old_idx[:, None], motif_old_idx[None, :]
+                ]
+                new_feats[bp.contact_conditioning][
+                    motif_new_idx[:, None], motif_new_idx[None, :]
+                ] = cc_motifs
+                continue
+
+            # Otherwise, 1D feature
+            try:
+                new_feats[prop][motif_new_idx] = feats[prop][
+                    motif_old_idx
+                ]  # scatter motif values
+            except Exception as e:
+                print(
+                    f"Error scattering {prop} from {motif_old_idx} to {motif_new_idx}, {feats[prop].shape} to {new_feats[prop].shape}, {feats[prop].dtype} to {new_feats[prop].dtype}, {feats[prop].device} to {new_feats[prop].device}, {e}"
+                )
+                raise e
+
         return new_feats
 
     def hot_spots_define(
         self,
         feats: BatchFeatures,
         hot_spots_str: Optional[str],
-        downsample: bool,
     ) -> torch.Tensor:
         """
         Define hot spots mask from metadata and current feature indices.
@@ -245,7 +305,6 @@ class BatchFeaturizer:
         Args:
             feats: BatchFeatures containing chain_idx and res_idx
             hot_spots_str: string defining hot spots, in format "<chain_id>:<res_index>:<num_interactions>,..." e.g. "A:10:2,"
-            downsample: Whether to apply subsampling during training
 
         Returns:
             Hot spots mask tensor
@@ -256,7 +315,7 @@ class BatchFeaturizer:
             return hot_spots_mask
 
         # Disabled some fraction of the time during training
-        if downsample and random.random() < self.cfg.hotspots.no_hotspots_prob:
+        if self.is_training and random.random() < self.cfg.hotspots.no_hotspots_prob:
             return torch.zeros_like(feats[bp.res_mask]).int()
 
         # Disabled if not multimer
@@ -283,7 +342,10 @@ class BatchFeaturizer:
         hot_spots_mask = hot_spots_mask * feats[bp.res_mask]
 
         # Apply subsampling during training if requested
-        if downsample and len(hot_spots) >= self.cfg.hotspots.min_hotspots_threshold:
+        if (
+            self.is_training
+            and len(hot_spots) >= self.cfg.hotspots.min_hotspots_threshold
+        ):
             # Subsample hot spots
             num_hot_spots = hot_spots_mask.sum().item()
             if num_hot_spots > 0:
@@ -306,6 +368,50 @@ class BatchFeaturizer:
                     hot_spots_mask = new_mask
 
         return hot_spots_mask
+
+    def contact_conditioning_define(
+        self,
+        feats: BatchFeatures,
+    ) -> torch.Tensor:
+        """
+        Define contact conditioning matrix from features, for a single item.
+        """
+        N = feats[bp.trans_1].shape[0]
+        empty_conditioning = torch.zeros(N, N, device=feats[bp.trans_1].device)
+
+        # Return empty matrix during training some proportion of the time
+        if random.random() < self.cfg.contact_conditioning.conditioning_prob_disabled:
+            return empty_conditioning
+
+        # Include inter-chain conditioning some proportion of the time in training
+        include_inter_chain = (
+            random.random() < self.cfg.contact_conditioning.include_inter_chain_prob
+        )
+        # Downsample inter-chain contacts to just a few
+        downsample_inter_chain = (
+            random.random() < self.cfg.contact_conditioning.downsample_inter_chain_prob
+        )
+
+        # Limit conditioning to motifs some proportion of the time in training
+        motif_only = (
+            random.random() < self.cfg.contact_conditioning.conditioning_prob_motif_only
+        )
+
+        return get_contact_conditioning_matrix(
+            trans=feats[bp.trans_1],
+            res_mask=feats[bp.res_mask],
+            motif_mask=feats.get(bp.motif_mask, None),
+            chain_idx=feats[bp.chain_idx],
+            include_inter_chain=include_inter_chain,
+            downsample_inter_chain=downsample_inter_chain,
+            downsample_inter_chain_min_contacts=self.cfg.contact_conditioning.downsample_inter_chain_min_contacts,
+            downsample_inter_chain_max_contacts=self.cfg.contact_conditioning.downsample_inter_chain_max_contacts,
+            motif_only=motif_only,
+            min_res_gap=self.cfg.contact_conditioning.min_res_gap,
+            min_dist=self.cfg.contact_conditioning.dist_minimum_ang,
+            max_dist=self.cfg.contact_conditioning.dist_maximum_ang,
+            dist_noise_ang=self.cfg.contact_conditioning.dist_noise_ang,
+        )
 
     @staticmethod
     def batch_features_from_processed_file(
@@ -377,7 +483,7 @@ class BatchFeaturizer:
         chain_idx = torch.tensor(processed_file[dpc.chain_index])
 
         # Extract method and b factors / pLDDTs (depending on the method)
-        bfactors = torch.tensor(processed_file[dpc.b_factors][:, 1])
+        bfactors = torch.tensor(processed_file[dpc.b_factors][:, 1]).float()
         method = StructureExperimentalMethod.from_value(
             csv_row.get(
                 mc.structure_method, StructureExperimentalMethod.XRAY_DIFFRACTION
@@ -404,6 +510,9 @@ class BatchFeaturizer:
         # Default hot spots mask is all zeros
         hot_spots_mask = torch.zeros_like(res_mask).int()
 
+        # Default contact conditioning matrix is all zeros
+        contact_conditioning = torch.zeros(res_mask.shape[0], res_mask.shape[0])
+
         feats: BatchFeatures = {
             bp.res_mask: res_mask,
             bp.aatypes_1: aatypes_1,
@@ -418,6 +527,8 @@ class BatchFeaturizer:
             bp.diffuse_mask: diffuse_mask,
             bp.plddt_mask: plddt_mask,
             bp.hot_spots: hot_spots_mask,
+            bp.contact_conditioning: contact_conditioning,
+            # bp.motif_mask: None,  # inpainting only, defined when featurizing
             # Pass through relevant data from CSV
             bp.pdb_name: csv_row.get(mc.pdb_name, ""),
         }
@@ -460,14 +571,6 @@ class BatchFeaturizer:
             processed_file_path=csv_row[mc.processed_path],
         )
 
-        # Define subsampled hot spots for multimers
-        # TODO - consider how this works with chain down selection, e.g. drop interacting chain...
-        feats[bp.hot_spots] = self.hot_spots_define(
-            feats=feats,
-            hot_spots_str=csv_row.get(mc.hot_spots, None),
-            downsample=self.is_training,
-        )
-
         # Update `diffuse_mask` and `motif_mask` depending on task
         if self.task == DataTask.hallucination:
             # everything is diffused
@@ -489,23 +592,40 @@ class BatchFeaturizer:
             # `diffuse_mask` for inpainting with guidance is all ones; whole structure is modeled.
             # TODO(inpainting-fixed) `diffuse_mask` is complement to `motif_mask`
             feats[bp.diffuse_mask] = torch.ones_like(feats[bp.res_mask])
-
-            # For inpainting evaluation (i.e. not training), vary scaffold lengths
-            # Using the `diffuse_mask`, modify the scaffold region lengths, and mask out the scaffolds
-            # i.e. {trans,rots,aatypes}_1 only defined for motif positions
-            if not self.is_training and (feats[bp.motif_mask] == 1).any():
-                segments = self.motif_factory.generate_segments_from_motif_mask(
-                    motif_mask=feats[bp.motif_mask],
-                    chain_idx=feats[bp.chain_idx],
-                )
-                # apply segmenting (note, updates masks and generates new chain_idx)
-                feats = BatchFeaturizer.segment_features(feats=feats, segments=segments)
         else:
             raise ValueError(f"Unknown task {self.task}")
+
+        # Define subsampled hot spots for multimers
+        # TODO(conditioning) - consider how to define hot spots with chain down selection, e.g. drop interacting chain...
+        #   currently, should be dropped in scaffolds, but we may specify fewer than we want
+        feats[bp.hot_spots] = self.hot_spots_define(
+            feats=feats,
+            hot_spots_str=csv_row.get(mc.hot_spots, None),
+        )
+
+        # Contact conditioning matrix
+        feats[bp.contact_conditioning] = self.contact_conditioning_define(
+            feats=feats,
+        )
 
         # Ensure have a valid `diffuse_mask` for modeling
         if torch.sum(feats[bp.diffuse_mask]) == 0:
             feats[bp.diffuse_mask] = torch.ones_like(feats[bp.res_mask]).int()
+
+        # For inpainting evaluation (i.e. not training), vary scaffold lengths
+        # Using the `diffuse_mask`, modify the scaffold region lengths, and mask out the scaffolds
+        # i.e. {trans,rots,aatypes}_1 only defined for motif positions
+        if (
+            not self.is_training
+            and self.task == DataTask.inpainting
+            and (feats[bp.motif_mask] == 1).any()
+        ):
+            segments = self.motif_factory.generate_segments_from_motif_mask(
+                motif_mask=feats[bp.motif_mask],
+                chain_idx=feats[bp.chain_idx],
+            )
+            # apply segmenting (note, updates masks and generates new chain_idx)
+            feats = BatchFeaturizer.segment_features(feats=feats, segments=segments)
 
         # Centering
         if bp.motif_mask in feats and (feats[bp.motif_mask] == 1).any():

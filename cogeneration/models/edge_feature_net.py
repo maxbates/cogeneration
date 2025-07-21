@@ -1,13 +1,16 @@
+from typing import Optional
+
 import torch
 from torch import nn
 
 from cogeneration.config.base import ModelEdgeFeaturesConfig
+from cogeneration.models.contact_conditioning import ContactConditioning
 from cogeneration.models.embed import calc_distogram, get_index_embedding
 
 
 class EdgeFeatureNet(nn.Module):
     """
-    Embed edges using distrogram, plus self-conditioned dist, chain, masks etc.
+    Embed edges using distrogram, plus self-conditioned dist, chain, masks, dist constraints, etc.
     """
 
     def __init__(self, cfg: ModelEdgeFeaturesConfig):
@@ -35,6 +38,11 @@ class EdgeFeatureNet(nn.Module):
             nn.ReLU(),
             nn.Linear(self.cfg.c_p, self.cfg.c_p),
             nn.LayerNorm(self.cfg.c_p),
+        )
+
+        # contact conditioning
+        self.contact_conditioning = ContactConditioning(
+            cfg=self.cfg.contact_conditioning
         )
 
     def embed_relpos(self, r):
@@ -72,6 +80,7 @@ class EdgeFeatureNet(nn.Module):
         edge_mask: torch.Tensor,  # (B, N, N)
         diffuse_mask: torch.Tensor,  # (B, N)
         chain_index: torch.Tensor,  # (B, N)
+        contact_conditioning: Optional[torch.Tensor],  # (B, N, N)
     ):
         num_batch, num_res, _ = node_embed.shape
 
@@ -104,5 +113,8 @@ class EdgeFeatureNet(nn.Module):
 
         edge_feats = self.edge_embedder(torch.concat(all_edge_feats, dim=-1))
         edge_feats *= edge_mask.unsqueeze(-1)
+
+        # modulate edge features with contact conditioning
+        edge_feats = self.contact_conditioning(edge_feats, contact_conditioning)
 
         return edge_feats  # (B, N, N, c_p)

@@ -316,6 +316,92 @@ class HotSpotPotential(Potential):
 
 
 @dataclass
+class ContactConditioningPotential(Potential):
+    """
+    Potential that encourages adherence to contact conditioning constraints.
+    Uses ReLU penalty for distances that exceed the defined contact thresholds.
+    Normalizes energy over the number of defined contacts.
+    Optionally ignores contacts in motifs and upweights inter-chain contacts.
+    """
+
+    tolerance_dist: float = 0.5  # tolerance distance for contact conditioning
+    inter_chain_weight: float = 2.0  # upweight factor for inter-chain contacts
+    max_distance_penalty: float = 10.0  # maximum distance penalty
+
+    def compute_energy(
+        self,
+        batch: NoisyFeatures,
+        model_pred: SamplingStep,
+        protein_pred: SamplingStep,
+        protein_state: SamplingStep,
+    ) -> torch.Tensor:
+        num_batch, num_res = batch[bp.res_idx].size()  # (B, N)
+        device = batch[bp.res_idx].device
+
+        if bp.contact_conditioning not in batch:
+            return torch.zeros(num_batch, device=device)
+
+        contact_conditioning = batch[bp.contact_conditioning]  # (B, N, N)
+        contact_mask = contact_conditioning > 0  # (B, N, N)
+
+        if not contact_mask.any():
+            return torch.zeros(num_batch, device=device)
+
+        # pairwse distances
+        pred_trans = protein_pred.trans  # (B, N, 3)
+        pairwise_dists = torch.norm(
+            pred_trans.unsqueeze(2) - pred_trans.unsqueeze(1),
+            dim=-1,
+        )  # (B, N, N)
+
+        # clamped ReLU penalty
+        shortfall = torch.relu(
+            contact_conditioning - pairwise_dists - self.tolerance_dist
+        )
+        excess = torch.relu(pairwise_dists - contact_conditioning - self.tolerance_dist)
+        contact_penalties = excess + shortfall
+        contact_penalties = contact_penalties.clamp(max=self.max_distance_penalty)
+
+        # Only for defined contacts
+        contact_penalties = contact_penalties * contact_mask.float()  # (B, N, N)
+
+        # Ignore contacts in motifs, if defined
+        motif_mask = batch.get(bp.motif_mask, None)
+        if motif_mask is not None:
+            # Create motif edge mask: both residues must NOT be in motifs
+            motif_edge_mask = (~motif_mask.bool()).unsqueeze(2) & (
+                ~motif_mask.bool()
+            ).unsqueeze(1)
+            contact_penalties = contact_penalties * motif_edge_mask.float()
+
+        # reweight inter-chain contacts if specified
+        if self.inter_chain_weight != 1.0:
+            chain_idx = batch[bp.chain_idx]  # (B, N)
+            chain_i = chain_idx.unsqueeze(2)  # (B, N, 1)
+            chain_j = chain_idx.unsqueeze(1)  # (B, 1, N)
+            inter_chain_mask = chain_i != chain_j  # (B, N, N)
+
+            contact_weights = torch.ones_like(contact_penalties)
+            contact_weights = torch.where(
+                inter_chain_mask & contact_mask,
+                self.inter_chain_weight,
+                contact_weights,
+            )
+            contact_penalties = contact_penalties * contact_weights
+
+        # Sum penalties and normalize by number of defined contacts
+        penalty_per_batch = contact_penalties.sum(dim=(1, 2))  # (B,)
+        num_contacts = contact_mask.float().sum(dim=(1, 2)).clamp_min(1.0)  # (B,)
+        penalty_per_batch = penalty_per_batch / num_contacts  # (B,)
+
+        # Normalize energy to [0, 1] range
+        energy = penalty_per_batch / self.max_distance_penalty
+        energy = energy.clamp(min=0.0, max=1.0)
+
+        return energy
+
+
+@dataclass
 class FKSteeringCalculator:
     """
     Helper to implement Feynman-Kac steering potentials for inference.
@@ -353,6 +439,11 @@ class FKSteeringCalculator:
                 scale=cfg.hot_spot_scale,
                 contact_distance_ang=cfg.hot_spot_contact_distance_ang,
                 max_distance_penalty=cfg.hot_spot_max_distance_penalty,
+            ),
+            ContactConditioningPotential(
+                scale=cfg.contact_conditioning_scale,
+                inter_chain_weight=cfg.contact_conditioning_inter_chain_weight,
+                max_distance_penalty=cfg.contact_conditioning_max_distance_penalty,
             ),
         ]
 

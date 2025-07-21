@@ -1517,6 +1517,7 @@ class Interpolant(nn.Module):
         stochasticity_scale: float = 1.0,
         structure_method: StructureExperimentalMethod = StructureExperimentalMethod.XRAY_DIFFRACTION,
         hot_spots: Optional[torch.Tensor] = None,
+        contact_conditioning: Optional[torch.Tensor] = None,
     ) -> Tuple[SamplingTrajectory, SamplingTrajectory, FKSteeringTrajectory]:
         """
         Generate samples by interpolating towards model predictions.
@@ -1618,6 +1619,10 @@ class Interpolant(nn.Module):
         # set up additional default values
         if hot_spots is None:
             hot_spots = torch.zeros(num_batch, num_res, device=self._device)
+        if contact_conditioning is None:
+            contact_conditioning = torch.zeros(
+                num_batch, num_res, num_res, device=self._device
+            )
 
         # Set up batch. This batch object will be modified and be re-used for each time step.
         batch = {
@@ -1629,6 +1634,7 @@ class Interpolant(nn.Module):
             .to(self._device)
             .expand(num_batch, 1),
             bp.hot_spots: hot_spots,
+            bp.contact_conditioning: contact_conditioning,
             nbp.trans_sc: trans_sc,
             nbp.aatypes_sc: aatypes_sc,
         }

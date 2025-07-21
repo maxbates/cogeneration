@@ -1,8 +1,11 @@
 import math
 
 import torch
+from einops import rearrange
+from torch import nn
 from torch.nn import functional as F
 
+from cogeneration.models.attention.ipa_pytorch import Linear
 from cogeneration.type.embed import PositionalEmbeddingMethod
 
 
@@ -141,3 +144,20 @@ def calc_distogram(pos, min_bin, max_bin, num_bins):
     upper = torch.cat([lower[1:], lower.new_tensor([1e8])], dim=-1)
     dgram = ((dists_2d > lower) * (dists_2d < upper)).type(pos.dtype)
     return dgram
+
+
+class FourierEmbedding(nn.Module):
+    """Simple Fourier embedding from Boltz"""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.proj = Linear(1, dim, init="normal")
+        self.proj.requires_grad_(False)
+
+    def forward(
+        self,
+        times,  # Float[' b'],
+    ):  # -> Float['b d']:
+        times = rearrange(times, "b -> b 1")
+        rand_proj = self.proj(times)
+        return torch.cos(2 * math.pi * rand_proj)

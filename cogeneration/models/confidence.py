@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from cogeneration.config.base import ModelPAEConfig, ModelPLDDTConfig
+from cogeneration.models.attention.ipa_pytorch import Linear
 
 
 def compute_aggregated_metric(logits: torch.Tensor, end: float = 1.0) -> torch.Tensor:
@@ -72,7 +73,7 @@ class PLDDTModule(nn.Module):
 
     def __init__(self, cfg: ModelPLDDTConfig) -> None:
         super().__init__()
-        self.plddt = nn.Linear(cfg.c_s, cfg.num_bins)
+        self.plddt = Linear(cfg.c_s, cfg.num_bins)
 
     def forward(self, node_embed: torch.Tensor) -> torch.Tensor:
         return self.plddt(node_embed)  # (B, N, num_bins)
@@ -83,7 +84,7 @@ class PAEModule(nn.Module):
 
     def __init__(self, cfg: ModelPAEConfig) -> None:
         super().__init__()
-        self.linear = nn.Linear(cfg.c_z, cfg.num_bins)
+        self.linear = Linear(cfg.c_z, cfg.num_bins)
 
     def forward(
         self,
