@@ -84,7 +84,7 @@ cogeneration/ - main directory containing all source code
 │   ├── protein_downloader.py - dataloader with DDP and `LengthBatcher`
 │   └── test_utils.py - test utilities for mock features and datasets
 ├── datasets/ - training and test data directory
-│   └── install.sh - MultiFlow dataset download script
+│   └── install_multiflow_datasets.sh - MultiFlow dataset download script
 ├── models/
 │   ├── attention/
 │   │   ├── attention_pair_bias.py - (~Boltz) `AttentionPairBias` module 

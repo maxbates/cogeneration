@@ -11,9 +11,7 @@ install_requires = [
     "async-timeout==4.0.3",
     "attrs==24.2.0",
     "biopython==1.84",
-    "black==24.10.0",
-    # Boltz 2.1.1 req CUDA
-    "boltz==2.0.3",
+    "boltz==2.2.0",
     "certifi==2024.8.30",
     "charset-normalizer==3.3.2",
     "click==8.1.7",
@@ -22,7 +20,7 @@ install_requires = [
     "einops==0.8.0",
     "exceptiongroup==1.2.2",
     # faesm / faplm pending https://github.com/pengzhangzhi/faplm/pull/16
-    "faesm @ git+https://github.com/maxbates/faplm.git@attns",
+    "faesm @ git+https://github.com/maxbates/faplm.git@ad0633b4cb271083d2dd29fc760e0cee958ecfbb",
     "fair-esm==2.0.0",
     "filelock==3.16.1",
     "frozenlist==1.4.1",
@@ -33,7 +31,6 @@ install_requires = [
     "hydra-core==1.3.2",
     "idna==3.10",
     "iniconfig==2.0.0",
-    "isort==5.13.2",
     "Jinja2==3.1.4",
     "joblib==1.4.2",
     "lightning-utilities==0.11.7",
@@ -52,11 +49,9 @@ install_requires = [
     "platformdirs==4.3.6",
     "pluggy==1.5.0",
     "protobuf==5.28.2",
-    "prody @ git+https://github.com/prody/ProDy",
+    "prody @ git+https://github.com/prody/ProDy@4baa78e8cda0539d6c732c9e01f0f176883076c9",
     "psutil==6.0.0",
     "pyparsing==3.1.1",
-    "pytest==8.3.3",
-    "pytest-timeout==2.4.0",
     "python-dateutil==2.9.0.post0",
     "pytorch-lightning==2.5.0",
     "pytz==2024.2",
@@ -70,13 +65,8 @@ install_requires = [
     "smmap==5.0.1",
     "sympy==1.13.3",
     "threadpoolctl==3.5.0",
-    "tmtools==0.0.3",
+    "tmtools==0.2.0",
     "tomli==2.0.2",
-    # PyTorch CPU version - will be overridden by CUDA extras if needed
-    "torch>=2.4.1",
-    "torchvision",
-    "torchaudio",
-    "torchmetrics==1.4.2",
     "tqdm==4.66.5",
     "typing_extensions==4.12.2",
     "tzdata==2024.2",
@@ -85,21 +75,6 @@ install_requires = [
     "yarl==1.13.1",
 ]
 
-# CUDA-specific dependencies
-cuda_requires = [
-    # PyTorch with CUDA support
-    "torch==2.4.1+cu124",
-    "torchvision==0.19.1+cu124", 
-    "torchaudio==2.4.1+cu124",
-    # CUDA-accelerated packages
-    "torch-scatter @ https://data.pyg.org/whl/torch-2.4.1%2Bcu124/torch_scatter-2.1.2%2Bpt24cu124-cp311-cp311-linux_x86_64.whl",
-    "cuequivariance-torch>=0.5.0",
-    "cuequivariance-ops-torch-cu12>=0.5.0",
-    # Flash attention (requires manual install with --no-build-isolation)
-    "flash-attn>=2.0.0",
-    # Flash IPA - from git repo
-    "flash-ipa @ git+https://github.com/flagshippioneering/flash_ipa.git",
-]
 
 tools.setup(
     name="cogeneration",
@@ -111,7 +86,44 @@ tools.setup(
     },
     install_requires=install_requires,
     extras_require={
-        "cuda": cuda_requires,
+        "cpu": [
+            "torch==2.7.1",
+            "torchvision==0.22.1",
+            "torchaudio==2.7.1",
+            "torchmetrics==1.4.2",
+        ],
+        # Requires CUDA 12.8 and specifying CUDA wheels, e.g.
+        # pip install -e .[cu128] --extra-index-url https://data.pyg.org/whl/torch-2.7.1+cu128 --extra-index-url https://data.pyg.org/whl/torch-2.7.1+cu128 
+        "cu128": [
+            # PyTorch with CUDA support
+            "torch==2.7.1+cu128",
+            "torchvision==0.22.1", 
+            "torchaudio==2.7.1",
+            "torchmetrics==1.4.2",
+            # CUDA-accelerated packages
+            "torch-scatter==2.1.2",
+            "cuequivariance-torch==0.5.1",
+            "cuequivariance-ops-torch-cu12==0.5.1",
+            # pin nvidia cuda packages
+            # "nvidia-cublas-cu12==12.9.1.4",
+            # "nvidia-cuda-nvrtc-cu12==12.8.61",
+            # "nvidia-cuda-runtime-cu12==12.8.57",
+            # "nvidia-cudnn-cu12==9.11.0.98",
+            # "nvidia-cufft-cu12==11.4.1.4",
+            # "nvidia-curand-cu12==10.3.10.19",
+            # "nvidia-cusolver-cu12==11.7.5.82",
+            # "nvidia-cusparse-cu12==12.5.10.65",
+            # "nvidia-cusparselt-cu12==0.7.1",
+            # "nvidia-nccl-cu12==2.27.6",
+            # "nvidia-nvjitlink-cu12==12.9.86",
+            # "nvidia-nvtx-cu12==12.9.79",
+            # Flash attention (requires manual install with --no-build-isolation)
+            "flash-attn==2.8.1",
+            # Flash IPA - from git repo
+            # Drop dependency for now - requires pytorch 2.4.1 hard-pin
+            # Need to look into repo. doesnt seem to have kernels. not sure why pinned. maybe can fork.
+            # "flash-ipa @ git+https://github.com/flagshippioneering/flash_ipa.git@525844fad9d92942e0caff4d7673db09c18a6564",
+        ],
         "dev": [
             "black==24.10.0",
             "isort==5.13.2",
@@ -119,5 +131,5 @@ tools.setup(
             "pytest-timeout==2.4.0",
         ],
     },
-    python_requires=">=3.10",
+    python_requires=">=3.12",
 )

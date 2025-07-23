@@ -1,40 +1,62 @@
 Notes for getting set up on local or remote machine:
 
+See also `install.sh`, which automates most steps in this file (assumes repo has been downloaded/copied).
+
 ## (If Remote) sync local to remote
 
 set up ssh
 
 **Option 1: Using rsync (recommended):**
+
+Run from local machine:
+
 ```bash
-# Sync from local to remote (run from local machine)
-rsync -avz --filter=':- .gitignore' --exclude='.git' ./ username@remote_host:~/projects/cogeneration/
+# Sync from local `./` (cogeneration directory) to remote ~/cogeneration
+rsync -avz --filter=':- .gitignore' --exclude='.git' --exclude '*.tar' ./ username@remote_host:~/cogeneration/
 ```
 
 **Option 2: Using PyCharm:**
 Set up PyCharm remote deployment to ensure all source files are copied to remote.
 
+## (If required) Set up venv / conda on remote machine
+
 ```
-cd cogeneration
+# download mamba / conda
+wget -O Mambaforge.sh https://github.com/conda-forge/miniforge/releases/download/25.3.0-3/Miniforge3-25.3.0-3-Linux-x86_64.sh
+bash Mambaforge.sh -b -p $HOME/mambaforge
+source ~/mambaforge/bin/activate
+
+# create env and activate
+mamba create -n cogeneration python=3.12 pip -c conda-forge
+mamba activate cogeneration
 ```
 
 ## Install package
 
-**Option 1: CUDA installation (recommended for training on GPU machines):**
 ```
-pip install -e .[cuda]
+cd cogeneration
+```
+
+**Option 1: CUDA 12.8 installation (for training on GPU machines):**
+```
+pip install -e .[cu128]
 ```
 
 **Option 2: CPU-only installation:**
 ```
-pip install -e .
+pip install -e .[cpu]
 ```
 
 **Option 3: Development installation with CUDA:**
 ```
-pip install -e .[cuda,dev]
+pip install -e .[cu128,dev]
 ```
 
-**Fallback**: If you encounter issues with the CUDA installation, you can install manually:
+**Debugging CUDA Setup**
+
+If you encounter issues with the CUDA installation, you may need to update `setup.py` to match your machine. There are configuration variables at the top for CUDA version that must match your machine, and may limit / impact the appropriate versions for other torch packages. 
+
+Otherwise, you can install manually
 ```
 # Install PyTorch with CUDA first
 pip install torch==2.4.1+cu124 torchvision==0.19.1+cu124 torchaudio==2.4.1+cu124 --index-url https://download.pytorch.org/whl/cu124
@@ -100,7 +122,7 @@ sudo apt-get install ffmpeg
 Datasets are required for training and evaluation, or provide a base set of structures for inpainting.
 
 ```
-bash ./cogeneration/datasets/install.sh
+bash ./cogeneration/datasets/install_multiflow_datasets.sh
 ```
 
 ### To run Public Multiflow, download weights
