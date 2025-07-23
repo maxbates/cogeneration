@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple
 from unittest.mock import patch
 
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 import pytest
 import torch
@@ -16,8 +17,9 @@ from torch.utils.data import DataLoader
 
 from cogeneration.config.base import PATH_PUBLIC_WEIGHTS, Config, InferenceSamplesConfig
 from cogeneration.data import all_atom
+from cogeneration.data.const import aatype_to_seq, seq_to_aatype
 from cogeneration.data.protein import write_prot_to_pdb
-from cogeneration.data.residue_constants import restypes_with_x
+from cogeneration.data.residue_constants import restype_order_with_x, restypes_with_x
 from cogeneration.dataset.datasets import (
     BatchFeaturizer,
     DatasetConstructor,
@@ -147,9 +149,10 @@ class FoldingValidationMockValue:
     seqs: List[Tuple[str, str]]
     true_aa: np.ndarray
     true_bb_pos: np.ndarray
-    mpnn_fasta_path: str
     af2_pdb_path: str
-    af2_df: pd.DataFrame
+    af2_df: pd.DataFrame  # folding of prediction
+    mpnn_fasta_path: str  # inverse folded sequences
+    designability_af2_df: pd.DataFrame  # folding of inverse folded sequences
 
 
 @pytest.fixture
@@ -169,17 +172,49 @@ def mock_folding_validation(tmp_path):
                 print(
                     f"WARNING. mocks currently assume unconditional generation. May impact outputs. Got {cfg.inference.task}"
                 )
-            if len(torch.unique(batch[bp.chain_idx])) > 1:
+            if batch[bp.res_mask].shape[0] != 1:
                 print(
-                    f"WARNING. mocks currently assume single chain generation. May impact outputs. Got {len(torch.unique(batch[bp.chain_idx]))} chains"
+                    f"WARNING. mocks currently assume single sequence generation. May impact outputs. Got {batch[bp.res_mask].shape[0]} sequences"
                 )
 
             # determine size of batch and residues, handling conditional and unconditional batches
             batch_size, num_res = batch[bp.res_mask].shape
+            # use consistent chain_idx for all sequences (assume single sequence)
+            chain_idx = batch[bp.chain_idx][0].cpu().detach().numpy()
 
             # Prep return values
             mock_run_protein_mpnn_calls = []
             mock_run_alphafold2_calls = []
+
+            # Helper to create atom37 structure for AF2 predictions
+            def dummy_structure(batch_size: int, num_res: int) -> npt.NDArray:
+                return (
+                    all_atom.atom37_from_trans_rot(
+                        trans=torch.rand(batch_size, num_res, 3),
+                        rots=torch.rand(batch_size, num_res, 3, 3),
+                    )
+                    .cpu()
+                    .detach()
+                    .numpy()
+                )
+
+            # Helper to create DataFrame for folding.
+            def create_af2_df(
+                seq_names: List[str], seqs: List[str], af2_pdb_paths: List[str]
+            ):
+                return pd.DataFrame.from_records(
+                    [
+                        {
+                            MetricName.header: header,
+                            MetricName.sequence: sequence,
+                            MetricName.folded_pdb_path: af2_pdb_path,
+                            MetricName.plddt_mean: np.random.rand() * 100,
+                        }
+                        for (header, sequence, af2_pdb_path) in zip(
+                            seq_names, seqs, af2_pdb_paths
+                        )
+                    ]
+                )
 
             # Generate mock values for each item in the batch
             mock_values: List[FoldingValidationMockValue] = []
@@ -188,11 +223,8 @@ def mock_folding_validation(tmp_path):
                 mock_seqs: List[Tuple[str, str]] = [
                     (
                         f"{batch[bp.pdb_name][i] if (bp.pdb_name in batch) else ''}pmpnn_seq_{n}",
-                        "".join(
-                            [
-                                restypes_with_x[x]
-                                for x in np.random.randint(0, 20, num_res)
-                            ]
+                        aatype_to_seq(
+                            np.random.randint(0, 20, num_res), chain_idx=chain_idx
                         ),
                     )
                     for n in range(n_inverse_folds)
@@ -220,15 +252,34 @@ def mock_folding_validation(tmp_path):
                     )
                 else:
                     # mock it, e.g. for unconditional batches
-                    true_bb_pos = (
-                        all_atom.atom37_from_trans_rot(
-                            trans=torch.rand(batch_size, num_res, 3),
-                            rots=torch.rand(batch_size, num_res, 3, 3),
-                        )
-                        .cpu()
-                        .detach()
-                        .numpy()
+                    true_bb_pos = dummy_structure(
+                        batch_size=batch_size, num_res=num_res
                     )
+
+                # mock folding: AlphaFold2 PDB and DataFrame
+                # Currently, only run and care about model_4
+                # Actual af2_pdb_path may include indexing
+                af2_pdb_path = write_prot_to_pdb(
+                    prot_pos=true_bb_pos[0],
+                    file_path=str(tmp_path / "model_4.pdb"),
+                    aatype=true_aa,
+                    chain_idx=chain_idx,
+                )
+
+                # Mock folding the designed seq
+                # we don't have easy access to sample_name / sample_id here, but it doesn't really matter
+                af2_df = create_af2_df(
+                    seq_names=[
+                        (
+                            batch[bp.pdb_name][0]
+                            if (bp.pdb_name in batch)
+                            else "mocked_true"
+                        )
+                    ],
+                    seqs=[aatype_to_seq(true_aa, chain_idx=chain_idx)],
+                    af2_pdb_paths=[af2_pdb_path],
+                )
+                mock_run_alphafold2_calls.append(af2_df)
 
                 # mock inverse folding: ProteinMPNN fasta
                 mock_mpnn_fasta_path = str(tmp_path / "mpnn.fasta")
@@ -238,59 +289,40 @@ def mock_folding_validation(tmp_path):
                         f.write(f">{mock_seq_name}\n")
                         f.write(mock_inverse_fold_seq)
 
-                # mock folding: AlphaFold2 PDB and DataFrame
-                # Currently, only run and care about model_4
-                # Actual af2_pdb_path may include indexing
-                af2_pdb_path = write_prot_to_pdb(
-                    prot_pos=true_bb_pos[0],
-                    file_path=str(tmp_path / "model_4.pdb"),
-                    aatype=true_aa,
-                )
-
-                # Helper to create DataFrame for AF2 return. For now just reuse PDB across multiple seqs.
-                def create_af2_df(
-                    seq_names: List[str], seqs: List[str], af2_pdb_path: str
-                ):
-                    return pd.DataFrame.from_records(
-                        [
-                            {
-                                MetricName.header: header,
-                                MetricName.sequence: sequence,
-                                MetricName.folded_pdb_path: af2_pdb_path,
-                                MetricName.plddt_mean: np.random.rand() * 100,
-                            }
-                            for (header, sequence) in zip(seq_names, seqs)
-                        ]
-                    )
-
-                # Mock folding the designed seq
-                # we don't have easy access to sample_name / sample_id here, but it doesn't really matter
-                af2_df = create_af2_df(
-                    seq_names=[mock_seqs[0][0]],
-                    seqs=[mock_seqs[0][1]],
-                    af2_pdb_path=af2_pdb_path,
-                )
-                mock_run_alphafold2_calls.append(af2_df)
-
                 # For designability, we also fold the inverse folded sequences.
                 # Always done for validation. Usually done for prediction...
                 # This means folding a single fasta with multiple sequences.
-                # So additional call to mock_run_alphafold2
-                mock_run_alphafold2_calls.append(
-                    create_af2_df(
-                        seq_names=[seq[0] for seq in mock_seqs],
-                        seqs=[seq[1] for seq in mock_seqs],
-                        af2_pdb_path=af2_pdb_path,
+
+                # First we need to write a PDB for each inverse folded sequence
+                # (so the correct sequence is in the PDB)
+                af2_inverse_fold_paths = [
+                    write_prot_to_pdb(
+                        prot_pos=dummy_structure(
+                            batch_size=1, num_res=len(mock_inverse_fold_seq)
+                        )[0],
+                        file_path=str(tmp_path / f"inv_fold_{i}_model_4.pdb"),
+                        aatype=np.array(seq_to_aatype(mock_inverse_fold_seq)),
+                        chain_idx=chain_idx,
                     )
+                    for (i, (_, mock_inverse_fold_seq)) in enumerate(mock_seqs)
+                ]
+
+                # Mock second round of folding: designability
+                designability_af2_df = create_af2_df(
+                    seq_names=[seq[0] for seq in mock_seqs],
+                    seqs=[seq[1] for seq in mock_seqs],
+                    af2_pdb_paths=af2_inverse_fold_paths,
                 )
+                mock_run_alphafold2_calls.append(designability_af2_df)
 
                 mock_value = FoldingValidationMockValue(
                     seqs=mock_seqs,
                     true_aa=true_aa,
                     true_bb_pos=true_bb_pos,
-                    mpnn_fasta_path=mock_mpnn_fasta_path,
                     af2_pdb_path=af2_pdb_path,
                     af2_df=af2_df,
+                    mpnn_fasta_path=mock_mpnn_fasta_path,
+                    designability_af2_df=designability_af2_df,
                 )
                 mock_values.append(mock_value)
 
@@ -325,7 +357,7 @@ def mock_checkpoint(mock_folding_validation):
         final_ckpt_path = str(ckpt_dir / "final.ckpt")
 
         # update config with the checkpoint
-        assert cfg.inference.task == InferenceTask.unconditional
+        # assert cfg.inference.task == InferenceTask.unconditional
         cfg.inference.unconditional_ckpt_path = str(ckpt_path)
         cfg.inference.inpainting_ckpt_path = str(ckpt_path)
         cfg.inference.forward_folding_ckpt_path = str(ckpt_path)

@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 from pytorch_lightning.utilities.model_summary import ModelSummary
 from torch.utils.data import DataLoader
@@ -105,10 +106,18 @@ class TestFlowModule:
         module = FlowModule(mock_cfg)
         module.training_step(pdb_noisy_batch)
 
-    def test_validation_step(self, mock_cfg, pdb_noisy_batch, mock_folding_validation):
+    @pytest.mark.parametrize(
+        "task", [InferenceTask.unconditional, InferenceTask.inpainting]
+    )
+    def test_validation_step(
+        self, mock_cfg_uninterpolated, pdb_noisy_batch, mock_folding_validation, task
+    ):
+        mock_cfg_uninterpolated.inference.task = task
+        mock_cfg = mock_cfg_uninterpolated.interpolate()
+
         module = FlowModule(mock_cfg)
 
-        mock_folding_validation(
+        validation_mock_values = mock_folding_validation(
             batch=pdb_noisy_batch,
             cfg=mock_cfg,
             n_inverse_folds=1,  # only one for validation
@@ -140,17 +149,43 @@ class TestFlowModule:
                 for x in pdb_noisy_batch[bp.aatypes_1][0].cpu().detach().numpy()
             ]
         )
+
+        print(validation_mock_values[0].seqs)
+        print(validation_mock_values[0].true_aa)
+        with open(validation_mock_values[0].mpnn_fasta_path, "r") as f:
+            print(f.read())
+        print(sample.to_csv(sep="\t"))
+
         assert sample[MetricName.sequence] == input_seq
         # should not sample the original structure
         assert sample[MetricName.bb_rmsd_folded] > 0.1
         # random seq above should have low recovery
-        assert sample[MetricName.inverse_folding_sequence_recovery_mean] < 0.2
+        # i.e. for inpainting, should not include motifs
+        assert (
+            sample[MetricName.inverse_folding_sequence_recovery_mean] < 0.2
+        ), f"Expected low sequence recovery for {task}"
 
+    @pytest.mark.parametrize(
+        "task", [InferenceTask.unconditional, InferenceTask.inpainting]
+    )
     def test_predict_step_default_outputs(
-        self, mock_cfg, mock_pred_unconditional_dataloader, mock_folding_validation
+        self,
+        mock_cfg_uninterpolated,
+        mock_pred_unconditional_dataloader,
+        mock_pred_inpainting_dataloader,
+        mock_folding_validation,
+        task,
     ):
+        mock_cfg_uninterpolated.inference.task = task
+        mock_cfg = mock_cfg_uninterpolated.interpolate()
+
         module = FlowModule(mock_cfg)
-        batch = next(iter(mock_pred_unconditional_dataloader))
+        if task == InferenceTask.unconditional:
+            batch = next(iter(mock_pred_unconditional_dataloader))
+        elif task == InferenceTask.inpainting:
+            batch = next(iter(mock_pred_inpainting_dataloader))
+        else:
+            raise ValueError(f"Unknown task {task}")
 
         mock_folding_validation(
             batch=batch,
@@ -181,9 +216,15 @@ class TestFlowModule:
             MetricName.aatype_histogram_dist not in predictions.columns
         ), f"Unexpected metric {MetricName.aatype_histogram_dist}"
 
-    def test_predict_step_torsions_option(
-        self, mock_cfg, mock_pred_unconditional_dataloader, mock_folding_validation
+    def test_predict_step_unconditional_torsions_option(
+        self,
+        mock_cfg_uninterpolated,
+        mock_pred_unconditional_dataloader,
+        mock_folding_validation,
     ):
+        mock_cfg_uninterpolated.inference.task = InferenceTask.unconditional
+        mock_cfg = mock_cfg_uninterpolated.interpolate()
+
         # flip the default, whether we predict torsion angles or not
         mock_cfg.model.predict_psi_torsions = not mock_cfg.model.predict_psi_torsions
         mock_cfg.model.predict_all_torsions = mock_cfg.model.predict_psi_torsions
@@ -201,9 +242,13 @@ class TestFlowModule:
         _ = module.predict_step(batch, 0)
 
     def test_predict_step_unconditional_works(
-        self, mock_cfg, mock_pred_unconditional_dataloader, mock_folding_validation
+        self,
+        mock_cfg_uninterpolated,
+        mock_pred_unconditional_dataloader,
+        mock_folding_validation,
     ):
-        assert mock_cfg.inference.task == InferenceTask.unconditional
+        mock_cfg_uninterpolated.inference.task = InferenceTask.unconditional
+        mock_cfg = mock_cfg_uninterpolated.interpolate()
 
         module = FlowModule(mock_cfg)
         batch = next(iter(mock_pred_unconditional_dataloader))
