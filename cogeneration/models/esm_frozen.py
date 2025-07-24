@@ -176,42 +176,49 @@ ESM_REGISTRY.register_dummy()
 class SequenceData:
     """Container for an ESM‑formatted sequence and a mask for real residues."""
 
-    aa_sequence: torch.Tensor  # (B, L_total) - ESM tokens with BOS/EOS/linkers/pad
-    non_linker_mask: torch.Tensor  # (B, L_total) – mask for real residues (sum == L)
-    orig_len: int  # := L - original input length
+    aa_sequence: torch.Tensor  # (B, L) - ESM tokens with BOS/EOS/linkers/pad
+    non_linker_mask: (
+        torch.Tensor
+    )  # (B, L) – mask for real residues including UNK (sum == N)
+    orig_len: int  # := N - original input length
 
     @classmethod
     def from_af2(
         cls,
-        aatypes: torch.Tensor,  # (B, L) AF2 indices (0‑20, 0==A)
-        chain_idx: torch.Tensor,  # (B, L) chain identifiers
+        aatypes: torch.Tensor,  # (B, N) AF2 indices (0‑20, 0==A)
+        chain_idx: torch.Tensor,  # (B, N) chain identifiers
         esm_dict: Alphabet,  # alphabet/dictionary from ESM model
-        res_mask: torch.Tensor,  # (B, L) 1 for valid residues
+        res_mask: torch.Tensor,  # (B, N) 1 for valid residues
     ) -> "SequenceData":
         """
         End‑to‑end conversion: AF2‑indices → ESM tokens with BOS/EOS/linkers.
         adapted from https://github.com/facebookresearch/esm/blob/main/esm/esmfold/v1/esmfold.py
         """
-        B, L = aatypes.shape
+        B, N = aatypes.shape
 
-        # convert AF2 indices -> ESM indices (with padding/masking)
+        bos = esm_dict.cls_idx
+        eos = esm_dict.eos_idx
+        pad = esm_dict.padding_idx
+        mask = esm_dict.mask_idx
+        X = esm_dict.get_idx("X")
+        linker = eos  # use <eos> as linker (ESM authors' recommendation)
+
+        # Convert AF2 indices to ESM indices
         conv_table = cls._make_af2_to_esm_lookup(esm_dict).to(aatypes.device)
-        bos, eos, pad = esm_dict.cls_idx, esm_dict.eos_idx, esm_dict.padding_idx
+        # shift by +1 so 0‑based AA becomes 1..20 (0 is padding)
+        seq = conv_table[aatypes + 1]
 
-        # shift by +1 so 0‑based AA becomes 1..20
-        seq = aatypes + 1
-        seq = conv_table[seq]
-        # set non-residue positions to <pad> to ignore (<unk> rarely observed so less stable)
+        # set positions not in res_mask to X, i.e. assume they are residues.
+        # with chain-independent trimming, this is probably a reasonable assumption.
+        # (also, avoid using <pad> for simplicity with flash attention, which drops it.)
         # TODO(model) - ideally differentiate non-canonical residues from non-residues (e.g. metal ion)
         #   So that residues in the chain are set to X. We don't differentiate in res_mask.
-        seq = seq.masked_fill(~res_mask.bool(), pad)
-
-        # add BOS / EOS / linker tokens between chains
-        linker = eos  # use <eos> as separator (ESM authors' recommendation)
+        seq = seq.masked_fill(~res_mask.bool(), X)
 
         device, dtype = seq.device, seq.dtype
         sequences, residue_masks = [], []
 
+        # add BOS / EOS / linker tokens between chains
         for b in range(B):
             breaks = torch.nonzero(
                 chain_idx[b][1:] != chain_idx[b][:-1], as_tuple=False
@@ -227,7 +234,7 @@ class SequenceData:
                 last = idx
             # tail + EOS
             tokens.extend(seq[b, last:].tolist())
-            mask_bits.extend([True] * (L - last))
+            mask_bits.extend([True] * (N - last))
             tokens.append(eos)
             mask_bits.append(False)
 
@@ -242,11 +249,11 @@ class SequenceData:
         batch_mask = torch.zeros((B, max_len), dtype=torch.bool, device=device)
 
         for b in range(B):
-            l_total = sequences[b].size(0)
-            batch_seq[b, :l_total] = sequences[b]
-            batch_mask[b, :l_total] = residue_masks[b]
+            l_seq = sequences[b].size(0)
+            batch_seq[b, :l_seq] = sequences[b]
+            batch_mask[b, :l_seq] = residue_masks[b]
 
-        return cls(aa_sequence=batch_seq, non_linker_mask=batch_mask, orig_len=L)
+        return cls(aa_sequence=batch_seq, non_linker_mask=batch_mask, orig_len=N)
 
     @staticmethod
     @lru_cache(maxsize=1)  # expect single esm_dict
@@ -359,7 +366,13 @@ class FrozenEsmModel(nn.Module):
         ):
             return self._previous_call["outputs"]
 
-        padding_mask = sequence_data.aa_sequence == self.esm_dict.padding_idx
+        residue_mask = sequence_data.non_linker_mask  # (B, L)
+        padding_mask = sequence_data.aa_sequence == self.esm_dict.padding_idx  # (B, L)
+
+        # track sizes
+        B, N = aatypes.shape
+        L = residue_mask.shape[1]  # L > N; includes BOS, EOS, maybe linkers
+
         res = self.esm(
             sequence_data.aa_sequence,
             # FAPLM style arguments
@@ -373,32 +386,49 @@ class FrozenEsmModel(nn.Module):
         )
 
         # postprocess
-        # for single chains, we could just take `[1:-1]`
+        # for single chains, we could just take `[1:-1]` (remove BOS, EOS)
         # but to support chain breaks / linkers use `non_linker_mask`
 
-        residue_mask = sequence_data.non_linker_mask  # (B, L_total)
-        N = sequence_data.orig_len  # original residue count, target length
+        # # FAIR esm style
+        # reps = torch.stack(
+        #     [v for _, v in sorted(res["representations"].items())],
+        #     dim=2,
+        # )  # (B, L, nLayers, C)
 
+        # FAPLM style
+        # Flash attention may introduce pseudo-batch and flattens actual batch,
+        # i.e. (1, B * L, C), and drops pad tokens (unknown are treated as pad).
         reps = torch.stack(
-            # [v for _, v in sorted(res["representations"].items())], dim=2  # FAIR esm style
-            [v.squeeze(0) for v in res["hidden_states"]],
-            dim=2,  # FAPLM style
-        )
-        B, L_total, nLayers, C = reps.shape
+            [h.squeeze(0).view(B, L, -1) for h in res["hidden_states"]],
+            dim=2,
+        )  # (B, L, nLayers, C)
 
-        single_repns = torch.empty(
-            (B, N, nLayers, C), device=reps.device, dtype=reps.dtype
-        )
-        for b in range(B):
-            single_repns[b] = reps[b][residue_mask[b]]
+        # keep only the non-linker / non-special residues
+        single_repns = reps[residue_mask].view(
+            B, N, *reps.shape[2:]
+        )  # (B, N, nLayers, C)
 
         if self.use_esm_attn_map:
-            # attn = res["attentions"]  # FAIR ESM style
-            attn = torch.stack(
-                [a.squeeze(0) for a in res["attentions"]], dim=1
-            )  # FAPLM style
-            attn = attn.permute(0, 3, 4, 1, 2)  # B, L_total, L_total, nLayers, nHeads
-            attn = attn.flatten(3, 4)  # B, L_total, L_total, nLayers*nHeads
+            # FAIR esm style
+            # attn = res["attentions"]
+
+            # FAPLM style
+            flat_attn = []
+            for a in res["attentions"]:
+                # handle flash attention "layer batch".
+                # If batch size is actually 1, handled by view() below
+                if a.shape[0] == 1:  # (1, h, B·L, B·L)
+                    a = a.squeeze(0)  # (h, B·L, B·L)
+                    a = a.view(B, -1, L, L)  # (B, h, L, L)
+                # else: no FA, already (B, h, L, L)
+                flat_attn.append(a)
+            # stack over layers: (B, nLayers, nHeads, L, L)
+            attn = torch.stack(flat_attn, dim=1)
+
+            attn = attn.permute(0, 3, 4, 1, 2)  # B, L, L, nLayers, nHeads
+            attn = attn.flatten(3, 4)  # B, L, L, nLayers*nHeads
+
+            # limit to actual residues
             pair_repns = torch.empty(
                 (B, N, N, attn.shape[-1]), device=attn.device, dtype=attn.dtype
             )

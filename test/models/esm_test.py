@@ -53,7 +53,7 @@ class TestSequenceData:
             [
                 [esm2_alphabet.cls_idx]
                 + [esm2_alphabet.get_idx(aa) for aa in restypes_with_x[:4]]
-                + [esm2_alphabet.padding_idx]
+                + [esm2_alphabet.get_idx("X")]  # explicit check X is not <unk>
                 + [esm2_alphabet.get_idx(aa) for aa in restypes_with_x[5:]]
                 + [esm2_alphabet.eos_idx]
             ]
