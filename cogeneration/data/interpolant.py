@@ -97,7 +97,7 @@ class BatchTrueFeatures:
         )
 
 
-class Interpolant(nn.Module):
+class Interpolant:
     """
     Interpolant is responsible for generating noise, corrupting samples, and sampling from learned vector fields.
 
@@ -109,7 +109,7 @@ class Interpolant(nn.Module):
 
     (1) Translations
     - in R^3 and are Euclidean
-    - Noise is Gaussian
+    - Noise is Gaussian, or uses harmonic prior
     - Supports minibatch optimal transport (OT)
     - Supports stochastic paths
     - Supports Euler sampling (standard flow matching, i.e. Euclidean)
@@ -137,7 +137,6 @@ class Interpolant(nn.Module):
     """
 
     def __init__(self, cfg: InterpolantConfig):
-        super().__init__()
         self.cfg = cfg
 
         self.resampler = FKSteeringResampler(cfg=self.cfg.steering)
@@ -147,6 +146,8 @@ class Interpolant(nn.Module):
                 == 0
             ), f"Number of sampling timesteps ({self.cfg.sampling.num_timesteps}) must be divisible by the steering resampling interval ({self.resampler.cfg.resampling_interval})"
 
+        # TODO - consider building igso3 on instantiation, to simplify device management
+        #   (will increase instantiation time slightly)
         self._igso3 = None
         self._device = None
 
@@ -158,14 +159,22 @@ class Interpolant(nn.Module):
 
     @property
     def igso3(self):
-        # On CPU
         if self._igso3 is None:
             sigma_grid = torch.linspace(0.1, self.cfg.rots.igso3_sigma, 1000)
             self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=".cache")
+
+            # on CUDA, move to GPU, so can be broadcasted. on MPS, leave on CPU.
+            if self._device is not None and self._device.type != "mps":
+                self._igso3.to(self._device)
+
         return self._igso3
 
     def set_device(self, device):
         self._device = device
+
+        # on CUDA, move to GPU, so can be broadcasted. on MPS, leave on CPU.
+        if not device.type == "mps" and self._igso3 is not None:
+            self._igso3.to(device)
 
     def sample_t(self, num_batch):
         """
@@ -404,7 +413,9 @@ class Interpolant(nn.Module):
         num_batch, num_res = res_mask.shape
 
         # sample IGSO(3)
-        sigma = torch.tensor([self.cfg.rots.igso3_sigma])
+        sigma = torch.tensor(
+            [self.cfg.rots.igso3_sigma], device=self.igso3.sigma_grid.device
+        )
         noisy_rotmats = self.igso3.sample(sigma, num_batch * num_res).to(self._device)
         noisy_rotmats = noisy_rotmats.reshape(num_batch, num_res, 3, 3)
 
@@ -440,7 +451,7 @@ class Interpolant(nn.Module):
             )
 
             # sample IGSO(3) noise
-            sigma_t = sigma_t.cpu()  # ensure on cpu for igso3 calculation
+            sigma_t = sigma_t.to(self.igso3.sigma_grid.device)
             intermediate_noise = self.igso3.sample(sigma_t, num_res).to(self._device)
             intermediate_noise = intermediate_noise.reshape(num_batch, num_res, 3, 3)
 
@@ -871,7 +882,7 @@ class Interpolant(nn.Module):
             ) * math.sqrt(
                 d_t
             )  # (B,)
-            sigma_t = sigma_t.cpu()  # ensure on cpu for igso3 calculation
+            sigma_t = sigma_t.to(self.igso3.sigma_grid.device)
             intermediate_noise = self.igso3.sample(sigma_t, num_res)
             intermediate_noise = intermediate_noise.to(rotmats_t.device)
             intermediate_noise = intermediate_noise.reshape(num_batch, num_res, 3, 3)
@@ -1097,7 +1108,9 @@ class Interpolant(nn.Module):
 
         # determine how many masked residues to unmask
         # probability of unmasking is scaled by d_t, noise, and time
-        unmask_probs = (d_t * ((1.0 + noise * t) / (1.0 - t))).clamp(max=1.0)  # scalar
+        unmask_probs = (
+            (d_t * ((1.0 + noise * t) / (1.0 - t))).clamp(max=1.0).to(device)
+        )  # scalar
         masked_counts = (aatypes_t == MASK_TOKEN_INDEX).sum(dim=-1).float()  # (B,)
         number_to_unmask = torch.binomial(
             count=masked_counts, prob=unmask_probs
