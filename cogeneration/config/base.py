@@ -124,8 +124,6 @@ class SharedConfig(BaseClassConfig):
     local: bool = True
     # enable CUDA optimized kernels (cuEquivariance, Flash Attention, etc.)
     kernels: bool = field(default_factory=lambda: torch.cuda.is_available())
-    # enable bf16 precision for CUDA kernels when available
-    kernels_bf16: bool = field(default_factory=lambda: torch.cuda.is_available())
     # randomness / stochastic paths
     stochastic: bool = True
     # project root path
@@ -161,7 +159,7 @@ class ModelHyperParamsConfig(BaseClassConfig):
 
     @classmethod
     def tiny(cls):
-        """Factory for tiny configuration, e.g. for testing"""
+        """Factory for tiny configuration, for test suite. won't work with kernels."""
         return cls(
             node_embed_size=4,
             edge_embed_size=4,
@@ -172,6 +170,21 @@ class ModelHyperParamsConfig(BaseClassConfig):
             trunk_num_layers=1,
             ipa_num_layers=1,
             seq_trunk_num_layers=1,
+        )
+
+    @classmethod
+    def small(cls):
+        """Factory for small configuration, e.g. for testing complete model"""
+        return cls(
+            node_embed_size=64,
+            edge_embed_size=64,  # min for cuEquiv kernel
+            pos_embed_size=32,
+            timestep_embed_size=32,
+            # small attention networks
+            num_recycles=0,
+            trunk_num_layers=2,
+            ipa_num_layers=2,
+            seq_trunk_num_layers=2,
         )
 
     @classmethod
@@ -418,7 +431,7 @@ class ModelESMCombinerConfig(BaseClassConfig):
     # only get single rep, which can use speed up e.g. using flash attention
     only_single: bool = True
     # which ESM model size to use
-    esm_model_key: ModelESMKey = ModelESMKey.esm2_t30_150M_UR50D
+    esm_model_key: ModelESMKey = ModelESMKey.esm2_t12_35M_UR50D
     # dims coming from simple node/edge networks
     node_embed_size: int = "${model.hyper_params.node_embed_size}"
     edge_embed_size: int = "${model.hyper_params.edge_embed_size}"
@@ -800,15 +813,17 @@ class InterpolantConfig(BaseClassConfig):
 
 @dataclass
 class DataLoaderConfig(BaseClassConfig):
-    num_workers: int = 8
+    num_workers: int = max(1, os.cpu_count() // 2, os.cpu_count() - 4)
     prefetch_factor: int = 10
 
 
 @dataclass
 class DataSamplerConfig(BaseClassConfig):
-    # Setting for 40GB GPUs
-    max_batch_size: int = 80  # 128 for 80GB GPUs
-    max_num_res_squared: int = 400_000  # 1_000_000 for 80GB GPUs
+    # GPU memory in GB. ensure value defined in tables, or explicitly set.
+    gpu_memory_gb: int = 40
+    # table lookups in format: ${table:${.gpu_memory_gb},key1,value1,...}
+    max_batch_size: int = "${table:${.gpu_memory_gb},40,64,80,128}"
+    max_num_res_squared: int = "${table:${.gpu_memory_gb},40,184000,80,1024000}"
 
 
 class DatasetEnum(StrEnum):
@@ -819,7 +834,7 @@ class DatasetEnum(StrEnum):
 
 @dataclass
 class DataConfig(BaseClassConfig):
-    task: DataTask = DataTask.hallucination
+    task: DataTask = DataTask.inpainting
     dataset: DatasetEnum = DatasetEnum.pdb
     loader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
     sampler: DataSamplerConfig = field(default_factory=DataSamplerConfig)
@@ -1178,10 +1193,11 @@ class ExperimentTrainerConfig(BaseClassConfig):
 
     # probably want "gpu" if not on a Mac, "mps" for Mac M# GPU
     # `accelerator` is argument name to Trainer()
-    accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'gpu'}"
+    accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'cuda'}"
     # `strategy` is argument name to Trainer(), ddp = distributed data parallel
+    # use `ddp_find_unused_parameters_true` if using frozen ESM
     strategy: Optional[str] = (
-        "${ternary:${equals: ${shared.local}, True}, 'auto', 'ddp'}"
+        "${ternary:${equals: ${shared.local}, True}, 'auto', 'ddp_find_unused_parameters_true'}"
     )
     overfit_batches: int = 0
     min_epochs: int = 1  # prevents early stopping
@@ -1191,7 +1207,7 @@ class ExperimentTrainerConfig(BaseClassConfig):
     accumulate_grad_batches: int = 2
     # enable lower precision off MPS
     precision: Union[str, int] = (
-        "${ternary:${equals: ${shared.local}, True}, '32', 'bf16'}"
+        "${ternary:${equals: ${shared.local}, True}, '32', 'bf16-mixed'}"
     )
     # logging
     log_every_n_steps: int = 1
@@ -1223,7 +1239,7 @@ class ExperimentCheckpointerConfig(BaseClassConfig):
     # recommend checkpoint on some multiple of validation epoch interval. too frequent will eat up disk.
     every_n_epochs: int = 8
     # save `k` best models according to some metric
-    save_top_k: int = 2
+    save_top_k: int = 1
     monitor: str = "valid/codesign_bb_rmsd"
     mode: str = "min"
 
@@ -1243,13 +1259,13 @@ class ExperimentConfig(BaseClassConfig):
     warm_start_cfg_override: bool = False
     # force reload module config, provide path
     raw_state_dict_reload: Optional[str] = None
-    # pytorch Trainer profiler, "simple", "advanced", None
-    profiler: Optional[str] = None
     # enable torch.compile(), requires no graph breaks TODO(model) working torch.compile
     torch_compile: bool = False
     # save a `final.ckpt` when training is complete, defaults to symlink sentinel
     save_final_ckpt: bool = True
     final_ckpt_symlink: bool = True
+    # save chrome trace during training (modify code to change frequency etc.)
+    profile_chrome_trace: bool = True
 
     # sub-modules
     training: ExperimentTrainingConfig = field(default_factory=ExperimentTrainingConfig)
@@ -1292,7 +1308,7 @@ class InferenceSamplesConfig(BaseClassConfig):
 
 @dataclass
 class InferenceConfig(BaseClassConfig):
-    task: InferenceTask = InferenceTask.unconditional
+    task: InferenceTask = InferenceTask.inpainting
 
     seed: int = "${shared.seed}"
     use_gpu: bool = True
@@ -1345,11 +1361,13 @@ class ProteinMPNNRunnerConfig(BaseClassConfig):
     # Seed for ProteinMPNN
     # each `num_passes` will get a unique seed but otherwise set every inference call.
     pmpnn_seed: Optional[int] = None
-    seq_per_sample: int = 8
+    # Number of inverse folds to run per sample
+    # Note, increases validation + prediction step time
+    seq_per_sample: int = 4
 
     # Native runner options
     use_native_runner: bool = True  # Use native runner instead of subprocess
-    accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'gpu'}"
+    accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'cuda'}"
     model_type: ModelType = ModelType.PROTEIN_MPNN
     temperature: float = 0.1  # Sampling temperature
 
@@ -1391,10 +1409,10 @@ class BoltzConfig(BaseClassConfig):
     # Prefer running in memory vs using subprocess and CLI API
     run_native: bool = True
 
-    # Directory containing checkpoint, `mols`, etc.
-    cache_dir: Path = Path("~/.boltz/cache").expanduser()
+    # Directory containing checkpoint, `mols`, etc. Should match boltz default.
+    cache_dir: Path = Path("~/.boltz").expanduser()
     # Path to Boltz-2 checkpoint. Downloaded file name chosen by Boltz.
-    checkpoint_path: Path = Path("~/.boltz/cache/boltz2_conf.ckpt").expanduser()
+    checkpoint_path: Path = Path("~/.boltz/boltz2_conf.ckpt").expanduser()
 
     # Inputs and outputs
     # TODO(boltz) - update directories, standardize checkpoint path, etc (alphafold too)
@@ -1416,7 +1434,8 @@ class BoltzConfig(BaseClassConfig):
     diffusion_samples: int = 1
 
     # Hardware and output settings
-    accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'gpu'}"
+    num_workers: int = 2  # generally only processing 1 at a time with current setup
+    accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'cuda'}"
     # Output format for structures ("pdb", "mmcif").
     output_format: str = "pdb"
     # Training precision ("bf16-mixed", "32") otherwise inferred

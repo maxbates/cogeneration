@@ -2,16 +2,17 @@
 
 Cogeneration is a protein generative model that simultaneously generates protein sequences and structures.
 
-Proteins are represented as frames, each with a translation and rotation and torsions, and a sequence of amino acids.
-It is based on MultiFlow, which applies flow matching across several domains:
+It is based on MultiFlow, which uses the AlphaFold2 style frame representation, and  applies flow matching across several domains:
 Translations are interpolated in Euclidean space, rotations are interpolated in SO(3), and the sequence with discrete flow matching.
 
-This project introduces several extensions over MultiFlow:
-- **Inpainting (conditional generation)** given partial sequences / structures
+This project collects several ideas from other work and includes several extensions over MultiFlow:
+- **Inpainting (conditional generation)** given partial sequences / structures using guidance
   - MultiFlow only supports per-domain conditioning via seperate t (i.e. folding and inverse folding)
-- **Multimer** support, enabling binder design, and specifying RFDiffusion style **hot spot** residues
+- **Multimer** support
 - **Stochastic paths**, for the structure and sequence, enabling e.g. conformation sampling and sequence redesign
-- **2D constraints** to guide structure, e.g. of a binder
+- Conditioning for better binder design:
+  - **2D constraints** to guide structure, e.g. of the binder 
+  - Specifying RFDiffusion style **hot spot** residues
 - **Feynman-Kac steering** for sequential monte-carlo sampling guided by potentials, defined only at inference time
 - **existing protein language models (e.g. ESM)** to get frozen embeddings, enriching the node and edge representations
   - particularly for sequence-conditioned tasks like inpainting
@@ -20,15 +21,17 @@ This project introduces several extensions over MultiFlow:
 - **B-factor and confidence (pLDDT, PTM, iPTM) prediction**, improving model understanding of flexible regions, and embedding structure experimental method
 - additional losses (e.g. for atomic interactions, clashes)
 - Support for **LigandMPNN (in memory) for inverse folding** during validation / redesigning sequences
-- Support for **Boltz-2 (in memory) for structure prediction** or AlphaFold2 duiring validation / redesigning sequences
+- Support for **Boltz-2 (in memory)or AlphaFold2** for structure prediction during validation / redesigning sequences
 - **Complete PDB processing data pipeline** to generate or augment training data, with several fields added to metadata
   - Scripts to download and process **AlphaFold Database** (by default, only part of it)
   - Track information about chains, multimer interactions, presence of non-residues, etc.
 - Adds a trunk with **choice of attention mechanisms, e.g. IPA, Pairformer** (triangle attention)
+- **Harmonic prior** instead of only gaussian prior
 - Enables **recyling** through the trunk + IPA
-- **CUDA optimizations**, e.g. Flash Attention, Flash IPA, cuEquivariant triangle attention
+- **CUDA optimizations + kernels**, e.g. Flash Attention (and Flash IPA), cuEquivariant triangle attention
 - many improvements to code base: typing, enums, documentation, tests, etc.
-- Many of these **new features and modules are optional, i.e. easily reverse compatible with MultiFlow**, and can use public Multiflow weights
+- Many of these **new features and modules are optional**
+  - everything is easily **reverse compatible with MultiFlow, i.e. can use public Multiflow weights** with a config preset
 
 ## Installation, Training, and Sampling
 

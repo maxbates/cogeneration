@@ -357,7 +357,6 @@ def mock_checkpoint(mock_folding_validation):
         final_ckpt_path = str(ckpt_dir / "final.ckpt")
 
         # update config with the checkpoint
-        # assert cfg.inference.task == InferenceTask.unconditional
         cfg.inference.unconditional_ckpt_path = str(ckpt_path)
         cfg.inference.inpainting_ckpt_path = str(ckpt_path)
         cfg.inference.forward_folding_ckpt_path = str(ckpt_path)

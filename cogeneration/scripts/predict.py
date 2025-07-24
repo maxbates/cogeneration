@@ -79,7 +79,7 @@ class EvalRunner:
             cfg=self.cfg,
         )
         self._flow_module.folding_validator.set_device_id(0)
-        log.info(ModelSummary(self._flow_module, max_depth=2))
+        log.info("\n" + str(ModelSummary(self._flow_module, max_depth=2)))
         self._flow_module.eval()
 
     @property
@@ -117,6 +117,8 @@ class EvalRunner:
             # not what was in the ckpt config
             # TODO(dataset) - actually read the config, rather than using constructor to get new instance
             pdb_test_cfg = self.cfg.dataset.PDBPost2021()
+            # Hack avoid cfg interpolation and just set necessary field
+            pdb_test_cfg.seed = self.cfg.dataset.seed
 
             # The dataset will behave differently depending on the task
             # i.e. for inpainting, we generate motifs.
@@ -186,6 +188,7 @@ class EvalRunner:
 def run(cfg: Config) -> None:
     log.info(f"Starting inference, using {cfg.inference.num_gpus} GPUs")
 
+    cfg = OmegaConf.to_object(cfg)
     cfg = cfg.interpolate()
 
     sampler = EvalRunner(cfg=cfg)

@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any
 
 from omegaconf import OmegaConf
 
@@ -14,6 +15,28 @@ OmegaConf.register_new_resolver(
     ),
     replace=True,
 )
+
+
+# table lookup
+def _table_resolver(key: Any, *args: Any) -> Any:
+    """
+    Table lookup resolver.
+    Usage: ${table:key,k1,v1,k2,v2,...}
+    """
+    if len(args) % 2 != 0:
+        raise ValueError(
+            "table resolver requires an even number of key-value arguments"
+        )
+    table = dict(zip(args[0::2], args[1::2]))
+    return table.get(key)
+
+
+OmegaConf.register_new_resolver(
+    "table",
+    _table_resolver,
+    replace=True,
+)
+
 
 # Compare values
 OmegaConf.register_new_resolver(

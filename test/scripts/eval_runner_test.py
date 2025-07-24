@@ -1,7 +1,10 @@
 import os.path
 
+import pytest
+
 from cogeneration.scripts.predict import EvalRunner
 from cogeneration.type.metrics import MetricName
+from cogeneration.type.task import InferenceTask
 
 
 class TestEvalRunner:
@@ -11,20 +14,34 @@ class TestEvalRunner:
         cfg, ckpt_path = mock_checkpoint(cfg=mock_cfg)
         _ = EvalRunner(cfg=cfg)
 
+    @pytest.mark.parametrize(
+        "task", [InferenceTask.unconditional, InferenceTask.inpainting]
+    )
     def test_sampling_and_compute_metrics(
-        self, mock_cfg, mock_checkpoint, mock_folding_validation, tmp_path
+        self,
+        mock_cfg_uninterpolated,
+        mock_checkpoint,
+        mock_folding_validation,
+        tmp_path,
+        task,
     ):
-        # This is a long-running end-to-end test that performs sampling and computes metrics.
-
-        # create a dummy checkpoint
-        cfg, ckpt_path = mock_checkpoint(cfg=mock_cfg)
+        # This is a end-to-end test that performs sampling and computes metrics
+        mock_cfg_uninterpolated.dataset.task = task.to_data_task(task)
+        mock_cfg_uninterpolated.inference.task = task
 
         # only sample one sample
+        # TODO(inpainting) - support better inpainting dataset / dataloader cfg
+        #   currently not respecting cfg.inference, just using dataset eval == validation
         # TODO(test) - support multiple samples
         #   We need to mock folding validation for all samples in pred dataloader.
         n_samples_expected = 1
-        cfg.inference.samples.samples_per_length = 1
-        cfg.inference.samples.length_subset = [23]
+        mock_cfg_uninterpolated.inference.samples.samples_per_length = 1
+        mock_cfg_uninterpolated.inference.samples.length_subset = [23]
+
+        cfg = mock_cfg_uninterpolated.interpolate()
+
+        # create a dummy checkpoint
+        cfg, ckpt_path = mock_checkpoint(cfg=cfg)
 
         # Run sampling
         sampler = EvalRunner(cfg=cfg)

@@ -93,7 +93,7 @@ class TestProteinMPNNRunner:
         pdb_batch = create_pdb_batch(
             cfg=mock_cfg,
             training=False,
-            eval_batch_size=2,
+            eval_batch_size=1,  # TODO(test) - increase batch size > 1, requires length batching
         )
 
         # Get actual dimensions from the input

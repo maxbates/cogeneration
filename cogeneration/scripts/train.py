@@ -1,16 +1,20 @@
 import os
+from textwrap import dedent
 
 import hydra
 import torch
 import torch._dynamo as dynamo
 from omegaconf import OmegaConf
 from pytorch_lightning import LightningDataModule, LightningModule
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.loggers.wandb import WandbLogger
+from pytorch_lightning.profilers import PyTorchProfiler
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.utilities.model_summary import ModelSummary
+from torch.profiler import ProfilerActivity, schedule
 
+import wandb
 from cogeneration.config.base import Config
 from cogeneration.dataset.datasets import DatasetConstructor
 from cogeneration.dataset.protein_dataloader import ProteinData
@@ -97,7 +101,7 @@ class Experiment:
             self.cfg,
             folding_device_id=folding_device_id,
         )
-        log.info(ModelSummary(self._module, max_depth=2))
+        log.info("\n" + str(ModelSummary(self._module, max_depth=2)))
 
         # Load model state dict if provided
         if self.cfg.experiment.raw_state_dict_reload is not None:
@@ -108,6 +112,8 @@ class Experiment:
     @print_timing
     def train(self):
         callbacks = []
+
+        callbacks.append(TQDMProgressBar(refresh_rate=1))
 
         if self.cfg.experiment.debug:
             # Debug mode uses only one device and no workers
@@ -147,15 +153,53 @@ class Experiment:
             if logger is not None and isinstance(logger, WandbLogger):
                 logger.experiment.config.update(self.cfg.flatdict())
 
+        # set up profiler to save traces to wandb
+        profiler = None
+        if self.cfg.experiment.profile_chrome_trace:
+            log.warning(
+                dedent(
+                    """
+                    ⚠️ Setting up profiler to save chrome traces to wandb.
+                    These are large (100+ MB) and only recommended for debugging if training is slow / failing.
+                    """
+                )
+            )
+
+            def wandb_trace_uploader(prof: torch.profiler.profile):
+                # save chrome trace to wandb
+                step = prof.step_num
+                fname = f"trace_step{step}.json"
+                prof.export_chrome_trace(fname)
+                artifact_trace = wandb.Artifact(f"trace_{step}", type="trace")
+                artifact_trace.add_file(fname)
+                wandb.run.log_artifact(artifact_trace)
+
+                # save memory snapshot
+                if torch.cuda.is_available():
+                    snapshot_path = f"snapshot_{step}.pickle"
+                    torch.cuda.memory._dump_snapshot(snapshot_path)
+                    artifact_snapshot = wandb.Artifact(
+                        f"snapshot_{step}", type="snapshot"
+                    )
+                    artifact_snapshot.add_file(snapshot_path)
+                    wandb.run.log_artifact(artifact_snapshot)
+
+            profiler = PyTorchProfiler(
+                # activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=schedule(wait=0, warmup=0, active=1, repeat=0),
+                on_trace_ready=wandb_trace_uploader,
+                record_shapes=True,
+                profile_memory=True,
+            )
+
         log.info("Setting up Trainer...")
         trainer = Trainer(
-            self.cfg.experiment.trainer.asdict(),
+            **self.cfg.experiment.trainer.asdict(),
             callbacks=callbacks,
             logger=logger,  # pass w&b logger
-            use_distributed_sampler=False,
-            enable_progress_bar=True,
+            use_distributed_sampler=False,  # TODO - ddp
             devices=self._train_device_ids,
-            profiler=self.cfg.experiment.profiler,
+            profiler=profiler,
         )
 
         # Try to compile model
@@ -209,6 +253,8 @@ class Experiment:
 @hydra.main(version_base=None, config_path="../config", config_name="base")
 def run(cfg: Config) -> None:
     log.info(f"Starting training. {cfg.experiment.num_devices} GPUs specified.")
+
+    cfg = OmegaConf.to_object(cfg)
     cfg = cfg.interpolate()
 
     trainer = Experiment(cfg=cfg)

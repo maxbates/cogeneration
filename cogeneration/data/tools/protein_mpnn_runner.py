@@ -79,6 +79,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import numpy.typing as npt
 import torch
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
@@ -414,7 +415,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
             checkpoint_path = self._get_checkpoint_path()
 
             # Load checkpoint
-            logger.info(f"Loading ProteinMPNN checkpoint: {checkpoint_path}")
+            logger.debug(f"Loading ProteinMPNN checkpoint: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location=self._device)
 
             # Determine model parameters based on model type
@@ -448,7 +449,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
             self._model.to(self._device)
             self._model.eval()
 
-            logger.info(f"Successfully loaded {self.cfg.model_type} model")
+            logger.debug(f"Successfully loaded {self.cfg.model_type} model")
             return self._model
 
         except ImportError as e:
@@ -522,7 +523,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
                 )
                 return None
 
-            logger.info(f"Loading side chain packing model: {checkpoint_path_sc}")
+            logger.debug(f"Loading side chain packing model: {checkpoint_path_sc}")
 
             self._model_sc = Packer(
                 node_features=128,
@@ -549,7 +550,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
             self._model_sc.to(self._device)
             self._model_sc.eval()
 
-            logger.info("Successfully loaded side chain packing model")
+            logger.debug("Successfully loaded side chain packing model")
             return self._model_sc
 
         except Exception as e:
@@ -617,7 +618,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
         self,
         pdb_path: Path,
         output_dir: Path,
-        diffuse_mask: torch.Tensor,
+        diffuse_mask: Optional[npt.NDArray],
         num_sequences: Optional[int] = None,
         seed: Optional[int] = None,
         temperature: Optional[float] = None,
@@ -637,6 +638,11 @@ class ProteinMPNNRunner(InverseFoldingTool):
         Returns:
             InverseFoldingFasta
         """
+
+        # convert diffuse_mask to tensor
+        if diffuse_mask is not None:
+            diffuse_mask = torch.tensor(diffuse_mask)
+
         if self.cfg.use_native_runner:
             return self.inverse_fold_pdb_native(
                 pdb_path=pdb_path,
@@ -690,7 +696,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         # Write processed sequences
         SeqIO.write(records, output_fasta, "fasta")
-        logger.info(f"Processed {len(records)} sequences saved to {output_fasta}")
+        logger.debug(f"Processed {len(records)} sequences saved to {output_fasta}")
 
         return output_fasta
 
@@ -718,10 +724,11 @@ class ProteinMPNNRunner(InverseFoldingTool):
         if temperature is None:
             temperature = self.cfg.temperature
 
+        start_time = time.time()
+        logger.debug(f"Running native ProteinMPNN on {pdb_path}")
+
         # Create output directory
         output_dir.mkdir(parents=True, exist_ok=True)
-
-        logger.info(f"Running native ProteinMPNN on {pdb_path}")
 
         # Parse PDB and create protein_dict
         protein_dict = self._parse_pdb_to_protein_dict(
@@ -796,7 +803,11 @@ class ProteinMPNNRunner(InverseFoldingTool):
             output_fasta, output_dir, pdb_path.stem
         )
 
-        logger.info(f"Native ProteinMPNN completed successfully")
+        end_time = time.time()
+        logger.debug(
+            f"Native ProteinMPNN completed successfully in {end_time - start_time:.2f} seconds"
+        )
+
         return processed_fasta
 
     def inverse_fold_pdb_subprocess(
@@ -869,7 +880,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
                 json.dump(fixed_residues_json, f)
             cmd.extend(["--fixed_positions_jsonl", str(fixed_positions_path)])
 
-        logger.info(f"Running ProteinMPNN subprocess: {' '.join(cmd)}")
+        logger.debug(f"Running ProteinMPNN subprocess: {' '.join(cmd)}")
 
         env = os.environ.copy()
         # Set CUDA_VISIBLE_DEVICES based on the configured device, defaulting to 0
@@ -903,7 +914,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
                 logger.error(f"STDERR: {result.stderr}")
                 raise subprocess.CalledProcessError(result.returncode, cmd)
 
-            logger.info("ProteinMPNN subprocess completed successfully")
+            logger.debug("ProteinMPNN subprocess completed successfully")
 
         except subprocess.TimeoutExpired:
             logger.error("ProteinMPNN subprocess timed out")
@@ -1038,7 +1049,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
         feature_dicts = []
         for i, protein_dict in enumerate(protein_dicts):
             # Extract the diffuse_mask for this specific structure
-            if diffuse_mask.dim() == 2:  # (B, N)
+            if diffuse_mask.ndim == 2:  # (B, N)
                 structure_diffuse_mask = diffuse_mask[i]  # (N,)
             else:  # (N,) - single structure case
                 structure_diffuse_mask = diffuse_mask
@@ -1223,9 +1234,9 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         # Accept (N,) or (B, N). For batched inputs we take the first (and only relevant)
         # row because this function is called once per structure.
-        if diffuse_mask.dim() == 2:
+        if diffuse_mask.ndim == 2:
             diffuse_mask = diffuse_mask[0]
-        elif diffuse_mask.dim() != 1:
+        elif diffuse_mask.ndim != 1:
             logger.warning(
                 f"Unsupported diffuse_mask shape: {tuple(diffuse_mask.shape)}. Expected (N,) or (1, N)."
             )
@@ -1281,7 +1292,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
         return {pdb_name: fixed_residues}
 
     def _features_from_protein_dict(
-        self, protein_dict: MPNNProteinDict, diffuse_mask: torch.Tensor
+        self, protein_dict: MPNNProteinDict, diffuse_mask: Optional[torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
         """
         Create feature dictionary from protein dictionary.
@@ -1302,25 +1313,29 @@ class ProteinMPNNRunner(InverseFoldingTool):
         # Convert diffuse_mask to chain_mask for ProteinMPNN
         # diffuse_mask semantics: 1 = design, 0 = fix
         # chain_mask semantics: 1 = design, 0 = fix (same as diffuse_mask)
-        if diffuse_mask is not None:
-            # Handle both (N,) and (B, N) shapes, taking first batch element if needed
-            if diffuse_mask.dim() == 2:
-                diffuse_mask_1d = diffuse_mask[0]  # Take first batch element
-            else:
-                diffuse_mask_1d = diffuse_mask
 
-            # Ensure diffuse_mask has correct length
-            if diffuse_mask_1d.shape[0] != N:
-                raise ValueError(
-                    f"diffuse_mask length {diffuse_mask_1d.shape[0]} does not match "
-                    f"protein sequence length {N}"
-                )
+        if diffuse_mask is None:
+            diffuse_mask = torch.ones(N, device=self._device)
 
-            # Convert to chain_mask format (move to device, no batch dimension yet)
-            chain_mask = diffuse_mask_1d.float().to(self._device)  # (N,)
+        # Handle both (N,) and (B, N) shapes, taking first batch element if needed
+        if diffuse_mask.ndim == 2:
+            diffuse_mask_1d = diffuse_mask[0]  # Take first batch element
         else:
-            # If no diffuse_mask provided, design all positions
-            chain_mask = torch.ones(N, device=self._device)
+            diffuse_mask_1d = diffuse_mask
+
+        # Ensure diffuse_mask has correct length
+        if diffuse_mask_1d.shape[0] != N:
+            print(protein_dict)
+            for k, v in protein_dict.items():
+                print(
+                    f"{k}: {v.shape if isinstance(v, torch.Tensor) else (len(v) if isinstance(v, list) else v)}"
+                )
+            raise ValueError(
+                f"diffuse_mask length {diffuse_mask_1d.shape[0]} != protein sequence length {N}."
+            )
+
+        # Convert to chain_mask format (move to device, no batch dimension yet)
+        chain_mask = diffuse_mask_1d.float().to(self._device)  # (N,)
 
         # Set chain_mask in protein_dict BEFORE calling featurize
         # This is critical because featurize() expects chain_mask in the input_dict
@@ -1459,7 +1474,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
         cogen_sequences = self._convert_mpnn_sequences_to_cogen(struct_sequences)
 
         total_sequences = num_passes * sequences_per_pass
-        logger.info(
+        logger.debug(
             f"Successfully generated {total_sequences} sequences for 1 structure"
         )
 
@@ -1525,7 +1540,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
         )  # (B, num_passes, sequences_per_pass, N)
 
         total_sequences = B * num_passes * sequences_per_pass
-        logger.info(
+        logger.debug(
             f"Successfully generated {total_sequences} sequences across {B} structures"
         )
 
@@ -1694,7 +1709,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
         output_fasta = output_dir / f"{name}.fa"
 
         total_sequences = cogen_aatypes_stack.shape[0]
-        logger.info(f"Saving {total_sequences} sequences to {output_fasta}")
+        logger.debug(f"Saving {total_sequences} sequences to {output_fasta}")
 
         with open(output_fasta, "w") as f:
             # Write header
@@ -1773,7 +1788,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         NOTE - will fail on MPS due to float64 tensors (VonMises used under the hood).
         """
-        logger.info("Applying side chain packing...")
+        logger.debug("Applying side chain packing...")
 
         # Load side chain model if needed
         model_sc = self._load_side_chain_model()
@@ -1822,7 +1837,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         # Pack side chains for each generated sequence
         for seq_idx in range(total_sequences):
-            logger.info(
+            logger.debug(
                 f"Packing side chains for sequence {seq_idx + 1}/{total_sequences}"
             )
 
@@ -1887,7 +1902,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         # Save packed structures as PDB files
         if packed_structures:
-            logger.info(f"Saving packed structures to PDB files...")
+            logger.debug(f"Saving packed structures to PDB files...")
             packed_dir = output_dir / "packed"
             packed_dir.mkdir(exist_ok=True)
 
@@ -1918,7 +1933,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
                             icodes=icodes,
                         )
 
-                        logger.info(f"Saved packed structure: {packed_pdb_path}")
+                        logger.debug(f"Saved packed structure: {packed_pdb_path}")
 
                     except Exception as e:
                         logger.error(
@@ -1926,7 +1941,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
                         )
                         continue
 
-            logger.info(
+            logger.debug(
                 f"Side chain packing completed. Saved {len([p for seq_list in packed_structures for p in seq_list])} packed structures."
             )
         else:
@@ -2018,7 +2033,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
         # Process each structure in the batch
         for b in range(B):
             # Get the diffuse mask for this structure
-            if diffuse_mask.dim() == 2:
+            if diffuse_mask.ndim == 2:
                 structure_diffuse_mask = diffuse_mask[b]  # (N,)
             else:
                 structure_diffuse_mask = diffuse_mask  # (N,) - single structure case
@@ -2104,7 +2119,7 @@ class ProteinMPNNRunnerPool:
                 device_id = device_ids[i % len(device_ids)]
                 if torch.cuda.is_available():
                     runner._device = torch.device(f"cuda:{device_id}")
-                    logger.info(f"Runner {i} assigned to cuda:{device_id}")
+                    logger.debug(f"Runner {i} assigned to cuda:{device_id}")
                 else:
                     logger.warning(f"CUDA not available, ignoring device_ids")
 

@@ -21,11 +21,11 @@ from cogeneration.data.tools.boltz_runner import (
 from cogeneration.type.dataset import DatasetProteinColumn
 from cogeneration.type.metrics import MetricName
 
-simple_sequence = "MKLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL"
+simple_sequence = "MKYTGLP"
 
 multiple_sequences = [
-    "MKLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL",
-    "ARNDCQEGHILKMFPSTWYV" * 2,  # All amino acids repeated
+    "ARNDCQEGHI",
+    "LKMFPSTWYV",
 ]
 
 
@@ -267,16 +267,39 @@ class TestBoltzRunner:
         protein_result = result[0]
         assert isinstance(protein_result, BoltzPrediction)
 
-        print(list(protein_result.output_dir.glob("*")))
-
         # confirm namespaced by protein_id
         assert protein_result.protein_id == protein_id
-        assert protein_result.output_dir.name == protein_id
+        assert protein_result.predictions_dir.name == protein_id
 
-        # Confirm outputs exist
+        # Confirm expected outputs exist
         assert protein_result.path_pdb.exists()
         assert protein_result.path_confidence_json.exists()
         assert protein_result.path_plddt_npz.exists()
+        assert (
+            protein_result.path_structure_npz is None
+            or protein_result.path_structure_npz.exists()
+        )
+
+        folding_dir = protein_result.predictions_dir.parent.parent
+        print(folding_dir)
+
+        # sanity check
+        assert (
+            folding_dir / "predictions" / protein_id
+        ) == protein_result.predictions_dir
+
+        # Ensure other prediction files have been cleaned up
+        assert len(list(protein_result.predictions_dir.glob("**/*"))) <= 4
+
+        # processed and MSA directories should exist and contain only directories (no files)
+        processed_dir = folding_dir / "processed"
+        msa_dir = folding_dir / "msa"
+        assert processed_dir.exists()
+        assert msa_dir.exists()
+        processed_files = [p for p in processed_dir.glob("**/*") if p.is_file()]
+        msa_files = [p for p in msa_dir.glob("**/*") if p.is_file()]
+        assert len(processed_files) == 0
+        assert len(msa_files) == 0
 
         # Test parsed_structure method
         parsed_file = protein_result.parsed_structure()
@@ -440,7 +463,7 @@ class TestBoltzPrediction:
 
         prediction = BoltzPrediction(
             protein_id=protein_id,
-            output_dir=output_dir,
+            predictions_dir=output_dir,
             path_pdb=pdb_path,
             path_structure_npz=structure_npz_path,
             path_plddt_npz=plddt_npz_path,

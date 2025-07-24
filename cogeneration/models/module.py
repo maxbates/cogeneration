@@ -17,6 +17,7 @@ from lightning_fabric.utilities.warnings import PossibleUserWarning
 from lightning_utilities.core.apply_func import apply_to_collection
 from pytorch_lightning import LightningModule
 from pytorch_lightning.loggers.wandb import WandbLogger
+from torch.profiler import ProfilerActivity, profile
 
 import wandb
 from cogeneration.config.base import Config
@@ -49,6 +50,8 @@ from cogeneration.type.task import DataTask, InferenceTask
 def to_numpy(x: Optional[torch.Tensor]) -> Optional[np.ndarray]:
     if x is None:
         return None
+    if x.dtype is torch.bfloat16:
+        x = x.to(torch.float32)
     return x.detach().cpu().numpy()
 
 
@@ -190,6 +193,9 @@ class FlowModule(LightningModule):
                 f"Module {module_id}: resuming at epoch {epochs_done}/{epochs_total} ({epochs_remaining} left)"
             )
 
+        if torch.cuda.is_available():
+            print(torch.cuda.memory_summary())
+
     def on_train_epoch_end(self):
         epoch_time = (time.time() - self._epoch_start_time) / 60.0
         self.log(
@@ -241,6 +247,76 @@ class FlowModule(LightningModule):
                 )
             self.validation_epoch_metrics.clear()
 
+    def get_true_values(
+        self, task: InferenceTask, batch: Union[InferenceFeatures, BatchFeatures]
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Extract true amino acid types and backbone positions from batch if appropriate for the task.
+
+        Note for inpainting, only the motifs are defined, and only if motifs are defined (sometimes unconditional!).
+        Metrics should handle accordingly.
+        """
+        res_mask = batch[bp.res_mask]
+        motif_mask = batch.get(bp.motif_mask, None)
+        num_batch, sample_length = res_mask.shape
+
+        # If inpainting, only have true values if motifs are defined (sometimes unconditional!).
+        if task == InferenceTask.inpainting:
+            if motif_mask is None or torch.sum(motif_mask) == 0:
+                return None, None
+
+        # Extract true amino acid types for certain tasks
+        true_aa = None
+        if task in [
+            InferenceTask.inpainting,
+            InferenceTask.forward_folding,
+            InferenceTask.inverse_folding,
+        ]:
+            aatypes_1 = batch.get(bp.aatypes_1, None)
+            assert aatypes_1 is not None, f"aatypes_1 required for task {task}"
+
+            true_aa = aatypes_1
+            assert true_aa.shape == (
+                num_batch,
+                sample_length,
+            ), f"true_aa shape {true_aa.shape}, expected ({num_batch}, {sample_length})"
+
+        # Extract true backbone positions for certain tasks
+        true_bb_pos = None
+        if task in [InferenceTask.inpainting, InferenceTask.forward_folding]:
+            trans_1 = batch.get(bp.trans_1, None)
+            rotmats_1 = batch.get(bp.rotmats_1, None)
+            torsions_1 = batch.get(bp.torsions_1, None)
+
+            assert trans_1 is not None, f"trans_1 required for task {task}"
+            assert rotmats_1 is not None, f"rotmats_1 required for task {task}"
+            assert torsions_1 is not None, f"torsions_1 required for task {task}"
+            assert true_aa is not None, f"true_aa required for task {task}"
+
+            # For inpainting, limit true structure to motif positions
+            true_mask = res_mask
+            if task == InferenceTask.inpainting:
+                if motif_mask is not None and torch.sum(motif_mask) > 0:
+                    true_mask = motif_mask
+
+            true_bb_pos = all_atom.atom37_from_trans_rot(
+                trans=trans_1,
+                rots=rotmats_1,
+                torsions=torsions_1,
+                res_mask=true_mask,
+                aatype=true_aa,
+                unknown_to_alanine=True,
+            )
+
+            assert true_bb_pos.shape == (
+                num_batch,
+                sample_length,
+                37,
+                3,
+            ), f"true_bb_pos shape {true_bb_pos.shape}, expected ({num_batch}, {sample_length}, 37, 3)"
+
+        return true_aa, true_bb_pos
+
     def model_step(self, batch: NoisyFeatures) -> TrainingLosses:
         model_output = self.model(batch)
 
@@ -264,6 +340,9 @@ class FlowModule(LightningModule):
 
     def training_step(self, batch: BatchFeatures):
         step_start_time = time.time()
+
+        if torch.cuda.is_available():
+            print(torch.cuda.memory_summary())
 
         self.interpolant.set_device(batch[bp.res_mask].device)
         noisy_batch = self.interpolant.corrupt_batch(batch, task=self.cfg.data.task)
@@ -435,6 +514,11 @@ class FlowModule(LightningModule):
         assert generated_aatypes.shape == (num_batch, num_res)
         batch_level_aatype_metrics = metrics.calc_aatype_metrics(generated_aatypes)
 
+        # Get true values for the batch
+        true_aa_batch, true_bb_pos_batch = self.get_true_values(
+            task=inference_task, batch=batch
+        )
+
         batch_metrics = []
         for i in range(num_batch):
             sample_id = f"sample_{csv_idx[i].item()}_idx_{batch_idx}_len_{num_res}"
@@ -449,6 +533,12 @@ class FlowModule(LightningModule):
                 if (bp.motif_mask in batch and batch[bp.motif_mask] is not None)
                 else None
             )
+
+            # Extract per-sample true values
+            true_bb_pos = (
+                true_bb_pos_batch[i] if true_bb_pos_batch is not None else None
+            )
+            true_aa = true_aa_batch[i] if true_aa_batch is not None else None
 
             # Extract FK steering trajectory for this batch member
             sample_fk_traj = (
@@ -470,8 +560,8 @@ class FlowModule(LightningModule):
                     motif_mask=to_numpy(sample_motif_mask),
                     chain_idx=to_numpy(batch[bp.chain_idx][i]),
                     res_idx=to_numpy(batch[bp.res_idx][i]),
-                    true_bb_pos=None,  # codesign  # TODO(inpainting) define
-                    true_aa=None,  # codesign  # TODO(inpainting) define
+                    true_bb_pos=to_numpy(true_bb_pos),
+                    true_aa=to_numpy(true_aa),
                     also_fold_pmpnn_seq=True,  # always fold during validation
                     write_sample_trajectories=False,  # don't write trajectories during validation (just structures)
                     write_animations=False,
@@ -578,52 +668,24 @@ class FlowModule(LightningModule):
         for sample_dir in sample_dirs:
             os.makedirs(sample_dir, exist_ok=True)
 
-        # For some tasks, we have a `true_aatypes` sequence for sample metrics
-        # Note for inpainting, only the motifs are defined
-        true_aatypes = None
-        if (
-            task == InferenceTask.inpainting
-            or task == InferenceTask.forward_folding
-            or task == InferenceTask.inverse_folding
-        ):
-            assert aatypes_1 is not None
+        # Get true values for the batch
+        true_aatypes, true_bb_pos = self.get_true_values(task=task, batch=batch)
 
-            true_aatypes = aatypes_1
-
-            # Ensure only have one valid sequence for the batch, extract it
+        # For predict_step, we expect batch size 1, so extract the single sample
+        if true_aatypes is not None:
             assert true_aatypes.shape == (
                 1,
                 sample_length,
             ), f"true_aa shape {true_aatypes.shape}"
             true_aatypes = true_aatypes[0]
             assert true_aatypes.shape == (sample_length,)
-
-        # For some tasks, we have a `true_bb_pos` ground truth structure for sample metrics
-        # Note for inpainting, `true_bb_pos` is masked and only defined at the motifs
-        true_bb_pos = None
-        if task == InferenceTask.inpainting or task == InferenceTask.forward_folding:
-            assert trans_1 is not None
-            assert rotmats_1 is not None
-            assert torsions_1 is not None
-            assert true_aatypes is not None
-
-            # For inpainting, limit true structure to motif positions
-            if task == InferenceTask.inpainting:
-                true_mask = 1 - diffuse_mask
-            else:
-                true_mask = res_mask
-
-            true_bb_pos = all_atom.atom37_from_trans_rot(
-                trans=trans_1,
-                rots=rotmats_1,
-                torsions=torsions_1,
-                res_mask=true_mask,
-                aatype=true_aatypes,
-                unknown_to_alanine=True,
-            )
-
-            # Ensure only have one valid structure for the batch, extract it
-            assert true_bb_pos.shape == (1, sample_length, 37, 3)
+        if true_bb_pos is not None:
+            assert true_bb_pos.shape == (
+                1,
+                sample_length,
+                37,
+                3,
+            ), f"true_bb_pos shape {true_bb_pos.shape}"
             true_bb_pos = true_bb_pos[0]
             assert true_bb_pos.shape == (sample_length, 37, 3)
 
@@ -784,7 +846,7 @@ class FlowModule(LightningModule):
                 sample_length,
                 37,
                 3,
-            ), f"true_bb_pos shape {true_bb_pos.shape}"
+            ), f"true_bb_pos shape {true_bb_pos.shape}, expected atom37"
             # require sequence if given structure, so can save accurately
             assert true_aa is not None, "true_aa required if true_bb_pos given"
 

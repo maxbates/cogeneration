@@ -6,7 +6,9 @@ and allows for efficient repeated inference. It supports single-sequence mode
 (no templates, no MSA) with potentials support and batching.
 """
 
+import gc
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -47,15 +49,19 @@ from cogeneration.dataset.process_pdb import pdb_path_pdb_name, process_pdb_file
 from cogeneration.type.dataset import DatasetProteinColumn, ProcessedFile
 from cogeneration.type.metrics import MetricName
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class BoltzPrediction:
     """
     Output structure for Boltz predictions containing paths to generated files.
+
+    The directory is something like `output_dir/predictions/record.id`
     """
 
     protein_id: str
-    output_dir: Path
+    predictions_dir: Path
     path_pdb: Path
     path_plddt_npz: Path
     path_confidence_json: Path
@@ -65,7 +71,7 @@ class BoltzPrediction:
         self._processed_file = None
 
     @classmethod
-    def from_output_dir(cls, output_dir: Union[str, Path]) -> "BoltzPrediction":
+    def from_output_dir(cls, predictions_dir: Union[str, Path]) -> "BoltzPrediction":
         """
         Create a BoltzPrediction instance by scanning an output directory for Boltz files.
 
@@ -75,41 +81,44 @@ class BoltzPrediction:
         Returns:
             BoltzPrediction instance with paths to found files.
         """
-        output_path = Path(output_dir)
+        predictions_path = Path(predictions_dir)
 
-        if not output_path.exists():
-            raise FileNotFoundError(f"Output directory does not exist: {output_path}")
+        if not predictions_path.exists():
+            raise FileNotFoundError(
+                f"Output directory does not exist: {predictions_path}"
+            )
 
         # Extract record_id from directory name (Note, assumes directory is named after record_id)
-        record_id = output_path.name
+        record_id = predictions_path.name
 
         # Use rank 0 files (highest confidence prediction)
 
-        pdb_file = output_path / f"{record_id}_model_0.pdb"
+        pdb_file = predictions_path / f"{record_id}_model_0.pdb"
         assert pdb_file.exists(), f"PDB file does not exist: {pdb_file}"
 
-        plddt_npz_file = output_path / f"plddt_{record_id}_model_0.npz"
+        plddt_npz_file = predictions_path / f"plddt_{record_id}_model_0.npz"
         assert (
             plddt_npz_file.exists()
         ), f"Plddt NPZ file does not exist: {plddt_npz_file}"
 
-        confidence_json_file = output_path / f"confidence_{record_id}_model_0.json"
+        confidence_json_file = predictions_path / f"confidence_{record_id}_model_0.json"
         assert (
             confidence_json_file.exists()
         ), f"Confidence JSON file does not exist: {confidence_json_file}"
 
         # may only have PDB output
-        structure_npz_file = output_path / f"{record_id}_model_0.npz"
+        structure_npz_file = predictions_path / f"{record_id}_model_0.npz"
+        structure_npz_file = (
+            None if not structure_npz_file.exists() else structure_npz_file
+        )
 
         prediction = cls(
             protein_id=record_id,
-            output_dir=output_path,
+            predictions_dir=predictions_path,
             path_pdb=pdb_file,
             path_plddt_npz=plddt_npz_file,
             path_confidence_json=confidence_json_file,
-            path_structure_npz=(
-                structure_npz_file if structure_npz_file.exists() else None
-            ),
+            path_structure_npz=structure_npz_file,
         )
 
         return prediction
@@ -190,7 +199,7 @@ class BoltzPrediction:
 
         return sequence
 
-    def clean_output_dir(self):
+    def clean_predictions_dir(self):
         """
         Remove outputs we don't need. Keep paths that are in the struct.
         """
@@ -205,7 +214,8 @@ class BoltzPrediction:
             if path is not None and path.exists()
         ]
 
-        for file in self.output_dir.glob("*"):
+        # glob recursively
+        for file in self.predictions_dir.glob("**/*"):
             if file.is_file() and file not in files_to_keep:
                 try:
                     os.remove(file)
@@ -401,7 +411,6 @@ class BoltzManifestBuilder:
 
         msa_filename = f"{msa_taxonomy_id}.csv"
         msa_path = msa_dir / msa_filename
-        msa_dir.mkdir(parents=True, exist_ok=True)
 
         # Write dummy MSA with just the target sequence using MSA_ID
         with open(msa_path, "w") as msa_f:
@@ -458,6 +467,15 @@ class BoltzManifestBuilder:
         if len(sequences) != len(protein_ids):
             raise ValueError("Number of sequences and protein IDs must match")
 
+        # ensure mols dir exists and is not empty
+        assert (
+            self.paths.mols_dir.exists()
+        ), f"Mols directory {self.paths.mols_dir} does not exist"
+        # HACK - check a specific file exists, not empty directory
+        assert (
+            self.paths.mols_dir / "000.pkl"
+        ).exists(), f"Mols directory {self.paths.mols_dir} is empty"
+
         ccd = load_canonicals(self.paths.mols_dir)
 
         records = []
@@ -479,6 +497,10 @@ class BoltzManifestBuilder:
                     use_msa_server=False,
                     msa_server_url="",
                     msa_pairing_strategy="",
+                    msa_server_username=None,
+                    msa_server_password=None,
+                    api_key_header=None,
+                    api_key_value=None,
                     max_msa_seqs=0,
                     processed_msa_dir=self.paths.processed_msa_dir,
                     processed_constraints_dir=self.paths.constraints_dir,
@@ -524,6 +546,10 @@ class BoltzManifestBuilder:
         """
         records = self._create_targets_from_sequences(
             sequences=sequences, protein_ids=protein_ids
+        )
+
+        logger.info(
+            f"Prepared Boltz-2 manifest with {len(records)} records, lengths: {[len(seq) for seq in sequences]}"
         )
         return Manifest(records=records)
 
@@ -734,15 +760,14 @@ class BoltzRunner(FoldingTool):
         if self.model is not None:
             self.model.to(self.device)
 
-        # TODO confirm trainer moved properly
         if self.trainer is not None:
             # Use string instead of device object for trainer accelerator
             if self.device.type == "cuda":
-                self.trainer.accelerator = "gpu"
+                self.trainer.strategy.accelerator = "gpu"
             elif self.device.type == "mps":
-                self.trainer.accelerator = "mps"
+                self.trainer.strategy.accelerator = "mps"
             else:
-                self.trainer.accelerator = "cpu"
+                self.trainer.strategy.accelerator = "auto"
 
     def _download_model_if_needed(self):
         """Download Boltz-2 model, mols, etc if not present in cache_dir."""
@@ -771,24 +796,26 @@ class BoltzRunner(FoldingTool):
             "write_full_pde": False,
         }
 
-        # TODO - upgrade to version 2.1.x that uses CUDA kernels,
-        #   which defines `use_kernels` instead of `use_trifast`
-        # (At writing, requires CUDA is available)
+        logger.info(f"Loading Boltz-2 model, will stay loaded...")
 
         self.model = Boltz2.load_from_checkpoint(
             self.checkpoint_path,
             strict=True,
             predict_args=predict_args,
-            map_location="cpu",
+            map_location=self.device,
             diffusion_process_args=asdict(self.diffusion_params),
             ema=False,
-            use_trifast=getattr(torch.cuda, "is_available", lambda: False)(),
+            use_kernels=self.device.type == "cuda",
             pairformer_args=asdict(self.pairformer_args),
             msa_args=asdict(self.msa_args),
             steering_args=asdict(self.steering_args),
         )
         self.model.eval()
         self.model.to(self.device)
+
+        # log model size
+        model_size = sum(p.numel() * p.element_size() for p in self.model.parameters())
+        logger.info(f"Boltz-2 model size: {model_size / (1024 ** 2):.2f} MB")
 
         self.trainer = Trainer(
             accelerator=self.cfg.accelerator,
@@ -813,6 +840,29 @@ class BoltzRunner(FoldingTool):
         return BoltzManifestBuilder(
             outputs_dir=output_dir, cache_dir=self.default_paths.cache_dir
         )
+
+    @staticmethod
+    def _cleanup_paths(paths: BoltzPaths) -> None:
+        """
+        Remove intermediate files/directories following predictions.
+
+        This function cleans up the input artifacts created and intermediate processed files.
+        Prediction directories are handled separately by `BoltzPrediction.clean_predictions_dir`.
+
+        We leave the top-level directories in place, as they are expected to remain created.
+        """
+        for dir in [
+            # remove boltz intermediate files
+            paths.processed_dir,
+            # Remove dummy MSAs
+            paths.msa_dir,
+        ]:
+            if dir.exists():
+                for item in dir.iterdir():
+                    if item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+                    else:
+                        item.unlink(missing_ok=True)
 
     def predict(
         self,
@@ -870,7 +920,7 @@ class BoltzRunner(FoldingTool):
             target_dir=paths.structures_dir,
             msa_dir=paths.processed_msa_dir,
             mol_dir=paths.mols_dir,
-            num_workers=1,
+            num_workers=self.cfg.num_workers,
             constraints_dir=paths.constraints_dir,
             template_dir=paths.templates_dir,
             extra_mols_dir=paths.processed_mols_dir,
@@ -890,6 +940,7 @@ class BoltzRunner(FoldingTool):
         self.trainer.callbacks = [writer]
 
         # Run prediction
+        logger.debug(f"Running Boltz prediction for {len(manifest.records)} records")
         self.trainer.predict(
             self.model,
             datamodule=data_module,
@@ -902,8 +953,11 @@ class BoltzRunner(FoldingTool):
             protein_output_dir = paths.predictions_dir / record.id
             prediction = BoltzPrediction.from_output_dir(protein_output_dir)
             # remove unnecesary outputs
-            prediction.clean_output_dir()
+            prediction.clean_predictions_dir()
             predictions.append(prediction)
+
+        # remove remaining intermediate Boltz-2 input / processing artifacts
+        self._cleanup_paths(paths)
 
         return BoltzPredictionSet(predictions)
 
@@ -1026,7 +1080,9 @@ class BoltzRunner(FoldingTool):
             for item in predictions_dir.iterdir():
                 if item.is_dir():
                     try:
-                        predictions.append(BoltzPrediction.from_output_dir(item))
+                        prediction = BoltzPrediction.from_output_dir(item)
+                        prediction.clean_predictions_dir()
+                        predictions.append(prediction)
                     except (FileNotFoundError, AssertionError):
                         continue
 

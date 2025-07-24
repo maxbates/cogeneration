@@ -23,10 +23,13 @@ from cogeneration.models.attention.triangular_mult import (
 CHUNK_SIZE_THRESHOLD = 384
 
 
-def _get_chunk_size(is_training: bool, edge_embed: torch.Tensor) -> Optional[int]:
+def _get_chunk_size(
+    is_training: bool,
+    edge_embed: torch.Tensor,  # (B, N, N, c_z)
+) -> Optional[int]:
     if not is_training:
         if edge_embed.shape[1] > CHUNK_SIZE_THRESHOLD:
-            chunk_size_tri_attn = 128
+            chunk_size_tri_attn = min(128, edge_embed.shape[1] // 2)
         else:
             chunk_size_tri_attn = 512
     else:
