@@ -119,4 +119,11 @@ if [[ "$WITH_CUDA" -eq 1 ]]; then
     set -a && source $REPO_DIR/cogeneration/.env.cuda && set +a
 fi
 
+# 8. Dummy boltz run, to trigger downloading of weights + mols
+echo "Running Boltz to trigger weights + mols download"
+echo ">dummy|protein|empty\nACGTDK\n" > boltz_dummy.fasta
+boltz predict boltz_dummy.fasta
+rm boltz_dummy.fasta
+rm -r boltz_results_boltz_dummy
+
 echo "\nSetup complete. You should run 'wandb login' before training."
