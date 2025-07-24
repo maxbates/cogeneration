@@ -154,7 +154,8 @@ class LengthBatcher:
         else:
             replica_csv = self._data_csv
 
-        # Each batch contains multiple proteins of the same length.
+        # Each batch contains multiple proteins of the same length,
+        # and limit batch sizes to avoid OOM.
         sample_order = []
         for seq_len, len_df in replica_csv.groupby(self.modeled_length_col):
             max_batch_size = min(
@@ -168,7 +169,7 @@ class LengthBatcher:
                 batch_repeats = math.floor(max_batch_size / len(batch_indices))
                 sample_order.append(batch_indices * batch_repeats)
 
-        # Remove any length bias.
+        # Shuffle to remove any length bias.
         if self.shuffle:
             new_order = (
                 torch.randperm(len(sample_order), generator=rng).numpy().tolist()

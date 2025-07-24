@@ -789,6 +789,8 @@ def save_trajectory(
         chain_idx=chain_idx,
         res_idx=res_idx,
         backbone_only=False,
+        # ensure UNK converted to ALA, e.g. for ProteinMPNN
+        convert_unk_to_alanine=True,
     )
     sample_pdb_backbone_path = write_prot_to_pdb(
         sample_atom37,
@@ -799,6 +801,7 @@ def save_trajectory(
         chain_idx=chain_idx,
         res_idx=res_idx,
         backbone_only=True,
+        convert_unk_to_alanine=True,
     )
 
     if not write_trajectories:

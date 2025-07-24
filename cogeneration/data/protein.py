@@ -325,10 +325,11 @@ def write_prot_to_pdb(
     overwrite=False,
     no_indexing=False,
     backbone_only: bool = False,
+    convert_unk_to_alanine: bool = True,
 ) -> str:
     """
     Writes a protein (3D tensor) or a trajectory (N steps, 3D tensor) to a PDB file.
-    The positions should be the full atom37 representation
+    The positions should be the full atom37 representation.
     """
     if overwrite:
         max_existing_idx = 0
@@ -356,6 +357,12 @@ def write_prot_to_pdb(
 
     if aatype is not None:
         assert aatype.ndim == prot_pos.ndim - 2
+
+        # Convert UNK residues (20) to alanine (0)
+        # Otherwise even if atom37 has ALA, but aatype is UNK, will override to UNK
+        if convert_unk_to_alanine:
+            aatype = aatype.copy()
+            aatype[aatype == 20] = 0  # UNK -> alanine
 
     with open(save_path, "w") as f:
         if prot_pos.ndim == 4:

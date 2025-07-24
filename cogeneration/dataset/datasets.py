@@ -818,9 +818,14 @@ class BaseDataset(Dataset):
         # If test set IDs defined, remove from training set
         if self.cfg.test_set_pdb_ids_path is not None:
             test_set_df = pd.read_csv(cfg.test_set_pdb_ids_path)
+            len_before = len(self.csv)
             self.csv = self.csv[
                 self.csv[mc.pdb_name].isin(test_set_df[mc.pdb_name].values)
             ]
+            len_after = len(self.csv)
+            self._log.info(
+                f"Filtered to test set: {len_before} -> {len_after} examples"
+            )
 
     @property
     def is_training(self):
@@ -839,8 +844,14 @@ class BaseDataset(Dataset):
             self.csv = data_csv
             self._log.info(f"Training: {len(self.csv)} examples")
         else:
-            # pick all samples in data_csv with valid eval length
-            eval_lengths = data_csv[self.modeled_length_col]
+            # Limit validation set to `self.cfg.num_eval_lengths` length subset
+
+            length_column = self.modeled_length_col
+            # Fix a random seed to get the same split each time.
+            fixed_seed = 123
+
+            # Pick `self.cfg.num_eval_lengths` lengths
+            eval_lengths = data_csv[length_column]
             if self.cfg.max_eval_length is not None:
                 eval_lengths = eval_lengths[eval_lengths <= self.cfg.max_eval_length]
             all_lengths = np.sort(eval_lengths.unique())
@@ -849,13 +860,13 @@ class BaseDataset(Dataset):
             )
             length_indices = length_indices.astype(int)
             eval_lengths = all_lengths[length_indices]
-            eval_csv = data_csv[data_csv[self.modeled_length_col].isin(eval_lengths)]
+            eval_csv = data_csv[data_csv[length_column].isin(eval_lengths)]
 
-            # Fix a random seed to get the same split each time.
-            eval_csv = eval_csv.groupby(self.modeled_length_col).sample(
-                self.cfg.samples_per_eval_length, replace=True, random_state=123
+            # Pick subset per length
+            eval_csv = eval_csv.groupby(length_column).sample(
+                self.cfg.samples_per_eval_length, replace=True, random_state=fixed_seed
             )
-            eval_csv = eval_csv.sort_values(self.modeled_length_col, ascending=False)
+            eval_csv = eval_csv.sort_values(length_column, ascending=False)
             self.csv = eval_csv
             self._log.info(
                 f"Validation: {len(self.csv)} examples with lengths {eval_lengths}"

@@ -149,7 +149,12 @@ class StructureExperimentalMethod(StrEnum):
         if value in _STR_TO_METHOD:
             return _STR_TO_METHOD[value]
 
-        raise ValueError(f"Unknown structure method: {value}")
+        # try splitting on ',' and ';' because methods can come concatenated
+        for part in map(str.strip, value.replace(",", ";").split(";")):
+            if part in _STR_TO_METHOD:
+                return _STR_TO_METHOD[part]
+
+        raise ValueError(f"Unknown experimental method: {value}")
 
     @classmethod
     def from_structure(cls, structure: Structure) -> "StructureExperimentalMethod":
@@ -166,17 +171,6 @@ class StructureExperimentalMethod(StrEnum):
         # PDBParser sets 'structure_method', MMCIFParser may set 'experiment_method'
         raw: str = (
             header.get("structure_method") or header.get("experiment_method") or ""
-        ).upper()
+        )
 
-        # split on ';' because methods can come concatenated
-        for part in map(str.strip, raw.split(";")):
-            if not part:
-                continue
-            try:
-                return cls.from_value(part)
-            except ValueError:
-                # continue to try next part
-                continue
-
-        # Don't fallback to an Unknown / other
-        raise ValueError(f"Unknown structure method: {raw}")
+        return cls.from_value(raw)

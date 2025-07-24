@@ -49,7 +49,9 @@ def aatype_to_seq(aatype, chain_idx=None):
 
 
 def seq_to_aatype(seq):
-    return [residue_constants.restypes_with_x.index(x) for x in seq]
+    return [
+        residue_constants.restypes_with_x.index(x) for x in seq if x != CHAIN_BREAK_STR
+    ]
 
 
 CHAIN_BREAK_STR = ":"

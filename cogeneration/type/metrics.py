@@ -34,7 +34,7 @@ class MetricName(StrEnum):
 
     # sequence + structure information
     header = "header"  # sequence name, header in fasta file
-    sequence = "sequence"  # sequence of amino acids
+    sequence = "sequence"  # sequence of amino acids; or, inverse folded sequence
     sample_pdb_path = "sample_pdb_path"  # filepath to generated pdb file
     folded_pdb_path = "folded_path"  # filepath to folded pdb file
 

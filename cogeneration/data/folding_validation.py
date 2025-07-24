@@ -12,7 +12,7 @@ from Bio import SeqIO
 
 from cogeneration.config.base import FoldingConfig, FoldingModel
 from cogeneration.data import residue_constants
-from cogeneration.data.const import CA_IDX, aatype_to_seq
+from cogeneration.data.const import CA_IDX, aatype_to_seq, seq_to_aatype
 from cogeneration.data.io import write_numpy_json
 from cogeneration.data.metrics import calc_ca_ca_metrics, calc_mdtraj_metrics
 from cogeneration.data.protein import write_prot_to_pdb
@@ -123,6 +123,7 @@ class FoldingValidator:
         sample_dir = Path(sample_dir)
         inverse_folding_dir = sample_dir / "inverse_folding"
         folding_dir = sample_dir / "folding"
+        designability_folding_dir = folding_dir / "designability"
 
         # Check files / directories
         assert os.path.exists(
@@ -219,7 +220,7 @@ class FoldingValidator:
 
         # Sequence recovery helpers
         def _seq_str_to_np(seq: str) -> npt.NDArray:
-            return np.array([restype_order_with_x[x] for x in seq])
+            return np.array(seq_to_aatype(seq))
 
         def _calc_seq_recovery(ref_seq: npt.NDArray, pred_seq: npt.NDArray) -> float:
             return (ref_seq == pred_seq).mean()
@@ -268,7 +269,7 @@ class FoldingValidator:
         if also_fold_pmpnn_seq or not is_codesign:
             designability_df = self.fold_fasta(
                 fasta_path=inverse_folded_fasta_path,
-                output_dir=folding_dir,
+                output_dir=designability_folding_dir,
             )
             designability_df = FoldingValidator.assess_folded_structures(
                 sample_pdb_path=pred_pdb_path,
@@ -540,12 +541,14 @@ class FoldingValidator:
         metrics_df.to_csv(metrics_csv_path, index=False)
         return metrics_df, metrics_csv_path
 
-    def fold_fasta(self, fasta_path: Path, output_dir: Path) -> FoldingDataFrame:
+    def fold_fasta(
+        self, fasta_path: Path, output_dir: Path, require_empty: bool = True
+    ) -> FoldingDataFrame:
         """
         Fold sequences in a fasta file.
 
-        Require `output_dir` to be empty,
-        since content inside it will be removed to prevent AF2 artifact bloat.
+        If `require_empty` is True, require `output_dir` to be empty,
+        since content inside it will be removed to prevent artifact bloat.
 
         Returns a dataframe with `header`, `sequence`, `folded_pdb_path`, `mean_plddt`
         """
@@ -669,11 +672,29 @@ class FoldingValidator:
                 pdb_file_path=row[MetricName.folded_pdb_path],
                 pdb_name=row[MetricName.header],
             )
+
+            # Check that the sequence in the folded_df matches the sequence in the folded PDB
+            # Convert unknown to alanine to match how PDBs are written.
+            df_seq = row[MetricName.sequence].replace("X", "A")
+            folded_pdb_seq = aatype_to_seq(
+                folded_feats[dpc.aatype], chain_idx=folded_feats[dpc.chain_index]
+            ).replace("X", "A")
+            if df_seq != folded_pdb_seq:
+                print(f"header:         {row[MetricName.header]}")
+                print(f"df_seq:         {df_seq}")
+                print(f"folded_pdb_seq: {folded_pdb_seq}")
+                print(
+                    f"chains:         {"".join([str(x) for x in folded_feats[dpc.chain_index].tolist()])}"
+                )
+                print(f"task:           {task}")
+                print(f"PDB:            {row[MetricName.folded_pdb_path]}")
+                print(f"num folds:      {len(folded_df)}")
+                raise Exception("Folded sequence mismatch!")
+
             sample_metrics = {
-                # Include the original row. Includes `header`, `folded_pdb_path`, `plddt_mean` from AF2.
+                # Include the original row. Includes `header`, `sequence`, `folded_pdb_path`, `plddt_mean` from folding.
                 **row.to_dict(),
                 # Associate with the generated sample
-                MetricName.sequence: aatype_to_seq(folded_feats[dpc.aatype]),
                 MetricName.sample_pdb_path: str(sample_pdb_path),
             }
 
