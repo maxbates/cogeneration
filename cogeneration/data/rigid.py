@@ -255,7 +255,12 @@ def align_structures(
 
     # Compute rotation matrix correction for ensuring right-handed coordinate system
     # For comparison with other sources: det(AB) = det(A)*det(B) and det(A) = det(A.T)
-    sign_correction = torch.sign(torch.linalg.det(torch.bmm(v, u_t)))
+    with torch.amp.autocast(device_type="cuda", enabled=False):
+        # suspend BF16 autocast for LU kernel
+        # TODO remove when supported
+        # https://docs.pytorch.org/docs/stable/generated/torch.linalg.det.html
+        det = torch.linalg.det(torch.bmm(v.float(), u_t.float()))
+    sign_correction = torch.sign(det).to(v.dtype)
     # Correct transpose of U: diag(1, 1, sign_correction) @ U.T
     u_t[:, 2, :] = u_t[:, 2, :] * sign_correction[:, None]
 

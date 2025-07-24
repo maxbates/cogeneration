@@ -179,7 +179,7 @@ def angles_noise(
     vm_device = sigma.device if "mps" not in str(sigma.device) else torch.device("cpu")
     vm = VonMises(
         loc=torch.zeros((num_batch,), device=vm_device),
-        concentration=kappa.cpu(),
+        concentration=kappa.to(vm_device),
     )
     # sample raw angles in (−π, π]
     angles = vm.sample((num_samples, num_angles))  # (N, K, B)

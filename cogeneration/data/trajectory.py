@@ -73,6 +73,9 @@ class SamplingStep:
         """
         Select batch members by index `idx`.
         """
+        # force device; may be detached or copied to CPU
+        idx = idx.to(self.res_mask.device)
+
         return SamplingStep(
             res_mask=self.res_mask[idx],
             trans=self.trans[idx],

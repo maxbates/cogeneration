@@ -460,9 +460,7 @@ class MotifFactory:
         max_scaffold_length = max(
             bound_length, num_res - floor(num_res * self.cfg.min_percent_motifs)
         )
-        scaffold_length = self.rng.integers(
-            min_scaffold_length, max_scaffold_length + 1
-        )
+        scaffold_length = self.rng.integers(min_scaffold_length, max_scaffold_length)
 
         # get a distance cut off
         seed_dists = dist2d[seed_idx]

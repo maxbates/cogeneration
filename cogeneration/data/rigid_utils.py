@@ -1031,6 +1031,12 @@ class Rigid:
         """
         return self._trans
 
+    def detach(self):
+        """
+        Detaches the rotation and translation from the computation graph.
+        """
+        return Rigid(self._rots.detach(), self._trans.detach())
+
     def compose_q_update_vec(
         self,
         q_update_vec: torch.Tensor,
