@@ -161,7 +161,11 @@ class ProteinMPNNRunner(InverseFoldingTool):
     and returns logits without PDB I/O overhead.
     """
 
-    def __init__(self, cfg: ProteinMPNNRunnerConfig):
+    def __init__(
+        self,
+        cfg: ProteinMPNNRunnerConfig,
+        device: Optional[Union[str, int]] = None,
+    ):
         """
         Initialize the ProteinMPNN runner.
 
@@ -169,26 +173,31 @@ class ProteinMPNNRunner(InverseFoldingTool):
             cfg: ProteinMPNN configuration object
         """
         self.cfg = cfg
+
+        # Initialize model before setting device
         self._model = None
         self._model_sc = None  # Side chain packing model
         self._checkpoint_path = None
         self._ligandmpnn_modules = {}  # Cache for loaded modules
 
+        self.set_device_id(device)
+
         # Thread-safe lock for this instance
         self._instance_lock = threading.Lock()
-
-        self.set_device_id(None)
 
     @property
     def device(self) -> torch.device:
         """Public access to the device."""
         return self._device
 
-    def set_device_id(self, device_id: Optional[int] = None):
+    def set_device_id(self, device_id: Optional[Union[str, int]] = None):
         """Set the device ID"""
         self._device = infer_device_id(device_id=device_id)
 
         if self._model is not None:
+            logger.info(
+                f"Moving {self.cfg.model_type} model to device {self._device}..."
+            )
             self._model.to(self._device)
 
     def _create_mpnn_to_cogen_conversion_map(self) -> torch.Tensor:
@@ -407,6 +416,10 @@ class ProteinMPNNRunner(InverseFoldingTool):
             return self._model
 
         try:
+            logger.info(
+                f"Loading LigandMPNN ({self.cfg.model_type}) (will persist in memory)..."
+            )
+
             # Load required modules
             model_utils = self._load_ligandmpnn_module("model_utils")
             ProteinMPNN = model_utils.ProteinMPNN
@@ -449,7 +462,12 @@ class ProteinMPNNRunner(InverseFoldingTool):
             self._model.to(self._device)
             self._model.eval()
 
-            logger.debug(f"Successfully loaded {self.cfg.model_type} model")
+            # calculate model size
+            model_size = sum(p.numel() for p in self._model.parameters())
+
+            logger.info(
+                f"Successfully loaded {self.cfg.model_type} model on {self.device} (size: {model_size / (1024 ** 2):.2f} MB)"
+            )
             return self._model
 
         except ImportError as e:
@@ -804,7 +822,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
         )
 
         end_time = time.time()
-        logger.debug(
+        logger.info(
             f"Native ProteinMPNN completed successfully in {end_time - start_time:.2f} seconds"
         )
 
@@ -834,6 +852,8 @@ class ProteinMPNNRunner(InverseFoldingTool):
             seed = self.cfg.pmpnn_seed or 0
         if temperature is None:
             temperature = self.cfg.temperature
+
+        start_time = time.time()
 
         # Create output directory
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -940,6 +960,11 @@ class ProteinMPNNRunner(InverseFoldingTool):
         # Process FASTA output
         processed_fasta = self._process_fasta_output(
             original_fasta, output_dir, pdb_path.stem
+        )
+
+        end_time = time.time()
+        logger.info(
+            f"Subprocess ProteinMPNN completed successfully in {end_time - start_time:.2f} seconds"
         )
 
         return processed_fasta

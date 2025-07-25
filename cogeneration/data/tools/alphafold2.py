@@ -4,7 +4,7 @@ import logging
 import os
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -22,16 +22,10 @@ class AlphaFold2Tool(FoldingTool):
     def __init__(
         self,
         cfg: AlphaFold2Config,
+        device: Optional[Union[str, int]] = None,
     ):
-        """
-        Initialize AlphaFold2 tool.
-
-        Args:
-            colabfold_path: Path to ColabFold executable
-            device_id: GPU device ID to use
-            seed: Random seed for reproducibility
-        """
         self.cfg = cfg
+        self.set_device_id(device)
 
         self.log = logging.getLogger(__name__)
 
@@ -39,7 +33,7 @@ class AlphaFold2Tool(FoldingTool):
             self.cfg.colabfold_path
         ), f"ColabFold path {self.cfg.colabfold_path} does not exist"
 
-    def set_device_id(self, device_id: Optional[int] = None):
+    def set_device_id(self, device_id: Optional[Union[str, int]] = None):
         """Set the GPU device ID."""
         if device_id is None:
             device_id = 0

@@ -471,7 +471,8 @@ class BoltzManifestBuilder:
         assert (
             self.paths.mols_dir.exists()
         ), f"Mols directory {self.paths.mols_dir} does not exist"
-        # HACK - check a specific file exists, not empty directory
+        # check a specific file exists, not empty directory
+        # (brittle - may break if Boltz changes)
         assert (
             self.paths.mols_dir / "000.pkl"
         ).exists(), f"Mols directory {self.paths.mols_dir} is empty"
@@ -695,6 +696,15 @@ class BoltzManifestBuilder:
         return fasta_only_dir
 
 
+class QuietBoltzWriter(BoltzWriter):
+    """
+    Quiet BoltzWriter that does not print the number of failed examples.
+    """
+
+    def on_predict_epoch_end(self, *args, **kwargs):
+        pass
+
+
 class BoltzRunner(FoldingTool):
     """
     Boltz-2 structure prediction class for efficient repeated inference.
@@ -707,12 +717,19 @@ class BoltzRunner(FoldingTool):
     def __init__(
         self,
         cfg: BoltzConfig,
+        device: Optional[Union[str, int]] = None,
     ):
         """
         Initialize the Boltz predictor.
 
         """
         self.cfg = cfg
+
+        # Initialize model and trainer to None before setting device
+        self.model = None
+        self.trainer = None
+
+        self.set_device_id(device)
 
         # Set up default paths using BoltzPaths
         self.default_paths = BoltzPaths(
@@ -721,13 +738,6 @@ class BoltzRunner(FoldingTool):
         self.default_paths.mkdirs()
 
         self.checkpoint_path = self.cfg.checkpoint_path
-
-        # Initialize model and trainer to None before setting device
-        self.model = None
-        self.trainer = None
-
-        # setup default device
-        self.set_device_id(None)
 
         # Set up precision with fallback logic
         if self.cfg.precision is None:
@@ -753,11 +763,12 @@ class BoltzRunner(FoldingTool):
 
         # Model loaded in `predict` when first needed
 
-    def set_device_id(self, device_id: Optional[int] = None):
+    def set_device_id(self, device_id: Optional[Union[str, int]] = None):
         """Set the device ID for the folding tool."""
         self.device = infer_device_id(device_id=device_id)
 
         if self.model is not None:
+            logger.info(f"Moving Boltz-2 model to device {self.device}...")
             self.model.to(self.device)
 
         if self.trainer is not None:
@@ -796,7 +807,10 @@ class BoltzRunner(FoldingTool):
             "write_full_pde": False,
         }
 
-        logger.info(f"Loading Boltz-2 model, will stay loaded...")
+        logger.info(f"Loading Boltz-2 model (will persist in memory)...")
+
+        # performance settings
+        # TODO(boltz) use compile kwargs. Issue naming state keys.
 
         self.model = Boltz2.load_from_checkpoint(
             self.checkpoint_path,
@@ -805,7 +819,8 @@ class BoltzRunner(FoldingTool):
             map_location=self.device,
             diffusion_process_args=asdict(self.diffusion_params),
             ema=False,
-            use_kernels=self.device.type == "cuda",
+            use_kernels=self.cfg.use_kernels,
+            predict_bfactor=True,
             pairformer_args=asdict(self.pairformer_args),
             msa_args=asdict(self.msa_args),
             steering_args=asdict(self.steering_args),
@@ -815,7 +830,9 @@ class BoltzRunner(FoldingTool):
 
         # log model size
         model_size = sum(p.numel() * p.element_size() for p in self.model.parameters())
-        logger.info(f"Boltz-2 model size: {model_size / (1024 ** 2):.2f} MB")
+        logger.info(
+            f"Successfully loaded Boltz-2 model on {self.device} (size: {model_size / (1024 ** 2):.2f} MB)"
+        )
 
         self.trainer = Trainer(
             accelerator=self.cfg.accelerator,
@@ -879,7 +896,11 @@ class BoltzRunner(FoldingTool):
         Returns:
             BoltzPredictionSet containing BoltzPrediction objects for each protein in the manifest.
         """
+        # Load model if not already loaded
+        if self.model is None or self.trainer is None:
+            self._load_model()
 
+        start_time = time.time()
         paths.predictions_dir.mkdir(parents=True, exist_ok=True)
 
         # Require an empty output directory, so we can safely clean up outputs.
@@ -890,10 +911,6 @@ class BoltzRunner(FoldingTool):
                     f"Output directory {protein_output_dir} is not empty. "
                     "Please provide an empty directory for new targets."
                 )
-
-        # Load model if not already loaded
-        if self.model is None or self.trainer is None:
-            self._load_model()
 
         # Use BoltzPaths processed directory
         processed_path = paths.processed_dir
@@ -929,7 +946,7 @@ class BoltzRunner(FoldingTool):
         )
 
         # Set up writer
-        writer = BoltzWriter(
+        writer = QuietBoltzWriter(
             data_dir=str(paths.structures_dir),
             output_dir=str(paths.predictions_dir),
             output_format=self.cfg.output_format,
@@ -940,7 +957,7 @@ class BoltzRunner(FoldingTool):
         self.trainer.callbacks = [writer]
 
         # Run prediction
-        logger.debug(f"Running Boltz prediction for {len(manifest.records)} records")
+        logger.debug(f"Running Boltz prediction for {len(manifest.records)} records...")
         self.trainer.predict(
             self.model,
             datamodule=data_module,
@@ -958,6 +975,11 @@ class BoltzRunner(FoldingTool):
 
         # remove remaining intermediate Boltz-2 input / processing artifacts
         self._cleanup_paths(paths)
+
+        end_time = time.time()
+        logger.info(
+            f"Boltz prediction completed in {end_time - start_time:.2f} seconds"
+        )
 
         return BoltzPredictionSet(predictions)
 

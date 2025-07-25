@@ -57,20 +57,28 @@ class FoldingValidator:
     """
 
     cfg: FoldingConfig
+    device: Optional[Union[str, int]] = None
 
     def __post_init__(self):
         self.log = logging.getLogger(__name__)
 
         # Initialize inverse folding tool (ProteinMPNN)
         self.inverse_folding_tool: InverseFoldingTool = ProteinMPNNRunner(
-            cfg=self.cfg.protein_mpnn
+            cfg=self.cfg.protein_mpnn,
+            device=self.device,
         )
 
         # Initialize folding tool
         if self.cfg.folding_model == FoldingModel.alphafold2:
-            self.folding_tool = AlphaFold2Tool(cfg=self.cfg.alphafold)
+            self.folding_tool = AlphaFold2Tool(
+                cfg=self.cfg.alphafold,
+                device=self.device,
+            )
         elif self.cfg.folding_model == FoldingModel.boltz2:
-            self.folding_tool = BoltzRunner(cfg=self.cfg.boltz)
+            self.folding_tool = BoltzRunner(
+                cfg=self.cfg.boltz,
+                device=self.device,
+            )
         else:
             raise ValueError(f"Unsupported folding model: {self.cfg.folding_model}")
 

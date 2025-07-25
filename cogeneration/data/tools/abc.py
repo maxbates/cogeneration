@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -34,7 +34,7 @@ class FoldingTool(ABC):
         raise NotImplementedError("Subclasses must implement this method.")
 
     @abstractmethod
-    def set_device_id(self, device_id: Optional[int] = None):
+    def set_device_id(self, device_id: Optional[Union[str, int]] = None):
         """Set the device ID for the folding tool."""
         raise NotImplementedError("Subclasses must implement this method.")
 
@@ -69,12 +69,15 @@ class InverseFoldingTool(ABC):
         raise NotImplementedError("Subclasses must implement this method.")
 
     @abstractmethod
-    def set_device_id(self, device_id: Optional[int] = None):
+    def set_device_id(self, device_id: Optional[Union[str, int]] = None):
         """Set the device ID for the folding tool."""
         raise NotImplementedError("Subclasses must implement this method.")
 
 
-def infer_device_id(device_id: Optional[int] = None) -> torch.device:
+def infer_device_id(device_id: Optional[Union[str, int]] = None) -> torch.device:
+    if isinstance(device_id, str):
+        return torch.device(device_id)
+
     if torch.cuda.is_available():
         if device_id is None:
             device = "cuda"
