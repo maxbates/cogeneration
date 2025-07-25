@@ -1630,6 +1630,11 @@ class Interpolant:
         )
 
         # set up additional default values
+        structure_method_tensor = (
+            StructureExperimentalMethod.to_tensor(structure_method)
+            .to(self._device)
+            .expand(num_batch, 1)
+        )
         if hot_spots is None:
             hot_spots = torch.zeros(num_batch, num_res, device=self._device)
         if contact_conditioning is None:
@@ -1643,9 +1648,7 @@ class Interpolant:
             bp.diffuse_mask: diffuse_mask,
             bp.chain_idx: chain_idx,
             bp.res_idx: res_idx,
-            bp.structure_method: StructureExperimentalMethod.to_tensor(structure_method)
-            .to(self._device)
-            .expand(num_batch, 1),
+            bp.structure_method: structure_method_tensor,
             bp.hot_spots: hot_spots,
             bp.contact_conditioning: contact_conditioning,
             nbp.trans_sc: trans_sc,

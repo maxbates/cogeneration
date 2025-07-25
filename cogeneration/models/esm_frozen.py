@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -22,6 +23,8 @@ If want pair representation out of ESM, then will fall back to standard attentio
 However, if we only cared about enriching the single representation, or using for logits, 
 and not the pair representation, we use these faster variants using FAPLM.
 """
+
+logger = logging.getLogger(__name__)
 
 
 # registry keys are string or ModelESMKey
@@ -113,7 +116,7 @@ class _DummyRandomFAPLM(nn.Module):
     def __init__(self, embed_dim: int, n_layers: int, n_heads: int):
         super().__init__()
 
-        # hack - use fair-ESM style, since FAPLM uses hidden struct class
+        # use fair-ESM style, since FAPLM uses hidden struct class
         self.embed_dim = embed_dim
         self.num_layers = n_layers
         self.attention_heads = n_heads
@@ -289,6 +292,9 @@ class FrozenEsmModel(nn.Module):
         caching: bool = True,  # enable caching the last call
     ):
         super().__init__()
+
+        logger.info(f"Loading ESM model: {model_key}...")
+
         self.esm = ESM_REGISTRY.load_model(model_key)
         self.esm_dict = ESM_REGISTRY.load_alphabet()
         self.use_esm_attn_map = use_esm_attn_map
@@ -300,7 +306,9 @@ class FrozenEsmModel(nn.Module):
         for param in self.esm.parameters():
             param.requires_grad = False
         self.esm.eval()
-        self.esm.to(torch.float16)  # half precision
+
+        model_size = sum(p.numel() for p in self.esm.parameters())
+        logger.info(f"ESM {model_key} loaded, size: {model_size / (1024 ** 2):.2f} MB")
 
     def state_dict(self, *args, **kwargs):
         # contibute nothing to state_dict (save space in checkpoints)

@@ -99,7 +99,8 @@ class Experiment:
         # Module
         self._module = FlowModule(
             self.cfg,
-            folding_device_id=folding_device_id,
+            folding_device=folding_device_id,
+            offload_tools=not self.cfg.folding.own_device,
         )
         log.info("\n" + str(ModelSummary(self._module, max_depth=2)))
 
@@ -143,7 +144,9 @@ class Experiment:
         if local_rank == 0:
             # write locally
             ckpt_dir = self.cfg.experiment.checkpointer.dirpath
-            log.info(f"Checkpoints saved to {ckpt_dir}")
+            log.info(
+                f"Checkpoints, config, validations etc. will be saved to: {ckpt_dir}"
+            )
             os.makedirs(ckpt_dir, exist_ok=True)
             cfg_path = os.path.join(ckpt_dir, "config.yaml")
             with open(cfg_path, "w") as f:
@@ -175,22 +178,46 @@ class Experiment:
                 wandb.run.log_artifact(artifact_trace)
 
                 # save memory snapshot
-                if torch.cuda.is_available():
-                    snapshot_path = f"snapshot_{step}.pickle"
-                    torch.cuda.memory._dump_snapshot(snapshot_path)
-                    artifact_snapshot = wandb.Artifact(
-                        f"snapshot_{step}", type="snapshot"
-                    )
-                    artifact_snapshot.add_file(snapshot_path)
-                    wandb.run.log_artifact(artifact_snapshot)
+                # if torch.cuda.is_available():
+                #     snapshot_path = f"snapshot_{step}.pickle"
+                #     torch.cuda.memory._dump_snapshot(snapshot_path)
+                #     artifact_snapshot = wandb.Artifact(
+                #         f"snapshot_{step}", type="snapshot"
+                #     )
+                #     artifact_snapshot.add_file(snapshot_path)
+                #     wandb.run.log_artifact(artifact_snapshot)
 
             profiler = PyTorchProfiler(
-                # activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                schedule=schedule(wait=0, warmup=0, active=1, repeat=0),
+                # choose schedule based on observed problems
+                schedule=schedule(wait=0, warmup=1, active=1, repeat=0),
                 on_trace_ready=wandb_trace_uploader,
-                record_shapes=True,
-                profile_memory=True,
+                # Including both CPU + GPU, esp with memory, may yield a very large trace (>> GB)
+                # activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                with_stack=True,
+                # disable to avoid large memory allocation
+                # may lead to dataloader worker overload
+                profile_memory=False,
+                # disable to reduce profiler memory usage
+                record_shapes=False,
             )
+
+        # Try to compile model
+        model = self._module
+        if self.cfg.experiment.torch_compile:
+            log.info("Running torch.compile()...")
+
+            # torch dynamo explanation for debugging - note requires DDP set up for data module
+            # explanation = dynamo.explain(model)(
+            #     next(iter(self._datamodule.train_dataloader()))
+            # )
+            # log.info(explanation)
+
+            try:
+                model: LightningModule = torch.compile(self._module, mode="max-autotune")  # type: ignore
+            except Exception as e:
+                log.warning(
+                    f"Failed to torch.compile model, continuing with original: {e}"
+                )
 
         log.info("Setting up Trainer...")
         trainer = Trainer(
@@ -200,23 +227,8 @@ class Experiment:
             use_distributed_sampler=False,  # TODO - ddp
             devices=self._train_device_ids,
             profiler=profiler,
+            enable_model_summary=False,  # manual model summary
         )
-
-        # Try to compile model
-        model = self._module
-        if self.cfg.experiment.torch_compile:
-            # torch dynamo explanation for debugging
-            explanation = dynamo.explain(model)(
-                next(iter(self._datamodule.train_dataloader()))
-            )
-            log.info(explanation)
-
-            try:
-                model: LightningModule = torch.compile(self._module)  # type: ignore
-            except Exception as e:
-                log.warning(
-                    f"Failed to torch.compile model, continuing with original: {e}"
-                )
 
         # Train
         log.info("Starting training...")

@@ -1,3 +1,4 @@
+import gc
 import glob
 import json
 import logging
@@ -55,10 +56,36 @@ def to_numpy(x: Optional[torch.Tensor]) -> Optional[np.ndarray]:
     return x.detach().cpu().numpy()
 
 
+# TODO move to util or remove
+def snapshot_tensors(tag):
+    """
+    Print all live GPU tensors.
+    """
+    print(f"\n=== {tag} ===")
+    print(torch.cuda.memory_summary())
+    # Walk the Python GC to find live GPU tensors
+    for obj in gc.get_objects():
+        if torch.is_tensor(obj) and obj.is_cuda:
+            print(type(obj), obj.shape, obj.dtype)
+
+
 class FlowModule(LightningModule):
-    def __init__(self, cfg: Config, folding_device_id: int = 0):
+    def __init__(
+        self,
+        cfg: Config,
+        folding_device: Union[str, int] = 0,
+        offload_tools: bool = False,
+    ):
         super().__init__()
         self.cfg = cfg
+
+        # Track folding device
+        self.folding_device = folding_device
+        # May offload during training, load onto it for validation / predictions
+        self.offload_tools = offload_tools
+        # Default folding device is CPU if offloading tools
+        initial_folding_device = "cpu" if offload_tools else folding_device
+
         self.save_hyperparameters("cfg")
 
         self.model = FlowModel(self.cfg.model)
@@ -67,12 +94,14 @@ class FlowModule(LightningModule):
 
         self.folding_validator = FoldingValidator(
             cfg=self.cfg.folding,
+            device=initial_folding_device,
         )
 
         # self.logger defined in LightningModule
         self._log = logging.getLogger(__name__)
 
         self._epoch_start_time = None
+        self._validation_epoch_start_time = None
         # metrics generated during validation_step()
         self.validation_epoch_metrics: List[pd.DataFrame] = []
         # sample information tracked during validation_step()
@@ -82,7 +111,7 @@ class FlowModule(LightningModule):
         self._inference_dir = None
 
         # batch / state tracking
-        self._data_history = deque(maxlen=100)
+        self._data_history = deque(maxlen=5)
 
     @property
     def checkpoint_dir(self) -> str:
@@ -193,12 +222,11 @@ class FlowModule(LightningModule):
                 f"Module {module_id}: resuming at epoch {epochs_done}/{epochs_total} ({epochs_remaining} left)"
             )
 
-        if torch.cuda.is_available():
-            print(torch.cuda.memory_summary())
+        snapshot_tensors("on_train_start")
 
     def on_train_epoch_end(self):
         epoch_time = (time.time() - self._epoch_start_time) / 60.0
-        self.log(
+        self._log_scalar(
             "train/epoch_time_minutes",
             epoch_time,
             on_step=False,
@@ -206,6 +234,19 @@ class FlowModule(LightningModule):
             prog_bar=False,
         )
         self._epoch_start_time = time.time()
+
+        snapshot_tensors("on_train_epoch_end")
+
+    def on_validation_epoch_start(self):
+        snapshot_tensors("on_validation_epoch_start")
+
+        self._validation_epoch_start_time = time.time()
+        self._log.info(f"Validation epoch {self.current_epoch} starting...")
+
+        # If offloading tools, move them to folding device before validation
+        if self.offload_tools:
+            self.folding_validator.set_device_id(self.folding_device)
+            snapshot_tensors("on_validation_epoch_start, tools loaded")
 
     def on_validation_epoch_end(self):
         # Log validation samples
@@ -246,6 +287,22 @@ class FlowModule(LightningModule):
                     rank_zero_only=False,
                 )
             self.validation_epoch_metrics.clear()
+
+        snapshot_tensors("on_validation_epoch_end")
+
+        end_time = time.time()
+        self._log.info(
+            f"Validation epoch {self.current_epoch} completed in {end_time - self._validation_epoch_start_time:.2f} seconds"
+        )
+
+        # If offloading tools, move them to CPU after validation
+        if self.offload_tools:
+            self.folding_validator.set_device_id("cpu")
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            snapshot_tensors("on_validation_epoch_end, tools offloaded")
 
     def get_true_values(
         self, task: InferenceTask, batch: Union[InferenceFeatures, BatchFeatures]
@@ -340,9 +397,6 @@ class FlowModule(LightningModule):
 
     def training_step(self, batch: BatchFeatures):
         step_start_time = time.time()
-
-        if torch.cuda.is_available():
-            print(torch.cuda.memory_summary())
 
         self.interpolant.set_device(batch[bp.res_mask].device)
         noisy_batch = self.interpolant.corrupt_batch(batch, task=self.cfg.data.task)
@@ -521,7 +575,10 @@ class FlowModule(LightningModule):
 
         batch_metrics = []
         for i in range(num_batch):
-            sample_id = f"sample_{csv_idx[i].item()}_idx_{batch_idx}_len_{num_res}"
+            # include global_step to avoid collisions across epochs
+            sample_id = (
+                f"sample_step{self.global_step}_idx{csv_idx[i].item()}_len{num_res}"
+            )
             sample_dir = os.path.join(
                 self.checkpoint_dir,
                 sample_id,

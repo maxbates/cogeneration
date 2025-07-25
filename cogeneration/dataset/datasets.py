@@ -850,10 +850,16 @@ class BaseDataset(Dataset):
             # Fix a random seed to get the same split each time.
             fixed_seed = 123
 
-            # Pick `self.cfg.num_eval_lengths` lengths
             eval_lengths = data_csv[length_column]
             if self.cfg.max_eval_length is not None:
+                min_length = min(eval_lengths)
+                assert min_length <= self.cfg.max_eval_length, (
+                    f"Minimum length {min_length} is greater than max eval length "
+                    f"{self.cfg.max_eval_length}, no data remains for validation"
+                )
                 eval_lengths = eval_lengths[eval_lengths <= self.cfg.max_eval_length]
+
+            # Pick `self.cfg.num_eval_lengths` lengths
             all_lengths = np.sort(eval_lengths.unique())
             length_indices = (len(all_lengths) - 1) * np.linspace(
                 0.0, 1.0, self.cfg.num_eval_lengths

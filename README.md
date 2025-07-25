@@ -29,6 +29,7 @@ This project collects several ideas from other work and includes several extensi
 - **Harmonic prior** instead of only gaussian prior
 - Enables **recyling** through the trunk + IPA
 - **CUDA optimizations + kernels**, e.g. Flash Attention (and Flash IPA), cuEquivariant triangle attention
+- **Unified Config** with structured configs, in code using dataclasses instead of YAML
 - many improvements to code base: typing, enums, documentation, tests, etc.
 - Many of these **new features and modules are optional**
   - everything is easily **reverse compatible with MultiFlow, i.e. can use public Multiflow weights** with a config preset
@@ -92,7 +93,7 @@ cogeneration/ - main directory containing all source code
 │   ├── attention/
 │   │   ├── attention_pair_bias.py - (~Boltz) `AttentionPairBias` module 
 │   │   ├── attention_trunk.py - `AttentionTrunk` switch module
-│   │   ├── double_attention_pair.py - hacky cheaper triangle attention alternative
+│   │   ├── double_attention_pair.py - simpler, cheaper alternative to triangle attention
 │   │   ├── dropout.py - (~Boltz) dropout module
 │   │   ├── ipa_attention.py - `AttentionIPATrunk` module
 │   │   ├── ipa_flash.py - FlashIPA wrapper

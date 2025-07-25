@@ -153,9 +153,9 @@ class ModelHyperParamsConfig(BaseClassConfig):
     timestep_embed_size: int = 128
     # layers
     num_recycles: int = 2  # of trunk + IPA. 0 for single pass
-    trunk_num_layers: int = 4  # 0 to disable
+    trunk_num_layers: int = 8  # 0 to disable
     ipa_num_layers: int = 4  # >= 1
-    seq_trunk_num_layers: int = 4  # 0 to disable
+    seq_trunk_num_layers: int = 2  # 0 to disable
 
     @classmethod
     def tiny(cls):
@@ -165,7 +165,6 @@ class ModelHyperParamsConfig(BaseClassConfig):
             edge_embed_size=4,
             pos_embed_size=4,
             timestep_embed_size=4,
-            # small attention networks
             num_recycles=0,
             trunk_num_layers=1,
             ipa_num_layers=1,
@@ -173,18 +172,17 @@ class ModelHyperParamsConfig(BaseClassConfig):
         )
 
     @classmethod
-    def small(cls):
-        """Factory for small configuration, e.g. for testing complete model"""
+    def poc(cls):
+        """Factory for proof of concept configuration, e.g. for testing complete model"""
         return cls(
             node_embed_size=64,
-            edge_embed_size=64,  # min for cuEquiv kernel
-            pos_embed_size=32,
-            timestep_embed_size=32,
-            # small attention networks
+            edge_embed_size=64,  # min 64 for cuEquiv kernel
+            pos_embed_size=16,
+            timestep_embed_size=16,
             num_recycles=0,
             trunk_num_layers=2,
             ipa_num_layers=2,
-            seq_trunk_num_layers=2,
+            seq_trunk_num_layers=1,
         )
 
     @classmethod
@@ -500,7 +498,9 @@ class ModelPAEConfig(BaseClassConfig):
 
 @dataclass
 class ModelConfig(BaseClassConfig):
-    hyper_params: ModelHyperParamsConfig = field(default_factory=ModelHyperParamsConfig)
+    hyper_params: ModelHyperParamsConfig = field(
+        default_factory=ModelHyperParamsConfig.poc
+    )
     node_features: ModelNodeFeaturesConfig = field(
         default_factory=ModelNodeFeaturesConfig
     )
@@ -814,7 +814,7 @@ class InterpolantConfig(BaseClassConfig):
 @dataclass
 class DataLoaderConfig(BaseClassConfig):
     num_workers: int = max(1, os.cpu_count() // 2, os.cpu_count() - 4)
-    prefetch_factor: int = 10
+    prefetch_factor: int = 4
 
 
 @dataclass
@@ -1086,10 +1086,10 @@ class DatasetConfig(BaseClassConfig):
         dataset_metadata_dir_path / "distillation.clusters"
     )
 
-    # Eval parameters
+    # validation parameters
     test_set_pdb_ids_path: Optional[Path] = None
-    max_eval_length: Optional[int] = 256
-    samples_per_eval_length: int = 5
+    max_eval_length: Optional[int] = "${dataset.filter.max_num_res}"
+    samples_per_eval_length: int = 4
     num_eval_lengths: int = 8
 
     # Scaffolding / inpainting parameters
@@ -1159,11 +1159,11 @@ class ExperimentTrainingConfig(BaseClassConfig):
     # multimer interchain clashes
     aux_multimer_clash_loss_weight: float = 0.05
     # b factors (if provided in experimental structure)
-    aux_bfactor_loss_weight: float = 1e-3
+    aux_bfactor_loss_weight: float = 0.01
     # pLDDT confidence (comparing pred to GT structure)
-    aux_plddt_loss_weight: float = 1e-3
+    aux_plddt_loss_weight: float = 0.01
     # Predicted aligned error (PAE) confidence
-    aux_pae_loss_weight: float = 1e-3
+    aux_pae_loss_weight: float = 0.01
     # hot spots inter-chain contact loss
     aux_hot_spots_loss_weight: float = 0.05
     # contact conditioning constraint loss
@@ -1189,6 +1189,7 @@ class ExperimentOptimizerConfig(BaseClassConfig):
 class ExperimentTrainerConfig(BaseClassConfig):
     """
     Arguments to Pytorch Lightning Trainer()
+    (i.e. key names must be arguments to Trainer)
     """
 
     # probably want "gpu" if not on a Mac, "mps" for Mac M# GPU
@@ -1203,17 +1204,20 @@ class ExperimentTrainerConfig(BaseClassConfig):
     min_epochs: int = 1  # prevents early stopping
     max_epochs: int = 200
     deterministic: bool = False
-    check_val_every_n_epoch: int = 4
-    accumulate_grad_batches: int = 2
-    # enable lower precision off MPS
+    # Perform validation every `n` epochs.
+    check_val_every_n_epoch: int = 5
+    # Enable gradient accumulation
+    accumulate_grad_batches: int = 1
+    # enable lower precision off MPS (local)
     precision: Union[str, int] = (
         "${ternary:${equals: ${shared.local}, True}, '32', 'bf16-mixed'}"
     )
     # logging
     log_every_n_steps: int = 1
-
-    # TODO(cfg) put somewhere else, invalid argument to Trainer()
-    # local_tensorboard_logdir: str = "./tensorboard_logs"
+    # disable pytorch lightning sanity checking by setting to 0.
+    # usually, lightning runs train, validation, predict on a few samples before actual fit().
+    # disabling will hit first train_step() much faster e.g. for debugging.
+    num_sanity_val_steps: Optional[int] = None
 
     def __post_init__(self):
         # distributed training (ddp) not currently supported with MPS
@@ -1259,13 +1263,15 @@ class ExperimentConfig(BaseClassConfig):
     warm_start_cfg_override: bool = False
     # force reload module config, provide path
     raw_state_dict_reload: Optional[str] = None
-    # enable torch.compile(), requires no graph breaks TODO(model) working torch.compile
-    torch_compile: bool = False
+    # enable torch.compile()  # TODO(cfg) get this working
+    torch_compile: bool = (
+        False  # "${ternary:${equals: ${shared.local}, True}, False, True}"
+    )
     # save a `final.ckpt` when training is complete, defaults to symlink sentinel
     save_final_ckpt: bool = True
     final_ckpt_symlink: bool = True
     # save chrome trace during training (modify code to change frequency etc.)
-    profile_chrome_trace: bool = True
+    profile_chrome_trace: bool = False
 
     # sub-modules
     training: ExperimentTrainingConfig = field(default_factory=ExperimentTrainingConfig)
@@ -1361,8 +1367,9 @@ class ProteinMPNNRunnerConfig(BaseClassConfig):
     # Seed for ProteinMPNN
     # each `num_passes` will get a unique seed but otherwise set every inference call.
     pmpnn_seed: Optional[int] = None
-    # Number of inverse folds to run per sample
-    # Note, increases validation + prediction step time
+    # Number of inverse folds to run per sample during inference.
+    # Note that only 1 inverse fold is generated during validation.
+    # Note that each is folded by default, which increases prediction time.
     seq_per_sample: int = 4
 
     # Native runner options
@@ -1436,6 +1443,7 @@ class BoltzConfig(BaseClassConfig):
     # Hardware and output settings
     num_workers: int = 2  # generally only processing 1 at a time with current setup
     accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'cuda'}"
+    use_kernels: bool = "${shared.kernels}"
     # Output format for structures ("pdb", "mmcif").
     output_format: str = "pdb"
     # Training precision ("bf16-mixed", "32") otherwise inferred

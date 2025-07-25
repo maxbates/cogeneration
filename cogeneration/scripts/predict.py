@@ -117,8 +117,11 @@ class EvalRunner:
             # not what was in the ckpt config
             # TODO(dataset) - actually read the config, rather than using constructor to get new instance
             pdb_test_cfg = self.cfg.dataset.PDBPost2021()
-            # Hack avoid cfg interpolation and just set necessary field
-            pdb_test_cfg.seed = self.cfg.dataset.seed
+            # HACK avoid cfg interpolation and just set necessary fields
+            if isinstance(pdb_test_cfg.seed, str):
+                pdb_test_cfg.seed = self.cfg.dataset.seed
+            if isinstance(pdb_test_cfg.max_eval_length, str):
+                pdb_test_cfg.max_eval_length = self.cfg.dataset.max_eval_length
 
             # The dataset will behave differently depending on the task
             # i.e. for inpainting, we generate motifs.

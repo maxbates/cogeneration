@@ -7,7 +7,7 @@ from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler, dist
 
-from cogeneration.config.base import DataSamplerConfig, DatasetConfig
+from cogeneration.config.base import DataConfig, DataSamplerConfig, DatasetConfig
 from cogeneration.dataset.datasets import BaseDataset
 from cogeneration.type.dataset import MetadataColumn
 
@@ -17,7 +17,7 @@ class ProteinData(LightningDataModule):
     def __init__(
         self,
         *,
-        data_cfg,
+        data_cfg: DataConfig,
         train_dataset: BaseDataset,
         valid_dataset: BaseDataset,
         dataset_cfg: DatasetConfig,
@@ -25,18 +25,16 @@ class ProteinData(LightningDataModule):
     ):
         super().__init__()
         self.data_cfg = data_cfg
-        self.loader_cfg = data_cfg.loader
-        self.sampler_cfg = data_cfg.sampler
         self.dataset_cfg = dataset_cfg
         self._train_dataset = train_dataset
         self._valid_dataset = valid_dataset
         self._predict_dataset = predict_dataset
 
     def train_dataloader(self, rank=None, num_replicas=None) -> DataLoader:
-        num_workers = self.loader_cfg.num_workers
+        num_workers = self.data_cfg.loader.num_workers
 
         batch_sampler = LengthBatcher(
-            sampler_cfg=self.sampler_cfg,
+            sampler_cfg=self.data_cfg.sampler,
             metadata_csv=self._train_dataset.csv,
             modeled_length_col=self.dataset_cfg.modeled_trim_method.to_dataset_column(),
             rank=rank,
@@ -48,7 +46,7 @@ class ProteinData(LightningDataModule):
             batch_sampler=batch_sampler,
             num_workers=num_workers,
             prefetch_factor=(
-                None if num_workers == 0 else self.loader_cfg.prefetch_factor
+                None if num_workers == 0 else self.data_cfg.loader.prefetch_factor
             ),
             pin_memory=False,
             persistent_workers=True if num_workers > 0 else False,
@@ -58,20 +56,20 @@ class ProteinData(LightningDataModule):
         return DataLoader(
             self._valid_dataset,
             sampler=DistributedSampler(self._valid_dataset, shuffle=False),
-            num_workers=2,
+            num_workers=4,
             prefetch_factor=2,
             pin_memory=False,
             persistent_workers=True,
         )
 
     def predict_dataloader(self) -> DataLoader:
-        num_workers = self.loader_cfg.num_workers
+        num_workers = self.data_cfg.loader.num_workers
         return DataLoader(
             self._predict_dataset,
             sampler=DistributedSampler(self._predict_dataset, shuffle=False),
             num_workers=num_workers,
             prefetch_factor=(
-                None if num_workers == 0 else self.loader_cfg.prefetch_factor
+                None if num_workers == 0 else self.data_cfg.loader.prefetch_factor
             ),
             pin_memory=False,
             persistent_workers=True,
