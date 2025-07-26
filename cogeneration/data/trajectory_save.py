@@ -20,6 +20,7 @@ from cogeneration.data.potentials import FKSteeringTrajectory
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.type.metrics import OutputFileName
+from cogeneration.util.log import rank_zero_logger
 
 """
 Blitting-friendly trajectory visualization.
@@ -751,7 +752,7 @@ def save_trajectory(
     """
 
     start_time = time.time()
-    logger = logging.getLogger(__name__)
+    logger = rank_zero_logger(__name__)
 
     def log_time(msg):
         elapsed_time = time.time() - start_time

@@ -40,16 +40,23 @@ from boltz.main import (
 )
 from boltz.model.models.boltz2 import Boltz2
 from pytorch_lightning import Trainer
+from pytorch_lightning.accelerators import (
+    CPUAccelerator,
+    CUDAAccelerator,
+    MPSAccelerator,
+)
 
 from cogeneration.config.base import BoltzConfig
 from cogeneration.data import residue_constants
 from cogeneration.data.const import CHAIN_BREAK_STR, aatype_to_seq
 from cogeneration.data.tools.abc import FoldingDataFrame, FoldingTool, infer_device_id
 from cogeneration.dataset.process_pdb import pdb_path_pdb_name, process_pdb_file
+from cogeneration.models.utils import get_model_size_str
 from cogeneration.type.dataset import DatasetProteinColumn, ProcessedFile
 from cogeneration.type.metrics import MetricName
+from cogeneration.util.log import rank_zero_logger
 
-logger = logging.getLogger(__name__)
+logger = rank_zero_logger(__name__)
 
 
 @dataclass
@@ -613,7 +620,7 @@ class BoltzManifestBuilder:
             sequences=sequences_with_breaks, protein_ids=protein_ids
         )
 
-    def _parse_fasta_records(self, fasta_path: Path) -> List[SeqRecord]:
+    def parse_fasta_records(self, fasta_path: Path) -> List[SeqRecord]:
         """
         Parse a FASTA file into a list of SeqRecord objects.
         """
@@ -639,7 +646,7 @@ class BoltzManifestBuilder:
             Manifest object
         """
         fasta_path = Path(fasta_path)
-        seq_records = self._parse_fasta_records(fasta_path=fasta_path)
+        seq_records = self.parse_fasta_records(fasta_path=fasta_path)
         sequences = [str(seq_record.seq) for seq_record in seq_records]
 
         if protein_ids is not None:
@@ -667,7 +674,7 @@ class BoltzManifestBuilder:
         Returns:
             Path to directory containing only Boltz-formatted FASTA files (for CLI)
         """
-        seq_records = self._parse_fasta_records(fasta_path=fasta_path)
+        seq_records = self.parse_fasta_records(fasta_path=fasta_path)
 
         # Require ids are unique
         assert len(set(seq_record.id for seq_record in seq_records)) == len(
@@ -739,12 +746,6 @@ class BoltzRunner(FoldingTool):
 
         self.checkpoint_path = self.cfg.checkpoint_path
 
-        # Set up precision with fallback logic
-        if self.cfg.precision is None:
-            self.precision = "bf16-mixed" if torch.cuda.is_available() else "32"
-        else:
-            self.precision = self.cfg.precision
-
         # Configure model parameters
         self.diffusion_params = Boltz2DiffusionParams()
         self.diffusion_params.step_scale = self.cfg.step_scale
@@ -768,17 +769,18 @@ class BoltzRunner(FoldingTool):
         self.device = infer_device_id(device_id=device_id)
 
         if self.model is not None:
-            logger.info(f"Moving Boltz-2 model to device {self.device}...")
+            emoji = "🧊" if self.device.type == "cpu" else "🔥"
+            logger.info(f"Moving Boltz-2 model to device {emoji} {self.device}")
             self.model.to(self.device)
 
-        if self.trainer is not None:
-            # Use string instead of device object for trainer accelerator
-            if self.device.type == "cuda":
-                self.trainer.strategy.accelerator = "gpu"
-            elif self.device.type == "mps":
-                self.trainer.strategy.accelerator = "mps"
-            else:
-                self.trainer.strategy.accelerator = "auto"
+        # if self.trainer is not None:
+        #     # Use string instead of device object for trainer accelerator
+        #     if self.device.type == "cuda":
+        #         self.trainer.strategy.accelerator = CUDAAccelerator()
+        #     elif self.device.type == "mps":
+        #         self.trainer.strategy.accelerator = MPSAccelerator()
+        #     else:
+        #         self.trainer.strategy.accelerator = CPUAccelerator()
 
     def _download_model_if_needed(self):
         """Download Boltz-2 model, mols, etc if not present in cache_dir."""
@@ -807,7 +809,7 @@ class BoltzRunner(FoldingTool):
             "write_full_pde": False,
         }
 
-        logger.info(f"Loading Boltz-2 model (will persist in memory)...")
+        logger.debug(f"Loading Boltz-2 model (will persist in memory)...")
 
         # performance settings
         # TODO(boltz) use compile kwargs. Issue naming state keys.
@@ -828,15 +830,13 @@ class BoltzRunner(FoldingTool):
         self.model.eval()
         self.model.to(self.device)
 
-        # log model size
-        model_size = sum(p.numel() * p.element_size() for p in self.model.parameters())
         logger.info(
-            f"Successfully loaded Boltz-2 model on {self.device} (size: {model_size / (1024 ** 2):.2f} MB)"
+            f"✅ Successfully loaded Boltz-2 model on {self.device} (size: {get_model_size_str(self.model)})"
         )
 
         self.trainer = Trainer(
             accelerator=self.cfg.accelerator,
-            precision=self.precision,
+            precision=self.cfg.precision,
             logger=False,
             enable_checkpointing=False,
             enable_progress_bar=False,
@@ -957,7 +957,9 @@ class BoltzRunner(FoldingTool):
         self.trainer.callbacks = [writer]
 
         # Run prediction
-        logger.debug(f"Running Boltz prediction for {len(manifest.records)} records...")
+        logger.debug(
+            f"Running Boltz (native) prediction for {len(manifest.records)} records..."
+        )
         self.trainer.predict(
             self.model,
             datamodule=data_module,
@@ -978,7 +980,7 @@ class BoltzRunner(FoldingTool):
 
         end_time = time.time()
         logger.info(
-            f"Boltz prediction completed in {end_time - start_time:.2f} seconds"
+            f"Boltz (native) prediction completed in {end_time - start_time:.2f} seconds"
         )
 
         return BoltzPredictionSet(predictions)
@@ -1042,11 +1044,19 @@ class BoltzRunner(FoldingTool):
         Returns:
             DataFrame with columns: header, sequence, folded_pdb_path, plddt_mean
         """
-        # Ensure model is downloaded
-        self._download_model_if_needed()
+        start_time = time.time()
 
         # Use ManifestBuilder to prepare FASTA with MSA files
         manifest_builder = self._get_manifest_builder(output_dir=output_dir)
+
+        # ensure can parse fasta
+        records = manifest_builder.parse_fasta_records(fasta_path=fasta_path)
+        logger.debug(
+            f"Running Boltz (subprocess) prediction for {len(records)} records from {fasta_path}..."
+        )
+
+        # Ensure model is downloaded
+        self._download_model_if_needed()
 
         # Get Boltz-formatted FASTA with dummy MSAs
         fasta_dir = manifest_builder.prepare_fasta_for_cli(fasta_path=fasta_path)
@@ -1072,6 +1082,10 @@ class BoltzRunner(FoldingTool):
             "--step_scale",
             str(self.cfg.step_scale),
         ]
+
+        logger.debug(
+            f"Running Boltz (subprocess) prediction for {len(records)} records: {cmd}"
+        )
 
         # Run the CLI command
         try:
@@ -1113,6 +1127,11 @@ class BoltzRunner(FoldingTool):
                 f"No valid predictions found in output directory: {output_dir}"
             )
 
+        end_time = time.time()
+
+        logger.info(
+            f"Boltz (subprocess) prediction for {len(predictions)}/{len(records)} records completed in {end_time - start_time:.2f} seconds"
+        )
         return BoltzPredictionSet(predictions).to_df()
 
     def fold_sequences(

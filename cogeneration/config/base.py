@@ -18,6 +18,7 @@ from cogeneration.config.dict_utils import (
 )
 from cogeneration.type.dataset import OLIGOMERIC_PREFIXES, MetadataColumn
 from cogeneration.type.embed import PositionalEmbeddingMethod
+from cogeneration.type.metrics import MetricName
 from cogeneration.type.str_enum import StrEnum
 from cogeneration.type.task import DataTask, InferenceTask
 
@@ -121,9 +122,10 @@ class SharedConfig(BaseClassConfig):
         default_factory=lambda: datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     )
     # `local` to train locally on a Mac. use `mps` not `gpu` with `ddp`, etc.
-    local: bool = True
-    # enable CUDA optimized kernels (cuEquivariance, Flash Attention, etc.)
-    kernels: bool = field(default_factory=lambda: torch.cuda.is_available())
+    local: bool = field(default_factory=lambda: not torch.cuda.is_available())
+    # estimated GPU memory in GB, used to control batch sizes etc.
+    # Requires key,values defined in relevant tables.
+    gpu_memory_gb: int = 40
     # randomness / stochastic paths
     stochastic: bool = True
     # project root path
@@ -132,6 +134,10 @@ class SharedConfig(BaseClassConfig):
     seed: int = 123
     # default dropout rate for attention modules
     dropout: float = 0.1
+    # default model precision, 32 for MPS, bf16-mixed for CUDA
+    precision: str = "bf16-mixed" if torch.cuda.is_available() else "32"
+    # enable CUDA optimized kernels (cuEquivariance, Flash Attention, etc.)
+    kernels: bool = field(default_factory=lambda: torch.cuda.is_available())
 
 
 @dataclass
@@ -175,12 +181,12 @@ class ModelHyperParamsConfig(BaseClassConfig):
     def poc(cls):
         """Factory for proof of concept configuration, e.g. for testing complete model"""
         return cls(
-            node_embed_size=64,
+            node_embed_size=256,
             edge_embed_size=64,  # min 64 for cuEquiv kernel
-            pos_embed_size=16,
-            timestep_embed_size=16,
+            pos_embed_size=64,
+            timestep_embed_size=64,
             num_recycles=0,
-            trunk_num_layers=2,
+            trunk_num_layers=4,
             ipa_num_layers=2,
             seq_trunk_num_layers=1,
         )
@@ -814,16 +820,15 @@ class InterpolantConfig(BaseClassConfig):
 @dataclass
 class DataLoaderConfig(BaseClassConfig):
     num_workers: int = max(1, os.cpu_count() // 2, os.cpu_count() - 4)
+    num_workers_validation: int = 4
     prefetch_factor: int = 4
 
 
 @dataclass
 class DataSamplerConfig(BaseClassConfig):
-    # GPU memory in GB. ensure value defined in tables, or explicitly set.
-    gpu_memory_gb: int = 40
-    # table lookups in format: ${table:${.gpu_memory_gb},key1,value1,...}
-    max_batch_size: int = "${table:${.gpu_memory_gb},40,64,80,128}"
-    max_num_res_squared: int = "${table:${.gpu_memory_gb},40,184000,80,1024000}"
+    # table lookups in format: ${table:${shared.gpu_memory_gb},key1,value1,...}
+    max_batch_size: int = "${table:${shared.gpu_memory_gb},40,64,80,128}"
+    max_num_res_squared: int = "${table:${shared.gpu_memory_gb},40,400000,80,1024000}"
 
 
 class DatasetEnum(StrEnum):
@@ -1140,7 +1145,7 @@ class ExperimentTrainingConfig(BaseClassConfig):
     # structure
     translation_loss_weight: float = 2.0
     rotation_loss_weight: float = 1.0
-    torsion_loss_weight: float = 0.1
+    torsion_loss_weight: float = 0.2
     # aatypes
     aatypes_loss_weight: float = 1.0  # default 0.0 in multiflow
     aatypes_loss_mean_or_sum: str = "mean"
@@ -1157,15 +1162,15 @@ class ExperimentTrainingConfig(BaseClassConfig):
     # multimer interchain contacts
     aux_multimer_interface_loss_weight: float = 0.25
     # multimer interchain clashes
-    aux_multimer_clash_loss_weight: float = 0.05
+    aux_multimer_clash_loss_weight: float = 0.1
     # b factors (if provided in experimental structure)
-    aux_bfactor_loss_weight: float = 0.01
+    aux_bfactor_loss_weight: float = 0.05
     # pLDDT confidence (comparing pred to GT structure)
-    aux_plddt_loss_weight: float = 0.01
+    aux_plddt_loss_weight: float = 0.05
     # Predicted aligned error (PAE) confidence
-    aux_pae_loss_weight: float = 0.01
+    aux_pae_loss_weight: float = 0.05
     # hot spots inter-chain contact loss
-    aux_hot_spots_loss_weight: float = 0.05
+    aux_hot_spots_loss_weight: float = 0.1
     # contact conditioning constraint loss
     aux_contact_conditioning_loss_weight: float = 0.1
 
@@ -1207,11 +1212,9 @@ class ExperimentTrainerConfig(BaseClassConfig):
     # Perform validation every `n` epochs.
     check_val_every_n_epoch: int = 5
     # Enable gradient accumulation
-    accumulate_grad_batches: int = 1
-    # enable lower precision off MPS (local)
-    precision: Union[str, int] = (
-        "${ternary:${equals: ${shared.local}, True}, '32', 'bf16-mixed'}"
-    )
+    accumulate_grad_batches: int = 4
+    # weights / tensor precision
+    precision: Union[str, int] = "${shared.precision}"
     # logging
     log_every_n_steps: int = 1
     # disable pytorch lightning sanity checking by setting to 0.
@@ -1241,10 +1244,11 @@ class ExperimentCheckpointerConfig(BaseClassConfig):
     # `save_last` ensures a `last.ckpt` copy is always created
     save_last: bool = True
     # recommend checkpoint on some multiple of validation epoch interval. too frequent will eat up disk.
-    every_n_epochs: int = 8
+    every_n_epochs: int = 10
     # save `k` best models according to some metric
     save_top_k: int = 1
-    monitor: str = "valid/codesign_bb_rmsd"
+    # metric to choose best models at checkpoints. Must be logged by module!
+    monitor: str = f"valid/{MetricName.bb_rmsd_folded}"
     mode: str = "min"
 
 
@@ -1318,7 +1322,7 @@ class InferenceConfig(BaseClassConfig):
 
     seed: int = "${shared.seed}"
     use_gpu: bool = True
-    num_gpus: int = 1
+    num_gpus: int = torch.cuda.device_count() if torch.cuda.is_available() else 1
     predict_dir: str = str(PATH_PROJECT_ROOT / "inference_outputs")
     inference_subdir: str = "${shared.id}"
 
@@ -1446,8 +1450,8 @@ class BoltzConfig(BaseClassConfig):
     use_kernels: bool = "${shared.kernels}"
     # Output format for structures ("pdb", "mmcif").
     output_format: str = "pdb"
-    # Training precision ("bf16-mixed", "32") otherwise inferred
-    precision: Optional[str] = None
+    # Boltz-2 Trainer precision, Boltz-2 defaults to bf16-mixed
+    precision: Optional[str] = "${shared.precision}"
 
 
 class FoldingModel(StrEnum):
@@ -1462,7 +1466,7 @@ class FoldingModel(StrEnum):
 class FoldingConfig(BaseClassConfig):
     folding_model: FoldingModel = FoldingModel.boltz2
 
-    # dedicated device for folding. decrement other devices by 1 if True
+    # dedicated device for folding. decrements training devices by 1 if True.
     own_device: bool = (
         True if torch.cuda.is_available() and torch.cuda.device_count() > 1 else False
     )

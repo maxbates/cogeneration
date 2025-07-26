@@ -1,4 +1,3 @@
-import gc
 import glob
 import json
 import logging
@@ -38,6 +37,7 @@ from cogeneration.models.loss_calculator import (
     TrainingLosses,
 )
 from cogeneration.models.model import FlowModel
+from cogeneration.models.utils import get_model_size_str
 from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import InferenceFeatures
@@ -46,6 +46,7 @@ from cogeneration.type.batch import NoisyFeatures
 from cogeneration.type.batch import PredBatchProp as pbp
 from cogeneration.type.metrics import MetricName, OutputFileName
 from cogeneration.type.task import DataTask, InferenceTask
+from cogeneration.util.log import rank_zero_logger
 
 
 def to_numpy(x: Optional[torch.Tensor]) -> Optional[np.ndarray]:
@@ -54,19 +55,6 @@ def to_numpy(x: Optional[torch.Tensor]) -> Optional[np.ndarray]:
     if x.dtype is torch.bfloat16:
         x = x.to(torch.float32)
     return x.detach().cpu().numpy()
-
-
-# TODO move to util or remove
-def snapshot_tensors(tag):
-    """
-    Print all live GPU tensors.
-    """
-    print(f"\n=== {tag} ===")
-    print(torch.cuda.memory_summary())
-    # Walk the Python GC to find live GPU tensors
-    for obj in gc.get_objects():
-        if torch.is_tensor(obj) and obj.is_cuda:
-            print(type(obj), obj.shape, obj.dtype)
 
 
 class FlowModule(LightningModule):
@@ -81,7 +69,7 @@ class FlowModule(LightningModule):
 
         # Track folding device
         self.folding_device = folding_device
-        # May offload during training, load onto it for validation / predictions
+        # May offload during training, load onto it for validation
         self.offload_tools = offload_tools
         # Default folding device is CPU if offloading tools
         initial_folding_device = "cpu" if offload_tools else folding_device
@@ -98,7 +86,7 @@ class FlowModule(LightningModule):
         )
 
         # self.logger defined in LightningModule
-        self._log = logging.getLogger(__name__)
+        self._log = rank_zero_logger(__name__)
 
         self._epoch_start_time = None
         self._validation_epoch_start_time = None
@@ -180,13 +168,6 @@ class FlowModule(LightningModule):
                 return tensor.to(torch.float32)
             # If using bf16 and kernels are enabled, keep float32 for stability
             # The attention modules will handle the bf16 conversion internally
-            elif (
-                tensor.dtype == torch.float32
-                and self.cfg.shared.kernels
-                and self.cfg.experiment.trainer.precision == "bf16"
-            ):
-                # Keep as float32, let the kernel-enabled modules handle bf16 conversion
-                return tensor
             return tensor
 
         # MPS: convert all tensors to float32
@@ -202,6 +183,16 @@ class FlowModule(LightningModule):
             )
 
         return super().transfer_batch_to_device(batch, device, dataloader_idx)
+
+    def on_fit_start(self):
+        # log model size, after initialized and precision set by Trainer
+        self._log.info(f"Model size: {get_model_size_str(self.model)}")
+        if hasattr(self.model, "esm_combiner") and hasattr(
+            self.model.esm_combiner, "esm"
+        ):
+            self._log.info(
+                f"ESM size: {get_model_size_str(self.model.esm_combiner.esm)}"
+            )
 
     def on_train_start(self):
         self._epoch_start_time = time.time()
@@ -222,8 +213,6 @@ class FlowModule(LightningModule):
                 f"Module {module_id}: resuming at epoch {epochs_done}/{epochs_total} ({epochs_remaining} left)"
             )
 
-        snapshot_tensors("on_train_start")
-
     def on_train_epoch_end(self):
         epoch_time = (time.time() - self._epoch_start_time) / 60.0
         self._log_scalar(
@@ -231,28 +220,21 @@ class FlowModule(LightningModule):
             epoch_time,
             on_step=False,
             on_epoch=True,
-            prog_bar=False,
         )
         self._epoch_start_time = time.time()
 
-        snapshot_tensors("on_train_epoch_end")
-
     def on_validation_epoch_start(self):
-        snapshot_tensors("on_validation_epoch_start")
-
         self._validation_epoch_start_time = time.time()
         self._log.info(f"Validation epoch {self.current_epoch} starting...")
 
         # If offloading tools, move them to folding device before validation
         if self.offload_tools:
             self.folding_validator.set_device_id(self.folding_device)
-            snapshot_tensors("on_validation_epoch_start, tools loaded")
 
     def on_validation_epoch_end(self):
-        # Log validation samples
+        # if wandb logger, log protein structures to wandb
         if len(self.validation_epoch_samples) > 0:
             if self.logger is not None and hasattr(self.logger, "log_table"):
-                # wandb logging
                 self.logger.log_table(
                     key="valid/samples",
                     columns=["sample_path", "global_step", "Protein"],
@@ -264,15 +246,9 @@ class FlowModule(LightningModule):
         if len(self.validation_epoch_metrics) > 0:
             val_epoch_metrics = pd.concat(self.validation_epoch_metrics)
 
-            # drop non-metrics columns, e.g. can't take `mean()`
+            # drop non-metrics columns
             val_epoch_metrics = val_epoch_metrics.drop(
-                columns=[
-                    MetricName.sample_id,
-                    MetricName.header,
-                    MetricName.sequence,
-                    MetricName.sample_pdb_path,
-                    MetricName.folded_pdb_path,
-                ]
+                columns=MetricName.metadata_columns()
             )
 
             for metric_name, metric_val in val_epoch_metrics.mean().to_dict().items():
@@ -281,14 +257,11 @@ class FlowModule(LightningModule):
                     metric_val,
                     on_step=False,
                     on_epoch=True,
-                    prog_bar=False,
                     batch_size=len(val_epoch_metrics),
                     sync_dist=True,
                     rank_zero_only=False,
                 )
             self.validation_epoch_metrics.clear()
-
-        snapshot_tensors("on_validation_epoch_end")
 
         end_time = time.time()
         self._log.info(
@@ -301,8 +274,6 @@ class FlowModule(LightningModule):
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-            snapshot_tensors("on_validation_epoch_end, tools offloaded")
 
     def get_true_values(
         self, task: InferenceTask, batch: Union[InferenceFeatures, BatchFeatures]
@@ -428,30 +399,26 @@ class FlowModule(LightningModule):
         # Model pass, get losses
         batch_losses = self.model_step(noisy_batch)
 
-        # Log the calculated and other losses we want to track
+        # Log the calculated losses and other metrics we want to track
 
         num_batch = batch_losses.trans_loss.shape[0]
         total_losses = {k: torch.mean(v) for k, v in batch_losses.items()}
         for k, v in total_losses.items():
-            self._log_scalar(f"train/{k}", v, prog_bar=False, batch_size=num_batch)
+            self._log_scalar(f"train/{k}", v, batch_size=num_batch)
 
         # log t
         so3_t = torch.squeeze(noisy_batch[nbp.so3_t])
         self._log_scalar(
             "train/so3_t",
             np.mean(to_numpy(so3_t)),
-            prog_bar=False,
             batch_size=num_batch,
         )
         r3_t = torch.squeeze(noisy_batch[nbp.r3_t])
-        self._log_scalar(
-            "train/r3_t", np.mean(to_numpy(r3_t)), prog_bar=False, batch_size=num_batch
-        )
+        self._log_scalar("train/r3_t", np.mean(to_numpy(r3_t)), batch_size=num_batch)
         cat_t = torch.squeeze(noisy_batch[nbp.cat_t])
         self._log_scalar(
             "train/cat_t",
             np.mean(to_numpy(cat_t)),
-            prog_bar=False,
             batch_size=num_batch,
         )
 
@@ -475,18 +442,19 @@ class FlowModule(LightningModule):
                 batch_t, loss_dict, loss_name=loss_name
             )
             for k, v in stratified_losses.items():
-                self._log_scalar(f"train/{k}", v, prog_bar=False, batch_size=num_batch)
+                self._log_scalar(f"train/{k}", v, batch_size=num_batch)
 
         # log training throughput
         self._log_scalar(
             "train/length",
             batch[bp.res_mask].shape[1],
-            prog_bar=False,
             batch_size=num_batch,
         )
         self._log_scalar("train/batch_size", num_batch, prog_bar=False)
         step_time = time.time() - step_start_time
-        self._log_scalar("train/examples_per_second", num_batch / step_time)
+        self._log_scalar(
+            "train/examples_per_second", num_batch / step_time, prog_bar=True
+        )
 
         # inpainting / scaffolding metrics
         # note that depending on `cfg.interpolant` some examples may be set to different subtasks.
@@ -498,20 +466,18 @@ class FlowModule(LightningModule):
             self._log_scalar(
                 "train/scaffolding_percent",
                 scaffold_percent,
-                prog_bar=False,
                 batch_size=num_batch,
             )
             num_motif_res = torch.sum(motif_mask, dim=-1)
             self._log_scalar(
                 "train/motif_size",
                 torch.mean(num_motif_res).item(),
-                prog_bar=False,
                 batch_size=num_batch,
             )
 
         # log final loss explicitly (though it's already logged as `train_loss`)
         train_loss = total_losses["train_loss"]
-        self._log_scalar("train/loss", train_loss, batch_size=num_batch)
+        self._log_scalar("train/loss", train_loss, prog_bar=True, batch_size=num_batch)
 
         return train_loss
 
@@ -640,6 +606,8 @@ class FlowModule(LightningModule):
 
         batch_metrics_df = pd.DataFrame(batch_metrics)
         self.validation_epoch_metrics.append(batch_metrics_df)
+
+        # Metrics are calculated + logged at `validation_epoch_end` across all validation samples.
 
         return batch_metrics_df
 
@@ -871,6 +839,8 @@ class FlowModule(LightningModule):
 
         Note that this function expects numpy inputs. Tensors should be detached and converted.
         """
+        start_time = time.time()
+
         # Noisy trajectory and model (clean) trajectory may not be the same number of steps.
         noisy_traj_length, sample_length, _, _ = sample_structure_traj.shape
         assert sample_structure_traj.shape == (
@@ -928,6 +898,7 @@ class FlowModule(LightningModule):
             write_animations=write_animations,
             animation_max_frames=animation_max_frames,
         )
+        time_to_save_trajectory = time.time() - start_time
 
         top_sample_metrics, folding_validation_paths = (
             self.folding_validator.assess_sample(
@@ -946,6 +917,11 @@ class FlowModule(LightningModule):
                 true_aa=true_aa,
                 n_inverse_folds=n_inverse_folds,
             )
+        )
+        time_to_assess_sample = time.time() - start_time
+
+        self._log.info(
+            f"Sample Metric timing: save_trajectory={time_to_save_trajectory:.2f}s, assess_sample={time_to_assess_sample:.2f}s"
         )
 
         return top_sample_metrics, saved_trajectory_files, folding_validation_paths
@@ -1000,7 +976,7 @@ class FlowModule(LightningModule):
         value,
         on_step=True,
         on_epoch=False,
-        prog_bar=True,
+        prog_bar=False,
         batch_size=None,
         sync_dist=False,
         rank_zero_only=True,

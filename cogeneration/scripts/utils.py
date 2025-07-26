@@ -8,7 +8,8 @@ import torch
 
 from cogeneration.util.log import rank_zero_logger
 
-logger = rank_zero_logger(__name__)
+# internal utils logger
+_logger = rank_zero_logger(__name__)
 
 
 def get_available_device(device_limit: int) -> List[Union[int, str]]:
@@ -29,7 +30,7 @@ def print_timing(f):
         ts = time()
         result = f(*args, **kw)
         te = time()
-        logger.info(f"func:{f.__name__} args:[{args}, {kw}] took: {te-ts:2.4f} sec")
+        _logger.info(f"func:{f.__name__} args:[{args}, {kw}] took: {te-ts:2.4f} sec")
         return result
 
     return wrap

@@ -12,6 +12,8 @@ from torch import nn
 
 from cogeneration.config.base import ModelESMKey
 from cogeneration.data.residue_constants import restypes_with_x
+from cogeneration.models.utils import get_model_size_str
+from cogeneration.util.log import rank_zero_logger
 
 """
 Note on Flash attention etc: 
@@ -24,7 +26,7 @@ However, if we only cared about enriching the single representation, or using fo
 and not the pair representation, we use these faster variants using FAPLM.
 """
 
-logger = logging.getLogger(__name__)
+logger = rank_zero_logger(__name__)
 
 
 # registry keys are string or ModelESMKey
@@ -295,6 +297,8 @@ class FrozenEsmModel(nn.Module):
 
         logger.info(f"Loading ESM model: {model_key}...")
 
+        # May see a warning about some parameters not being initialized,
+        # this is fine, because we aren't using the MaskedLM head.
         self.esm = ESM_REGISTRY.load_model(model_key)
         self.esm_dict = ESM_REGISTRY.load_alphabet()
         self.use_esm_attn_map = use_esm_attn_map
@@ -305,10 +309,10 @@ class FrozenEsmModel(nn.Module):
         # freeze ESM
         for param in self.esm.parameters():
             param.requires_grad = False
+        # Set to eval mode
         self.esm.eval()
 
-        model_size = sum(p.numel() for p in self.esm.parameters())
-        logger.info(f"ESM {model_key} loaded, size: {model_size / (1024 ** 2):.2f} MB")
+        logger.info(f"✅ ESM {model_key} loaded")
 
     def state_dict(self, *args, **kwargs):
         # contibute nothing to state_dict (save space in checkpoints)

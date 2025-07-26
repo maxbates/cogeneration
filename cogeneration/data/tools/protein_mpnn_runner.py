@@ -92,8 +92,10 @@ from cogeneration.data.tools.abc import (
     InverseFoldingTool,
     infer_device_id,
 )
+from cogeneration.models.utils import get_model_size_str
+from cogeneration.util.log import rank_zero_logger
 
-logger = logging.getLogger(__name__)
+logger = rank_zero_logger(__name__)
 
 # Type aliases for amino acid formats to clarify which alphabet ordering is used
 # ProteinMPNN uses alphabetical ordering: [A,C,D,E,F,G,H,I,K,L,M,N,P,Q,R,S,T,V,W,Y]
@@ -195,8 +197,9 @@ class ProteinMPNNRunner(InverseFoldingTool):
         self._device = infer_device_id(device_id=device_id)
 
         if self._model is not None:
+            emoji = "🧊" if self._device.type == "cpu" else "🔥"
             logger.info(
-                f"Moving {self.cfg.model_type} model to device {self._device}..."
+                f"Moving {self.cfg.model_type} model to device {emoji} {self._device}"
             )
             self._model.to(self._device)
 
@@ -416,7 +419,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
             return self._model
 
         try:
-            logger.info(
+            logger.debug(
                 f"Loading LigandMPNN ({self.cfg.model_type}) (will persist in memory)..."
             )
 
@@ -462,11 +465,8 @@ class ProteinMPNNRunner(InverseFoldingTool):
             self._model.to(self._device)
             self._model.eval()
 
-            # calculate model size
-            model_size = sum(p.numel() for p in self._model.parameters())
-
             logger.info(
-                f"Successfully loaded {self.cfg.model_type} model on {self.device} (size: {model_size / (1024 ** 2):.2f} MB)"
+                f"✅ Successfully loaded {self.cfg.model_type} model on {self.device} (size: {get_model_size_str(self._model)})"
             )
             return self._model
 
@@ -1350,10 +1350,10 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         # Ensure diffuse_mask has correct length
         if diffuse_mask_1d.shape[0] != N:
-            print(protein_dict)
+            # print(protein_dict)
             for k, v in protein_dict.items():
                 print(
-                    f"{k}: {v.shape if isinstance(v, torch.Tensor) else (len(v) if isinstance(v, list) else v)}"
+                    f"{k}: {v.shape if isinstance(v, torch.Tensor) else (len(v) if isinstance(v, (list, np.ndarray)) else v)}"
                 )
             raise ValueError(
                 f"diffuse_mask length {diffuse_mask_1d.shape[0]} != protein sequence length {N}."

@@ -2,6 +2,11 @@ import logging
 
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
 
+# quiet 3rd party loggers
+for pkg in ["prody", "numba", "pytorch_lightning"]:
+    logging.getLogger(pkg).setLevel(logging.WARNING)
+    logging.getLogger(pkg).propagate = False
+
 
 def rank_zero_logger(name=__name__) -> logging.Logger:
     """Initializes multi-thread-friendly python logger."""

@@ -56,10 +56,12 @@ class ProteinData(LightningDataModule):
         return DataLoader(
             self._valid_dataset,
             sampler=DistributedSampler(self._valid_dataset, shuffle=False),
-            num_workers=4,
+            num_workers=self.data_cfg.loader.num_workers_validation,
             prefetch_factor=2,
             pin_memory=False,
-            persistent_workers=True,
+            persistent_workers=(
+                True if self.data_cfg.loader.num_workers_validation > 0 else False
+            ),
         )
 
     def predict_dataloader(self) -> DataLoader:

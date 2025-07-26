@@ -859,10 +859,11 @@ class BaseDataset(Dataset):
                 )
                 eval_lengths = eval_lengths[eval_lengths <= self.cfg.max_eval_length]
 
-            # Pick `self.cfg.num_eval_lengths` lengths
+            # Pick up to `self.cfg.num_eval_lengths` lengths
+            num_eval_lengths = min(self.cfg.num_eval_lengths, len(eval_lengths))
             all_lengths = np.sort(eval_lengths.unique())
             length_indices = (len(all_lengths) - 1) * np.linspace(
-                0.0, 1.0, self.cfg.num_eval_lengths
+                0.0, 1.0, num_eval_lengths
             )
             length_indices = length_indices.astype(int)
             eval_lengths = all_lengths[length_indices]
