@@ -147,7 +147,7 @@ class TestInterpolantSample:
         mock_cfg_uninterpolated.data.task = DataTask.inpainting
         mock_cfg_uninterpolated.inference.task = InferenceTask.inpainting
         mock_cfg_uninterpolated.dataset.filter = DatasetFilterConfig.multimeric()
-        mock_cfg_uninterpolated.dataset.hotspots.no_hotspots_prob = 0.0
+        mock_cfg_uninterpolated.dataset.hotspots.hotspots_prob_disabled = 0.0
         mock_cfg_uninterpolated.dataset.contact_conditioning.conditioning_prob_disabled = (
             0.0
         )

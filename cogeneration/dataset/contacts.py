@@ -119,35 +119,39 @@ def get_contact_conditioning_matrix(
     # TODO(conditioning) - allow masking high b factor / low plddt residues
     edge_mask = res_mask.unsqueeze(-1) & res_mask.unsqueeze(-2)  # (B, N, N)
 
-    # identify inter-chain contact mask
+    # identify inter-chain and intra-chain contacts
     inter_chain_mask = chain_idx.unsqueeze(-1) != chain_idx.unsqueeze(-2)  # (B, N, N)
     intra_chain_mask = ~inter_chain_mask.bool()
 
-    # limit to min / max dists
+    # determine actual contacts, limited to min / max dists
     contact_mask = edge_mask & (
         (contact_conditioning < max_dist) & (contact_conditioning > min_dist)
     )
     contact_conditioning = contact_conditioning * contact_mask.float()
 
-    # add small noise to 2d constraint
-    noise = (
-        torch.rand(B, N, N, device=trans.device) * dist_noise_ang * contact_mask.float()
-    )
-    contact_conditioning += noise
-    contact_conditioning = contact_conditioning.clamp(min=min_dist, max=max_dist)
-
-    # limit to min res gap by removing the diagonal min_res_gap thick from the matrix
-    # to avoid focusing on alpha-helices (only apply to intra-chain contacts)
-    for b in range(B):
-        # Apply gap constraint only to intra-chain contacts
-        intra_chain_b = intra_chain_mask[b]
-        gap_filtered = torch.triu(contact_conditioning[b], diagonal=min_res_gap)
-        gap_filtered = torch.tril(gap_filtered, diagonal=-min_res_gap)
-        # Keep inter-chain contacts unchanged, apply gap filter to intra-chain
-        contact_conditioning[b] = (
-            gap_filtered * intra_chain_b.float()
-            + contact_conditioning[b] * (~intra_chain_b).float()
+    # optionally, add small noise to 2d constraint
+    if dist_noise_ang > 0:
+        noise = torch.rand(B, N, N, device=trans.device) * dist_noise_ang
+        contact_conditioning += noise
+        contact_conditioning = (
+            contact_conditioning.clamp(min=min_dist, max=max_dist)
+            * contact_mask.float()
         )
+
+    # mask closely adjacent residue pairs: |i − j| < min_res_gap
+    if min_res_gap > 1:
+        res_adjacency_mask = torch.tril(
+            torch.ones_like(contact_conditioning[0], dtype=torch.bool),
+            diagonal=min_res_gap - 1,
+        ) & torch.triu(
+            torch.ones_like(contact_conditioning[0], dtype=torch.bool),
+            diagonal=-(min_res_gap - 1),
+        )  # (N, N)
+        # limit res adjacency to intra-chain contacts
+        res_adjacency_mask = (
+            res_adjacency_mask.unsqueeze(0) & intra_chain_mask
+        )  # (B, N, N)
+        contact_conditioning = contact_conditioning * (~res_adjacency_mask).float()
 
     # optionally, limit to motif mask
     if motif_only and motif_mask is not None and motif_mask.any():

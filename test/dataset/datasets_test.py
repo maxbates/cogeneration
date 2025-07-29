@@ -1,6 +1,7 @@
+import pytest
 import torch
 
-from cogeneration.config.base import InferenceSamplesConfig
+from cogeneration.config.base import DatasetFilterConfig, InferenceSamplesConfig
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.noise_mask import torsions_empty
 from cogeneration.dataset.datasets import (
@@ -36,6 +37,45 @@ class TestBaseDataset:
             assert isinstance(
                 batch[batch_prop], torch.Tensor
             ), f"Batch property {batch_prop} should be a tensor"
+
+    @pytest.mark.parametrize("task", [DataTask.inpainting, DataTask.hallucination])
+    def test_features_defined(self, task, mock_cfg_uninterpolated):
+        """
+        Ensure that certain features are present in the batch esp. when their generation probabilities are set to 0 (i.e. always on).
+        """
+
+        # always generate motifs
+        mock_cfg_uninterpolated.data.task = task
+        mock_cfg_uninterpolated.interpolant.inpainting_unconditional_prop = 0.0
+        mock_cfg_uninterpolated.interpolant.codesign_forward_fold_prop = 0.0
+        mock_cfg_uninterpolated.interpolant.codesign_inverse_fold_prop = 0.0
+
+        # always generate hotspots + contact conditioning
+        # hotspots requires multimers
+        mock_cfg_uninterpolated.dataset.filter = DatasetFilterConfig.multimeric()
+        mock_cfg_uninterpolated.dataset.hotspots.hotspots_prob_disabled = 0.0
+        mock_cfg_uninterpolated.dataset.contact_conditioning.conditioning_prob_disabled = (
+            0.0
+        )
+        mock_cfg_uninterpolated.dataset.contact_conditioning.conditioning_prob_motif_only = (
+            0.0
+        )
+        # smaller gap, since short proteins in test
+        mock_cfg_uninterpolated.dataset.contact_conditioning.min_res_gap = 3
+
+        cfg = mock_cfg_uninterpolated.interpolate()
+
+        batch = create_pdb_batch(cfg=cfg, training=False)
+
+        assert bp.contact_conditioning in batch
+        assert (batch[bp.contact_conditioning] > 0).any()
+
+        assert bp.hot_spots in batch
+        assert batch[bp.hot_spots].sum() > 0
+
+        if task == DataTask.inpainting:
+            assert bp.motif_mask in batch
+            assert (batch[bp.motif_mask] > 0).any()
 
     def test_segment_features_preserves_motif_and_masks_scaffold(self):
         """

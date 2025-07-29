@@ -456,6 +456,18 @@ class FlowModule(LightningModule):
             "train/examples_per_second", num_batch / step_time, prog_bar=True
         )
 
+        # conditioning metrics
+        self._log_scalar(
+            "train/num_hotspots",
+            batch[bp.hot_spots].float().sum(dim=-1).mean(),
+            batch_size=num_batch,
+        )
+        self._log_scalar(
+            "train/contact_conditioning_defined",
+            (batch[bp.contact_conditioning].sum(dim=-1) > 0).float().mean(),
+            batch_size=num_batch,
+        )
+
         # inpainting / scaffolding metrics
         # note that depending on `cfg.interpolant` some examples may be set to different subtasks.
         if self.cfg.data.task == DataTask.inpainting:

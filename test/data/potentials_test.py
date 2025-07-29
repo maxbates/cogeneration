@@ -217,6 +217,8 @@ class TestContactConditioningPotential:
         batch, step = _make_batch_and_step(B=1, N=30, multimer=False)
 
         # No contact conditioning defined (default is zeros)
+        batch[bp.contact_conditioning] = torch.zeros((1, 30, 30))
+
         potential = ContactConditioningPotential()
         E = potential.compute_energy(
             batch=batch,

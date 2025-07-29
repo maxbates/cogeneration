@@ -9,6 +9,7 @@ from numpy import typing as npt
 from scipy.spatial import cKDTree
 from scipy.spatial.distance import cdist
 
+from cogeneration.data.all_atom import atom37_from_trans_rot
 from cogeneration.data.const import INT_TO_CHAIN
 from cogeneration.data.protein import chain_str_to_int
 from cogeneration.data.residue_constants import (
@@ -17,6 +18,7 @@ from cogeneration.data.residue_constants import (
     metal_types,
     unk_restype_index,
 )
+from cogeneration.type.batch import BatchFeatures, BatchProp
 from cogeneration.type.dataset import ChainFeatures
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.dataset import MetadataColumn as mc
@@ -285,10 +287,10 @@ class MultimerInteractions:
     def serialize_hot_spots(self) -> str:
         """
         Serialize hot spot residues (backbone interactions) to a string.
-        Format: "<chain_id>:<res_index>:<num_interactions>,..."
+        Format: "<chain_id><res_index>:<num_interactions>,..."
         """
         return ",".join(
-            f"{INT_TO_CHAIN[chain_id]}:{res_index}:{len(interaction_set)}"
+            f"{INT_TO_CHAIN[chain_id]}{res_index}:{len(interaction_set)}"
             for (
                 chain_id,
                 res_index,
@@ -364,6 +366,40 @@ class MultimerInteractions:
         return cls(
             chain_feats=complex_feats,
             interactions=all_interactions,
+        )
+
+    @classmethod
+    def from_batch_feats(cls, feats: BatchFeatures):
+        """
+        Calculate MultimerInteractions from single item batch features, i.e. without batch dimension
+        Probably should check if multimer before calling, but not
+        """
+        assert BatchProp.chain_idx in feats
+        assert BatchProp.trans_1 in feats
+        assert (
+            feats[BatchProp.chain_idx].ndim == 1
+        ), f"Expected (N,) tensor, got {feats[BatchProp.chain_idx].shape}"
+        assert (
+            feats[BatchProp.trans_1].ndim == 2
+        ), f"Expected (N, 3) tensor, got {feats[BatchProp.trans_1].shape}"
+
+        chain_feats: ChainFeatures = {
+            dpc.atom_positions: atom37_from_trans_rot(
+                trans=feats[BatchProp.trans_1].unsqueeze(0).detach().cpu(),
+                rots=feats[BatchProp.rotmats_1].unsqueeze(0).detach().cpu(),
+                torsions=feats[BatchProp.torsions_1].unsqueeze(0).detach().cpu(),
+                aatype=feats[BatchProp.aatypes_1].unsqueeze(0).detach().cpu(),
+                res_mask=feats[BatchProp.res_mask].unsqueeze(0).detach().cpu(),
+            )
+            .squeeze(0)
+            .numpy(),
+            dpc.chain_index: feats[BatchProp.chain_idx].detach().cpu().numpy(),
+            dpc.aatype: feats[BatchProp.aatypes_1].detach().cpu().numpy(),
+        }
+
+        return cls.from_chain_feats(
+            complex_feats=chain_feats,
+            metadata=None,
         )
 
     def update_metadata(

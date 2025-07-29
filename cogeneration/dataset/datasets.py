@@ -24,6 +24,7 @@ from cogeneration.data.noise_mask import mask_blend_2d
 from cogeneration.data.protein import chain_str_to_int
 from cogeneration.dataset.contacts import get_contact_conditioning_matrix
 from cogeneration.dataset.filterer import DatasetFilterer
+from cogeneration.dataset.interaction import MultimerInteractions
 from cogeneration.dataset.motif_factory import (
     ChainBreak,
     Motif,
@@ -311,25 +312,33 @@ class BatchFeaturizer:
         """
         hot_spots_mask = torch.zeros_like(feats[bp.res_mask]).int()
 
-        if hot_spots_str is None or hot_spots_str == "":
-            return hot_spots_mask
-
         # Disabled some fraction of the time during training
-        if self.is_training and random.random() < self.cfg.hotspots.no_hotspots_prob:
+        if (
+            self.is_training
+            and random.random() < self.cfg.hotspots.hotspots_prob_disabled
+        ):
             return torch.zeros_like(feats[bp.res_mask]).int()
 
         # Disabled if not multimer
         if feats[bp.chain_idx].unique().numel() <= 1:
             return torch.zeros_like(feats[bp.res_mask]).int()
 
-        # parse hot spots string
+        # if hot spots not defined in metadata, calculate them
+        if hot_spots_str is None or hot_spots_str == "":
+            multimer_interactions = MultimerInteractions.from_batch_feats(feats=feats)
+            hot_spots_str = multimer_interactions.serialize_hot_spots()
+
         hot_spots = []
         for item in hot_spots_str.split(","):
+            # our format is "<chain_id><res_index>:<num_interactions>,..."
+            # but also support  "<chain_id><res_index>" format
             if ":" in item:
-                chain_id, res_index, num_interactions = item.split(":")
-                hot_spots.append(
-                    (chain_str_to_int(chain_id), int(res_index), int(num_interactions))
-                )
+                item, num_interactions = item.split(":")
+            else:
+                num_interactions = 1
+            hot_spots.append(
+                (chain_str_to_int(item[0]), int(item[1:]), int(num_interactions))
+            )
 
         # Map hot spots to current feature indices
         for hot_chain_id, hot_res_index, num_interactions in hot_spots:
@@ -372,6 +381,7 @@ class BatchFeaturizer:
     def contact_conditioning_define(
         self,
         feats: BatchFeatures,
+        task: DataTask,
     ) -> torch.Tensor:
         """
         Define contact conditioning matrix from features, for a single item.
@@ -394,7 +404,9 @@ class BatchFeaturizer:
 
         # Limit conditioning to motifs some proportion of the time in training
         motif_only = (
-            random.random() < self.cfg.contact_conditioning.conditioning_prob_motif_only
+            task == DataTask.inpainting
+            and random.random()
+            < self.cfg.contact_conditioning.conditioning_prob_motif_only
         )
 
         return get_contact_conditioning_matrix(
@@ -606,6 +618,7 @@ class BatchFeaturizer:
         # Contact conditioning matrix
         feats[bp.contact_conditioning] = self.contact_conditioning_define(
             feats=feats,
+            task=self.task,
         )
 
         # Ensure have a valid `diffuse_mask` for modeling

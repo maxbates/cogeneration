@@ -944,7 +944,7 @@ class DatasetHotspotsConfig(BaseClassConfig):
     """
 
     # Percentage of time to include no hot spots
-    no_hotspots_prob: float = 0.5
+    hotspots_prob_disabled: float = 0.5
 
     # Downsampling
     # Minimum number of hot spots to consider in a structure
