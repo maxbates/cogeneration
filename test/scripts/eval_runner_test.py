@@ -30,11 +30,8 @@ class TestEvalRunner:
         mock_cfg_uninterpolated.inference.task = task
 
         # only sample one sample
-        # TODO(inpainting) - support better inpainting dataset / dataloader cfg
-        #   currently not respecting cfg.inference, just using dataset eval == validation
         # TODO(test) - support multiple samples
         #   We need to mock folding validation for all samples in pred dataloader.
-        n_samples_expected = 1
         mock_cfg_uninterpolated.inference.samples.samples_per_length = 1
         mock_cfg_uninterpolated.inference.samples.length_subset = [23]
 
@@ -43,12 +40,20 @@ class TestEvalRunner:
         # create a dummy checkpoint
         cfg, ckpt_path = mock_checkpoint(cfg=cfg)
 
-        # Run sampling
+        # set up eval runner
         sampler = EvalRunner(cfg=cfg)
 
-        # we implicitly test that inference config takes priority over checkpoint
+        # TODO(inpainting) - support better inpainting dataset / dataloader cfg
+        #   currently not respecting cfg.inference, just using dataset eval == validation
+        # TODO(inpainting) - handle stochasticity when sampling from dataloader
+        #   e.g. scaffold lengths change, motif positions change, etc.
+        # HACK - truncate dataset to single item for inpainting
+        if task == InferenceTask.inpainting:
+            sampler.dataloader.dataset.csv = sampler.dataloader.dataset.csv.head(1)
+
+        # for unconditional, we implicitly test that inference config takes priority over checkpoint for LengthSamplingDataset
         assert (
-            len(sampler.dataloader) == n_samples_expected
+            len(sampler.dataloader) == 1
         ), f"Expected only one sample in dataloader, got {len(sampler.dataloader)}"
         pred_batch = next(iter(sampler.dataloader))
         mock_folding_validation(
@@ -72,9 +77,7 @@ class TestEvalRunner:
         top_metrics_df.to_csv(tmp_path / "top_metrics_df.csv")
 
         # check top samples
-        assert (
-            len(top_samples_df) == n_samples_expected
-        ), f"Expected {n_samples_expected} samples"
+        assert len(top_samples_df) == 1, f"Expected 1 top sample"
         for col in [
             # pdb structure paths
             MetricName.sample_pdb_path,
@@ -91,6 +94,4 @@ class TestEvalRunner:
         assert (
             "Total Samples" in top_metrics_df.columns
         ), f"Expected 'Total Samples' in top_metrics_df"
-        assert (
-            top_metrics_df["Total Samples"].iloc[0] == n_samples_expected
-        ), f"Expected {n_samples_expected} samples"
+        assert top_metrics_df["Total Samples"].iloc[0] == 1, f"Expected 1 sample"
