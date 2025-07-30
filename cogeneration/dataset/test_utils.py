@@ -180,9 +180,10 @@ def create_pdb_dataloader(
     if task is None:
         task = cfg.data.task
 
-    dataset_constructor = DatasetConstructor.pdb_dataset(
-        dataset_cfg=cfg.dataset,
+    dataset_constructor = DatasetConstructor(
+        cfg=cfg.dataset,
         task=task,
+        use_test=False,
     )
 
     train_dataset, eval_dataset = dataset_constructor.create_datasets()

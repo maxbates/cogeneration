@@ -4,7 +4,7 @@ import json
 import os
 import pickle
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 
 import numpy as np
 import torch
@@ -61,8 +61,12 @@ def write_pkl(
             pickle.dump(pkl_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def read_pkl(read_path: str, verbose=True, use_torch=False, map_location=None):
+def read_pkl(
+    read_path: Union[Path, str], verbose=True, use_torch=False, map_location=None
+):
     """Read data from a pickle file. Handles both compressed and uncompressed files."""
+    read_path = str(read_path)
+
     try:
         if use_torch:
             return torch.load(read_path, map_location=map_location)
@@ -86,7 +90,7 @@ def read_pkl(read_path: str, verbose=True, use_torch=False, map_location=None):
                 print(
                     f"Error. Failed to read {read_path}. First error: {e}\n Second error: {e2}"
                 )
-            raise (e)
+            raise e
 
 
 def write_numpy_json(file_path: str, data: Any):

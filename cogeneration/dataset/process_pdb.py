@@ -4,7 +4,8 @@ import logging
 import os
 import tempfile
 from dataclasses import asdict
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 
 import mdtraj as md
 import numpy as np
@@ -646,7 +647,7 @@ def process_pdb_with_metadata(
 
 
 def read_processed_file(
-    processed_file_path: str,
+    processed_file_path: Union[Path, str],
     center: bool = True,
     trim_to_modeled_residues: bool = True,
     trim_chains_independently: bool = True,

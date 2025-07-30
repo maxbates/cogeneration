@@ -4,11 +4,8 @@ import torch
 from cogeneration.config.base import DatasetFilterConfig, InferenceSamplesConfig
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.noise_mask import torsions_empty
-from cogeneration.dataset.datasets import (
-    BaseDataset,
-    BatchFeaturizer,
-    LengthSamplingDataset,
-)
+from cogeneration.dataset.datasets import BaseDataset, LengthSamplingDataset
+from cogeneration.dataset.featurizer import BatchFeaturizer
 from cogeneration.dataset.motif_factory import ChainBreak, Motif, Scaffold
 from cogeneration.dataset.test_utils import create_pdb_batch
 from cogeneration.type.batch import METADATA_BATCH_PROPS

@@ -16,7 +16,7 @@ from Bio import PDB
 from tqdm.auto import tqdm
 
 from cogeneration.data.io import read_pkl
-from cogeneration.dataset.datasets import read_metadata_file
+from cogeneration.dataset.datasets import BaseDataset
 from cogeneration.dataset.interaction import (
     MultimerInteractions,
     NonResidueInteractions,
@@ -47,7 +47,7 @@ class MetadataUpdater:
         self.csv_path = Path(metadata_csv_path)
         self.logger = logging.getLogger(__name__)
 
-        self.df = read_metadata_file(metadata_csv_path)
+        self.df = BaseDataset.read_metadata_file(metadata_csv_path)
         # Load existing metadata
         self.logger.info(
             f"Loaded metadata CSV with {len(self.df)} entries from {metadata_csv_path}."

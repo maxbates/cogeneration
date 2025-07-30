@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 import torch
 
-from cogeneration.config.base import DatasetConfig, DatasetFilterConfig
+from cogeneration.config.base import DatasetConfig, DatasetFilterConfig, DatasetSpec
 from cogeneration.data.io import read_pkl
 from cogeneration.data.residue_constants import unk_restype_index
 from cogeneration.dataset.datasets import BaseDataset
@@ -146,23 +146,26 @@ class TestProcessPDBFiles:
         df = pd.DataFrame([metadata])
         df.to_csv(csv_path, index=False)
 
+        dataset_spec = DatasetSpec(
+            name="test_dataset",
+            processed_root_path=tmp_path,
+            metadata_path=csv_path,
+        )
+
         # Use BaseDataset because does not require clusters
         dataset = BaseDataset(
             cfg=DatasetConfig(
+                datasets=[dataset_spec],
                 seed=0,
-                processed_data_path=str(tmp_path),
-                csv_path=csv_path,
-                cluster_path=None,
-                use_synthetic=False,
-                use_redesigned=False,
                 filter=DatasetFilterConfig(
                     # allow oligomers for our example PDB
                     num_chains=[1, 2],
                     oligomeric=["monomeric", "dimeric"],
                 ),
             ),
-            is_training=True,
             task=DataTask.hallucination,
+            eval=False,
+            use_test=False,
         )
 
         assert len(dataset) > 0

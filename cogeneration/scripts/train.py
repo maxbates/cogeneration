@@ -71,7 +71,7 @@ class Experiment:
             data_cfg=self.cfg.data,
             dataset_cfg=self.cfg.dataset,
             train_dataset=train_dataset,
-            valid_dataset=valid_dataset,
+            eval_dataset=valid_dataset,
         )
 
         # Handle devices. Folding may be assigned its own device.

@@ -831,16 +831,9 @@ class DataSamplerConfig(BaseClassConfig):
     max_num_res_squared: int = "${table:${shared.gpu_memory_gb},40,400000,80,1024000}"
 
 
-class DatasetEnum(StrEnum):
-    """dataset for training"""
-
-    pdb = "pdb"
-
-
 @dataclass
 class DataConfig(BaseClassConfig):
     task: DataTask = DataTask.inpainting
-    dataset: DatasetEnum = DatasetEnum.pdb
     loader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
     sampler: DataSamplerConfig = field(default_factory=DataSamplerConfig)
 
@@ -849,7 +842,7 @@ class DataConfig(BaseClassConfig):
 class DatasetFilterConfig(BaseClassConfig):
     """Config for filtering metadata CSV. requires data to be in metadata CSV."""
 
-    max_num_res: int = 384
+    max_num_res: int = 512  # 256 in public Multiflow
     min_num_res: int = 60
     max_coil_percent: float = 0.667  # 0.5 in public MultiFlow
     # radius of gyration quantile
@@ -873,6 +866,8 @@ class DatasetFilterConfig(BaseClassConfig):
     oligomeric_skip: Optional[List[str]] = None
     num_chains: Optional[List[int]] = field(default_factory=lambda: [1])
     num_chains_skip: Optional[List[int]] = field(default_factory=lambda: [0])
+    # Redesigns
+    redesigned_rmsd_threshold: float = 2.0  # remove redesigns >RMSD
 
     @classmethod
     def multimeric(cls) -> "DatasetFilterConfig":
@@ -1009,14 +1004,13 @@ class DatasetInpaintingConfig(BaseClassConfig):
     proximity_dist_threshold_ang: float = 10.0
 
 
-# dataset_metadata_dir_path is the root directory for dataset / metadata files
-dataset_metadata_dir_path = PATH_PROJECT_ROOT / "cogeneration" / "datasets" / "metadata"
-
-
 class DatasetTrimMethod(StrEnum):
     """
     Methods for trimming ChainFeatures to modeled residues.
-    Relevant to multimers.
+    Relevant esp. to multimers, but for any dataset.
+
+    Note that each method requires 1:1 unique DatasetColumn,
+    and must be pre-computed in the metadata CSV (can add to update script if missing).
     """
 
     # concat chains and trim ends
@@ -1037,100 +1031,117 @@ class DatasetTrimMethod(StrEnum):
 
 
 @dataclass
+class DatasetSpec:
+    """
+    Paths etc. defining a dataset's metadata and processed data.
+    """
+
+    name: str
+    processed_root_path: Path
+    metadata_path: Path
+    redesigns_path: Optional[Path] = None
+    cluster_path: Optional[Path] = None
+
+    def __post_init__(self):
+        if not self.metadata_path.exists():
+            raise FileNotFoundError(
+                f"Metadata CSV for {self.name} not found: {self.metadata_path}"
+            )
+        if not self.processed_root_path.exists():
+            raise FileNotFoundError(
+                f"Processed data root path for {self.name} not found: {self.processed_root_path}"
+            )
+        if self.redesigns_path and not self.redesigns_path.exists():
+            raise FileNotFoundError(
+                f"Redesigns CSV for {self.name} not found: {self.redesigns_path}"
+            )
+        if self.cluster_path and not self.cluster_path.exists():
+            raise FileNotFoundError(
+                f"Cluster file for {self.name} not found: {self.cluster_path}"
+            )
+
+
+# dataset_metadata_dir_path is the root directory for dataset / metadata files
+datasets_path = PATH_PROJECT_ROOT / "cogeneration" / "datasets"
+metadata_path = datasets_path / "metadata"
+
+
+PDBDatasetSpec = DatasetSpec(
+    name="PDB",
+    processed_root_path=datasets_path,
+    metadata_path=metadata_path / "pdb_metadata.csv",
+    # redesigns_path=metadata_path / "pdb_redesigned.csv",  # TODO - working redesigns
+    cluster_path=metadata_path / "pdb.clusters",
+)
+
+PDBTestDatasetSpec = DatasetSpec(
+    name="PDBPost2021",
+    processed_root_path=datasets_path,
+    metadata_path=metadata_path / "test_set_metadata.csv",
+    cluster_path=metadata_path / "test_set_clusters.csv",
+)
+
+SyntheticDatasetSpec = DatasetSpec(
+    name="MultiFlowSynthetic",
+    processed_root_path=datasets_path,
+    metadata_path=metadata_path / "distillation_metadata.csv",
+    cluster_path=metadata_path / "distillation.clusters",
+)
+
+
+@dataclass
 class DatasetConfig(BaseClassConfig):
     """
     Information about the Dataset of protein structures and sequences.
-    Assumes a structure matching the data provided by public Multiflow,
-    but the pipeline to generate the data is not included.
-
-    Note that a dataset comprises:
-    - main data (i.e. from PDB)
-    - redesigned data (to fine tune using ProteinMPNN sequences)
-    - synthetic data (from AF2 predictions)
-    and each of these shards may have metadata and clustering associated.
-
-    Default dataset is PDB training dataset.
-
-    use PDBPost2021() for test dataset
-
-    # TODO(dataset) - support scope and swissprot datasets
-    # MultiFlow public config lists: `pdb`, `pdb_mixed`, `pdb_post2021`, `scope`, `scope_mixed`, `swissprot`
+    New datasets can be generated using `dataset/scripts` pipeline.
     """
 
-    seed: int = "${shared.seed}"
-    processed_data_path: str = os.path.dirname(dataset_metadata_dir_path)
-    csv_path: Path = dataset_metadata_dir_path / "pdb_metadata.csv"
-    cluster_path: Optional[Path] = dataset_metadata_dir_path / "pdb.clusters"
-    max_cache_size: int = 100_000
-    cache_num_res: int = 0  # min size to enable caching
-    # plddt [0, 100]. Minimum threshold, per residue, masked if below and add_plddt_mask=True
-    add_plddt_mask: bool = False
-    min_plddt_threshold: float = 60.0
-    # trim chains independently to modeled positions
-    # removes non-residues between chains, more important for multimers
+    # TODO(cfg) determine if there is a reasonable way to support CLI-friendly spec
+    datasets: List[DatasetSpec] = field(
+        default_factory=lambda: [
+            PDBDatasetSpec,
+            SyntheticDatasetSpec,
+        ]
+    )
+    # TODO - consider deprecating test dataset, and using a split like date, cluster ids, etc.
+    test_datasets: List[DatasetSpec] = field(
+        default_factory=lambda: [
+            PDBTestDatasetSpec,
+        ]
+    )
+
+    # Data processing and sample generation, shared across datasets
+    # Filtering
+    filter: DatasetFilterConfig = field(default_factory=DatasetFilterConfig)
+    # trimming chains independently to modeled positions removes non-residues between chains
     modeled_trim_method: DatasetTrimMethod = DatasetTrimMethod.chains_independently
-    # add gaussian noise to atom positions
+    # plddt mask, only for synthetic structures.
+    # Minimum threshold, per residue, masked if below and `add_plddt_mask=True`.
+    # (Does not apply to PDB b-factors, which we try to predict by default).
+    add_plddt_mask: bool = False
+    min_plddt_threshold: float = 60.0  # [0-100]
+    # add gaussian noise to atom positions prior to rigid frame calculation
     noise_atom_positions_angstroms: float = 0.1
-
-    # debug/test, take first N rows of metadata_csv
-    debug_head_samples: Optional[int] = None
-
-    # Redesigned, i.e. use ProteinMPNN to generate sequences for a structure
-    use_redesigned: bool = False
-    redesigned_csv_path: Optional[Path] = (
-        dataset_metadata_dir_path / "pdb_redesigned.csv"
-    )
-    redesigned_rmsd_threshold: float = 2.0
-
-    # Synthetic, e.g. AlphaFold structures?
-    use_synthetic: bool = True
-    synthetic_csv_path: Optional[Path] = (
-        dataset_metadata_dir_path / "distillation_metadata.csv"
-    )
-    synthetic_cluster_path: Optional[Path] = (
-        dataset_metadata_dir_path / "distillation.clusters"
-    )
-
-    # validation parameters
-    test_set_pdb_ids_path: Optional[Path] = None
-    max_eval_length: Optional[int] = "${dataset.filter.max_num_res}"
-    samples_per_eval_length: int = 4
-    num_eval_lengths: int = 8
-
-    # Scaffolding / inpainting parameters
+    # Inpainting / scaffolding parameters
     inpainting: DatasetInpaintingConfig = field(default_factory=DatasetInpaintingConfig)
-
     # Conditioning
     hotspots: DatasetHotspotsConfig = field(default_factory=DatasetHotspotsConfig)
     contact_conditioning: DatasetContactConditioningConfig = field(
         default_factory=DatasetContactConditioningConfig
     )
 
-    # Filtering
-    filter: DatasetFilterConfig = field(default_factory=DatasetFilterConfig)
+    # Validation: pick small subset of lengths for evaluation
+    # InferenceConfig separately specifies cfg for prediction/inference
+    max_eval_length: Optional[int] = "${dataset.filter.max_num_res}"
+    samples_per_eval_length: int = 4
+    num_eval_lengths: int = 8
 
-    @classmethod
-    def PDBPost2021(cls):
-        # Config for test-set of PDB structures from 2021 and later
-        return cls(
-            csv_path=dataset_metadata_dir_path / "test_set_metadata.csv",
-            cluster_path=dataset_metadata_dir_path / "test_set_clusters.csv",
-            cache_num_res=0,
-            add_plddt_mask=False,
-            # disable Redesigned and Synthetic for test set
-            use_redesigned=False,
-            redesigned_csv_path=None,
-            use_synthetic=False,
-            synthetic_csv_path=None,
-            synthetic_cluster_path=None,
-            # Eval parameters
-            test_set_pdb_ids_path=dataset_metadata_dir_path / "test_set_pdb_ids.csv",
-            # slightly relaxed filters to match original multiflow parameters
-            filter=DatasetFilterConfig(
-                max_num_res=400,
-                min_num_res=50,
-            ),
-        )
+    # Performance and debugging
+    seed: int = "${shared.seed}"
+    # dataset cache
+    cache_num_res: int = 0  # min length to enable caching
+    # debug/test, take first N rows of metadata_csv
+    debug_head_samples: Optional[int] = None
 
 
 @dataclass
@@ -1179,7 +1190,7 @@ class ExperimentTrainingConfig(BaseClassConfig):
 class ExperimentWandbConfig(BaseClassConfig):
     """W&B configuration. Some properties are kwargs to logger"""
 
-    name: str = "${data.task}_${data.dataset}_${shared.id}"
+    name: str = "${data.task}_${shared.id}"
     project: str = "cogeneration"
     # offline if `local` (not copied to W&B)
     offline: bool = "${ternary:${equals: ${shared.local}, True}, True, False}"
@@ -1293,26 +1304,25 @@ class ExperimentConfig(BaseClassConfig):
 class InferenceSamplesConfig(BaseClassConfig):
     """
     Inference sampling configuration.
-    Can define either `length_subset` or `min_length`, `max_length`, `length_step`.
-    `length_subset` takes priority.
+    Can define either `length_subset` (priority) or `min_length`, `max_length`, `length_step`.
     """
 
     # Number of backbone samples per sequence length.
-    samples_per_length: int = 100
+    samples_per_length: int = 10
     # Batch size when sampling from the model
     num_batch: int = 1
-    # Subset of lengths to sample. If null, sample all targets between min_length and max_length
+    # Subset of lengths to sample. If empty, sample all targets between min_length and max_length
     length_subset: Optional[List[int]] = field(
         default_factory=lambda: [70, 100, 200, 300]
     )
     # Minimum sequence length to sample.
-    min_length: int = 60
+    min_length: int = "${dataset.filter.min_num_res}"
     # Maximum sequence length to sample.
-    max_length: int = 256
+    max_length: int = "${dataset.filter.max_num_res}"
     # gap between lengths to sample, `range(min_length, max_length, length_step)`
-    length_step: int = 1
+    length_step: int = 16
     # Multimers - set `chain_idx` for 2+ chains, where each chain must be `min_length`
-    multimer_fraction: float = 0.25
+    multimer_fraction: float = 0.5
     multimer_min_length: int = 100
 
 
@@ -1650,9 +1660,6 @@ class Config(BaseClassConfig):
         raw_cfg.dataset.debug_head_samples = 1000
         raw_cfg.dataset.filter.min_num_res = 20
         raw_cfg.dataset.filter.max_num_res = 40
-        # avoid synthetic + redesigned samples
-        raw_cfg.dataset.use_redesigned = False
-        raw_cfg.dataset.use_synthetic = False
         # small batches
         raw_cfg.data.sampler.max_batch_size = 4
 

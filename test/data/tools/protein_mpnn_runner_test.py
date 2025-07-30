@@ -14,13 +14,14 @@ import torch
 from Bio import SeqIO
 from omegaconf.errors import ValidationError
 
+from cogeneration.config.base import Config
 from cogeneration.data import const, residue_constants
 from cogeneration.data.tools.protein_mpnn_runner import (
     NativeMPNNResult,
     ProteinMPNNRunner,
     ProteinMPNNRunnerPool,
 )
-from cogeneration.dataset.datasets import BatchFeaturizer
+from cogeneration.dataset.featurizer import BatchFeaturizer
 from cogeneration.dataset.process_pdb import process_chain_feats, process_pdb_file
 from cogeneration.dataset.test_utils import create_pdb_batch
 from cogeneration.type.batch import BatchProp as bp
@@ -138,22 +139,12 @@ class TestProteinMPNNRunner:
         avg_logits_per_pass = result.average_logits_per_pass
         assert avg_logits_per_pass.shape == (batch_size, num_passes, num_res, 21)
 
-    def test_run_batch_2qlw(self, mock_cfg, pdb_2qlw_path):
+    def test_run_batch_2qlw(self, mock_cfg, pdb_2qlw_processed_feats):
         """Test run_batch on 2qlw structure"""
         runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
 
-        # Process actual PDB file
-        batch = process_pdb_file(str(pdb_2qlw_path), "2qlw")
-        featurizer = BatchFeaturizer(
-            cfg=mock_cfg.dataset, task=mock_cfg.data.task, is_training=False
-        )
-        features = featurizer.featurize_processed_file(
-            processed_file=batch,
-            csv_row={
-                mc.pdb_name: "2qlw",
-                mc.processed_path: "",
-            },
-        )
+        # Get features for 2qlw structure
+        features = pdb_2qlw_processed_feats
 
         # Extract single structure and add batch dimension
         trans = features[bp.trans_1].unsqueeze(0)  # (1, N, 3)
@@ -1533,24 +1524,14 @@ class TestProteinMPNNRunner:
         ), "Logits should be different with different seed"
 
     def test_diffuse_mask_respected_run_batch(
-        self, mock_cfg_uninterpolated, pdb_2qlw_path
+        self, mock_cfg_uninterpolated, pdb_2qlw_processed_feats
     ):
         """Test that diffuse_mask=0 positions remain fixed in run_batch"""
         cfg = mock_cfg_uninterpolated.interpolate()
         runner = ProteinMPNNRunner(cfg.folding.protein_mpnn)
 
-        # Process actual PDB file to get real structure
-        batch = process_pdb_file(str(pdb_2qlw_path), "2qlw")
-        featurizer = BatchFeaturizer(
-            cfg=cfg.dataset, task=cfg.data.task, is_training=False
-        )
-        features = featurizer.featurize_processed_file(
-            processed_file=batch,
-            csv_row={
-                mc.pdb_name: "2qlw",
-                mc.processed_path: "",
-            },
-        )
+        # Get features for 2qlw
+        features = pdb_2qlw_processed_feats
 
         # Extract structure and add batch dimension
         trans = features[bp.trans_1].unsqueeze(0)  # (1, N, 3)
@@ -1968,22 +1949,12 @@ class TestProteinMPNNRunnerPool:
         if torch.cuda.is_available():
             assert pool.runners[0].device.type == "cuda"
 
-    def test_single_run_batch_2qlw(self, mock_cfg, pdb_2qlw_path):
+    def test_single_run_batch_2qlw(self, mock_cfg, pdb_2qlw_processed_feats):
         """Test pool run_batch on 2qlw structure"""
         pool = ProteinMPNNRunnerPool(mock_cfg.folding.protein_mpnn, num_models=2)
 
-        # Process actual PDB file
-        batch = process_pdb_file(str(pdb_2qlw_path), "2qlw")
-        featurizer = BatchFeaturizer(
-            cfg=mock_cfg.dataset, task=mock_cfg.data.task, is_training=False
-        )
-        features = featurizer.featurize_processed_file(
-            processed_file=batch,
-            csv_row={
-                mc.pdb_name: "2qlw",
-                mc.processed_path: "",
-            },
-        )
+        # Get features for 2qlw
+        features = pdb_2qlw_processed_feats
 
         # Extract single structure and add batch dimension
         trans = features[bp.trans_1].unsqueeze(0)  # (1, N, 3)

@@ -10,7 +10,7 @@ from cogeneration.config.base import (
     DatasetInpaintingConfig,
     DatasetInpaintingMotifStrategy,
 )
-from cogeneration.dataset.datasets import BatchFeaturizer
+from cogeneration.dataset.featurizer import BatchFeaturizer
 from cogeneration.dataset.motif_factory import ChainBreak, Motif, MotifFactory, Scaffold
 from cogeneration.dataset.process_pdb import process_pdb_file
 from cogeneration.type.batch import BatchProp as bp

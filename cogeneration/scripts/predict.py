@@ -74,10 +74,14 @@ class EvalRunner:
             log.info(f"Saving inference config to {config_path}")
 
         # Read checkpoint and initialize module
-        self._flow_module = FlowModule.load_from_checkpoint(
-            checkpoint_path=ckpt_path,
-            cfg=self.cfg,
-        )
+        try:
+            self._flow_module = FlowModule.load_from_checkpoint(
+                checkpoint_path=ckpt_path,
+                cfg=self.cfg,
+            )
+        except Exception as e:
+            log.error(f"Failed to load checkpoint {ckpt_path}: {e}")
+            raise e
         self._flow_module.folding_validator.set_device_id(0)
         log.info("\n" + str(ModelSummary(self._flow_module, max_depth=2)))
         self._flow_module.eval()
@@ -113,23 +117,18 @@ class EvalRunner:
             or self.cfg.inference.task == InferenceTask.forward_folding
             or self.cfg.inference.task == InferenceTask.inverse_folding
         ):
-            # We want to use the input cfg inference settings for the pdb dataset,
-            # not what was in the ckpt config
-            # TODO(dataset) - actually read the config, rather than using constructor to get new instance
-            pdb_test_cfg = self.cfg.dataset.PDBPost2021()
-            # HACK avoid cfg interpolation and just set necessary fields
-            if isinstance(pdb_test_cfg.seed, str):
-                pdb_test_cfg.seed = self.cfg.dataset.seed
-            if isinstance(pdb_test_cfg.max_eval_length, str):
-                pdb_test_cfg.max_eval_length = self.cfg.dataset.max_eval_length
+            # TODO - we should have a better helper for PDB inference set
+            # We want to use cfg.inference.samples to determine lengths etc.
 
-            # The dataset will behave differently depending on the task
-            # i.e. for inpainting, we generate motifs.
-            dataset_constructor = DatasetConstructor.pdb_dataset(
-                dataset_cfg=pdb_test_cfg,
+            # Use the test dataset for inference
+            # Note for inpainting, reasonable to use "training" eval dataset
+            # with randomized motifs + scaffold lengths
+            dataset_constructor = DatasetConstructor(
+                cfg=self.cfg.dataset,
                 task=InferenceTask.to_data_task(self.cfg.inference.task),
+                use_test=True,
             )
-            _, eval_dataset = dataset_constructor.create_datasets()
+            test_dataset, eval_dataset = dataset_constructor.create_datasets()
         else:
             raise ValueError(f"Unknown task {self.cfg.inference.task}")
 

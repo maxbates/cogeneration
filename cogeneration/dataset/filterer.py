@@ -14,7 +14,7 @@ from cogeneration.config.base import (
 )
 from cogeneration.dataset.process_pdb import DataError
 from cogeneration.type.dataset import MetadataColumn as mc
-from cogeneration.type.dataset import MetadataCSVRow, MetadataDataFrame
+from cogeneration.type.dataset import MetadataCSVRow, MetadataDataFrame, RedesignColumn
 
 
 def _log_filter(stage: str) -> Callable[[Callable], Callable]:
@@ -158,6 +158,12 @@ class DatasetFilterer:
             df = df[datetime_col <= max_date]
 
         return df
+
+    @_log_filter("Redesign RMSD filter")
+    def _redesign_rmsd_filter(self, df: MetadataDataFrame) -> MetadataDataFrame:
+        if RedesignColumn.best_rmsd not in df.columns:
+            return df
+        return df[df[RedesignColumn.best_rmsd] <= self.cfg.redesigned_rmsd_threshold]
 
     @property
     def all_filters(

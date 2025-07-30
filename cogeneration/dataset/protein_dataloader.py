@@ -19,7 +19,7 @@ class ProteinData(LightningDataModule):
         *,
         data_cfg: DataConfig,
         train_dataset: BaseDataset,
-        valid_dataset: BaseDataset,
+        eval_dataset: BaseDataset,
         dataset_cfg: DatasetConfig,
         predict_dataset=None,
     ):
@@ -27,7 +27,7 @@ class ProteinData(LightningDataModule):
         self.data_cfg = data_cfg
         self.dataset_cfg = dataset_cfg
         self._train_dataset = train_dataset
-        self._valid_dataset = valid_dataset
+        self._eval_dataset = eval_dataset
         self._predict_dataset = predict_dataset
 
     def train_dataloader(self, rank=None, num_replicas=None) -> DataLoader:
@@ -54,8 +54,8 @@ class ProteinData(LightningDataModule):
 
     def val_dataloader(self) -> DataLoader:
         return DataLoader(
-            self._valid_dataset,
-            sampler=DistributedSampler(self._valid_dataset, shuffle=False),
+            self._eval_dataset,
+            sampler=DistributedSampler(self._eval_dataset, shuffle=False),
             num_workers=self.data_cfg.loader.num_workers_validation,
             prefetch_factor=2,
             pin_memory=False,

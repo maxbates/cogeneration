@@ -20,11 +20,8 @@ from cogeneration.data import all_atom
 from cogeneration.data.const import aatype_to_seq, seq_to_aatype
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restype_order_with_x, restypes_with_x
-from cogeneration.dataset.datasets import (
-    BatchFeaturizer,
-    DatasetConstructor,
-    LengthSamplingDataset,
-)
+from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingDataset
+from cogeneration.dataset.featurizer import BatchFeaturizer
 from cogeneration.dataset.process_pdb import process_chain_feats, process_pdb_file
 from cogeneration.dataset.protein_dataloader import ProteinData
 from cogeneration.dataset.test_utils import (
@@ -401,7 +398,7 @@ def mock_checkpoint(mock_folding_validation):
             data_cfg=cfg.data,
             dataset_cfg=cfg.dataset,
             train_dataset=train_dataset,
-            valid_dataset=valid_dataset,
+            eval_dataset=valid_dataset,
         )
 
         # Patch config to only allow one training epoch.
@@ -491,7 +488,7 @@ def pdb_2qlw_processed_feats(pdb_2qlw_path, mock_cfg):
     featurizer = BatchFeaturizer(
         cfg=mock_cfg.dataset,
         task=DataTask.hallucination,
-        is_training=False,
+        eval=True,
     )
     features = featurizer.featurize_processed_file(
         processed_file=processed_file,
