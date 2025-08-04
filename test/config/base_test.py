@@ -127,8 +127,10 @@ data:
         assert loaded.data.task == DataTask.inpainting
 
     def test_merge_checkpoint_cfg(self, tmp_path):
-        # set up an original config with a changed inference flag
+        # set up an original config
         orig = Config()
+        # changed inference flag
+        assert orig.inference.use_gpu is True  # check default
         orig.inference.use_gpu = False
         # create a fake checkpoint directory and files
         ckpt_dir = tmp_path / "ckpt"

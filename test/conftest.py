@@ -19,14 +19,11 @@ from cogeneration.config.base import PATH_PUBLIC_WEIGHTS, Config, InferenceSampl
 from cogeneration.data import all_atom
 from cogeneration.data.const import aatype_to_seq, seq_to_aatype
 from cogeneration.data.protein import write_prot_to_pdb
-from cogeneration.data.residue_constants import restype_order_with_x, restypes_with_x
-from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingDataset
+from cogeneration.dataset.datasets import DatasetConstructor, EvalDatasetConstructor
 from cogeneration.dataset.featurizer import BatchFeaturizer
 from cogeneration.dataset.process_pdb import process_chain_feats, process_pdb_file
 from cogeneration.dataset.protein_dataloader import ProteinData
 from cogeneration.dataset.test_utils import (
-    MockDataloader,
-    MockDataset,
     create_pdb_dataloader,
     create_pdb_noisy_batch,
 )
@@ -95,24 +92,26 @@ def pdb_noisy_batch(mock_cfg):
 
 @pytest.fixture
 def mock_pred_unconditional_dataloader(request):
-    # TODO(test) - increase default batch size > 1
     batch_size = getattr(request, "param", {}).get("batch_size", 1)
 
-    length_sampling_dataset = LengthSamplingDataset(
-        InferenceSamplesConfig(
+    eval_dataset = EvalDatasetConstructor(
+        cfg=InferenceSamplesConfig(
             samples_per_length=1,
             num_batch=1,
             length_subset=[10],
-        )
-    )
-    dataloader = DataLoader(length_sampling_dataset, batch_size=batch_size)
+        ),
+        task=InferenceTask.unconditional,
+        dataset_cfg=None,  # unnecessary for unconditional
+        use_test=False,
+    ).create_dataset()
+
+    dataloader = DataLoader(eval_dataset, batch_size=batch_size)
     return dataloader
 
 
 @pytest.fixture
 def mock_pred_conditional_dataloader(request, mock_cfg):
     """For `forward_folding` or `inverse_folding` tasks"""
-    # TODO(test) - increase default batch size > 1
     batch_size = getattr(request, "param", {}).get("batch_size", 1)
 
     return create_pdb_dataloader(
@@ -125,7 +124,6 @@ def mock_pred_conditional_dataloader(request, mock_cfg):
 
 @pytest.fixture
 def mock_pred_inpainting_dataloader(request, mock_cfg):
-    # TODO(test) - increase default batch size > 1
     batch_size = getattr(request, "param", {}).get("batch_size", 1)
 
     return create_pdb_dataloader(

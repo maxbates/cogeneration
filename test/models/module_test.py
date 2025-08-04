@@ -12,7 +12,7 @@ from cogeneration.config.base import (
     InterpolantTranslationsScheduleEnum,
 )
 from cogeneration.data.residue_constants import restypes_with_x
-from cogeneration.dataset.datasets import LengthSamplingDataset
+from cogeneration.dataset.datasets import EvalDatasetConstructor
 from cogeneration.dataset.test_utils import create_pdb_noisy_batch
 from cogeneration.models.loss_calculator import TrainingLosses
 from cogeneration.models.module import FlowModule
@@ -382,10 +382,12 @@ class TestFlowModule:
 
         module = FlowModule(mock_cfg)
 
-        dataloader = DataLoader(
-            dataset=LengthSamplingDataset(mock_cfg.inference.samples),
-            batch_size=1,
-        )
+        dataloader = EvalDatasetConstructor(
+            cfg=mock_cfg.inference.samples,
+            task=mock_cfg_uninterpolated.inference.task,
+            dataset_cfg=mock_cfg_uninterpolated.dataset,
+            use_test=False,
+        ).create_dataloader()
         batch = next(iter(dataloader))
         assert batch[bp.chain_idx].unique().shape[0] > 1
 

@@ -1304,13 +1304,24 @@ class ExperimentConfig(BaseClassConfig):
 class InferenceSamplesConfig(BaseClassConfig):
     """
     Inference sampling configuration.
+    Defines configuration for all inference tasks, i.e.:
+    - unconditional (defined length + index)
+    - conditional i.e. inpainting (partial structures)
+
+    For inpainting
+
+    For length sampling:
     Can define either `length_subset` (priority) or `min_length`, `max_length`, `length_step`.
     """
 
-    # Number of backbone samples per sequence length.
-    samples_per_length: int = 10
     # Batch size when sampling from the model
     num_batch: int = 1
+
+    # Conditional (partial PDB data)
+
+    # Unconditional (length + index sampling)
+    # Number of backbone samples per sequence length.
+    samples_per_length: int = 10
     # Subset of lengths to sample. If empty, sample all targets between min_length and max_length
     length_subset: Optional[List[int]] = field(
         default_factory=lambda: [70, 100, 200, 300]
@@ -1330,6 +1341,12 @@ class InferenceSamplesConfig(BaseClassConfig):
 class InferenceConfig(BaseClassConfig):
     task: InferenceTask = InferenceTask.inpainting
 
+    # configuration for inference samples
+    samples: InferenceSamplesConfig = field(default_factory=InferenceSamplesConfig)
+
+    # inference interpolant is configured separately
+    interpolant: InterpolantConfig = field(default_factory=InterpolantConfig)
+
     seed: int = "${shared.seed}"
     use_gpu: bool = True
     num_gpus: int = torch.cuda.device_count() if torch.cuda.is_available() else 1
@@ -1344,9 +1361,6 @@ class InferenceConfig(BaseClassConfig):
     inverse_folding_ckpt_path: Optional[str] = str(PATH_PUBLIC_WEIGHTS / "last.ckpt")
     # note inpainting not explicitly supported by public MultiFlow model
     inpainting_ckpt_path: Optional[str] = str(PATH_PUBLIC_WEIGHTS / "last.ckpt")
-
-    interpolant: InterpolantConfig = field(default_factory=InterpolantConfig)
-    samples: InferenceSamplesConfig = field(default_factory=InferenceSamplesConfig)
 
     # validation
     # whether to also fold the generated pmpnn seq for each structure

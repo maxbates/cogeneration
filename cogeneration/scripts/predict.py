@@ -10,7 +10,7 @@ from pytorch_lightning import Trainer
 from pytorch_lightning.utilities.model_summary import ModelSummary
 
 from cogeneration.config.base import Config
-from cogeneration.dataset.datasets import DatasetConstructor, LengthSamplingDataset
+from cogeneration.dataset.datasets import EvalDatasetConstructor
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.utils import get_available_device, print_timing
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
@@ -110,33 +110,15 @@ class EvalRunner:
         if self._dataloader is not None:
             return self._dataloader
 
-        if self.cfg.inference.task == InferenceTask.unconditional:
-            eval_dataset = LengthSamplingDataset(self.cfg.inference.samples)
-        elif (
-            self.cfg.inference.task == InferenceTask.inpainting
-            or self.cfg.inference.task == InferenceTask.forward_folding
-            or self.cfg.inference.task == InferenceTask.inverse_folding
-        ):
-            # TODO - we should have a better helper for PDB inference set
-            # We want to use cfg.inference.samples to determine lengths etc.
-
-            # Use the test dataset for inference
-            # Note for inpainting, reasonable to use "training" eval dataset
-            # with randomized motifs + scaffold lengths
-            dataset_constructor = DatasetConstructor(
-                cfg=self.cfg.dataset,
-                task=InferenceTask.to_data_task(self.cfg.inference.task),
-                use_test=True,
-            )
-            test_dataset, eval_dataset = dataset_constructor.create_datasets()
-        else:
-            raise ValueError(f"Unknown task {self.cfg.inference.task}")
-
-        self._dataloader = torch.utils.data.DataLoader(
-            eval_dataset,
+        eval_constructor = EvalDatasetConstructor(
+            cfg=self.cfg.inference.samples,
+            task=self.cfg.inference.task,
+            dataset_cfg=self.cfg.dataset,
+            use_test=True,
+        )
+        self._dataloader = eval_constructor.create_dataloader(
             batch_size=1,
             shuffle=False,
-            drop_last=False,
         )
 
         return self._dataloader

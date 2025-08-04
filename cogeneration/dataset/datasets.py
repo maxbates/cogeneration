@@ -4,7 +4,7 @@ import random
 from dataclasses import dataclass
 from math import floor
 from pathlib import Path
-from typing import Optional, Tuple, TypeVar, Union
+from typing import List, Optional, Tuple, TypeVar, Union
 
 import numpy as np
 import pandas as pd
@@ -14,6 +14,7 @@ from torch.utils.data import Dataset
 from cogeneration.config.base import (
     Config,
     DatasetConfig,
+    DatasetFilterConfig,
     DatasetSpec,
     DatasetTrimMethod,
     InferenceSamplesConfig,
@@ -28,7 +29,7 @@ from cogeneration.type.dataset import DatasetColumn, DatasetCSVRow, DatasetDataF
 from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.dataset import MetadataDataFrame, ProcessedFile, RedesignColumn
 from cogeneration.type.structure import StructureExperimentalMethod
-from cogeneration.type.task import DataTask
+from cogeneration.type.task import DataTask, InferenceTask
 
 
 class BaseDataset(Dataset):
@@ -328,17 +329,55 @@ class BaseDataset(Dataset):
         return feats
 
 
+@dataclass
+class DatasetConstructor:
+    """Helper to create train + eval BaseDatasets from cfg.dataset"""
+
+    cfg: DatasetConfig
+    task: DataTask
+    use_test: bool
+
+    def create_datasets(self) -> Tuple[BaseDataset, BaseDataset]:
+        """generate dataset, and possibly validation dataset"""
+        train_dataset = BaseDataset(
+            cfg=self.cfg,
+            task=self.task,
+            eval=False,
+            use_test=self.use_test,
+        )
+
+        eval_dataset = BaseDataset(
+            cfg=self.cfg,
+            task=self.task,
+            eval=True,
+            use_test=self.use_test,
+        )
+
+        return train_dataset, eval_dataset
+
+    @classmethod
+    def from_cfg(cls, cfg: Config, use_test: bool = False):
+        return cls(cfg=cfg.dataset, task=cfg.data.task, use_test=use_test)
+
+
+@dataclass
 class LengthSamplingDataset(Dataset):
     """
     During unconditional predictions/inference, dataset to generate samples across lengths
     """
 
-    def __init__(self, cfg: InferenceSamplesConfig):
-        self.cfg = cfg
+    cfg: InferenceSamplesConfig
 
+    def __post_init__(self):
+        self._all_sample_ids = self.create_sample_lengths()
+
+    def __len__(self):
+        return len(self._all_sample_ids)
+
+    def create_sample_lengths(self) -> List[Tuple[int, torch.Tensor]]:
         # determine lengths to sample
-        if cfg.length_subset is not None:
-            all_sample_lengths = [int(x) for x in cfg.length_subset]
+        if self.cfg.length_subset is not None:
+            all_sample_lengths = [int(x) for x in self.cfg.length_subset]
         else:
             all_sample_lengths = range(
                 self.cfg.min_length, self.cfg.max_length + 1, self.cfg.length_step
@@ -347,18 +386,15 @@ class LengthSamplingDataset(Dataset):
         all_sample_ids = []
         num_batch = self.cfg.num_batch
         assert self.cfg.samples_per_length % num_batch == 0
-        self.n_samples = self.cfg.samples_per_length // num_batch
+        num_samples_per_batch = self.cfg.samples_per_length // num_batch
 
         for length in all_sample_lengths:
-            for sample_id in range(self.n_samples):
+            for sample_id in range(num_samples_per_batch):
                 sample_ids = torch.tensor(
                     [num_batch * sample_id + i for i in range(num_batch)]
                 )
                 all_sample_ids.append((length, sample_ids))
-        self._all_sample_ids = all_sample_ids
-
-    def __len__(self):
-        return len(self._all_sample_ids)
+        return all_sample_ids
 
     def generate_idx(self, num_res: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Generates chain_idx and res_idx, potentially multimeric"""
@@ -433,31 +469,103 @@ class LengthSamplingDataset(Dataset):
 
 
 @dataclass
-class DatasetConstructor:
-    """Helper to create train + eval BaseDatasets from cfg.dataset"""
+class EvalDatasetConstructor:
+    """
+    Helper to create eval dataset
+    may be unconditional (length sampling) or conditional (partial structures for inpainting)
+    """
 
-    cfg: DatasetConfig
-    task: DataTask
-    use_test: bool
+    cfg: InferenceSamplesConfig
+    task: InferenceTask
+    # dataset config required for inpainting, folding tasks
+    dataset_cfg: Optional[DatasetConfig] = None
+    # use test dataset for tasks using PDBs (inpainting, folding)
+    use_test: bool = False
 
-    def create_datasets(self) -> Tuple[BaseDataset, BaseDataset]:
-        """generate dataset, and possibly validation dataset"""
-        train_dataset = BaseDataset(
-            cfg=self.cfg,
-            task=self.task,
-            eval=False,
-            use_test=self.use_test,
+    def create_dataset(self) -> Union[LengthSamplingDataset, BaseDataset]:
+        """generate eval dataset"""
+        if self.task == InferenceTask.unconditional:
+            return LengthSamplingDataset(cfg=self.cfg)
+        elif (
+            self.task == InferenceTask.inpainting
+            or self.task == InferenceTask.forward_folding
+            or self.task == InferenceTask.inverse_folding
+        ):
+            return BaseDataset(
+                cfg=self._get_dataset_cfg(),
+                task=InferenceTask.to_data_task(self.task),
+                eval=True,
+                use_test=self.use_test,
+            )
+        else:
+            raise ValueError(f"Unsupported inference task {self.task}")
+
+    def create_dataloader(
+        self,
+        batch_size: Optional[int] = None,
+        shuffle: bool = False,
+    ) -> torch.utils.data.DataLoader:
+        """
+        Create a DataLoader for the dataset.
+        """
+        if batch_size is None:
+            batch_size = self.cfg.num_batch
+
+        dataset = self.create_dataset()
+
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=False,
         )
 
-        eval_dataset = BaseDataset(
-            cfg=self.cfg,
-            task=self.task,
-            eval=True,
-            use_test=self.use_test,
-        )
+    def _get_dataset_cfg(self) -> DatasetConfig:
+        """Patch DatasetConfig for inference tasks"""
+        assert (
+            self.dataset_cfg is not None
+        ), f"DatasetConfig required for task {self.task}"
 
-        return train_dataset, eval_dataset
+        # Patch dataset config with relevant inference configuration
+        # TODO - should not have to re-specify inference config in dataset config
+        dataset_cfg = self.dataset_cfg.clone()
+        filter_cfg = dataset_cfg.filter
+
+        # Pass through relevant parameters
+        dataset_cfg.samples_per_eval_length = self.cfg.samples_per_length
+        filter_cfg.max_num_res = self.cfg.max_length
+        filter_cfg.min_num_res = self.cfg.min_length
+
+        # handle specifying length_subset vs min, max, step
+        if self.cfg.length_subset is not None:
+            dataset_cfg.num_eval_lengths = len(self.cfg.length_subset)
+            dataset_cfg.max_eval_length = max(self.cfg.length_subset)
+            dataset_cfg.filter.min_num_res = min(self.cfg.length_subset)
+            dataset_cfg.filter.max_num_res = max(self.cfg.length_subset)
+        else:
+            dataset_cfg.max_eval_length = self.cfg.max_length
+            dataset_cfg.num_eval_lengths = (
+                (self.cfg.max_length - self.cfg.min_length) // self.cfg.length_step
+            ) + 1
+            dataset_cfg.filter.min_num_res = self.cfg.min_length
+            dataset_cfg.filter.max_num_res = self.cfg.max_length
+
+        # hacky handle multimer by update dataset filter
+        # doesn't handle fraction correctly - that depends on data subset picked...
+        if self.cfg.multimer_fraction == 0.0:
+            dataset_cfg.filter.num_chains = [1]
+        elif self.cfg.multimer_fraction == 1.0:
+            dataset_cfg.filter.num_chains = [2, 3, 4]
+            dataset_cfg.filter.oligomeric = None
+        else:
+            dataset_cfg.filter.num_chains = [1, 2, 3, 4]
+            dataset_cfg.filter.oligomeric = None
+
+        return dataset_cfg
 
     @classmethod
-    def from_cfg(cls, cfg: Config, use_test: bool = False):
-        return cls(cfg=cfg.dataset, task=cfg.data.task, use_test=use_test)
+    def from_cfg(cls, cfg: Config):
+        return cls(
+            cfg=cfg.inference.samples,
+            task=cfg.inference.task,
+        )

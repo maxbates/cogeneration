@@ -89,7 +89,8 @@ class MetricName(StrEnum):
     )
     inverse_folding_motif_bb_rmsd_mean = "inverse_folding_motif_bb_rmsd_mean"
 
-    def metadata_columns(self) -> List["MetricName"]:
+    @staticmethod
+    def metadata_columns() -> List["MetricName"]:
         """Return columns that are metadata, not metrics, e.g. can't take mean"""
         return [
             MetricName.sample_id,

@@ -6,7 +6,11 @@ def get_model_size_str(model: nn.Module) -> str:
     """
     Get the size of a model in MB, and the number of parameters by dtype.
     """
-    device = next(model.parameters()).device
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        return "(Model has no parameters)"
+
     emoji = "🧊" if device.type == "cpu" else "🔥"
 
     total_size = sum(p.numel() * p.element_size() for p in model.parameters())

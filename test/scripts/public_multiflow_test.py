@@ -1,14 +1,11 @@
 import os.path
 
 import pytest
-import torch
 
 from cogeneration.config.base import Config, InferenceSamplesConfig
-from cogeneration.dataset.datasets import LengthSamplingDataset
-from cogeneration.dataset.test_utils import create_pdb_dataloader
+from cogeneration.dataset.datasets import EvalDatasetConstructor
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.predict import EvalRunner
-from cogeneration.type.metrics import MetricName
 from cogeneration.type.task import InferenceTask
 
 
@@ -60,8 +57,11 @@ class TestEvalRunner:
         cfg.inference.predict_dir = str(tmp_path / "inference")
         # control number of timesteps. e.g. use 1 to debug folding validation / plotting
         cfg.inference.interpolant.sampling.num_timesteps = 200
-        # limit eval length
-        cfg.dataset.max_eval_length = 120
+        # number of samples + eval lengths etc.
+        cfg.inference.samples.samples_per_length = 1
+        cfg.inference.samples.num_batch = 1
+        cfg.inference.samples.multimer_fraction = 0.0
+        cfg.inference.samples.length_subset = [120]
         # skip designability? requires folding each ProteinMPNN sequence
         cfg.inference.also_fold_pmpnn_seq = False
         # write trajectories to inspect
@@ -84,24 +84,17 @@ class TestEvalRunner:
         module.folding_validator.set_device_id(0)
         module.eval()
 
-        # create inference batch
-        if cfg.inference.task == InferenceTask.unconditional:
-            dataset = LengthSamplingDataset(
-                InferenceSamplesConfig(
-                    samples_per_length=1,
-                    num_batch=1,
-                    length_subset=[cfg.dataset.max_eval_length],
-                    multimer_fraction=0.0,
-                )
-            )
-            dataloader = torch.utils.data.DataLoader(dataset, batch_size=1)
-        else:
-            dataloader = create_pdb_dataloader(
-                cfg=cfg,
-                task=InferenceTask.to_data_task(cfg.inference.task),
-                training=False,
-                eval_batch_size=1,
-            )
+        eval_constructor = EvalDatasetConstructor(
+            cfg=cfg.inference.samples,
+            # Multiflow not trained to support inpainting but sort of can
+            task=cfg.inference.task,
+            dataset_cfg=cfg.dataset,
+            use_test=False,
+        )
+        dataloader = eval_constructor.create_dataloader(
+            batch_size=1,
+            shuffle=True,
+        )
         batch = next(iter(dataloader))
 
         # sample
