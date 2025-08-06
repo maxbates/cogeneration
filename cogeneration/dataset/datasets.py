@@ -25,9 +25,14 @@ from cogeneration.dataset.process_pdb import read_processed_file
 from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import InferenceFeatures
-from cogeneration.type.dataset import DatasetColumn, DatasetCSVRow, DatasetDataFrame
+from cogeneration.type.dataset import (
+    BestRedesignColumn,
+    DatasetColumn,
+    DatasetCSVRow,
+    DatasetDataFrame,
+)
 from cogeneration.type.dataset import MetadataColumn as mc
-from cogeneration.type.dataset import MetadataDataFrame, ProcessedFile, RedesignColumn
+from cogeneration.type.dataset import MetadataDataFrame, ProcessedFile
 from cogeneration.type.structure import StructureExperimentalMethod
 from cogeneration.type.task import DataTask, InferenceTask
 
@@ -196,14 +201,14 @@ class BaseDataset(Dataset):
             metadata=metadata,
         )
 
-        # Concat redesigned data, if provided.
+        # Replace sequences using best redesigns, if provided.
         # Redesigned data is not filtered except for RMSD requirement.
-        if spec.redesigns_path is not None:
-            redesigns_df = pd.read_csv(spec.redesigns_path)
+        if spec.best_redesigns_path is not None:
+            redesigns_df = pd.read_csv(spec.best_redesigns_path)
             metadata = metadata.merge(
                 redesigns_df,
                 left_on=mc.pdb_name,
-                right_on=RedesignColumn.example,
+                right_on=BestRedesignColumn.example,
             )
 
         return metadata

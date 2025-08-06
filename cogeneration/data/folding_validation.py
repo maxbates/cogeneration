@@ -550,7 +550,9 @@ class FoldingValidator:
         return metrics_df, metrics_csv_path
 
     def fold_fasta(
-        self, fasta_path: Path, output_dir: Path, require_empty: bool = True
+        self,
+        fasta_path: Path,
+        output_dir: Path,
     ) -> FoldingDataFrame:
         """
         Fold sequences in a fasta file.

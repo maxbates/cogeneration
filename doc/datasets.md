@@ -22,7 +22,7 @@ willing to drop compatibility with MultiFlow data
 - [x] synthetic structures just treated as another dataset
 - [x] clarify training / eval modes, use `eval` flag for dataset
 
-- [ ] improve cfg for inference using PDB data for inpainting
+- [] improve cfg for inference using PDB data for inpainting
   - [x] clearer separation of training and inference configurations
   - [x] unify inference cfg across length sampling or PDB data
   - [x] helper to get PDB dataset for inference using inference.samples cfg
@@ -32,14 +32,15 @@ willing to drop compatibility with MultiFlow data
   - [ ] ? separate subset for unconditional and conditional config (after use helper)
   - [ ] ? refactor DatasetConfig validation params, should not be required for defining eval dataset
     - [ ] ? esp handling for multimers
+  - [ ] add LengthSampler wrapper for PDBs to pull out specified lengths for inference
 
 - [ ] reprocess PDB
 
 - [ ] clearer dataset splits across a single dataset
   - !! Requires reprocessing PDB and tracking date 
-  - [ ] using date to split
-  - [ ] deprecate test dataset
-  - avoid use of file to specify ids
+  - [ ] using date to split (MultiFlow uses 2021 or something)
+  - [ ] deprecate test dataset (i.e. merge with training dataset)
+  - [ ] avoid use of file to specify ids
 
 - [ ] add Dayhoff dataset, esp if have redesigned -> backbone mapping
   - says they should but doesnt appear to be available in hugging face
@@ -52,13 +53,15 @@ However, we also predict torsions etc., so we rely on a new structure for each r
 Therefore, it's easiest to treat redesigns as a separate dataset.
 The redesign script should just generate new metadata file into a new dataset, but also track the source structure and sequence.
 
-- [ ] refactor redesign generation
-  - [ ] refactor scripts to generate redesigns
-  - [ ] keep all redesigns under some threshold, and track RMSD -- dont only keep best
-  - [ ] track source of generation + tools used + time, combine with multiflow data
+- [x] refactor redesign generation
+  - [x] refactor scripts to generate redesigns
+  - [x] keep all redesigns under some threshold, and track RMSD -- dont only keep best
+  - [x] track source of generation + tools used + time, combine with multiflow data
+  - [ ] improve performance
   
 - [ ] Script to convert multiflow redesigns... may need to predict structures from redesigns?
   - Already have the needles in the haystack, so probably worth it?
+  - [ ] also can use on Dayhoff dataset, esp if have original structure
 
 - [ ] Generate own redesign dataset, e.g. multimers
 

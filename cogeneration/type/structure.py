@@ -48,6 +48,9 @@ class StructureExperimentalMethod(StrEnum):
     Structure experimental / modeling methods, ~ aligned with Boltz-2
     """
 
+    # e.g. Boltz predictions don't include header, PDB parser -> 'unknown'
+    UNKNOWN = "UNKNOWN"
+
     MD = "MD"
     XRAY_DIFFRACTION = "XRAY_DIFFRACTION"
     ELECTRON_MICROSCOPY = "ELECTRON_MICROSCOPY"
@@ -56,6 +59,7 @@ class StructureExperimentalMethod(StrEnum):
     # synthetic
     AFDB = "AFDB"  # AF2 DB
     BOLTZ_1 = "BOLTZ-1"  # Boltz-1 structures
+    BOLTZ_2 = "BOLTZ-2"  # Boltz-2 structures
     # placeholder for future methods... safe-ish to change enum values?
     FUTURE1 = "FUTURE1"
     FUTURE2 = "FUTURE2"
@@ -109,6 +113,7 @@ class StructureExperimentalMethod(StrEnum):
             return cls.XRAY_DIFFRACTION
 
         _STR_TO_METHOD: Mapping[str, StructureExperimentalMethod] = {
+            # common methods
             "MD": cls.MD,
             "X-RAY DIFFRACTION": cls.XRAY_DIFFRACTION,
             "ELECTRON MICROSCOPY": cls.ELECTRON_MICROSCOPY,
@@ -128,12 +133,15 @@ class StructureExperimentalMethod(StrEnum):
             # synthetic
             "AFDB": cls.AFDB,
             "BOLTZ-1": cls.BOLTZ_1,
+            "BOLTZ-2": cls.BOLTZ_2,
             # future
             "FUTURE1": cls.FUTURE1,
             "FUTURE2": cls.FUTURE2,
             "FUTURE3": cls.FUTURE3,
             "FUTURE4": cls.FUTURE4,
             "FUTURE5": cls.FUTURE5,
+            # unknown catch
+            "UNKNOWN": cls.UNKNOWN,
         }
 
         if not isinstance(value, str):

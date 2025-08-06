@@ -84,7 +84,7 @@ import torch
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
 
-from cogeneration.config.base import ModelType, ProteinMPNNRunnerConfig
+from cogeneration.config.base import LigandMPNNModelType, ProteinMPNNRunnerConfig
 from cogeneration.data import all_atom, residue_constants
 from cogeneration.data.const import CHAIN_BREAK_STR
 from cogeneration.data.tools.abc import (
@@ -435,7 +435,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
             checkpoint = torch.load(checkpoint_path, map_location=self._device)
 
             # Determine model parameters based on model type
-            if self.cfg.model_type == ModelType.LIGAND_MPNN:
+            if self.cfg.model_type == LigandMPNNModelType.LIGAND_MPNN:
                 atom_context_num = checkpoint.get("atom_context_num", 16)
                 ligand_mpnn_use_side_chain_context = (
                     self.cfg.ligand_mpnn_use_side_chain_context
@@ -590,11 +590,11 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         # Map model types to checkpoint files
         checkpoint_mapping = {
-            ModelType.PROTEIN_MPNN: "proteinmpnn_v_48_020.pt",
-            ModelType.LIGAND_MPNN: "ligandmpnn_v_32_010_25.pt",
-            ModelType.SOLUBLE_MPNN: "solublempnn_v_48_020.pt",
-            ModelType.MEMBRANE_MPNN: "proteinmpnn_v_48_020.pt",  # Same as protein_mpnn
-            ModelType.GLOBAL_MEMBRANE_MPNN: "global_membrane_mpnn_v_48_020.pt",
+            LigandMPNNModelType.PROTEIN_MPNN: "proteinmpnn_v_48_020.pt",
+            LigandMPNNModelType.LIGAND_MPNN: "ligandmpnn_v_32_010_25.pt",
+            LigandMPNNModelType.SOLUBLE_MPNN: "solublempnn_v_48_020.pt",
+            LigandMPNNModelType.MEMBRANE_MPNN: "proteinmpnn_v_48_020.pt",  # Same as protein_mpnn
+            LigandMPNNModelType.GLOBAL_MEMBRANE_MPNN: "global_membrane_mpnn_v_48_020.pt",
         }
 
         checkpoint_file = checkpoint_mapping.get(self.cfg.model_type)
@@ -1214,7 +1214,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
         # atom37 format: [N, CA, C, O, CB, ...] - we need first 4
         X_backbone = atom37[:, :4, :]  # (N, 4, 3)
 
-        if self.cfg.model_type == ModelType.LIGAND_MPNN:
+        if self.cfg.model_type == LigandMPNNModelType.LIGAND_MPNN:
             # TODO - support LigandMPNN style protein_dict, probably not very different.
             raise NotImplementedError(
                 "running LigandMPNN model natively not yet supported (req different input dict)"
@@ -1720,7 +1720,10 @@ class ProteinMPNNRunner(InverseFoldingTool):
         # Compute combined mask for ligand confidence
         feature_dict_mask = torch.ones(1, len(native_seq), device=self._device)
         chain_mask = torch.ones(1, len(native_seq), device=self._device)
-        if self.cfg.model_type == ModelType.LIGAND_MPNN and "mask_XY" in protein_dict:
+        if (
+            self.cfg.model_type == LigandMPNNModelType.LIGAND_MPNN
+            and "mask_XY" in protein_dict
+        ):
             combined_mask = (
                 feature_dict_mask
                 * protein_dict.get("mask_XY", feature_dict_mask)
@@ -1854,7 +1857,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
             cutoff_for_score=8.0,
             use_atom_context=True,  # Use atom context for side chain packing
             number_of_ligand_atoms=16,
-            model_type=ModelType.LIGAND_MPNN,
+            model_type=LigandMPNNModelType.LIGAND_MPNN,
         )
 
         # Create lists to store packed results

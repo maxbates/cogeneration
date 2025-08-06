@@ -325,6 +325,24 @@ class TestBoltzRunner:
         assert result is not None
         assert len(result) == 2
 
+        # check the sequences
+        for i, protein_result in enumerate(result):
+            assert protein_result.get_sequence() == multiple_sequences[i]
+
+    @pytest.mark.slow
+    def test_multiplicity_multiple_sequence_prediction(self, mock_cfg):
+        """Test batched inference with multiple sequences."""
+        mock_cfg.folding.boltz.diffusion_samples = 2  # multiplicity
+        predictor = BoltzRunner(cfg=mock_cfg.folding.boltz)
+        result = predictor.fold_sequences(multiple_sequences, ["protein1", "protein2"])
+
+        assert result is not None
+        assert len(result) == 2
+
+        # check the sequences
+        for i, protein_result in enumerate(result):
+            assert protein_result.get_sequence() == multiple_sequences[i]
+
     @pytest.mark.slow
     def test_multimer_prediction(self, mock_cfg):
         """Test that we can run a multimer prediction."""

@@ -1,11 +1,7 @@
 import logging
+import warnings
 
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
-
-# quiet 3rd party loggers
-for pkg in ["prody", "numba", "pytorch_lightning"]:
-    logging.getLogger(pkg).setLevel(logging.WARNING)
-    logging.getLogger(pkg).propagate = False
 
 
 def rank_zero_logger(name=__name__) -> logging.Logger:
@@ -27,3 +23,33 @@ def rank_zero_logger(name=__name__) -> logging.Logger:
         setattr(logger, level, rank_zero_only(getattr(logger, level)))
 
     return logger
+
+
+# set default log level
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s | %(message)s"
+)
+
+# quiet 3rd party loggers
+for pkg in [
+    "prody",
+    "numba",
+    "pytorch_lightning",
+    "matplotlib.font_manager",
+    "matplotlib.animation",
+]:
+    logging.getLogger(pkg).setLevel(logging.WARNING)
+    logging.getLogger(pkg).propagate = False
+
+
+# quiet warnings
+warnings.filterwarnings(
+    "ignore",
+    message="'pin_memory' argument is set as true but not supported on MPS now, then device pinned memory won't be used.",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message="Consider setting `persistent_workers=True` in 'predict_dataloader' to speed up the dataloader worker initialization.",
+    category=UserWarning,
+)

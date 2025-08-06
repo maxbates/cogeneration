@@ -22,11 +22,11 @@ from cogeneration.dataset.motif_factory import (
 from cogeneration.type.batch import METADATA_BATCH_PROPS, BatchFeatures
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import empty_feats
-from cogeneration.type.dataset import DatasetCSVRow
+from cogeneration.type.dataset import BestRedesignColumn, DatasetCSVRow
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.dataset import DatasetTransformColumn as dtc
 from cogeneration.type.dataset import MetadataColumn as mc
-from cogeneration.type.dataset import MetadataCSVRow, ProcessedFile, RedesignColumn
+from cogeneration.type.dataset import MetadataCSVRow, ProcessedFile
 from cogeneration.type.structure import StructureExperimentalMethod
 from cogeneration.type.task import DataTask
 
@@ -546,8 +546,8 @@ class BatchFeaturizer:
         because it adds noise to atom positions, picks motif positions, etc. as defined by cfg.
         """
         # Redesigned sequences can be used to substitute the original sequence during training.
-        if self.is_training and RedesignColumn.best_seq in csv_row:
-            best_seq = csv_row[RedesignColumn.best_seq]
+        if self.is_training and BestRedesignColumn.best_seq in csv_row:
+            best_seq = csv_row[BestRedesignColumn.best_seq]
             if not isinstance(best_seq, str):
                 raise ValueError(f"Unexpected value best_seq: {best_seq}")
             best_aatype = np.array(seq_to_aatype(best_seq))

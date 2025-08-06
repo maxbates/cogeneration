@@ -19,6 +19,7 @@ from cogeneration.type.batch import PredBatchProp as pbp
 TODO(model) Additional losses to consider:
 
 - side chain interactions / clashes / vdw
+    all-atom pairwise distances explode if done naively
 
 - translation vector field loss 
     instead of just translation coordinates
@@ -192,7 +193,10 @@ class BatchLossCalculator:
 
     @cached_property
     def loss_mask(self) -> torch.Tensor:
-        """Mask for residues to consider for loss calculation."""
+        """
+        Mask for residues to consider for loss calculation.
+        Note for inpainting, we ignore motifs in loss.
+        """
         bb_mask = self.batch[bp.res_mask]
         diffuse_mask = self.batch[bp.diffuse_mask]
         loss_mask = bb_mask * diffuse_mask

@@ -14,7 +14,7 @@ class MetadataColumn(StrEnum):
     """
 
     pdb_name = "pdb_name"
-    # (optional) original PDB file, may be compressed
+    # original PDB file, may be compressed
     raw_path = "raw_path"
     # pkl file for processed structure/sequence
     processed_path = "processed_path"
@@ -91,9 +91,25 @@ class MetadataColumn(StrEnum):
 
 
 class RedesignColumn(StrEnum):
-    """Columns in the redesign metadata CSVs"""
+    """Columns in redesign CSVs, containing all redesigned sequences"""
 
-    example = "example"  # pdb_name
+    example = "example"  # original pdb_name
+    pred_pdb_path = "pred_pdb_path"  # path to predicted structure
+    rmsd = "rmsd"  # RMSD to the original structure
+    sequence_id = "sequence_id"  # modified ProteinMPNN sequence name
+    sequence = "sequence"  # redesigned sequence
+    example_sequence = "example_sequence"  # original sequence
+    example_pdb_path = "example_pdb_path"  # path to original PDB file
+    fasta_path = "fasta_path"  # redesign fasta
+    fasta_idx = "fasta_idx"  # index within the fasta (0-based)
+    inverse_folding_tool = "inverse_folding_tool"  # inverse folding tool used
+    folding_tool = "folding_tool"  # folding tool used
+
+
+class BestRedesignColumn(StrEnum):
+    """Columns in the best redesign CSVs, matching MultiFlow style specification"""
+
+    example = "example"  # original pdb_name
     wildtype_seq = "wildtype_seq"  # original sequence
     wildtype_rmsd = "wildtype_rmsd"  # RMSD of original sequence to reference structure
     best_seq = "best_seq"  # best 1 redesign per structure
@@ -160,7 +176,8 @@ MetadataDataFrame = pd.DataFrame
 
 """DatasetCSVRow is row of MetadatDataFrame augmented with clusters, redesigned data, etc."""
 DatasetCSVRow = Dict[
-    Union[MetadataColumn, RedesignColumn, DatasetColumn], NumpyPrimitiveFeat
+    Union[MetadataColumn, RedesignColumn, BestRedesignColumn, DatasetColumn],
+    NumpyPrimitiveFeat,
 ]
 
 """DatasetDataFrame is the full dataset, composed of DatasetCSVRow"""

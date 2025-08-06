@@ -1036,10 +1036,15 @@ class DatasetSpec:
     Paths etc. defining a dataset's metadata and processed data.
     """
 
+    # name of dataset
     name: str
-    processed_root_path: Path
+    # path to metadata CSV, which contains all the information about the dataset
     metadata_path: Path
-    redesigns_path: Optional[Path] = None
+    # directory where processed data is stored, esp if relative paths defined in CSV
+    processed_root_path: Path
+    # BestRedesigns CSV (MultiFlow style). Always replaces original sequence with redesign sequence.
+    best_redesigns_path: Optional[Path] = None
+    # cluster file
     cluster_path: Optional[Path] = None
 
     def __post_init__(self):
@@ -1051,9 +1056,9 @@ class DatasetSpec:
             raise FileNotFoundError(
                 f"Processed data root path for {self.name} not found: {self.processed_root_path}"
             )
-        if self.redesigns_path and not self.redesigns_path.exists():
+        if self.best_redesigns_path and not self.best_redesigns_path.exists():
             raise FileNotFoundError(
-                f"Redesigns CSV for {self.name} not found: {self.redesigns_path}"
+                f"BestRedesigns CSV for {self.name} not found: {self.best_redesigns_path}"
             )
         if self.cluster_path and not self.cluster_path.exists():
             raise FileNotFoundError(
@@ -1372,7 +1377,7 @@ class InferenceConfig(BaseClassConfig):
     animation_max_frames: int = 50
 
 
-class ModelType(StrEnum):
+class LigandMPNNModelType(StrEnum):
     """Supported LigandMPNN model types."""
 
     PROTEIN_MPNN = "protein_mpnn"
@@ -1403,7 +1408,7 @@ class ProteinMPNNRunnerConfig(BaseClassConfig):
     # Native runner options
     use_native_runner: bool = True  # Use native runner instead of subprocess
     accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'cuda'}"
-    model_type: ModelType = ModelType.PROTEIN_MPNN
+    model_type: LigandMPNNModelType = LigandMPNNModelType.PROTEIN_MPNN
     temperature: float = 0.1  # Sampling temperature
 
     # Advanced features from LigandMPNN
@@ -1504,6 +1509,30 @@ class FoldingConfig(BaseClassConfig):
 
 
 @dataclass
+class RedesignConfig(BaseClassConfig):
+    """Configuration for sequence redesign using ProteinMPNN."""
+
+    # Specify metadata CSV instead of using dataset
+    metadata_csv: Optional[Path] = None
+    # Directory to write redesign files
+    output_dir: Path = field(
+        default_factory=lambda: Path("~/pdb/rcsb/redesigned").expanduser()
+    )
+    # Sequences generated per example
+    seqs_per_sample: int = 4
+    # Maximum RMSD to retain redesigns, 0 to keep all
+    rmsd_max: float = 0.0
+    # RMSD threshold for good redesigns
+    rmsd_good: float = 2.0
+    # Skip existing redesigned sequences
+    skip_existing: bool = True
+    # Filename for all redesigns CSV
+    all_csv: str = "redesigned_all.csv"
+    # Filename for best redesigns CSV
+    best_csv: str = "redesigned.csv"
+
+
+@dataclass
 class Config(BaseClassConfig):
     """
     We use dataclasses as part of hydra's structured config system, to enable type checking and default values.
@@ -1518,6 +1547,7 @@ class Config(BaseClassConfig):
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     interpolant: InterpolantConfig = field(default_factory=InterpolantConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    redesign: RedesignConfig = field(default_factory=RedesignConfig)
 
     @classmethod
     def load_dict_from_file(

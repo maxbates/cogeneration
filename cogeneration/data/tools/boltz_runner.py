@@ -4,6 +4,8 @@ Boltz-2 structure prediction module.
 This module provides a BoltzRunner class that loads the Boltz-2 model once
 and allows for efficient repeated inference. It supports single-sequence mode
 (no templates, no MSA) with potentials support and batching.
+
+TODO - boltz now supports `empty` MSA keyword, so we don't need to make a dummy one.
 """
 
 import gc
@@ -40,11 +42,6 @@ from boltz.main import (
 )
 from boltz.model.models.boltz2 import Boltz2
 from pytorch_lightning import Trainer
-from pytorch_lightning.accelerators import (
-    CPUAccelerator,
-    CUDAAccelerator,
-    MPSAccelerator,
-)
 
 from cogeneration.config.base import BoltzConfig
 from cogeneration.data import residue_constants

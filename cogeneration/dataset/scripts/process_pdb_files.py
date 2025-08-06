@@ -5,6 +5,11 @@ Script to preprocessing PDB files, generating metadata file and pkls expected by
 Supports partial processing and restarts and appending metadata, if has the same fields.
 
 Pass `--alphafold` to use default AlphaFold directory structure and metadata file naming.
+
+Pass `--max_structures` for debugging to limit number of files processed.
+
+Usage:
+    python process_pdb_files.py
 """
 
 import argparse
@@ -141,6 +146,7 @@ def safe_process_pdb(
     delete_original: bool = False,
     verbose: bool = False,
     max_combined_length: int = 8192,
+    pdb_name: Optional[str] = None,
 ) -> Tuple[Optional[MetadataCSVRow], Optional[str]]:
     try:
         # if greater than 7 MB, skip
@@ -149,6 +155,7 @@ def safe_process_pdb(
 
         metadata, _ = process_pdb_with_metadata(
             pdb_file_path=raw_pdb_path,
+            pdb_name=pdb_name,
             write_dir=write_dir,
             max_combined_length=max_combined_length,
         )

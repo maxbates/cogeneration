@@ -28,10 +28,6 @@ Most of the complexity here is to avoid redrawing the entire figure on each fram
 Artists are created once (`_init` methods), and then updated in plate (`_update` methods).
 """
 
-# quiet down the matplotlib logs
-logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
-logging.getLogger("matplotlib.animation").setLevel(logging.WARNING)
-
 
 @dataclass
 class SavedTrajectory:
