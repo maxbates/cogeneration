@@ -3,6 +3,19 @@
 """
 Download AlphaFold PDB tarball for SwissProt from EBI and extract to local directory.
 Only extracts .pdb.gz files, skipping .cif.gz files.
+
+You can download more than one database by specifying the URL (and local path).
+See https://ftp.ebi.ac.uk/pub/databases/alphafold/v4/
+
+Specify `extract_dir` to keep separate and treat as separate dataset.
+Otherwise, structures from multiple sources can be mixed in the same directory.
+
+Example:
+    python download_alphafold.py \
+    --url https://ftp.ebi.ac.uk/pub/databases/alphafold/v4/UP000005640_9606_HUMAN_v4.tar \
+    --tarball_path ~/pdb/alphafold/swissprot_human_pdb_v4.tar
+    [--extract_dir ~/pdb/alphafold_human/raw]
+
 """
 
 import argparse
@@ -211,12 +224,11 @@ def main(args: Args) -> None:
         print(
             f"Found {existing_pdb_count} PDB files already extracted in {args.extract_dir}"
         )
-        print("Skipping extraction...")
-    else:
-        # Extract the tarball
-        if not extract_tarball(args.tarball_path, args.extract_dir):
-            print("Failed to extract tarball")
-            return
+
+    # Extract the tarball
+    if not extract_tarball(args.tarball_path, args.extract_dir):
+        print("Failed to extract tarball")
+        return
 
     # Final stats
     final_pdb_count = count_pdb_files(args.extract_dir)

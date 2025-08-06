@@ -46,7 +46,7 @@ class MetadataColumn(StrEnum):
     # (new) mean pLDDT of modeled backbone atoms, if synthetic else 100
     mean_plddt_modeled_bb = "mean_plddt_modeled_bb"
 
-    # trajectory metadata
+    # trajectory / multiple model metadata
     num_frames = "num_frames"
 
     # secondary structure stats

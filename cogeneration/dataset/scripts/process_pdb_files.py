@@ -10,6 +10,7 @@ Pass `--max_structures` for debugging to limit number of files processed.
 
 Usage:
     python process_pdb_files.py
+    python process_pdb_files.py --alphafold
 """
 
 import argparse

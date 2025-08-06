@@ -4,9 +4,16 @@
 Runs Foldseek's `easy-cluster` on one or more directories of structures and
 writes a single `<out>.clusters` file (one line = one cluster).
 
-TODO save DB for assessing designability later
+Clustering may take some time, depending on the number of input structures.
 
 https://github.com/steineggerlab/foldseek
+
+TODO save DB for assessing designability later
+
+Example:
+    python cluster_pdbs.py \
+    --dirs ~/pdb/rcsb/processed/raw ~/pdb/alphafold/raw
+    --prefix cogeneration
 """
 
 import argparse
@@ -77,14 +84,15 @@ class Args:
             help="Copy representative PDBs next to <prefix>.clusters",
         )
         a = p.parse_args()
+
         return cls(
-            a.dirs,
-            a.prefix,
-            a.tm_score,
-            a.cov,
-            a.cov_mode,
-            a.threads,
-            a.copy_representatives,
+            dirs=a.dirs,
+            prefix=a.prefix,
+            tm_score=a.tm_score,
+            cov=a.cov,
+            cov_mode=a.cov_mode,
+            threads=a.threads,
+            copy_representatives=a.copy_representatives,
         )
 
 
