@@ -8,11 +8,12 @@ from cogeneration.dataset.datasets import BaseDataset, LengthSamplingDataset
 from cogeneration.dataset.featurizer import BatchFeaturizer
 from cogeneration.dataset.motif_factory import ChainBreak, Motif, Scaffold
 from cogeneration.dataset.spec import (  # CogenerationAFDBDatasetSpec,
+    CogenerationAFDBDatasetSpec,
     CogenerationPDBDatasetSpec,
     MultiflowPDBDatasetSpec,
     MultiflowPDBRedesignedDatasetSpec,
     MultiflowPDBTestDatasetSpec,
-    MultiflowSyntheticDatasetSpec, CogenerationAFDBDatasetSpec,
+    MultiflowSyntheticDatasetSpec,
 )
 from cogeneration.dataset.test_utils import create_pdb_batch
 from cogeneration.type.batch import METADATA_BATCH_PROPS

@@ -1669,8 +1669,7 @@ class Config(BaseClassConfig):
         raw_cfg.inference.samples.length_subset = [10, 30]
         raw_cfg.dataset.samples_per_eval_length = 2
         raw_cfg.dataset.num_eval_lengths = 1
-        # shortest validation samples in public data are 60 residues
-        raw_cfg.dataset.max_eval_length = 63
+        raw_cfg.dataset.max_eval_length = 200
 
         # inpainting, always generate motifs by default
         raw_cfg.dataset.inpainting.strategy = (

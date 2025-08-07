@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
+import pandas as pd
 import torch
 
 from cogeneration.config.base import DatasetConfig
@@ -545,16 +546,18 @@ class BatchFeaturizer:
         This function should be called as examples are needed, i.e. in `__get_item__`,
         because it adds noise to atom positions, picks motif positions, etc. as defined by cfg.
         """
-        # Redesigned sequences can be used to substitute the original sequence during training.
+        # Redesigned sequences substitute the original sequence during training.
         if self.is_training and BestRedesignColumn.best_seq in csv_row:
             best_seq = csv_row[BestRedesignColumn.best_seq]
-            if not isinstance(best_seq, str):
-                raise ValueError(f"Unexpected value best_seq: {best_seq}")
-            best_aatype = np.array(seq_to_aatype(best_seq))
-            assert (
-                processed_file[dpc.aatype].shape == best_aatype.shape
-            ), f"best_seq different length: {processed_file[dpc.aatype].shape} vs {best_aatype.shape}"
-            processed_file[dpc.aatype] = best_aatype
+            # because we concat datasets, some rows may have NaN for best_seq. skip if so.
+            if not pd.isna(best_seq):
+                if not isinstance(best_seq, str):
+                    raise ValueError(f"Unexpected value best_seq: {best_seq}")
+                best_aatype = np.array(seq_to_aatype(best_seq))
+                assert (
+                    processed_file[dpc.aatype].shape == best_aatype.shape
+                ), f"best_seq different length: {processed_file[dpc.aatype].shape} vs {best_aatype.shape}"
+                processed_file[dpc.aatype] = best_aatype
 
         # Construct feats from processed_file.
         feats = BatchFeaturizer.batch_features_from_processed_file(

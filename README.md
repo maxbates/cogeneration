@@ -76,16 +76,18 @@ cogeneration/ - main directory containing all source code
 │   │   ├── download_alphafold.py - AlphaFold PDB database download (SwissProt proteins)
 │   │   ├── download_pdb.py - PDB database download
 │   │   ├── process_pdb_files.py - PDB to Metadata CSV and pkl ProcessedFiles
-│   │   ├── redesign_structures.py - ProteinMPNN structure redesign
+│   │   ├── redesign_structures.py - ProteinMPNN + folding structure redesign
 │   │   └── update_dataset_metadata.py - metadata CSV updates (~deprecated)
 │   ├── contacts.py - utils to generate 2D contact constraints
-│   ├── datasets.py - `BaseDataset` and `PdbDataset` classes. `BatchFeaturizer` for `BatchFeatures`
+│   ├── datasets.py - `BaseDataset` class, `LengthBatcher`, `DatasetConstructor`, `EvalDatasetConstructor`
+│   ├── featurizer.py - `BatchFeaturizer` which converts `ProcessedFile` to `BatchFeatures`
 │   ├── filterer.py - `DatasetFilterer` for dataset filtering using metadata
 │   ├── interaction.py - `NonResidueInteractions` and `MultimerInteraction` for computing interactions + clashes
 │   ├── mmcif_parsing.py - mmCIF file parsing utilities
 │   ├── motif_factory.py - `MotifFactory` for motif and scaffold generation (inpainting)
 │   ├── process_pdb.py - PDB parsing to `ProcessedFile` and `MetadataCSVRow`
 │   ├── protein_downloader.py - dataloader with DDP and `LengthBatcher`
+│   ├── spec.py - DatasetSpec, enumeration of datasets
 │   └── test_utils.py - test utilities for mock features and datasets
 ├── datasets/ - training and test data directory
 │   └── install_multiflow_datasets.sh - MultiFlow dataset download script
