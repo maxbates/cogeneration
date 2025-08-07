@@ -43,6 +43,7 @@ from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
 from cogeneration.data.trajectory import SamplingStep, SamplingTrajectory
 from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProp as bp
+from cogeneration.type.batch import ModelPrediction
 from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
 from cogeneration.type.batch import PredBatchProp as pbp
@@ -253,6 +254,8 @@ class Interpolant:
             self.cfg.trans.noise_type
             == InterpolantTranslationsNoiseTypeEnum.centered_harmonic
         ):
+            # For harmonic noise, each Brownian increment has covariance J^{-1}
+            # (the harmonic prior) instead of identity.
             return (
                 centered_harmonic(
                     chain_idx=chain_idx,
@@ -787,14 +790,6 @@ class Interpolant:
 
         return noisy_batch
 
-    def _rot_sample_kappa(self, t: torch.Tensor):
-        if self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.exp:
-            return 1 - torch.exp(-t * self.cfg.rots.exp_rate)
-        elif self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.linear:
-            return t
-        else:
-            raise ValueError(f"Invalid schedule: {self.cfg.rots.sample_schedule}")
-
     def _trans_vector_field(
         self, t: float, trans_1: torch.Tensor, trans_t: torch.Tensor
     ):
@@ -826,17 +821,18 @@ class Interpolant:
         trans_t: torch.Tensor,  # (B, N, 3)
         chain_idx: torch.Tensor,  # (B, N)
         stochasticity_scale: float = 1.0,
+        potential: Optional[torch.Tensor] = None,  # (B, N, 3)
     ) -> torch.Tensor:
-        trans_vf = self._trans_vector_field(t, trans_1, trans_t)
-        trans_next = trans_t + trans_vf * d_t
+        # unconditional vector field
+        trans_vf = self._trans_vector_field(t=t, trans_1=trans_1, trans_t=trans_t)
 
+        # noise for stochastic paths
         if (
             self.cfg.trans.stochastic
             and self.cfg.trans.stochastic_noise_intensity > 0.0
             and stochasticity_scale > 0.0
         ):
             # Sample from either Gaussian or Harmonic prior (zero‐mean, correct covariance)
-            # For harmonic noise, each Brownian increment has covariance J^{-1} (the harmonic prior) instead of identity.
             base_noise = self._trans_noise(
                 chain_idx=chain_idx
             )  # (B, N, 3) in Angstroms
@@ -844,10 +840,30 @@ class Interpolant:
                 torch.ones(trans_1.shape[0]) * t,  # (B)
                 scale=self.cfg.trans.stochastic_noise_intensity * stochasticity_scale,
             )
-            sigma_t = sigma_t.to(trans_next.device)
-            trans_next += base_noise * math.sqrt(d_t) * sigma_t[..., None, None]
+            sigma_t = sigma_t.to(trans_t.device)
+            noise = base_noise * math.sqrt(d_t) * sigma_t[..., None, None]
+        else:
+            noise = torch.zeros_like(trans_t)
+
+        # potential, if provided, modifies the vector field
+        if potential is not None:
+            assert (
+                potential.shape == trans_vf.shape
+            ), f"potential {potential.shape} != trans_vf {trans_vf.shape}"
+            trans_vf += potential
+
+        trans_next = trans_t + trans_vf * d_t + noise
 
         return trans_next
+
+    def _rots_vf_scaling(self, t: float):
+        """Calculate rotmats scaling factor of `d_t` step given `t`, depending on the schedule."""
+        if self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.linear:
+            return 1 / (1 - t)
+        elif self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.exp:
+            return self.cfg.rots.exp_rate
+        else:
+            raise ValueError(f"Unknown sample schedule {self.cfg.rots.sample_schedule}")
 
     def _rots_euler_step(
         self,
@@ -856,15 +872,26 @@ class Interpolant:
         rotmats_1: torch.Tensor,  # (B, N, 3, 3)
         rotmats_t: torch.Tensor,  # (B, N, 3, 3)
         stochasticity_scale: float = 1.0,
+        potential: Optional[
+            torch.Tensor
+        ] = None,  # (B, N, 3) rot VF (tangent to rotmats_t)
     ) -> torch.Tensor:
-        if self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.linear:
-            scaling = 1 / (1 - t)
-        elif self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.exp:
-            scaling = self.cfg.rots.exp_rate
-        else:
-            raise ValueError(f"Unknown sample schedule {self.cfg.rots.sample_schedule}")
+        scaling = self._rots_vf_scaling(t)
 
-        rotmats_next = so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)
+        rot_vf = so3_utils.calc_rot_vf(mat_t=rotmats_t, mat_1=rotmats_1)
+
+        if potential is not None:
+            assert (
+                potential.shape == rot_vf.shape
+            ), f"potential {potential.shape} != rot_vf {rot_vf.shape}"
+            rot_vf += potential
+
+        rotmats_next = so3_utils.geodesic_t(
+            t=scaling * d_t,  # scaled time along geodesic
+            mat=rotmats_1,
+            base_mat=rotmats_t,
+            rot_vf=rot_vf,
+        )
 
         if (
             self.cfg.rots.stochastic
@@ -1292,6 +1319,123 @@ class Interpolant:
 
         return aatypes_t
 
+    def motif_potentials(
+        self,
+        t: float,  # scalar Tensor
+        noisy_batch: NoisyFeatures,
+        pred: ModelPrediction,
+        true_feats: BatchTrueFeatures,
+        motif_mask: Optional[torch.Tensor],  # (B, N) bool
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Generate potentials for motif guidance, returning translation and rotation vector fields.
+
+        Model predicts an unconditional drift, and this VF (masked to motifs) is passed to
+        euler steps and modifies those unconditional velocities.
+
+        This is similar to how FrameFlow does it, or twisted SMC,
+        but only considering a single trajectory and without gradients.
+
+        Cf. substituting the motifs into the prediction and interpolating towards them,
+        prefer using an additional velocity because:
+        - keep ODE smooth
+        - reduce scaffold jitter
+        - softens as t-> 1 (but > 0) so motifs are not completely locked in
+        - preserves equivariance
+
+        See FrameFlow paper for details about motif guidance (sec 3.2):
+        https://arxiv.org/pdf/2401.04082
+        """
+        if motif_mask is None or not motif_mask.any():
+            return None, None
+
+        trans_t = noisy_batch[nbp.trans_t]
+        rotmats_t = noisy_batch[nbp.rotmats_t]
+        pred_trans_1 = pred[pbp.pred_trans]
+        pred_rotmats_1 = pred[pbp.pred_rotmats]
+        motif_sel = motif_mask.bool()
+
+        eps = 1e-3
+        t = torch.clamp(t, min=eps, max=1.0 - eps)
+
+        # derive scale = ½ g(t)² / ω², starting with g(t) (guidance scale) and ω² (posterior scale)
+        # ω² values from FrameFlow eq 14, 15 assume linear interpolation
+        # ω²(t) for linear path κ(t)=1−t is (1−t)² / (t² + (1−t)²)
+        # generalized form: ω²(t) = κ(t)² / (t² + κ(t)²)
+        # similarly, g(t) in FrameFlow is (1-t)/t because linear and so because it matches
+        # diffusion coefficient for diffusion SDE that matches marginals of flow SDE.
+        # g(t) can be generalized to κ(t) / t
+        # However, we support non-linear schedules for interpolation.
+        # Additionally, translations and rotations may have different schedules.
+        # Note on signs -- the scale is positive, and the drift is (true - pred).
+
+        # translations
+        if self.cfg.trans.sample_schedule == InterpolantTranslationsScheduleEnum.linear:
+            kappa_trans = 1.0 - t
+        elif (
+            self.cfg.trans.sample_schedule == InterpolantTranslationsScheduleEnum.vpsde
+        ):
+            bmin, bmax = self.cfg.trans.vpsde_bmin, self.cfg.trans.vpsde_bmax
+            # ᾱ(t) = exp(-∫₀ᵗ β(s)ds), β(s)=bmax-(bmax-bmin)s  ⇒ ∫= bmax t - 0.5(bmax-bmin)t²
+            alphabar_t = torch.exp(-(bmax * t - 0.5 * (bmax - bmin) * t * t))
+            # κ_T(t) = sqrt(ᾱ(t)) makes κ(0)=1, κ(1)≈0 (noise→data)
+            kappa_trans = torch.sqrt(alphabar_t)
+        else:
+            raise ValueError("Unknown translation schedule")
+        g_trans = kappa_trans / t
+        omega2_trans = kappa_trans**2 / (t**2 + kappa_trans**2)
+        scale_trans = 0.5 * g_trans * g_trans / omega2_trans
+
+        # rotations
+        if self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.linear:
+            kappa_rotmats = 1.0 - t
+        elif self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.exp:
+            # exp(-c•t) for c>0 => fast early rotation "lock-in" and vanishing near t->1
+            kappa_rotmats = torch.exp(-self.cfg.rots.exp_rate * t)
+        else:
+            raise ValueError("Unknown rotation schedule")
+        g_rotmats = kappa_rotmats / t
+        omega2_rotmats = kappa_rotmats**2 / (t**2 + kappa_rotmats**2)
+        scale_rotmats = 0.5 * g_rotmats * g_rotmats / omega2_rotmats
+
+        # clamp the scales, which can be very large (>100) near t=0 and lead to overshooting.
+        # TODO make configurable, scale depending on noise strength, maybe proportional to uncond VF
+        scale_trans = torch.clamp(scale_trans, min=0.0, max=10.0).to(
+            pred_trans_1.device
+        )
+        scale_rotmats = torch.clamp(scale_rotmats, min=0.0, max=10.0).to(
+            pred_rotmats_1.device
+        )
+
+        # trans_vf = ½ g(t)² ∇xΦ / ω²(t) = scale_trans • ∇xΦ
+        # diff = (true - pred) so push towards target.
+        trans_vf = torch.zeros_like(pred_trans_1)  # (B, N, 3)
+        trans_vf[motif_sel] = (true_feats.trans - pred_trans_1)[motif_sel]
+        trans_vf *= scale_trans
+
+        # rotmats_vf = ½ g(t)² ∇rΦ / ω²(t) = scale_rotmats • ∇rΦ
+        # compute tangent from current -> true and current -> pred
+        # and their difference is ~ the gradient (all in tangent space of current)
+        rotmats_t_to_true = so3_utils.calc_rot_vf(
+            mat_t=rotmats_t,
+            mat_1=true_feats.rotmats,
+        )
+        rotmats_t_to_pred = so3_utils.calc_rot_vf(mat_t=rotmats_t, mat_1=pred_rotmats_1)
+        rotmats_vf = torch.zeros_like(rotmats_t_to_true)
+        rotmats_vf[motif_sel] = (rotmats_t_to_true - rotmats_t_to_pred)[motif_sel]
+        rotmats_vf *= scale_rotmats
+
+        return trans_vf, rotmats_vf
+
+    def _rot_sample_kappa(self, t: torch.Tensor):
+        """kappa to scale rotation `so3_t` times, so that rotations settle more quickly"""
+        if self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.exp:
+            return 1 - torch.exp(-t * self.cfg.rots.exp_rate)
+        elif self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.linear:
+            return t
+        else:
+            raise ValueError(f"Invalid schedule: {self.cfg.rots.sample_schedule}")
+
     def sample_single_step(
         self,
         noisy_batch: NoisyFeatures,
@@ -1325,8 +1469,10 @@ class Interpolant:
         res_mask = noisy_batch[bp.res_mask]
         diffuse_mask = noisy_batch[bp.diffuse_mask]
         chain_idx = noisy_batch[bp.chain_idx]
-        # for inpainting, define `scaffold_mask` for sequence corruption using `1-motif_mask`
         motif_mask = noisy_batch.get(bp.motif_mask, None)
+        # for inpainting, define `scaffold_mask` for sequence corruption using `1-motif_mask`.
+        # we use `scaffold_mask` for sequence interpolation, and `diffuse_mask` for structure.
+        # if `motif_mask` is missing or empty, effectively uses `diffuse_mask`.
         scaffold_mask = (1 - motif_mask) if motif_mask is not None else diffuse_mask
 
         # Pull out t_1 values
@@ -1349,11 +1495,16 @@ class Interpolant:
             res_mask=res_mask,
         )
 
+        # Placeholder: inpainting with motifs may define gradients to modify velocity fields below.
+        grad_trans = None
+        grad_rotmats = None
+
         # Mask fixed values to prepare for integration and update the batch for next step.
         if task == InferenceTask.unconditional:
             pass
         elif task == InferenceTask.inpainting:
-            # fix the logits / sequence
+            # Fix the logits / sequence outside of scaffold_mask / diffuse_mask.
+            # i.e. if we have motifs, fix the sequence in the motifs.
             pred_logits_1 = mask_blend_2d(
                 pred_logits_1, true_feats.logits, scaffold_mask
             )
@@ -1361,20 +1512,21 @@ class Interpolant:
                 pred_aatypes_1, true_feats.aatypes, scaffold_mask
             )
 
-            # TODO(inpainting) - consider whether we should first align (i.e. rotate)
-            #   the pred structure to known motifs, rather than simply substituting them in.
-            #   I don't think FrameFlow guidance did this, but the twisting variant sort of does?
-
-            # For inpainting with guidance, fix known motifs of predicted structure
-            # so that we interpolate toward the known motifs. Also for self-conditioning.
-            pred_trans_1 = mask_blend_2d(pred_trans_1, true_feats.trans, scaffold_mask)
-            pred_rotmats_1 = mask_blend_3d(
-                pred_rotmats_1, true_feats.rotmats, scaffold_mask
+            # For rotations and translations, compute a "potential" scaled by `t=t_1`
+            # to pull the motifs towards their known positions.
+            grad_trans, grad_rotmats = self.motif_potentials(
+                t=t_1,
+                noisy_batch=noisy_batch,
+                pred=model_out,
+                true_feats=true_feats,
+                motif_mask=motif_mask,
             )
+
+            # Leave the torsions alone, let the model predict them,
+            # since they mostly depend on the frames.
             if pred_torsions_1 is not None:
-                pred_torsions_1 = mask_blend_3d(
-                    pred_torsions_1, true_feats.torsions, scaffold_mask
-                )
+                pass
+
         elif task == InferenceTask.forward_folding:
             # scale logits during integration, assumes will `softmax`
             pred_logits_1 = 100.0 * true_feats.logits
@@ -1428,6 +1580,7 @@ class Interpolant:
                 trans_t=trans_t_1,
                 chain_idx=chain_idx,
                 stochasticity_scale=stochasticity_scale,
+                potential=grad_trans,
             )
             rotmats_t_2 = self._rots_euler_step(
                 d_t=d_t,
@@ -1435,6 +1588,7 @@ class Interpolant:
                 rotmats_1=pred_rotmats_1,
                 rotmats_t=rotmats_t_1,
                 stochasticity_scale=stochasticity_scale,
+                potential=grad_rotmats,
             )
             aatypes_t_2 = self._aatypes_euler_step(
                 d_t=d_t,
@@ -1490,7 +1644,6 @@ class Interpolant:
         )
 
         # Feynman-Kac steering, if enabled.
-        # TODO(FK) better expose metrics, to track in trajectory over time
         # TODO(FK) Determine if we should expose model states for un-selected particles
         noisy_batch, resample_idx, step_metrics = self.resampler.on_step(
             step_idx=step_idx,
@@ -1526,7 +1679,7 @@ class Interpolant:
         # t_nn is model/function that generates explicit time steps (r3, so3, cat) given t
         t_nn: Union[Callable[[torch.Tensor], torch.Tensor], Any] = None,
         # scale euler step stochasticity, 0 to disable for this `sample()`.
-        # stochasticity must be enabled in cfg, this only scales it per domain
+        # stochasticity for each domain must be enabled in cfg; this scales it those values
         stochasticity_scale: float = 1.0,
         structure_method: StructureExperimentalMethod = StructureExperimentalMethod.XRAY_DIFFRACTION,
         hot_spots: Optional[torch.Tensor] = None,

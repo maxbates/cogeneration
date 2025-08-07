@@ -14,7 +14,14 @@ from cogeneration.type.task import DataTask, InferenceTask
 class TestInterpolantSample:
     """Test suite for Interpolant.sample()."""
 
-    def _run_sample(self, cfg: Config, batch: NoisyFeatures, task: InferenceTask):
+    def _run_sample(
+        self,
+        cfg: Config,
+        batch: NoisyFeatures,
+        task: InferenceTask,
+        model_predicts_true: bool = False,
+        model_corruption: float = 0.0,
+    ):
         # ensure don't use training interpolant, will mess up shapes
         cfg.interpolant.sampling.num_timesteps = 7
 
@@ -28,21 +35,49 @@ class TestInterpolantSample:
         # Dummy model
         class ModelStub:
             def __call__(self, noisy_batch: NoisyFeatures):
-                trans = noisy_batch[nbp.trans_t]
-                rotmats = noisy_batch[nbp.rotmats_t]
-                torsions = noisy_batch[nbp.torsions_t]
-                aatypes = noisy_batch[nbp.aatypes_t].long()
-
-                # low fidelity corruptions
-                trans = trans + torch.randn_like(noisy_batch[nbp.trans_t])
-                rotmats = rotmats + torch.randn_like(noisy_batch[nbp.rotmats_t]) * 0.25
+                trans = (
+                    batch[bp.trans_1]
+                    if model_predicts_true
+                    else noisy_batch[nbp.trans_t]
+                )
+                rotmats = (
+                    batch[bp.rotmats_1]
+                    if model_predicts_true
+                    else noisy_batch[nbp.rotmats_t]
+                )
                 torsions = (
-                    torsions + torch.randn_like(noisy_batch[nbp.torsions_t]) * 0.25
+                    batch[bp.torsions_1]
+                    if model_predicts_true
+                    else noisy_batch[nbp.torsions_t]
                 )
-                aatypes = aatypes + torch.randint(
-                    0, num_tokens, aatypes.shape, dtype=torch.long
-                )
-                aatypes = aatypes % num_tokens
+                aatypes = (
+                    batch[bp.aatypes_1]
+                    if model_predicts_true
+                    else noisy_batch[nbp.aatypes_t]
+                ).long()
+
+                # apply low fidelity corruptions
+                if model_corruption > 0.0:
+                    trans = (
+                        trans
+                        + torch.randn_like(noisy_batch[nbp.trans_t])
+                        * model_corruption
+                        * 2
+                    )
+                    rotmats = (
+                        rotmats
+                        + torch.randn_like(noisy_batch[nbp.rotmats_t])
+                        * model_corruption
+                    )
+                    torsions = (
+                        torsions
+                        + torch.randn_like(noisy_batch[nbp.torsions_t])
+                        * model_corruption
+                    )
+                    aatypes = aatypes + torch.randint(
+                        0, num_tokens, aatypes.shape, dtype=torch.long
+                    )
+                    aatypes = aatypes % num_tokens
 
                 logits = torch.nn.functional.one_hot(
                     aatypes, num_classes=num_tokens
@@ -178,33 +213,42 @@ class TestInterpolantSample:
 
         self._run_sample(cfg=cfg, batch=batch, task=InferenceTask.inpainting)
 
+    @pytest.mark.parametrize("corruption", [0.0, 0.025])
     def test_inpainting_preserves_motif_in_sampling(
-        self, mock_cfg_uninterpolated, mock_pred_inpainting_dataloader
+        self, corruption, mock_cfg_uninterpolated, mock_pred_inpainting_dataloader
     ):
         """
         Inpainting sampling should preserve motif positions
         """
+        mock_cfg_uninterpolated.shared.stochastic = False
         mock_cfg_uninterpolated.inference.task = InferenceTask.inpainting
         mock_cfg_uninterpolated.interpolant.sampling.num_timesteps = 3
         cfg = mock_cfg_uninterpolated.interpolate()
 
         batch = next(iter(mock_pred_inpainting_dataloader))
         sample_traj, model_traj, fk_traj = self._run_sample(
-            cfg=cfg, batch=batch, task=InferenceTask.inpainting
+            cfg=cfg,
+            batch=batch,
+            task=InferenceTask.inpainting,
+            model_predicts_true=True,  # model should predict true structure
+            model_corruption=corruption,  # minimal drift from model, so mostly motif drift
         )
 
         motif_sel = batch[bp.motif_mask].bool()
+        assert motif_sel.sum() > 0, "Test batch should have some motif residues"
 
-        # sanity check, don't expect model and sample trajectories to be equal in motifs.
-        # if they are, likely accidentally overwriting the model states.
-        assert not torch.equal(
-            model_traj[-1].aatypes[motif_sel],
-            sample_traj[-1].aatypes[motif_sel],
-        ), "Model and sample trajectories should not be equal in motifs"
-        assert not torch.allclose(
-            model_traj[-1].trans[motif_sel],
-            sample_traj[-1].trans[motif_sel],
-        ), "Model and sample trajectories should not be equal in motifs"
+        if corruption > 0.0:
+            # sanity check - if model not predicting exactly:
+            # don't expect model and sample trajectories to be equal in motifs.
+            # if they are, likely accidentally overwriting the model states (or fixed motifs!)
+            assert not torch.equal(
+                model_traj[-1].aatypes[motif_sel],
+                sample_traj[-1].aatypes[motif_sel],
+            ), "Model and sample trajectories should not be equal in motifs"
+            assert not torch.allclose(
+                model_traj[-1].trans[motif_sel],
+                sample_traj[-1].trans[motif_sel],
+            ), "Model and sample trajectories should not be equal in motifs"
 
         # compare aatypes - should be fixed
         final_aa = sample_traj[-1].aatypes
@@ -217,9 +261,10 @@ class TestInterpolantSample:
         # But account for COM changing.
         final_trans = sample_traj[-1].trans
         orig_trans = batch[bp.trans_1]
-        com_shift = (final_trans[motif_sel] - orig_trans[motif_sel])[0]
         assert torch.allclose(
-            final_trans[motif_sel] - orig_trans[motif_sel], com_shift.unsqueeze(0)
+            final_trans[motif_sel],
+            orig_trans[motif_sel],
+            atol=1e-6 if corruption == 0.0 else 0.25,
         ), "Motif translations should be preserved in inpainting sampling"
 
     @pytest.mark.parametrize(
