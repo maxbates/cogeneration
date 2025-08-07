@@ -7,6 +7,13 @@ from cogeneration.data.noise_mask import torsions_empty
 from cogeneration.dataset.datasets import BaseDataset, LengthSamplingDataset
 from cogeneration.dataset.featurizer import BatchFeaturizer
 from cogeneration.dataset.motif_factory import ChainBreak, Motif, Scaffold
+from cogeneration.dataset.spec import (  # CogenerationAFDBDatasetSpec,
+    CogenerationPDBDatasetSpec,
+    MultiflowPDBDatasetSpec,
+    MultiflowPDBRedesignedDatasetSpec,
+    MultiflowPDBTestDatasetSpec,
+    MultiflowSyntheticDatasetSpec, CogenerationAFDBDatasetSpec,
+)
 from cogeneration.dataset.test_utils import create_pdb_batch
 from cogeneration.type.batch import METADATA_BATCH_PROPS
 from cogeneration.type.batch import BatchProp as bp
@@ -34,6 +41,44 @@ class TestBaseDataset:
             assert isinstance(
                 batch[batch_prop], torch.Tensor
             ), f"Batch property {batch_prop} should be a tensor"
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            CogenerationPDBDatasetSpec,
+            CogenerationAFDBDatasetSpec,
+            MultiflowPDBDatasetSpec,
+            MultiflowPDBRedesignedDatasetSpec,
+            MultiflowPDBTestDatasetSpec,
+            MultiflowSyntheticDatasetSpec,
+        ],
+    )
+    @pytest.mark.parametrize("task", [DataTask.inpainting, DataTask.hallucination])
+    @pytest.mark.parametrize("evaluation", [True, False])
+    def test_dataset_from_spec(self, mock_cfg, task, spec, evaluation):
+        # ensure can load metadata CSV
+        metadata = BaseDataset.load_dataset_spec_metadata(
+            spec=spec,
+            cfg=mock_cfg.dataset,
+        )
+        assert len(metadata) > 0
+
+        mock_cfg.dataset.filter = DatasetFilterConfig.lenient()
+        mock_cfg.dataset.max_eval_length = 10000
+
+        # build dataset
+        mock_cfg.dataset.datasets = [spec]
+        dataset = BaseDataset(
+            cfg=mock_cfg.dataset,
+            task=task,
+            eval=evaluation,
+            use_test=False,
+        )
+
+        assert len(dataset) > 0
+
+        # get an item, which requires processing + featurizing at least one entry
+        item = dataset[0]
 
     @pytest.mark.parametrize("task", [DataTask.inpainting, DataTask.hallucination])
     def test_features_defined(self, task, mock_cfg_uninterpolated):

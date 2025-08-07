@@ -222,7 +222,7 @@ def main(args: Args) -> None:
     existing_pdb_count = count_pdb_files(args.extract_dir)
     if existing_pdb_count > 0:
         print(
-            f"Found {existing_pdb_count} PDB files already extracted in {args.extract_dir}"
+            f"extract_dir {args.extract_dir} contains {existing_pdb_count} PDB files already extracted"
         )
 
     # Extract the tarball

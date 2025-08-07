@@ -208,11 +208,9 @@ def main(args: Args):
 
     # Determine metadata file path
     if args.debug:
-        metadata_file_name = (
-            "metadata_af2_debug.csv" if args.alphafold else "metadata_debug.csv"
-        )
+        metadata_file_name = "metadata_debug.csv"
     else:
-        metadata_file_name = "metadata_af2.csv" if args.alphafold else "metadata.csv"
+        metadata_file_name = "metadata.csv"
     metadata_path = os.path.join(write_dir, metadata_file_name)
     print(f"Metadata will be written to {metadata_path}")
 

@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 import torch
 
-from cogeneration.config.base import DatasetConfig, DatasetFilterConfig, DatasetSpec
+from cogeneration.config.base import DatasetConfig, DatasetFilterConfig
 from cogeneration.data.io import read_pkl
 from cogeneration.data.residue_constants import unk_restype_index
 from cogeneration.dataset.datasets import BaseDataset
@@ -16,6 +16,7 @@ from cogeneration.dataset.process_pdb import (
     read_processed_file,
     trim_chain_feats_to_modeled_residues,
 )
+from cogeneration.dataset.spec import DatasetSpec
 from cogeneration.type.dataset import DatasetProteinColumn
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.dataset import MetadataColumn as mc

@@ -500,6 +500,8 @@ def _process_pdb(
                 # radius of gyration calculation
                 pdb_rg = md.compute_rg(traj)
             except Exception as e:
+                # TODO - try to recover mis-shaped trajectories by taking first frame
+                # e.g. ~/pdb/rcsb/raw/k4/pdb2k45.ent.gz or ~/pdb/rcsb/raw/ma/pdb2maz.ent.gz
                 raise DataError(f"Mdtraj failed with error {e}")
 
             # track number of frames if trajectory

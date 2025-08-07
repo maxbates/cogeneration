@@ -300,24 +300,44 @@ class MotifFactory:
                 self._determine_bounds(res_mask=res_mask, plddt_mask=plddt_mask)
             )
 
-        motif_length = self.rng.integers(
-            # lower bound exceeding `min_motif_length`, `min_percent_motifs`
-            max(self.cfg.min_motif_len, floor(num_res * self.cfg.min_percent_motifs)),
-            # upper bound capped by `max_motif_length`, `max_percent_motifs`, max width of diffusable residues
+        # determine motif length
+        # upper bound capped by `max_motif_length`, `max_percent_motifs`, max width of diffusable residues
+        motif_len_max = min(
+            self.cfg.max_motif_len + 1,
+            ceil(num_res * self.cfg.max_percent_motifs),
+            bound_length,
+        )
+        # lower bound exceeding `min_motif_length`, `min_percent_motifs` capped at 1/2 max motif length
+        motif_len_min = max(
+            self.cfg.min_motif_len,
             min(
-                self.cfg.max_motif_len + 1,
-                ceil(num_res * self.cfg.max_percent_motifs),
-                bound_length,
+                self.cfg.max_motif_len // 2,
+                floor(num_res * self.cfg.min_percent_motifs),
             ),
+        )
+        # edge cases where impossible to satisfy target lengths and percents
+        if motif_len_max <= motif_len_min:
+            motif_len_min = max(1, motif_len_max - 1)
+        motif_length = self.rng.integers(
+            low=motif_len_min,
+            high=motif_len_max,
         )
 
-        motif_start = self.rng.integers(
-            low=max(bound_start, self.cfg.min_padding),
-            high=min(
-                bound_stop_exclusive,
-                bound_length - motif_length - self.cfg.min_padding + 1,
-            ),
+        # determine motif start position
+        motif_start_min = max(bound_start, self.cfg.min_padding)
+        motif_start_max = min(
+            bound_stop_exclusive - motif_length,
+            bound_length - motif_length - self.cfg.min_padding,
         )
+        if motif_start_max <= motif_start_min:
+            # if we can't fit the motif with padding, just place it at the earliest acceptable start
+            motif_start = motif_start_min
+            motif_length = min(motif_length, bound_stop_exclusive - motif_start)
+        else:
+            motif_start = self.rng.integers(
+                low=motif_start_min,
+                high=motif_start_max + 1,
+            )
 
         motif_end = motif_start + motif_length
 

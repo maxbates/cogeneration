@@ -1,5 +1,4 @@
 import datetime
-import itertools
 import os
 import re
 from collections import OrderedDict
@@ -16,7 +15,16 @@ from cogeneration.config.dict_utils import (
     flatten_dict,
     prune_unknown_dataclass_fields,
 )
-from cogeneration.type.dataset import OLIGOMERIC_PREFIXES, MetadataColumn
+from cogeneration.dataset.spec import (  # CogenerationAFDBDatasetSpec,
+    CogenerationAFDBDatasetSpec,
+    CogenerationPDBDatasetSpec,
+    DatasetSpec,
+    MultiflowPDBDatasetSpec,
+    MultiflowPDBRedesignedDatasetSpec,
+    MultiflowPDBTestDatasetSpec,
+    MultiflowSyntheticDatasetSpec,
+)
+from cogeneration.type.dataset import MetadataColumn
 from cogeneration.type.embed import PositionalEmbeddingMethod
 from cogeneration.type.metrics import MetricName
 from cogeneration.type.str_enum import StrEnum
@@ -1031,70 +1039,6 @@ class DatasetTrimMethod(StrEnum):
 
 
 @dataclass
-class DatasetSpec:
-    """
-    Paths etc. defining a dataset's metadata and processed data.
-    """
-
-    # name of dataset
-    name: str
-    # path to metadata CSV, which contains all the information about the dataset
-    metadata_path: Path
-    # directory where processed data is stored, esp if relative paths defined in CSV
-    processed_root_path: Path
-    # BestRedesigns CSV (MultiFlow style). Always replaces original sequence with redesign sequence.
-    best_redesigns_path: Optional[Path] = None
-    # cluster file
-    cluster_path: Optional[Path] = None
-
-    def __post_init__(self):
-        if not self.metadata_path.exists():
-            raise FileNotFoundError(
-                f"Metadata CSV for {self.name} not found: {self.metadata_path}"
-            )
-        if not self.processed_root_path.exists():
-            raise FileNotFoundError(
-                f"Processed data root path for {self.name} not found: {self.processed_root_path}"
-            )
-        if self.best_redesigns_path and not self.best_redesigns_path.exists():
-            raise FileNotFoundError(
-                f"BestRedesigns CSV for {self.name} not found: {self.best_redesigns_path}"
-            )
-        if self.cluster_path and not self.cluster_path.exists():
-            raise FileNotFoundError(
-                f"Cluster file for {self.name} not found: {self.cluster_path}"
-            )
-
-
-# dataset_metadata_dir_path is the root directory for dataset / metadata files
-datasets_path = PATH_PROJECT_ROOT / "cogeneration" / "datasets"
-metadata_path = datasets_path / "metadata"
-
-
-PDBDatasetSpec = DatasetSpec(
-    name="PDB",
-    processed_root_path=datasets_path,
-    metadata_path=metadata_path / "pdb_metadata.csv",
-    # redesigns_path=metadata_path / "pdb_redesigned.csv",  # TODO - working redesigns
-    cluster_path=metadata_path / "pdb.clusters",
-)
-
-PDBTestDatasetSpec = DatasetSpec(
-    name="PDBPost2021",
-    processed_root_path=datasets_path,
-    metadata_path=metadata_path / "test_set_metadata.csv",
-    cluster_path=metadata_path / "test_set_clusters.csv",
-)
-
-SyntheticDatasetSpec = DatasetSpec(
-    name="MultiFlowSynthetic",
-    processed_root_path=datasets_path,
-    metadata_path=metadata_path / "distillation_metadata.csv",
-    cluster_path=metadata_path / "distillation.clusters",
-)
-
-
-@dataclass
 class DatasetConfig(BaseClassConfig):
     """
     Information about the Dataset of protein structures and sequences.
@@ -1104,14 +1048,16 @@ class DatasetConfig(BaseClassConfig):
     # TODO(cfg) determine if there is a reasonable way to support CLI-friendly spec
     datasets: List[DatasetSpec] = field(
         default_factory=lambda: [
-            PDBDatasetSpec,
-            SyntheticDatasetSpec,
+            CogenerationPDBDatasetSpec,
+            CogenerationAFDBDatasetSpec,
+            MultiflowPDBRedesignedDatasetSpec,
+            MultiflowSyntheticDatasetSpec,
         ]
     )
-    # TODO - consider deprecating test dataset, and using a split like date, cluster ids, etc.
+    # TODO(dataset) - consider deprecating test dataset, and using a split like date, cluster ids, etc.
     test_datasets: List[DatasetSpec] = field(
         default_factory=lambda: [
-            PDBTestDatasetSpec,
+            MultiflowPDBTestDatasetSpec,
         ]
     )
 

@@ -61,6 +61,7 @@ class DatasetFilterer:
     def __post_init__(self):
         if self._log is None:
             self._log = logging.getLogger("DatasetFilterer")
+            self._log.setLevel(logging.DEBUG)
 
     @property
     def modeled_length_col(self) -> mc:
@@ -190,7 +191,12 @@ class DatasetFilterer:
         df = raw_csv.copy()
 
         for filter_name, filter_fn in self.all_filters.items():
-            df = filter_fn(df)
+            try:
+                df = filter_fn(df)
+            except KeyError as e:
+                self._log.warning(
+                    f"Skipping {filter_name} filter; missing respective column: {e}"
+                )
 
         return df.sort_values(by=self.modeled_length_col, ascending=False)
 

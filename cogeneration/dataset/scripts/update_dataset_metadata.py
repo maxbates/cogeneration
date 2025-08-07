@@ -2,6 +2,9 @@
 Script to update dataset metadata CSV with new columns.
 To be run on an ad-hoc basis if certain fields are required.
 
+The original multiflow datasets cannot be fully upgraded using this script
+because they do not reference the source PDB - it's easier to just reprocess the PDB from scratch.
+
 TODO(dataset) consider deprecating this file? Or improve how kept in sync with `process_pdb.py`
 """
 

@@ -15,13 +15,13 @@ from cogeneration.config.base import (
     Config,
     DatasetConfig,
     DatasetFilterConfig,
-    DatasetSpec,
     DatasetTrimMethod,
     InferenceSamplesConfig,
 )
 from cogeneration.dataset.featurizer import BatchFeaturizer
 from cogeneration.dataset.filterer import DatasetFilterer
 from cogeneration.dataset.process_pdb import read_processed_file
+from cogeneration.dataset.spec import DatasetSpec
 from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import InferenceFeatures
@@ -173,7 +173,7 @@ class BaseDataset(Dataset):
         )
 
     @staticmethod
-    def load_dataset(
+    def load_dataset_spec_metadata(
         spec: DatasetSpec,
         cfg: DatasetConfig,
     ):
@@ -263,7 +263,7 @@ class BaseDataset(Dataset):
 
         dfs = []
         for spec in specs:
-            metadata_csv = BaseDataset.load_dataset(
+            metadata_csv = BaseDataset.load_dataset_spec_metadata(
                 spec=spec,
                 cfg=self.cfg,
             )
