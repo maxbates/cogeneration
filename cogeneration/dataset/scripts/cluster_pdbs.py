@@ -12,7 +12,7 @@ TODO save DB for assessing designability later
 
 Example:
     python cluster_pdbs.py \
-    --dirs ~/pdb/rcsb/processed/raw ~/pdb/alphafold/raw
+    --dirs ~/pdb/rcsb/processed/raw ~/pdb/alphafold/raw \
     --prefix cogeneration
 """
 

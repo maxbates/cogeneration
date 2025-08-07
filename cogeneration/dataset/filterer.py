@@ -190,6 +190,7 @@ class DatasetFilterer:
         """
         df = raw_csv.copy()
 
+        # run filters serially
         for filter_name, filter_fn in self.all_filters.items():
             try:
                 df = filter_fn(df)
@@ -197,6 +198,12 @@ class DatasetFilterer:
                 self._log.warning(
                     f"Skipping {filter_name} filter; missing respective column: {e}"
                 )
+
+        # drop duplicates
+        len_before = len(df)
+        df = df.drop_duplicates()
+        if len(df) != len_before:
+            self._log.warning(f"Dropped {len_before - len(df)} duplicate rows")
 
         return df.sort_values(by=self.modeled_length_col, ascending=False)
 
