@@ -10,7 +10,6 @@ from cogeneration.config.base import DatasetConfig
 from cogeneration.data import data_transforms, rigid_utils
 from cogeneration.data.const import seq_to_aatype
 from cogeneration.data.noise_mask import mask_blend_2d
-from cogeneration.data.protein import chain_str_to_int
 from cogeneration.dataset.contacts import get_contact_conditioning_matrix
 from cogeneration.dataset.interaction import MultimerInteractions
 from cogeneration.dataset.motif_factory import (
@@ -287,14 +286,12 @@ class BatchFeaturizer:
     def hot_spots_define(
         self,
         feats: BatchFeatures,
-        hot_spots_str: Optional[str],
     ) -> torch.Tensor:
         """
-        Define hot spots mask from metadata and current feature indices.
+        Define hot spots mask on-the-fly using MultimerInteractions.
 
         Args:
             feats: BatchFeatures containing chain_idx and res_idx
-            hot_spots_str: string defining hot spots, in format "<chain_id>:<res_index>:<num_interactions>,..." e.g. "A:10:2,"
 
         Returns:
             Hot spots mask tensor
@@ -306,65 +303,59 @@ class BatchFeaturizer:
             self.is_training
             and random.random() < self.cfg.hotspots.hotspots_prob_disabled
         ):
-            return torch.zeros_like(feats[bp.res_mask]).int()
+            return hot_spots_mask
 
         # Disabled if not multimer
         if feats[bp.chain_idx].unique().numel() <= 1:
-            return torch.zeros_like(feats[bp.res_mask]).int()
+            return hot_spots_mask
 
-        # if hot spots not defined in metadata, calculate them
-        if hot_spots_str is None or hot_spots_str == "":
-            multimer_interactions = MultimerInteractions.from_batch_feats(feats=feats)
-            hot_spots_str = multimer_interactions.serialize_hot_spots()
+        # Calculate residue interaction counts on both sides of interfaces
+        multimer_interactions = MultimerInteractions.from_batch_feats(feats=feats)
+        res_to_counts = multimer_interactions.residue_backbone_interaction_counts()
 
-        hot_spots = []
-        for item in hot_spots_str.split(","):
-            # our format is "<chain_id><res_index>:<num_interactions>,..."
-            # but also support  "<chain_id><res_index>" format
-            if ":" in item:
-                item, num_interactions = item.split(":")
-            else:
-                num_interactions = 1
-            hot_spots.append(
-                (chain_str_to_int(item[0]), int(item[1:]), int(num_interactions))
-            )
+        if len(res_to_counts) == 0:
+            return hot_spots_mask
 
-        # Map hot spots to current feature indices
-        for hot_chain_id, hot_res_index, num_interactions in hot_spots:
-            mask = (feats[bp.chain_idx] == hot_chain_id) & (
-                feats[bp.res_idx] == hot_res_index
-            )
-            hot_spots_mask[mask] = 1
+        # Build candidate mask and weights per residue
+        candidate_mask = torch.zeros_like(hot_spots_mask, dtype=torch.bool)
+        weights = torch.zeros_like(feats[bp.res_mask]).float()
+
+        for (chain_id, res_index), count in res_to_counts.items():
+            mask = (feats[bp.chain_idx] == chain_id) & (feats[bp.res_idx] == res_index)
+            candidate_mask |= mask
+            weights[mask] = float(count)
 
         # Ignore hot spots not in res_mask
-        hot_spots_mask = hot_spots_mask * feats[bp.res_mask]
+        candidate_mask = candidate_mask * feats[bp.res_mask]
 
-        # Apply subsampling during training if requested
-        if (
-            self.is_training
-            and len(hot_spots) >= self.cfg.hotspots.min_hotspots_threshold
-        ):
-            # Subsample hot spots
-            num_hot_spots = hot_spots_mask.sum().item()
-            if num_hot_spots > 0:
-                target_fraction = random.uniform(
-                    self.cfg.hotspots.min_hotspot_fraction,
-                    self.cfg.hotspots.max_hotspot_fraction,
+        # Apply subsampling during training if requested and have enough candidates
+        num_candidates = int(candidate_mask.sum().item())
+        if num_candidates >= self.cfg.hotspots.min_hotspots_threshold:
+            # Determine target number of hotspots to keep
+            target_fraction = random.uniform(
+                self.cfg.hotspots.min_hotspot_fraction,
+                self.cfg.hotspots.max_hotspot_fraction,
+            )
+            target_count = max(1, int(num_candidates * target_fraction))
+
+            candidate_indices = torch.where(candidate_mask)[0]
+            hot_spot_weights = weights[candidate_indices]
+
+            # sample without replacement, biased to more contacts
+            if len(candidate_indices) > target_count:
+                sampled_rel = torch.multinomial(
+                    hot_spot_weights, num_samples=target_count, replacement=False
                 )
-                target_count = max(1, int(num_hot_spots * target_fraction))
+                sampled_indices = candidate_indices[sampled_rel]
+            else:
+                sampled_indices = candidate_indices
 
-                # Get indices of hot spots
-                hot_indices = torch.where(hot_spots_mask == 1)[0]
+            hot_spots_mask = torch.zeros_like(feats[bp.res_mask]).int()
+            hot_spots_mask[sampled_indices] = 1
+        else:
+            hot_spots_mask[candidate_mask] = 1
 
-                # Randomly sample subset
-                if len(hot_indices) > target_count:
-                    sampled_indices = hot_indices[
-                        torch.randperm(len(hot_indices))[:target_count]
-                    ]
-                    new_mask = torch.zeros_like(feats[bp.res_mask]).int()
-                    new_mask[sampled_indices] = 1
-                    hot_spots_mask = new_mask
-
+        hot_spots_mask = (hot_spots_mask * feats[bp.res_mask]).int()
         return hot_spots_mask
 
     def contact_conditioning_define(
@@ -597,7 +588,6 @@ class BatchFeaturizer:
         #   May be easiest to prioritize defining in motif_mask, if defined?
         feats[bp.hot_spots] = self.hot_spots_define(
             feats=feats,
-            hot_spots_str=csv_row.get(mc.hot_spots, None),
         )
 
         # Contact conditioning matrix

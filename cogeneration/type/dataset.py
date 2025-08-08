@@ -73,10 +73,6 @@ class MetadataColumn(StrEnum):
     # clashes across chains exceeding clash threshold
     num_chains_clashing = "num_chains_clashing"
 
-    # (new, multimer-only) Interaction hot spots
-    # serialized hot spot residues: "<chain_id>:<res_index>:<num_interactions>,..."
-    hot_spots = "hot_spots"
-
     # (new) Non-residue chains + interactions
     # [Can only be added on initial processing, because processed feats omit such chains.]
     # count of non-residue or empty chains (atoms, metals, molecules, DNA)

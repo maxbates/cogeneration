@@ -284,6 +284,34 @@ class MultimerInteractions:
 
         return grouped_interactions
 
+    def residue_backbone_interaction_counts(self) -> Dict[Tuple[int, int], int]:
+        """
+        Count unique backbone residue-residue interactions for ALL interacting residues.
+
+        Returns a mapping from (chain_id, res_index) -> number of unique interacting partners.
+
+        Notes:
+        - Excludes clashes
+        - Counts unique residue partners (one per residue-residue pair)
+        - Includes residues on both sides of an interacting pair (no early-chain bias)
+        """
+        counts: Dict[Tuple[int, int], Set[Tuple[int, int]]] = {}
+        for interaction in self.unique_backbone_interactions:
+            if interaction.is_clash:
+                continue
+            if not interaction.is_backbone:
+                continue
+
+            a_key = (interaction.chain_id, interaction.chain_res_index)
+            b_key = (interaction.other_id, interaction.other_res_index)
+
+            # Track unique partners for each residue
+            counts.setdefault(a_key, set()).add(b_key)
+            counts.setdefault(b_key, set()).add(a_key)
+
+        # Convert partner sets to counts
+        return {key: len(partners) for key, partners in counts.items()}
+
     def serialize_hot_spots(self) -> str:
         """
         Serialize hot spot residues (backbone interactions) to a string.
@@ -410,8 +438,6 @@ class MultimerInteractions:
         metadata[mc.num_backbone_interactions] = len(self.unique_backbone_interactions)
         metadata[mc.num_backbone_res_interacting] = len(self.backbone_res_interacting)
         # metadata[dc.num_atom_interactions] = len(self.atom_interactions)
-        # Hot spots
-        metadata[mc.hot_spots] = self.serialize_hot_spots()
 
         potential_clashes = self.potential_chain_clashes(backbone_only=True)
         # serialize chain clashes

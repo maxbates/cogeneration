@@ -1,8 +1,13 @@
 import pytest
 import torch
 
-from cogeneration.config.base import DatasetFilterConfig, InferenceSamplesConfig
+from cogeneration.config.base import (
+    DatasetFilterConfig,
+    InferenceSamplesConfig,
+    InterpolantTranslationsNoiseTypeEnum,
+)
 from cogeneration.data.const import MASK_TOKEN_INDEX
+from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import torsions_empty
 from cogeneration.dataset.datasets import BaseDataset, LengthSamplingDataset
 from cogeneration.dataset.featurizer import BatchFeaturizer
@@ -18,6 +23,7 @@ from cogeneration.dataset.spec import (  # CogenerationAFDBDatasetSpec,
 from cogeneration.dataset.test_utils import create_pdb_batch
 from cogeneration.type.batch import METADATA_BATCH_PROPS
 from cogeneration.type.batch import BatchProp as bp
+from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import empty_feats
 from cogeneration.type.task import DataTask
 
@@ -191,6 +197,55 @@ class TestBaseDataset:
 
         # Check metadata fields are carried over
         assert new_feats[bp.pdb_name] == feats[bp.pdb_name]
+
+    @pytest.mark.parametrize(
+        "trans_noise",
+        [
+            InterpolantTranslationsNoiseTypeEnum.centered_harmonic,
+            InterpolantTranslationsNoiseTypeEnum.centered_gaussian,
+        ],
+    )
+    @pytest.mark.parametrize("task", [DataTask.hallucination, DataTask.inpainting])
+    def test_structure_centered(self, mock_cfg, task, trans_noise):
+        mock_cfg.data.task = task
+        mock_cfg.interpolant.trans.noise_type = trans_noise
+
+        batch = create_pdb_batch(cfg=mock_cfg)
+
+        # corrupt the batch
+        interpolant = Interpolant(cfg=mock_cfg.interpolant)
+        noisy_batch = interpolant.corrupt_batch(batch, task=task)
+
+        trans = batch[bp.trans_1]
+        trans_t = noisy_batch[nbp.trans_t]
+
+        if task == DataTask.inpainting:
+            assert bp.motif_mask in batch
+            assert (batch[bp.motif_mask] == 1).any()
+            motif_mask = batch[bp.motif_mask].bool()
+
+            # motifs are centered to start
+            motif_mean = trans[motif_mask].mean(dim=0)  # (3,)
+            assert torch.allclose(
+                motif_mean, torch.zeros_like(motif_mean), atol=0.01
+            ), f"Motif structure not centered for task {task}: mean={motif_mean}"
+
+            # whole corrupted structure is centered
+            noisy_trans_mean = trans_t.mean(dim=1)
+            assert torch.allclose(
+                noisy_trans_mean, torch.zeros_like(noisy_trans_mean), atol=0.01
+            ), f"Noisy structure not centered for task {task}: mean={noisy_trans_mean}"
+        else:
+            # check whole structure is centered
+            trans_mean = trans.mean(dim=1)
+            assert torch.allclose(
+                trans_mean, torch.zeros_like(trans_mean), atol=0.01
+            ), f"Structure not centered for task {task}: mean={trans_mean}"
+
+            noisy_trans_mean = trans_t.mean(dim=1)
+            assert torch.allclose(
+                noisy_trans_mean, torch.zeros_like(trans_mean), atol=0.01
+            ), f"Noisy structure not centered for task {task}: mean={trans_mean}"
 
 
 class TestLengthSamplingDataset:
