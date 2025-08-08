@@ -1,6 +1,7 @@
 import os.path
 
 import pytest
+import torch
 
 from cogeneration.config.base import Config, InferenceSamplesConfig
 from cogeneration.dataset.datasets import EvalDatasetConstructor
@@ -43,21 +44,21 @@ class TestEvalRunner:
     def test_public_weights_sampling(self, public_weights_path, tmp_path):
         cfg = Config.public_multiflow()
 
-        # specify task (note public multiflow not trained to support inpainting)
-        # cfg.inference.task = InferenceTask.unconditional
+        # specify task
+        #cfg.inference.task = InferenceTask.unconditional
         cfg.inference.task = InferenceTask.inpainting
         # stochastic paths (NOTE public multiflow not trained to support, but can force)
-        cfg.shared.stochastic = True
-        cfg.inference.interpolant.trans.stochastic_noise_intensity = 0.75
-        cfg.inference.interpolant.rots.stochastic_noise_intensity = 0.5
-        cfg.inference.interpolant.aatypes.stochastic_noise_intensity = 0.25
+        cfg.shared.stochastic = False
+        cfg.inference.interpolant.trans.stochastic_noise_intensity *= 0.25
+        cfg.inference.interpolant.rots.stochastic_noise_intensity *= 0.25
+        cfg.inference.interpolant.aatypes.stochastic_noise_intensity *= 0.25
         # FK Steering
         cfg.inference.interpolant.steering.num_particles = 4
         # set up predict_dir to tmp_path
         cfg.inference.predict_dir = str(tmp_path / "inference")
         # control number of timesteps. e.g. use 1 to debug folding validation / plotting
         cfg.inference.interpolant.sampling.num_timesteps = 200
-        # number of samples + eval lengths etc.
+        # number of samples + eval lengths etc. (mostly for unconditional)
         cfg.inference.samples.samples_per_length = 1
         cfg.inference.samples.num_batch = 1
         cfg.inference.samples.multimer_fraction = 0.0
@@ -86,7 +87,7 @@ class TestEvalRunner:
 
         eval_constructor = EvalDatasetConstructor(
             cfg=cfg.inference.samples,
-            # Multiflow not trained to support inpainting but sort of can
+            # Multiflow not trained to support inpainting but should support using motif guidance
             task=cfg.inference.task,
             dataset_cfg=cfg.dataset,
             use_test=False,

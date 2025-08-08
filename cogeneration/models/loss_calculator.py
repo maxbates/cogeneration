@@ -972,8 +972,6 @@ class BatchLossCalculator:
         # aggregate losses
         loss_total = loss_trans + loss_rot_vf + loss_aatypes_ce + loss_auxiliary
 
-        if torch.any(torch.isnan(loss_total)):
-            raise ValueError("NaN loss encountered")
         assert loss_total.shape == (self.num_batch,)
 
         aux = AuxiliaryMetrics(
@@ -1027,5 +1025,8 @@ class BatchLossCalculator:
             contact_conditioning_loss=loss_contact_conditioning,
             train_loss=loss_total,
         )
+
+        if torch.any(torch.isnan(loss_total)):
+            raise ValueError(f"NaN loss encountered: {loss_total}, {losses}, {aux}")
 
         return losses, aux

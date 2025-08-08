@@ -28,6 +28,8 @@ Most of the complexity here is to avoid redrawing the entire figure on each fram
 Artists are created once (`_init` methods), and then updated in plate (`_update` methods).
 """
 
+logger = rank_zero_logger(__name__)
+
 
 @dataclass
 class SavedTrajectory:
@@ -350,11 +352,21 @@ class CameraLimits:
     width: float
 
     @classmethod
-    def from_bb_traj(cls, bb_traj: npt.NDArray) -> "CameraLimits":
+    def from_bb_traj(
+        cls, bb_traj: npt.NDArray, max_allowed_width=100.0
+    ) -> "CameraLimits":
         # determine camera limits by inspecting c-alphas
         ca_all = bb_traj[:, :, 1, :].reshape(-1, 3)  # CA = atom index 1
         center = ca_all.mean(0)  # 3D
         width = (ca_all - center).ptp(0).max() / 2
+
+        if width > max_allowed_width:
+            logger.warning(
+                f"Camera width is very large ({width:.1f}Å). "
+                f"Is the structure reasonable? Setting width to {max_allowed_width}Å."
+            )
+            width = max_allowed_width
+
         return cls(center=center, width=width)
 
     def set_limits(self, ax):
@@ -372,7 +384,7 @@ def _get_structure_cmap(N: int, diffuse_mask: Optional[npt.NDArray]):
     _GREY = (0.6, 0.6, 0.6, 1.0)
     cmap = plt.get_cmap("Spectral")(np.linspace(0, 1, N))
     if diffuse_mask is not None:
-        cmap[~diffuse_mask] = _GREY
+        cmap[~diffuse_mask.astype(bool)] = _GREY
     return cmap
 
 
@@ -774,8 +786,9 @@ def save_trajectory(
         assert model_aa_traj.shape == (model_traj_length, num_res)
 
     # Use b-factors to specify which residues are diffused.
-    diffuse_mask = diffuse_mask.astype(bool)
-    b_factors = np.tile((diffuse_mask * 100)[:, None], (1, 37))
+    b_factor_mask = motif_mask if motif_mask is not None else diffuse_mask
+    b_factor_mask = b_factor_mask.astype(bool)
+    b_factors = np.tile((b_factor_mask * 100)[:, None], (1, 37))
 
     sample_pdb_path = write_prot_to_pdb(
         sample_atom37,
