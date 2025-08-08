@@ -2,7 +2,8 @@ import pytest
 import torch
 
 from cogeneration.config.base import Config, DatasetFilterConfig
-from cogeneration.data.interpolant import Interpolant
+from cogeneration.data import so3_utils
+from cogeneration.data.interpolant import BatchTrueFeatures, Interpolant
 from cogeneration.dataset.test_utils import create_pdb_batch, mock_feats
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyBatchProp as nbp
@@ -328,3 +329,116 @@ class TestInterpolantSample:
         assert (
             step0.log_G_delta is not None
         ), "Log G delta should be computed for step 0"
+
+    def test_motif_potentials_points_toward_motifs(
+        self, mock_cfg_uninterpolated, mock_pred_inpainting_dataloader
+    ):
+        """The motif guidance vector field should point toward the true motif positions/orientations."""
+        mock_cfg_uninterpolated.inference.task = InferenceTask.inpainting
+        cfg = mock_cfg_uninterpolated.interpolate()
+
+        # get motif-containing batch and corrupt (trans_t, rotmats_t, etc.)
+        batch = next(iter(mock_pred_inpainting_dataloader))
+        interp_corrupt = Interpolant(cfg.interpolant)
+        interp_corrupt.set_device(torch.device("cpu"))
+        noisy = interp_corrupt.corrupt_batch(batch, DataTask.inpainting)
+
+        # true features at t=1 (used by guidance); logits auto-onehot from aatypes
+        true_feats = BatchTrueFeatures.from_optional(
+            res_mask=batch[bp.res_mask],
+            trans=batch[bp.trans_1],
+            rotmats=batch[bp.rotmats_1],
+            torsions=batch[bp.torsions_1],
+            aatypes=batch[bp.aatypes_1],
+            num_tokens=interp_corrupt.num_tokens,
+        )
+
+        # use current noisy state as the "prediction", so the guidance direction = (true - current)
+        pred = {
+            pbp.pred_trans: noisy[nbp.trans_t],
+            pbp.pred_rotmats: noisy[nbp.rotmats_t],
+        }
+
+        # compute motif potentials at the current scalar t (any scalar in (0,1) is fine)
+        t_scalar = noisy[nbp.r3_t].mean()  # scalar tensor
+        motif_sel = batch[bp.motif_mask].to(dtype=torch.bool)
+        assert motif_sel.any(), "Test batch should include a non-empty motif mask"
+
+        interp_infer = Interpolant(cfg.inference.interpolant)
+        interp_infer.set_device(torch.device("cpu"))
+        trans_vf, rot_vf = interp_infer.motif_potentials(
+            t=t_scalar,
+            noisy_batch=noisy,
+            pred=pred,
+            true_feats=true_feats,
+            motif_mask=motif_sel,
+        )
+
+        # --- translations: check <VF, (true - current)> > 0 on motif residues ---
+        dir_trans = batch[bp.trans_1] - noisy[nbp.trans_t]  # (B, N, 3)
+        dots_trans = (trans_vf * dir_trans).sum(dim=-1)  # (B, N)
+        assert torch.all(
+            dots_trans[motif_sel] > 0
+        ), "Translation VF should point toward motif positions"
+
+        # --- rotations: check <VF, log_{R_t}(R_true)> > 0 in T_{R_t}SO(3) on motif residues ---
+        dir_rot = so3_utils.calc_rot_vf(
+            mat_t=noisy[nbp.rotmats_t], mat_1=batch[bp.rotmats_1]
+        )  # (B, N, 3)
+        dots_rot = (rot_vf * dir_rot).sum(dim=-1)  # (B, N)
+        assert torch.all(
+            dots_rot[motif_sel] > 0
+        ), "Rotation VF should point toward motif orientations"
+
+    def test_motif_guidance_single_step_moves_toward_motifs(
+        self, mock_cfg_uninterpolated, mock_pred_inpainting_dataloader
+    ):
+        """1 deterministic step should reduce motif translation RMSD and SO(3) geodesic error."""
+        mock_cfg_uninterpolated.shared.stochastic = False
+        mock_cfg_uninterpolated.inference.task = InferenceTask.inpainting
+        mock_cfg_uninterpolated.interpolant.sampling.num_timesteps = 3
+        cfg = mock_cfg_uninterpolated.interpolate()
+
+        batch = next(iter(mock_pred_inpainting_dataloader))
+        # have the mock model predict the true structure to isolate guidance/euler behavior
+        sample_traj, model_traj, _ = self._run_sample(
+            cfg=cfg,
+            batch=batch,
+            task=InferenceTask.inpainting,
+            model_predicts_true=True,
+            model_corruption=0.0,
+        )
+
+        motif_sel = batch[bp.motif_mask].to(dtype=torch.bool)
+        assert motif_sel.any(), "Test batch should include a non-empty motif mask"
+
+        # step 0 = initial state, step 1 = after first Euler step
+        trans_true = batch[bp.trans_1]
+        rot_true = batch[bp.rotmats_1]
+
+        trans_0 = sample_traj[0].trans
+        trans_1 = sample_traj[1].trans
+
+        # translation RMSD on motif residues should decrease
+        d0 = ((trans_true - trans_0) ** 2).sum(dim=-1).sqrt()[motif_sel].mean()
+        d1 = ((trans_true - trans_1) ** 2).sum(dim=-1).sqrt()[motif_sel].mean()
+        assert (
+            d1 < d0
+        ), f"Motif translation error should decrease after 1 step (before: {float(d0):.4f}, after: {float(d1):.4f})"
+
+        # SO(3) geodesic error on motif residues should decrease (use tangent norm as the geodesic)
+        rot_0 = sample_traj[0].rotmats
+        rot_1 = sample_traj[1].rotmats
+        ang0 = (
+            so3_utils.calc_rot_vf(mat_t=rot_0, mat_1=rot_true)
+            .norm(dim=-1)[motif_sel]
+            .mean()
+        )
+        ang1 = (
+            so3_utils.calc_rot_vf(mat_t=rot_1, mat_1=rot_true)
+            .norm(dim=-1)[motif_sel]
+            .mean()
+        )
+        assert (
+            ang1 < ang0
+        ), f"Motif rotational error should decrease after 1 step (before: {float(ang0):.4f}, after: {float(ang1):.4f})"
