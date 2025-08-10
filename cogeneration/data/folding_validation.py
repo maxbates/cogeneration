@@ -580,6 +580,7 @@ class FoldingValidator:
         output_dir: Path,
         diffuse_mask: Optional[npt.NDArray],
         num_sequences: Optional[int] = None,
+        retain_top_n: Optional[int] = None,
         seed: Optional[int] = None,
         temperature: Optional[float] = None,
     ) -> InverseFoldingFasta:
@@ -597,6 +598,7 @@ class FoldingValidator:
             output_dir=output_dir,
             diffuse_mask=diffuse_mask,
             num_sequences=num_sequences,
+            retain_top_n=retain_top_n,
             seed=seed,
             temperature=temperature,
         )

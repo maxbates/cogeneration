@@ -648,7 +648,9 @@ class BatchLossCalculator:
             return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
 
         # Calculate pairwise distances
-        pred_ca_positions = self.pred_bb_atoms[:, :, 1, :]  # (B, N, 3) - CA atoms
+        pred_ca_positions = self.pred_bb_atoms[:, :, 1, :].to(
+            torch.float32
+        )  # (B, N, 3) - CA atoms
         pairwise_ca = pred_ca_positions.unsqueeze(2) - pred_ca_positions.unsqueeze(
             1
         )  # (B, N, N, 3)
@@ -671,6 +673,9 @@ class BatchLossCalculator:
         # Set distances to invalid pairs to a large value so they don't affect the min
         masked_dists = pairwise_dists.clone()
         masked_dists[~valid_inter_chain] = float("inf")
+        masked_dists = torch.nan_to_num(
+            masked_dists, nan=float("inf"), posinf=float("inf"), neginf=float("inf")
+        )
 
         # Find minimum distance to any other-chain residue for each residue
         min_inter_chain_dist, _ = masked_dists.min(dim=2)  # (B, N)
@@ -679,15 +684,15 @@ class BatchLossCalculator:
         hot_spot_min_dists = min_inter_chain_dist * hot_spots_mask.float()  # (B, N)
 
         # Apply relu loss: penalize when minimum distance exceeds contact threshold
-        # Replace inf values (no valid inter-chain residues) with contact_dist_ang to avoid large losses
+        # Replace inf values (no valid inter-chain residues) with high value to avoid inf losses
         hot_spot_min_dists = torch.where(
-            torch.isinf(hot_spot_min_dists),
-            torch.tensor(contact_dist_ang, device=hot_spot_min_dists.device),
+            torch.isinf(hot_spot_min_dists) | torch.isnan(min_inter_chain_dist),
+            torch.tensor(50.0, device=hot_spot_min_dists.device),
             hot_spot_min_dists,
         )
 
         contact_loss = torch.relu(hot_spot_min_dists - contact_dist_ang)  # (B, N)
-        contact_loss = contact_loss.clamp(max=10.0)  # cap distance
+        contact_loss = contact_loss.clamp(min=0.0, max=10.0)  # cap distance
 
         # Only apply loss to actual hot spots
         hot_spot_loss = contact_loss * hot_spots_mask.float()  # (B, N)

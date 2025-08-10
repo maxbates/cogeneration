@@ -49,6 +49,7 @@ class InverseFoldingTool(ABC):
         output_dir: Path,
         diffuse_mask: Optional[npt.NDArray],
         num_sequences: Optional[int] = None,
+        retain_top_n: Optional[int] = None,
         seed: Optional[int] = None,
         temperature: Optional[float] = None,
     ) -> InverseFoldingFasta:
@@ -60,6 +61,7 @@ class InverseFoldingTool(ABC):
             pdb_path: Path to input PDB file
             output_dir: Directory to save output files
             num_sequences: Number of sequences to generate
+            retain_top_n: If set, retain only the top-N sequences by score in the output FASTA
             diffuse_mask: Diffusion mask NDArray, to fix undiffused residues
             device_id: GPU device ID (required for subprocess mode)
             seed: Random seed

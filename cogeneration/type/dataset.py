@@ -92,6 +92,7 @@ class RedesignColumn(StrEnum):
     example = "example"  # original pdb_name
     pred_pdb_path = "pred_pdb_path"  # path to predicted structure
     rmsd = "rmsd"  # RMSD to the original structure
+    tm_score = "tm_score"  # TM-score of redesign to the example (normalized by example)
     sequence_id = "sequence_id"  # modified ProteinMPNN sequence name
     sequence = "sequence"  # redesigned sequence
     example_sequence = "example_sequence"  # original sequence

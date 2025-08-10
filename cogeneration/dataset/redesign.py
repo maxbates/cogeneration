@@ -15,13 +15,15 @@ from cogeneration.config.base import (
     LigandMPNNModelType,
     RedesignConfig,
 )
-from cogeneration.data.const import aatype_to_seq
+from cogeneration.data.const import CA_IDX, aatype_to_seq
 from cogeneration.data.folding_validation import FoldingValidator
+from cogeneration.data.superimposition import calc_tm_score
 from cogeneration.dataset.datasets import BaseDataset
 from cogeneration.dataset.process_pdb import process_pdb_file, read_processed_file
 from cogeneration.dataset.scripts.process_pdb_files import safe_process_pdb
 from cogeneration.type.dataset import BestRedesignColumn
 from cogeneration.type.dataset import DatasetProteinColumn as dpc
+from cogeneration.type.dataset import MetadataColumn
 from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.dataset import (
     MetadataCSVRow,
@@ -49,6 +51,15 @@ SequenceRedesigner generates both:
 logger = rank_zero_logger(__name__)
 
 
+def get_existing_fieldnames(csv_path):
+    """Helper to check existing CSV fieldnames."""
+    if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+        with open(csv_path, "r", newline="") as f:
+            reader = csv.reader(f)
+            return next(reader)
+    return None
+
+
 @dataclass
 class Redesign:
     """Single redesign, i.e. single sequence in a fasta of redesigned sequences."""
@@ -63,6 +74,7 @@ class Redesign:
     fasta_idx: int  # index within the fasta (0‑based)
     pred_pdb_path: str  # path to predicted structure
     rmsd: float  # RMSD to the original structure
+    tm_score: float  # TM-score to the original structure (normalized by example)
     # generation metadata
     inverse_folding_tool: LigandMPNNModelType  # NOTE assumes using LigandMPNN
     folding_tool: FoldingModel
@@ -107,6 +119,7 @@ class Redesign:
             # structure
             RedesignColumn.pred_pdb_path: self.pred_pdb_path,
             RedesignColumn.rmsd: self.rmsd,
+            RedesignColumn.tm_score: self.tm_score,
             # override structure method
             mc.structure_method: self.structure_method,
             # sequence
@@ -227,11 +240,13 @@ class SequenceRedesigner:
         work_dir.mkdir(parents=True, exist_ok=True)
 
         # Redesign the structure using inverse folding
+        # Keep top `fold_per_sample` of `seqs_per_sample` in fasta to fold. The others will be dropped.
         redesign_fasta_path = self.validator.inverse_fold_pdb(
             pdb_path=metadata_row[mc.raw_path],
             diffuse_mask=None,
             output_dir=work_dir,
             num_sequences=self.cfg.seqs_per_sample,
+            retain_top_n=self.cfg.fold_per_sample,
         )
 
         # Fold the redesigned sequences
@@ -250,7 +265,12 @@ class SequenceRedesigner:
             if col not in folding_df.columns:
                 raise ValueError(f"fold_fasta output must include '{col}' column")
 
-        orig_backbone_positions = processed_file[dpc.atom_positions][:, :3, :]
+        orig_backbone_positions = processed_file[dpc.atom_positions][
+            :, :3, :
+        ]  # (N, 3, 3)
+        pred_backbone_positions = self._get_pred_backbone_positions(
+            folding_df
+        )  # (N, 3, 3)
 
         redesigns: List[Redesign] = []
         for idx, folding_row in folding_df.iterrows():
@@ -265,6 +285,26 @@ class SequenceRedesigner:
             if rmsd > self.cfg.rmsd_max and self.cfg.rmsd_max > 0.01:
                 continue
 
+            # Calculate TM-score to original
+            try:
+                # Use CA positions and sequences for alignment
+                orig_ca = orig_backbone_positions[:, CA_IDX, :]
+                pred_ca = pred_backbone_positions[:, CA_IDX, :]
+                orig_seq = aatype_to_seq(
+                    processed_file[dpc.aatype],
+                    chain_idx=processed_file[dpc.chain_index],
+                ).replace("X", "A")
+                pred_seq = folding_row[MetricName.sequence].replace("X", "A")
+                tm_norm_chain1, _ = calc_tm_score(
+                    pos_1=orig_ca,
+                    pos_2=pred_ca,
+                    seq_1=orig_seq,
+                    seq_2=pred_seq,
+                )
+            except Exception as e:
+                self.log.error(f"Error calculating TM-score for {pdb_name}: {e}")
+                tm_norm_chain1 = 0.0
+
             # track redesign
             redesigns.append(
                 Redesign(
@@ -276,6 +316,7 @@ class SequenceRedesigner:
                     fasta_idx=int(idx),
                     pred_pdb_path=folding_row[MetricName.folded_pdb_path],
                     rmsd=rmsd,
+                    tm_score=float(tm_norm_chain1),
                     inverse_folding_tool=self.validator.cfg.protein_mpnn.model_type,
                     folding_tool=self.validator.cfg.folding_model,
                 )
@@ -307,6 +348,13 @@ class SequenceRedesigner:
             )
             metadata = dataset.csv.copy()
 
+        # Optionally shuffle before processing
+        if self.cfg.shuffle:
+            self.log.info(f"Shuffling metadata...")
+            metadata = metadata.sample(
+                frac=1, random_state=self.dataset_cfg.seed
+            ).reset_index(drop=True)
+
         self.log.info(f"Found {len(metadata)} structures to redesign")
         assert (
             mc.raw_path in metadata.columns
@@ -334,6 +382,14 @@ class SequenceRedesigner:
             self.log.info(
                 f"Found {len(existing_redesigns)} redesigns ({num_good_redesigns} < {self.cfg.rmsd_good}) for {len(redesigned_pdbs)} PDBs in {self.all_redesigns_path}, which will be skipped."
             )
+
+            # Basic compatibility check - assume columns match current redesign columns + metadata columns
+            df_columns = set(existing_redesigns.columns)
+            expected_columns = set(list(RedesignColumn) + list(MetadataColumn))
+            assert (
+                df_columns == expected_columns
+            ), f"Existing redesigns CSV has new ({df_columns - expected_columns}) or missing ({expected_columns - df_columns}) columns."
+
             metadata = metadata[~metadata[mc.pdb_name].isin(redesigned_pdbs)]
 
         return metadata
@@ -417,9 +473,23 @@ class SequenceRedesigner:
 
                     # setup writer if needed
                     if all_redesigns_writer is None:
+                        processed_redesign_fields = list(processed_redesign.keys())
+                        # handle existing file, ensure fields match
+                        existing_fieldnames = get_existing_fieldnames(
+                            self.all_redesigns_path
+                        )
+                        if existing_fieldnames is not None:
+                            if set(existing_fieldnames) != set(
+                                processed_redesign_fields
+                            ):
+                                raise ValueError(
+                                    f"Existing redesigns CSV at {self.all_redesigns_path} has different fields than current redesign. Existing: {existing_fieldnames}, Current: {processed_redesign_fields}"
+                                )
+                            processed_redesign_fields = existing_fieldnames
+
                         all_redesigns_writer = csv.DictWriter(
                             all_redesigns_handle,
-                            fieldnames=list(processed_redesign.keys()),
+                            fieldnames=processed_redesign_fields,
                         )
                         if all_redesigns_handle.tell() == 0:
                             all_redesigns_writer.writeheader()

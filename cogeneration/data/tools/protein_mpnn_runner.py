@@ -67,6 +67,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -638,6 +639,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
         output_dir: Path,
         diffuse_mask: Optional[npt.NDArray],
         num_sequences: Optional[int] = None,
+        retain_top_n: Optional[int] = None,
         seed: Optional[int] = None,
         temperature: Optional[float] = None,
     ) -> InverseFoldingFasta:
@@ -667,6 +669,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
                 output_dir=output_dir,
                 num_sequences=num_sequences,
                 diffuse_mask=diffuse_mask,
+                retain_top_n=retain_top_n,
                 seed=seed,
                 temperature=temperature,
             )
@@ -676,47 +679,103 @@ class ProteinMPNNRunner(InverseFoldingTool):
                 output_dir=output_dir,
                 num_sequences=num_sequences,
                 diffuse_mask=diffuse_mask,
+                retain_top_n=retain_top_n,
                 seed=seed,
                 temperature=temperature,
             )
 
     def _process_fasta_output(
-        self, original_fasta: Path, output_dir: Path, pdb_stem: str
+        self,
+        original_fasta: Path,
+        output_dir: Path,
+        pdb_stem: str,
+        retain_top_n: Optional[int] = None,
     ) -> Path:
         """
         Process and clean up FASTA output from ProteinMPNN.
 
         This method skips the native sequence (first record) and renames the
-        generated sequences with a cleaner ID format.
+        generated sequences with a cleaner ID format. If retain_top_n is set,
+        keeps only the top-N sequences sorted by score parsed from headers.
 
         Returns:
             Path to processed FASTA file
         """
         output_fasta = output_dir / f"{pdb_stem}_sequences.fa"
 
-        records = []
-        seq_counter = 1  # Counter for generated sequences
-        for i, record in enumerate(SeqIO.parse(original_fasta, "fasta")):
-            # skip the first record (native sequence)
-            if i == 0:
+        # Collect generated records
+        generated_records: List[Tuple[SeqRecord, float, int]] = []
+        for orig_idx, record in enumerate(SeqIO.parse(original_fasta, "fasta")):
+            # skip native header/sequence at i==0
+            if orig_idx == 0:
                 continue
 
-            # Rename to a cleaner and unique sequence id (assuming unique pdb_names)
-            # Also convert `/` style chain breaks to CHAIN_BREAK_STR
-            new_id = f"{pdb_stem}_seq_{seq_counter}"
-            new_record = SeqRecord(
-                seq=record.seq.replace("/", CHAIN_BREAK_STR),
-                id=new_id,
-                description=f"ProteinMPNN generated sequence {seq_counter}",
+            # Parse a score from the header; prefer overall_confidence, fallback to score
+            header = record.description or record.id
+            score = self._parse_score_from_header(header)
+
+            # Normalize chain break characters
+            normalized_seq = record.seq.replace("/", CHAIN_BREAK_STR)
+
+            # Create a clean SeqRecord without renaming yet
+            cleaned = SeqRecord(
+                seq=normalized_seq,
+                id=record.id,
+                description=header,
             )
-            records.append(new_record)
-            seq_counter += 1
+            generated_records.append((cleaned, score, orig_idx))
+
+        # Optionally filter to top-N by score (higher is better)
+        if retain_top_n is not None and retain_top_n > 0:
+            # Sort descending by score; records with missing scores are placed at the end
+            generated_records.sort(
+                key=lambda x: (x[1] is None, -(x[1] or float("-inf")))
+            )
+            generated_records = generated_records[:retain_top_n]
+
+        # Rename to stable, unique IDs in the final output order
+        processed_records: List[SeqRecord] = []
+        for idx, (rec, score, orig_idx) in enumerate(generated_records, start=1):
+            new_id = f"{pdb_stem}_seq_{idx}"
+            processed_records.append(
+                SeqRecord(
+                    seq=rec.seq,
+                    id=new_id,
+                    description=f"{self.cfg.model_type} score={score} orig={orig_idx}",
+                )
+            )
 
         # Write processed sequences
-        SeqIO.write(records, output_fasta, "fasta")
-        logger.debug(f"Processed {len(records)} sequences saved to {output_fasta}")
+        SeqIO.write(processed_records, output_fasta, "fasta")
+        logger.debug(
+            f"Processed {len(processed_records)} sequences saved to {output_fasta}"
+        )
 
         return output_fasta
+
+    @staticmethod
+    def _parse_score_from_header(header: str) -> Optional[float]:
+        """
+        Extract a numeric score from an MPNN FASTA header.
+
+        Tries keys in order: overall_confidence, score, ligand_confidence, seq_rec.
+        Returns None if no score-like field is found.
+        """
+
+        patterns = [
+            r"overall_confidence=([0-9eE+\-.]+)",
+            r"score=([0-9eE+\-.]+)",
+            r"ligand_confidence=([0-9eE+\-.]+)",
+            r"seq_rec=([0-9eE+\-.]+)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, header)
+            if m:
+                try:
+                    return float(m.group(1))
+                except Exception:
+                    continue
+        return None
 
     def inverse_fold_pdb_native(
         self,
@@ -724,6 +783,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
         output_dir: Path,
         num_sequences: Optional[int] = None,
         diffuse_mask: Optional[torch.Tensor] = None,
+        retain_top_n: Optional[int] = None,
         seed: Optional[int] = None,
         temperature: Optional[float] = None,
     ) -> InverseFoldingFasta:
@@ -818,7 +878,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         # Process FASTA output
         processed_fasta = self._process_fasta_output(
-            output_fasta, output_dir, pdb_path.stem
+            output_fasta, output_dir, pdb_path.stem, retain_top_n=retain_top_n
         )
 
         end_time = time.time()
@@ -836,6 +896,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
         num_sequences: Optional[int] = None,
         temperature: Optional[float] = None,
         seed: Optional[int] = None,
+        retain_top_n: Optional[int] = None,
     ) -> InverseFoldingFasta:
         """
         Run ProteinMPNN using subprocess.
@@ -959,7 +1020,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         # Process FASTA output
         processed_fasta = self._process_fasta_output(
-            original_fasta, output_dir, pdb_path.stem
+            original_fasta, output_dir, pdb_path.stem, retain_top_n=retain_top_n
         )
 
         end_time = time.time()
