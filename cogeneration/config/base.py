@@ -18,10 +18,9 @@ from cogeneration.config.dict_utils import (
 from cogeneration.dataset.spec import (  # CogenerationAFDBDatasetSpec,
     CogenerationAFDBDatasetSpec,
     CogenerationPDBDatasetSpec,
+    CogenerationRedesignDatasetSpec,
     DatasetSpec,
-    MultiflowPDBDatasetSpec,
     MultiflowPDBRedesignedDatasetSpec,
-    MultiflowPDBTestDatasetSpec,
     MultiflowSyntheticDatasetSpec,
 )
 from cogeneration.type.dataset import MetadataColumn
@@ -1046,20 +1045,20 @@ class DatasetConfig(BaseClassConfig):
     """
 
     # TODO(cfg) determine if there is a reasonable way to support CLI-friendly spec
+    # All datasets (train + test will be split by date)
     datasets: List[DatasetSpec] = field(
         default_factory=lambda: [
             CogenerationPDBDatasetSpec,
             CogenerationAFDBDatasetSpec,
+            CogenerationRedesignDatasetSpec,
             MultiflowPDBRedesignedDatasetSpec,
-            MultiflowSyntheticDatasetSpec,
+            # MultiflowSyntheticDatasetSpec,  # TODO enable if desired, unsure of quailty
         ]
     )
-    # TODO(dataset) - consider deprecating test dataset, and using a split like date, cluster ids, etc.
-    test_datasets: List[DatasetSpec] = field(
-        default_factory=lambda: [
-            MultiflowPDBTestDatasetSpec,
-        ]
-    )
+
+    # Date cutoff used to split train vs test from the unified datasets list.
+    # Note AFDB structures (which may be dupes) are mostly dated 2022-06-01.
+    test_date_cutoff: str = "2023-01-01"
 
     # Data processing and sample generation, shared across datasets
     # Filtering
@@ -1474,7 +1473,7 @@ class RedesignConfig(BaseClassConfig):
     # Skip existing redesigned sequences
     skip_existing: bool = True
     # Shuffle the metadata rows before redesigning
-    shuffle: bool = False
+    shuffle: bool = True
     # Filename for all redesigns CSV
     all_csv: str = "redesigned_all.csv"
     # Filename for best redesigns CSV
@@ -1652,9 +1651,9 @@ class Config(BaseClassConfig):
         # filter to small PDBs for faster model + sampling
         raw_cfg.dataset.debug_head_samples = 1000
         raw_cfg.dataset.filter.min_num_res = 20
-        raw_cfg.dataset.filter.max_num_res = 40
+        raw_cfg.dataset.filter.max_num_res = 80
         # small batches
-        raw_cfg.data.sampler.max_batch_size = 4
+        raw_cfg.data.sampler.max_batch_size = 3
 
         # set output directories to temp paths
         raw_cfg.experiment.checkpointer.dirpath = str(tmp_path / "ckpt")

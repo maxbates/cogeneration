@@ -44,7 +44,7 @@ class BaseDataset(Dataset):
         cfg: DatasetConfig,
         task: DataTask,
         eval: bool,  # process for evaluation
-        use_test: bool,  # use cfg.datasets.test_datasets if True
+        use_test: bool,  # use date-based split if True
     ):
         """
         BaseDataset collects all dataset files into a single Dataset, and yields samples.
@@ -73,6 +73,9 @@ class BaseDataset(Dataset):
 
         # Load specs as metadata DF
         metadata = self.load_datasets()
+
+        # Apply date-based train/test split before other filters
+        metadata = self._apply_date_split(metadata)
 
         # Filter all structures
         dataset_filterer = DatasetFilterer(
@@ -213,6 +216,33 @@ class BaseDataset(Dataset):
 
         return metadata
 
+    def _apply_date_split(self, metadata: MetadataDataFrame) -> MetadataDataFrame:
+        """
+        Split rows by date using cfg.test_date_cutoff and self.use_test.
+        - Train: rows with date < cutoff
+        - Test: rows with date >= cutoff
+        If date column is missing or nan, assigned to training.
+        """
+        assert (
+            mc.date in metadata.columns
+        ), "Date column not found in metadata, cannot create train/test split"
+
+        cutoff = pd.to_datetime(self.cfg.test_date_cutoff, errors="coerce")
+        dates = pd.to_datetime(metadata[mc.date], errors="coerce")
+
+        if self.use_test:
+            mask = (dates >= cutoff) & (~dates.isna())
+            self._log.info(
+                f"Test date cutoff {self.cfg.test_date_cutoff} split {len(metadata)} -> {mask.sum()} examples"
+            )
+        else:
+            mask = (dates < cutoff) & (~dates.isna())
+            self._log.info(
+                f"Train date cutoff {self.cfg.test_date_cutoff} split {len(metadata)} -> {mask.sum()} examples"
+            )
+
+        return metadata[mask]
+
     @staticmethod
     def filter_to_eval_lengths(
         metadata: DatasetDataFrame,
@@ -229,6 +259,7 @@ class BaseDataset(Dataset):
         assert (
             length_column in metadata.columns
         ), f"Length column {length_column} not found in metadata columns {metadata.columns}"
+        assert len(metadata) > 0, "No data remains for validation"
 
         eval_lengths = metadata[length_column]
         if cfg.max_eval_length is not None:
@@ -259,14 +290,19 @@ class BaseDataset(Dataset):
 
     def load_datasets(self):
         """Load datasets specified by cfg.datasets, and concat them into a single DataFrame."""
-        specs = self.cfg.test_datasets if self.use_test else self.cfg.datasets
-
         dfs = []
-        for spec in specs:
+        for spec in self.cfg.datasets:
+            if not spec.is_enabled():
+                continue
+
             metadata_csv = BaseDataset.load_dataset_spec_metadata(
                 spec=spec,
                 cfg=self.cfg,
             )
+
+            # track source dataset # TODO use enum
+            metadata_csv["dataset_name"] = spec.name
+
             dfs.append(metadata_csv)
             self._log.info(f"Loaded dataset {spec.name} with {len(metadata_csv)} rows")
 

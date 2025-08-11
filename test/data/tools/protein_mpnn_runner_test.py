@@ -570,7 +570,7 @@ class TestProteinMPNNRunner:
 
         for i, record in enumerate(records, 1):
             assert record.id == f"test_pdb_seq_{i}"
-            assert f"ProteinMPNN generated sequence {i}" in record.description
+            assert f"score=" in record.description
 
     def test_config_validation(self, mock_cfg_uninterpolated):
         """Test configuration validation"""

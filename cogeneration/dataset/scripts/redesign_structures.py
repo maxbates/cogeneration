@@ -40,7 +40,7 @@ def main(cfg: Config) -> None:
     validator = FoldingValidator(cfg=config.folding)
 
     redesigner = SequenceRedesigner(
-        cfg=config.redesign, validator=validator, dataset_cfg=cfg.dataset
+        cfg=config.redesign, validator=validator, dataset_cfg=config.dataset
     )
 
     redesigner.run()

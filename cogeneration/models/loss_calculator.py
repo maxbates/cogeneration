@@ -636,8 +636,11 @@ class BatchLossCalculator:
         # Skip if no hot spots marked
         if bp.hot_spots not in self.batch:
             return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
-        hot_spots_mask = self.batch[bp.hot_spots]  # (B, N)
-        hot_spots_present = hot_spots_mask.sum(-1) > 0  # (B,)
+
+        # Only consider hot spots that are also valid residues for loss
+        hot_spots_mask = self.batch[bp.hot_spots].bool()  # (B, N)
+        valid_hot_spots = hot_spots_mask & self.loss_mask  # (B, N)
+        hot_spots_present = valid_hot_spots.any(dim=-1)  # (B,)
         if not hot_spots_present.any():
             return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
 
@@ -669,7 +672,7 @@ class BatchLossCalculator:
         # Mask for valid inter-chain pairs
         valid_inter_chain = inter_chain & valid_pairs  # (B, N, N)
 
-        # For each hot spot residue, find minimum distance to any residue on another chain
+        # For each residue, find minimum distance to any residue on another chain
         # Set distances to invalid pairs to a large value so they don't affect the min
         masked_dists = pairwise_dists.clone()
         masked_dists[~valid_inter_chain] = float("inf")
@@ -679,33 +682,28 @@ class BatchLossCalculator:
 
         # Find minimum distance to any other-chain residue for each residue
         min_inter_chain_dist, _ = masked_dists.min(dim=2)  # (B, N)
-
-        # Only consider hot spot residues for loss
-        hot_spot_min_dists = min_inter_chain_dist * hot_spots_mask.float()  # (B, N)
-
-        # Apply relu loss: penalize when minimum distance exceeds contact threshold
-        # Replace inf values (no valid inter-chain residues) with high value to avoid inf losses
-        hot_spot_min_dists = torch.where(
-            torch.isinf(hot_spot_min_dists) | torch.isnan(min_inter_chain_dist),
-            torch.tensor(50.0, device=hot_spot_min_dists.device),
-            hot_spot_min_dists,
+        # Replace non-finite with a large finite value BEFORE masking to avoid NaNs from inf*0
+        min_inter_chain_dist = torch.nan_to_num(
+            min_inter_chain_dist, nan=50.0, posinf=50.0, neginf=50.0
         )
 
-        contact_loss = torch.relu(hot_spot_min_dists - contact_dist_ang)  # (B, N)
+        # Distance penalty only for residues that are valid hot spots
+        contact_loss = torch.relu(min_inter_chain_dist - contact_dist_ang)  # (B, N)
         contact_loss = contact_loss.clamp(min=0.0, max=10.0)  # cap distance
+        hot_spot_loss = contact_loss * valid_hot_spots.float()  # (B, N)
 
-        # Only apply loss to actual hot spots
-        hot_spot_loss = contact_loss * hot_spots_mask.float()  # (B, N)
-
-        # Sum over hot spots and normalize by number of hot spots
+        # Sum over valid hot spots and normalize by number of valid hot spots
         loss_per_batch = hot_spot_loss.sum(dim=1)  # (B,)
-        num_hot_spots = hot_spots_mask.float().sum(dim=1).clamp_min(1.0)  # (B,)
+        num_hot_spots = valid_hot_spots.float().sum(dim=1).clamp_min(1.0)  # (B,)
         loss_per_batch = loss_per_batch / num_hot_spots  # (B,)
 
         # Only apply to relevant batches
         loss_per_batch = (
             loss_per_batch * hot_spots_present.float() * multi_chain_mask.float()
         )
+
+        # # ensure no NaNs
+        # loss_per_batch = torch.nan_to_num(loss_per_batch, nan=0.0, posinf=0.0, neginf=0.0)
 
         return loss_per_batch
 

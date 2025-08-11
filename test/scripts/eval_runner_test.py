@@ -33,7 +33,7 @@ class TestEvalRunner:
         # TODO(test) - support multiple samples
         #   We need to mock folding validation for all samples in pred dataloader.
         mock_cfg_uninterpolated.inference.samples.samples_per_length = 1
-        mock_cfg_uninterpolated.inference.samples.length_subset = [26]
+        mock_cfg_uninterpolated.inference.samples.length_subset = [36]
 
         cfg = mock_cfg_uninterpolated.interpolate()
 

@@ -2,7 +2,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from cogeneration.util.log import rank_zero_logger
+
 PATH_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+logger = rank_zero_logger(__name__)
 
 
 @dataclass
@@ -23,25 +27,34 @@ class DatasetSpec:
     cluster_path: Optional[Path] = None
 
     def __post_init__(self):
-        if not self.metadata_path.exists():
-            raise FileNotFoundError(
-                f"Metadata CSV for {self.name} not found: {self.metadata_path}"
-            )
-        if not self.processed_root_path.exists():
-            raise FileNotFoundError(
-                f"Processed data root path for {self.name} not found: {self.processed_root_path}"
-            )
-        if self.best_redesigns_path and not self.best_redesigns_path.exists():
-            raise FileNotFoundError(
-                f"BestRedesigns CSV for {self.name} not found: {self.best_redesigns_path}"
-            )
-        if self.cluster_path and not self.cluster_path.exists():
-            raise FileNotFoundError(
-                f"Cluster file for {self.name} not found: {self.cluster_path}"
-            )
+        try:
+            if not self.metadata_path.exists():
+                raise FileNotFoundError(
+                    f"Metadata CSV for {self.name} not found: {self.metadata_path}"
+                )
+            if not self.processed_root_path.exists():
+                raise FileNotFoundError(
+                    f"Processed data root path for {self.name} not found: {self.processed_root_path}"
+                )
+            if self.best_redesigns_path and not self.best_redesigns_path.exists():
+                raise FileNotFoundError(
+                    f"BestRedesigns CSV for {self.name} not found: {self.best_redesigns_path}"
+                )
+            if self.cluster_path and not self.cluster_path.exists():
+                raise FileNotFoundError(
+                    f"Cluster file for {self.name} not found: {self.cluster_path}"
+                )
+            self._enabled = True
+        except FileNotFoundError as e:
+            logger.warning(f"Dataset {self.name} is disabled: {e}")
+            self._enabled = False
+
+    def is_enabled(self) -> bool:
+        return self._enabled
 
 
 # cogeneration data pipeline generated datasets
+# TODO - generate shared clusters file for these datasets
 
 cogeneration_datasets_path = Path("~/pdb/").expanduser().resolve()
 
@@ -49,7 +62,6 @@ CogenerationPDBDatasetSpec = DatasetSpec(
     name="CogenerationPDB",
     processed_root_path=cogeneration_datasets_path,
     metadata_path=cogeneration_datasets_path / "rcsb" / "processed" / "metadata.csv",
-    # cluster_path=cogeneration_datasets_path / "rcsb" / "processed" / "cogeneration.clusters",  # TODO?
 )
 
 CogenerationAFDBDatasetSpec = DatasetSpec(
@@ -59,20 +71,38 @@ CogenerationAFDBDatasetSpec = DatasetSpec(
     / "alphafold"
     / "processed"
     / "metadata.csv",
-    # cluster_path=cogeneration_datasets_path / "alphafold" / "processed" / "cogeneration.clusters",  # TODO?
+)
+
+CogenerationRedesignDatasetSpec = DatasetSpec(
+    name="CogenerationRedesigns",
+    processed_root_path=cogeneration_datasets_path,
+    metadata_path=cogeneration_datasets_path
+    / "rcsb"
+    / "redesigned"
+    / "redesigned_all.csv",
 )
 
 # multiflow metadata paths
 
+
 multiflow_datasets_path = PATH_PROJECT_ROOT / "cogeneration" / "datasets"
 multiflow_metadata = multiflow_datasets_path / "multiflow"
 
-MultiflowPDBDatasetSpec = DatasetSpec(
-    name="MultiflowPDB",
-    processed_root_path=multiflow_datasets_path,
-    metadata_path=multiflow_metadata / "pdb_metadata.csv",
-    cluster_path=multiflow_metadata / "pdb.clusters",
-)
+# NOTE - Multiflow PDB datasets are superceded by CogenerationPDBDatasetSpec
+
+# MultiflowPDBDatasetSpec = DatasetSpec(
+#     name="MultiflowPDB",
+#     processed_root_path=multiflow_datasets_path,
+#     metadata_path=multiflow_metadata / "pdb_metadata.csv",
+#     cluster_path=multiflow_metadata / "pdb.clusters",
+# )
+
+# MultiflowPDBTestDatasetSpec = DatasetSpec(
+#     name="MultiflowPDBPost2021",
+#     processed_root_path=multiflow_datasets_path,
+#     metadata_path=multiflow_metadata / "test_set_metadata.csv",
+#     cluster_path=multiflow_metadata / "test_set_clusters.csv",
+# )
 
 MultiflowPDBRedesignedDatasetSpec = DatasetSpec(
     name="MultiflowPDBRedesigned",
@@ -80,13 +110,6 @@ MultiflowPDBRedesignedDatasetSpec = DatasetSpec(
     metadata_path=multiflow_metadata / "pdb_metadata.csv",
     best_redesigns_path=multiflow_metadata / "pdb_redesigned.csv",
     cluster_path=multiflow_metadata / "pdb.clusters",
-)
-
-MultiflowPDBTestDatasetSpec = DatasetSpec(
-    name="MultiflowPDBPost2021",
-    processed_root_path=multiflow_datasets_path,
-    metadata_path=multiflow_metadata / "test_set_metadata.csv",
-    cluster_path=multiflow_metadata / "test_set_clusters.csv",
 )
 
 MultiflowSyntheticDatasetSpec = DatasetSpec(

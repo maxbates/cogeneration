@@ -233,7 +233,7 @@ class SequenceRedesigner:
         # may exist if already attempted to redesign, but none kept
         if work_dir.exists():
             self.log.warning(
-                f"Redesign for {pdb_name} work directory {work_dir} already exists. Skipping"
+                f"Redesign for {pdb_name} work directory {work_dir} already exists. You may wish to delete it. Skipping."
             )
             return [], None
 
@@ -268,12 +268,13 @@ class SequenceRedesigner:
         orig_backbone_positions = processed_file[dpc.atom_positions][
             :, :3, :
         ]  # (N, 3, 3)
-        pred_backbone_positions = self._get_pred_backbone_positions(
-            folding_df
-        )  # (N, 3, 3)
 
         redesigns: List[Redesign] = []
         for idx, folding_row in folding_df.iterrows():
+            pred_backbone_positions = self._get_pred_backbone_positions(
+                folding_row
+            )  # (N, 3, 3)
+
             # Calculate RMSD to original
             rmsd = self.validator.calc_backbone_rmsd(
                 mask=None,
@@ -454,7 +455,8 @@ class SequenceRedesigner:
                         processed_file=processed_file,
                     )
                 except Exception as e:
-                    self.log.error(f"⚠️ Error redesigning {pdb_name}: {e}")
+                    self.log.error(f"⚠️ Error redesigning {pdb_name}")
+                    self.log.error(e)
                     continue
 
                 if not redesigns or len(redesigns) == 0:

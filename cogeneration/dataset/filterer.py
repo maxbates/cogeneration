@@ -137,9 +137,6 @@ class DatasetFilterer:
 
     @_log_filter("date filter")
     def _date_filter(self, df: MetadataDataFrame) -> MetadataDataFrame:
-        if not mc.date in df.columns:
-            self._log.warning("No date column found, skipping date filter")
-            return df
         if self.cfg.min_date is None and self.cfg.max_date is None:
             return df
 
@@ -166,7 +163,9 @@ class DatasetFilterer:
         if BestRedesignColumn.best_rmsd not in df.columns:
             return df
         return df[
-            df[BestRedesignColumn.best_rmsd] <= self.cfg.redesigned_rmsd_threshold
+            # retain non-redesign rows after merge, i.e. no RMSD defined
+            df[BestRedesignColumn.best_rmsd].isna() | df[BestRedesignColumn.best_rmsd]
+            <= self.cfg.redesigned_rmsd_threshold
         ]
 
     @property

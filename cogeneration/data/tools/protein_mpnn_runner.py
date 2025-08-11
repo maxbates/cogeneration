@@ -883,7 +883,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         end_time = time.time()
         logger.info(
-            f"Native ProteinMPNN completed successfully in {end_time - start_time:.2f} seconds"
+            f"Native ProteinMPNN generated {num_sequences} sequences in {end_time - start_time:.2f} seconds"
         )
 
         return processed_fasta
@@ -1025,7 +1025,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         end_time = time.time()
         logger.info(
-            f"Subprocess ProteinMPNN completed successfully in {end_time - start_time:.2f} seconds"
+            f"Subprocess ProteinMPNN generated {num_sequences} sequences in {end_time - start_time:.2f} seconds"
         )
 
         return processed_fasta
