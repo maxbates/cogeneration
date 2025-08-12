@@ -282,10 +282,6 @@ class SequenceRedesigner:
                 pos_2=self._get_pred_backbone_positions(folding_row),
             )
 
-            # Optionally filter out high RMSD redesigns
-            if rmsd > self.cfg.rmsd_max and self.cfg.rmsd_max > 0.01:
-                continue
-
             # Calculate TM-score to original
             try:
                 # Use CA positions and sequences for alignment
@@ -324,9 +320,7 @@ class SequenceRedesigner:
             )
 
         if not redesigns:
-            self.log.info(
-                f"No redesigns for {pdb_name} with RMSD <= {self.cfg.rmsd_max}. Skipping."
-            )
+            self.log.info(f"No redesigns for {pdb_name}. Skipping.")
             return [], None
 
         # Track best redesign

@@ -35,6 +35,10 @@ class MetadataColumn(StrEnum):
     num_all_chains = "num_all_chains"
     # total number of residues
     seq_len = "seq_len"
+    # (new) md5 of complete sequence (full `dpc.aatype`)
+    seq_hash = "seq_hash"
+    # (new) md5 of modeled sequence (independent trimmed `dpc.aatype`)
+    seq_hash_indep = "seq_hash_indep"
     # (new) count of num residues in modeled structure, not including gaps
     moduled_num_res = "moduled_num_res"
     # modeled residues, whole complex trimming (i.e. max - min res number)

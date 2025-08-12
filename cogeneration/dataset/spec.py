@@ -76,10 +76,7 @@ CogenerationAFDBDatasetSpec = DatasetSpec(
 CogenerationRedesignDatasetSpec = DatasetSpec(
     name="CogenerationRedesigns",
     processed_root_path=cogeneration_datasets_path,
-    metadata_path=cogeneration_datasets_path
-    / "rcsb"
-    / "redesigned"
-    / "redesigned_all.csv",
+    metadata_path=cogeneration_datasets_path / "redesigned" / "redesigned_all.csv",
 )
 
 # multiflow metadata paths
@@ -88,21 +85,21 @@ CogenerationRedesignDatasetSpec = DatasetSpec(
 multiflow_datasets_path = PATH_PROJECT_ROOT / "cogeneration" / "datasets"
 multiflow_metadata = multiflow_datasets_path / "multiflow"
 
-# NOTE - Multiflow PDB datasets are superceded by CogenerationPDBDatasetSpec
+# NOTE - Multiflow PDB datasets are superseded by CogenerationPDBDatasetSpec
 
-# MultiflowPDBDatasetSpec = DatasetSpec(
-#     name="MultiflowPDB",
-#     processed_root_path=multiflow_datasets_path,
-#     metadata_path=multiflow_metadata / "pdb_metadata.csv",
-#     cluster_path=multiflow_metadata / "pdb.clusters",
-# )
+MultiflowPDBDatasetSpec = DatasetSpec(
+    name="MultiflowPDB",
+    processed_root_path=multiflow_datasets_path,
+    metadata_path=multiflow_metadata / "pdb_metadata.csv",
+    cluster_path=multiflow_metadata / "pdb.clusters",
+)
 
-# MultiflowPDBTestDatasetSpec = DatasetSpec(
-#     name="MultiflowPDBPost2021",
-#     processed_root_path=multiflow_datasets_path,
-#     metadata_path=multiflow_metadata / "test_set_metadata.csv",
-#     cluster_path=multiflow_metadata / "test_set_clusters.csv",
-# )
+MultiflowPDBTestDatasetSpec = DatasetSpec(
+    name="MultiflowPDBPost2021",
+    processed_root_path=multiflow_datasets_path,
+    metadata_path=multiflow_metadata / "test_set_metadata.csv",
+    cluster_path=multiflow_metadata / "test_set_clusters.csv",
+)
 
 MultiflowPDBRedesignedDatasetSpec = DatasetSpec(
     name="MultiflowPDBRedesigned",

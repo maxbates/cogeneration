@@ -1461,14 +1461,12 @@ class RedesignConfig(BaseClassConfig):
     metadata_csv: Optional[Path] = None
     # Directory to write redesign files
     output_dir: Path = field(
-        default_factory=lambda: Path("~/pdb/rcsb/redesigned").expanduser()
+        default_factory=lambda: Path("~/pdb/redesigned").expanduser()
     )
     # Sequences generated per example, number to keep and fold (sorted by score)
     seqs_per_sample: int = 10
     fold_per_sample: Optional[int] = 2
-    # Maximum RMSD to retain redesigns, 0 to keep all
-    rmsd_max: float = 0.0
-    # RMSD threshold for good redesigns
+    # RMSD threshold for good redesigns. Has no impact to dataset filtering.
     rmsd_good: float = 2.0
     # Skip existing redesigned sequences
     skip_existing: bool = True

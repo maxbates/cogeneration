@@ -36,6 +36,8 @@ from cogeneration.type.dataset import MetadataDataFrame, ProcessedFile
 from cogeneration.type.structure import StructureExperimentalMethod
 from cogeneration.type.task import DataTask, InferenceTask
 
+_dataset_key = "dataset_name"
+
 
 class BaseDataset(Dataset):
     def __init__(
@@ -73,6 +75,9 @@ class BaseDataset(Dataset):
 
         # Load specs as metadata DF
         metadata = self.load_datasets()
+
+        # Dedupe by sequence hash before applying date-based split
+        metadata = self._dedupe_by_sequence_hash(metadata)
 
         # Apply date-based train/test split before other filters
         metadata = self._apply_date_split(metadata)
@@ -216,6 +221,60 @@ class BaseDataset(Dataset):
 
         return metadata
 
+    def _dedupe_by_sequence_hash(
+        self, metadata: MetadataDataFrame
+    ) -> MetadataDataFrame:
+        """
+        Drop exact duplicate sequences, keeping the first, using sequence hash columns.
+        Redesigns should not have the same sequence, and will not be filtered unless they do.
+        TODO - handle same sequence, different structure conformations (e.g. trajectory).
+        - If `seq_hash_indep` exists, dedupe by it; else if `seq_hash` exists, use it.
+        - Rows missing the hash are treated as unique and will not be dropped as duplicates.
+        """
+        # pick hash column
+        hash_col: Optional[mc] = None
+        if mc.seq_hash_indep in metadata.columns:
+            hash_col = mc.seq_hash_indep
+        elif mc.seq_hash in metadata.columns:
+            hash_col = mc.seq_hash
+
+        if hash_col is None:
+            # No hash columns available; nothing to dedupe
+            self._log.info(
+                "No sequence hash column found; skipping sequence deduplication"
+            )
+            return metadata
+
+        len_before = len(metadata)
+
+        # Create a dedupe key where NaNs are replaced with per-row unique identifiers
+        # so that rows without a hash are never considered duplicates
+        dedupe_key = metadata[hash_col].astype(object).copy()
+        na_mask = pd.isna(dedupe_key)
+        if na_mask.any():
+            dedupe_key.loc[na_mask] = "NA_" + metadata.index[na_mask].astype(str)
+
+        tmp_key = "__dedupe_key__"
+        df_with_key = metadata.assign(**{tmp_key: dedupe_key})
+        duplicates_mask = df_with_key.duplicated(subset=[tmp_key], keep="first")
+        deduped = df_with_key.drop_duplicates(subset=[tmp_key], keep="first").drop(
+            columns=[tmp_key]
+        )
+
+        if len(deduped) != len_before:
+            self._log.info(
+                f"Dedupe by {hash_col} {len_before} -> {len(deduped)} (dropped {len_before - len(deduped)} duplicates; missing-hash rows kept: {int(na_mask.sum())})"
+            )
+            # Log per-dataset duplicate counts
+            per_dataset_counts = (
+                df_with_key.loc[duplicates_mask, _dataset_key].value_counts().to_dict()
+            )
+            # Only log if there were any duplicates by dataset
+            if len(per_dataset_counts) > 0:
+                self._log.info(f"Duplicates dropped per dataset: {per_dataset_counts}")
+
+        return deduped
+
     def _apply_date_split(self, metadata: MetadataDataFrame) -> MetadataDataFrame:
         """
         Split rows by date using cfg.test_date_cutoff and self.use_test.
@@ -223,9 +282,15 @@ class BaseDataset(Dataset):
         - Test: rows with date >= cutoff
         If date column is missing or nan, assigned to training.
         """
-        assert (
-            mc.date in metadata.columns
-        ), "Date column not found in metadata, cannot create train/test split"
+        if mc.date not in metadata.columns:
+            # Assign all rows to training if date column is missing
+            # For test split requests, return empty DataFrame
+            if self.use_test:
+                self._log.info(
+                    "Date column missing; assigning all rows to training and none to test"
+                )
+                return metadata.iloc[0:0]
+            return metadata
 
         cutoff = pd.to_datetime(self.cfg.test_date_cutoff, errors="coerce")
         dates = pd.to_datetime(metadata[mc.date], errors="coerce")
@@ -300,8 +365,7 @@ class BaseDataset(Dataset):
                 cfg=self.cfg,
             )
 
-            # track source dataset # TODO use enum
-            metadata_csv["dataset_name"] = spec.name
+            metadata_csv[_dataset_key] = spec.name
 
             dfs.append(metadata_csv)
             self._log.info(f"Loaded dataset {spec.name} with {len(metadata_csv)} rows")

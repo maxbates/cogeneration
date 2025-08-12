@@ -57,7 +57,7 @@ class StructureExperimentalMethod(StrEnum):
     SOLUTION_NMR = "SOLUTION_NMR"
     OTHER_EXPERIMENTAL = "OTHER"  # bucket for many less-common methods
     # synthetic
-    AFDB = "AFDB"  # AF2 DB
+    AFDB = "AFDB"  # AF2 DB and other AlphaFold predictions
     BOLTZ_1 = "BOLTZ-1"  # Boltz-1 structures
     BOLTZ_2 = "BOLTZ-2"  # Boltz-2 structures
     # placeholder for future methods... safe-ish to change enum values?

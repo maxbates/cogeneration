@@ -1,5 +1,6 @@
 import collections
 import gzip
+import hashlib
 import logging
 import os
 import tempfile
@@ -15,7 +16,7 @@ from Bio import PDB
 from Bio.PDB.Structure import Structure
 from numpy import typing as npt
 
-from cogeneration.data.const import CA_IDX, INT_TO_CHAIN
+from cogeneration.data.const import CA_IDX, INT_TO_CHAIN, aatype_to_seq
 from cogeneration.data.io import read_pkl, write_pkl
 from cogeneration.data.protein import chain_str_to_int, process_chain
 from cogeneration.data.residue_constants import unk_restype_index
@@ -168,6 +169,17 @@ def _chain_lengths(
             for chain_id, count in sorted(counts.items())
         ]
     )
+
+
+def aatypes_md5_hash(
+    aatype: npt.NDArray,
+    chain_idx: npt.NDArray,
+) -> str:
+    """
+    Generate an md5 hash of a sequence.
+    """
+    sequence = aatype_to_seq(aatype=aatype, chain_idx=chain_idx)
+    return hashlib.md5(sequence.encode()).hexdigest()
 
 
 def center_and_scale_chain_feats(
@@ -457,6 +469,16 @@ def _process_pdb(
                 trim_chains_independently=True,
             )
             metadata[mc.modeled_indep_seq_len] = np.sum(independent_keep_mask)
+
+            # Sequence hashes
+            metadata[mc.seq_hash] = aatypes_md5_hash(
+                aatype=complex_feats[dpc.aatype],
+                chain_idx=complex_feats[dpc.chain_index],
+            )
+            metadata[mc.seq_hash_indep] = aatypes_md5_hash(
+                aatype=complex_feats[dpc.aatype][independent_keep_mask],
+                chain_idx=complex_feats[dpc.chain_index][independent_keep_mask],
+            )
 
             # Track quaternary / oligomeric information
             metadata[mc.num_chains] = len(struct_feats)

@@ -2,10 +2,18 @@
 Script to update dataset metadata CSV with new columns.
 To be run on an ad-hoc basis if certain fields are required.
 
-The original multiflow datasets cannot be fully upgraded using this script
+NOTE The original multiflow datasets cannot be fully upgraded using this script
 because they do not reference the source PDB - it's easier to just reprocess the PDB from scratch.
 
+NOTE - does not support the `BestRedesigns` sequence replacement - only works on metadata file directly.
+
 TODO(dataset) consider deprecating this file? Or improve how kept in sync with `process_pdb.py`
+
+Example which writes to `_updated.csv` in same directory:
+    python update_dataset_metadata.py --metadata_csv /abs/path/to/metadata.csv
+
+Specify output path:
+    python update_dataset_metadata.py --metadata_csv /abs/path/to/metadata.csv --updated_csv /abs/path/to/metadata_updated.csv
 """
 
 import argparse
@@ -27,6 +35,7 @@ from cogeneration.dataset.interaction import (
 from cogeneration.dataset.process_pdb import (
     _chain_lengths,
     _concat_np_features,
+    aatypes_md5_hash,
     get_uncompressed_pdb_path,
     pdb_structure_to_chain_feats,
     process_chain_feats,
@@ -50,10 +59,10 @@ class MetadataUpdater:
         self.csv_path = Path(metadata_csv_path)
         self.logger = logging.getLogger(__name__)
 
-        self.df = BaseDataset.read_metadata_file(metadata_csv_path)
+        self.df = BaseDataset.read_metadata_file(self.csv_path)
         # Load existing metadata
         self.logger.info(
-            f"Loaded metadata CSV with {len(self.df)} entries from {metadata_csv_path}."
+            f"Loaded metadata CSV with {len(self.df)} entries from {self.csv_path}"
         )
 
     def abs_processed_path(self, processed_path: str) -> str:
@@ -70,10 +79,17 @@ class MetadataUpdater:
         Compute and add missing metadata columns: modeled_seq_len,
         modeled_indep_seq_len, and moduled_num_res.
         """
+        # Peek at first row and what will be updated
+        first_row = self.df.iloc[0]
+        first_row_updates = self._update_row(first_row, 0)
+        self.logger.info(
+            f"Updates first row:\n{'\n'.join([f'{k}: {v}' for k, v in first_row_updates.items()])}"
+        )
+
         # Compute updates per row by loading processed file once
         updates = []
         for idx, row in tqdm(
-            self.df.iterrows(), desc="Updating rows", total=len(self.df)
+            self.df.iterrows(), desc="Inspecting rows", total=len(self.df)
         ):
             updates.append(self._update_row(row_metadata=row, idx=idx))
 
@@ -153,25 +169,6 @@ class MetadataUpdater:
                 )
             return _chain_independent_trimmed
 
-        # chains / lengths
-
-        if mc.num_all_chains not in row_metadata:
-            structure = get_pdb_structure()
-            row_updates[mc.num_all_chains] = len(structure.get_chains())
-
-        if mc.chain_lengths not in row_metadata:
-            structure = get_pdb_structure()
-            struct_feats = pdb_structure_to_chain_feats(structure)
-            row_updates[mc.chain_lengths] = _chain_lengths(
-                struct_feats, modeled_only=False
-            )
-        if mc.chain_lengths_modeled not in row_metadata:
-            structure = get_pdb_structure()
-            struct_feats = pdb_structure_to_chain_feats(structure)
-            row_updates[mc.chain_lengths_modeled] = _chain_lengths(
-                struct_feats, modeled_only=True
-            )
-
         # modeled sequence lengths
 
         if mc.moduled_num_res not in row_metadata:
@@ -187,15 +184,21 @@ class MetadataUpdater:
                 _chain_independent_trimmed[dpc.aatype]
             )
 
-        # structure metadata like date, resolution
-        if mc.date not in row_metadata:
-            structure = get_pdb_structure()
-            row_updates[mc.date] = extract_structure_date(structure=structure)
-        if mc.resolution not in row_metadata:
-            structure = get_pdb_structure()
-            row_updates[mc.resolution] = structure.header.get("resolution", None)
+        # sequence hashes
+        if mc.seq_hash not in row_metadata:
+            row_updates[mc.seq_hash] = aatypes_md5_hash(
+                aatype=raw_processed_file[dpc.aatype],
+                chain_idx=raw_processed_file[dpc.chain_index],
+            )
+        if mc.seq_hash_indep not in row_metadata:
+            _chain_independent_trimmed = get_chain_independent_trimmed()
+            row_updates[mc.seq_hash_indep] = aatypes_md5_hash(
+                aatype=_chain_independent_trimmed[dpc.aatype],
+                chain_idx=_chain_independent_trimmed[dpc.chain_index],
+            )
 
-        # structure method enum, ensure in `row_updates` for future steps
+        # structure method required for future steps (b-factor vs plddt)
+        # HACK include in the updates...
         if mc.structure_method in row_metadata:
             row_updates[mc.structure_method] = StructureExperimentalMethod.from_value(
                 row_metadata[mc.structure_method]
@@ -239,7 +242,36 @@ class MetadataUpdater:
             )
             interactions.update_metadata(row_updates)
 
-        # non-residue interactions requires raw file - non-res chains are omitted when processed.
+        # chains / lengths (requires raw PDB)
+
+        if mc.num_all_chains not in row_metadata:
+            structure = get_pdb_structure()
+            row_updates[mc.num_all_chains] = len(structure.get_chains())
+
+        if mc.chain_lengths not in row_metadata:
+            structure = get_pdb_structure()
+            struct_feats = pdb_structure_to_chain_feats(structure)
+            row_updates[mc.chain_lengths] = _chain_lengths(
+                struct_feats, modeled_only=False
+            )
+        if mc.chain_lengths_modeled not in row_metadata:
+            structure = get_pdb_structure()
+            struct_feats = pdb_structure_to_chain_feats(structure)
+            row_updates[mc.chain_lengths_modeled] = _chain_lengths(
+                struct_feats, modeled_only=True
+            )
+
+        # structure metadata like date, resolution (requires raw PDB)
+
+        if mc.date not in row_metadata:
+            structure = get_pdb_structure()
+            row_updates[mc.date] = extract_structure_date(structure=structure)
+        if mc.resolution not in row_metadata:
+            structure = get_pdb_structure()
+            row_updates[mc.resolution] = structure.header.get("resolution", None)
+
+        # non-residue interactions (requires raw PDB)
+        # non-res chains are omitted when processed.
         if (
             mc.num_non_residue_chains not in row_metadata
             or mc.num_single_atom_chains not in row_metadata
@@ -267,9 +299,13 @@ class MetadataUpdater:
         missing = expected - present
         extra = present - expected
         if missing:
-            self.logger.error(f"Missing columns in metadata: {sorted(missing)}")
+            self.logger.error(
+                f"⚠️ Missing columns in metadata: {sorted(missing)}. Continuing..."
+            )
         if extra:
-            self.logger.error(f"Extra columns in metadata: {sorted(extra)}")
+            self.logger.error(
+                f"⚠️ Extra columns in metadata: {sorted(extra)}. Continuing..."
+            )
         if not missing and not extra:
             self.logger.info("All DatasetColumns are present in the metadata.")
 
@@ -278,8 +314,8 @@ class MetadataUpdater:
 class Args:
     """Command-line arguments for updating dataset metadata."""
 
-    metadata_csv_path: str
-    updated_csv_path: str
+    metadata_csv_path: Path
+    updated_csv_path: Path
 
     @classmethod
     def from_parser(cls):
@@ -296,9 +332,16 @@ class Args:
             "--updated_csv",
             help="Path to write the updated metadata CSV file.",
             type=str,
-            required=True,
+            default=None,
         )
         args = parser.parse_args()
+
+        args.metadata_csv = Path(args.metadata_csv).expanduser().absolute()
+
+        if args.updated_csv is None:
+            args.updated_csv = (
+                args.metadata_csv.parent / f"{args.metadata_csv.stem}_updated.csv"
+            )
 
         return cls(
             metadata_csv_path=args.metadata_csv,
@@ -308,8 +351,6 @@ class Args:
 
 def main(args: Args) -> None:
     # Check paths
-    # TODO(dataset) enable moving original and writing updated to original path
-    assert args.metadata_csv_path.startswith("/"), "Metadata CSV path must be absolute."
     if args.metadata_csv_path == args.updated_csv_path:
         raise ValueError("Input and output paths must be different.")
     if os.path.exists(args.updated_csv_path):
@@ -322,6 +363,10 @@ def main(args: Args) -> None:
     # Write updated metadata to file
     updater.df.to_csv(args.updated_csv_path, index=False)
     print(f"Updated metadata CSV written to {args.updated_csv_path}")
+
+    print(
+        f"🌟 Replace original with:\n\tmv {args.updated_csv_path} {args.metadata_csv_path}"
+    )
 
 
 if __name__ == "__main__":

@@ -12,9 +12,10 @@ from cogeneration.data.noise_mask import torsions_empty
 from cogeneration.dataset.datasets import BaseDataset, LengthSamplingDataset
 from cogeneration.dataset.featurizer import BatchFeaturizer
 from cogeneration.dataset.motif_factory import ChainBreak, Motif, Scaffold
-from cogeneration.dataset.spec import (  # CogenerationAFDBDatasetSpec,
+from cogeneration.dataset.spec import (
     CogenerationAFDBDatasetSpec,
     CogenerationPDBDatasetSpec,
+    CogenerationRedesignDatasetSpec,
     MultiflowPDBDatasetSpec,
     MultiflowPDBRedesignedDatasetSpec,
     MultiflowPDBTestDatasetSpec,
@@ -54,6 +55,7 @@ class TestBaseDataset:
         [
             CogenerationPDBDatasetSpec,
             CogenerationAFDBDatasetSpec,
+            CogenerationRedesignDatasetSpec,
             MultiflowPDBDatasetSpec,
             MultiflowPDBRedesignedDatasetSpec,
             MultiflowPDBTestDatasetSpec,
