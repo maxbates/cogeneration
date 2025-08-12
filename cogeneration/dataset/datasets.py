@@ -71,8 +71,9 @@ class BaseDataset(Dataset):
         # Load specs as metadata DF
         metadata = self.load_datasets()
 
-        # Dedupe by sequence hash before applying date-based split
-        metadata = self._dedupe_by_sequence_hash(metadata)
+        # Optionally dedupe by sequence hash, before applying date-based split
+        if self.cfg.dedupe_by_sequence_hash:
+            metadata = self._dedupe_by_sequence_hash(metadata)
 
         # Apply date-based train/test split before other filters
         metadata = self._apply_date_split(metadata)

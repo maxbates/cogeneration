@@ -137,9 +137,6 @@ class DatasetFilterer:
 
     @_log_filter("date filter")
     def _date_filter(self, df: MetadataDataFrame) -> MetadataDataFrame:
-        if self.cfg.min_date is None and self.cfg.max_date is None:
-            return df
-
         if self.cfg.min_date is not None:
             min_date = pd.to_datetime(self.cfg.min_date, errors="coerce")
             if min_date is pd.NaT:
@@ -164,8 +161,8 @@ class DatasetFilterer:
             return df
         return df[
             # retain non-redesign rows after merge, i.e. no RMSD defined
-            df[BestRedesignColumn.best_rmsd].isna() | df[BestRedesignColumn.best_rmsd]
-            <= self.cfg.redesigned_rmsd_threshold
+            df[BestRedesignColumn.best_rmsd].isna()
+            | (df[BestRedesignColumn.best_rmsd] <= self.cfg.redesigned_rmsd_threshold)
         ]
 
     @property
@@ -181,6 +178,7 @@ class DatasetFilterer:
             "max_coil": self._max_coil_filter,
             "rog": self._rog_filter,
             "plddt": self._plddt_filter,
+            "redesign_rmsd": self._redesign_rmsd_filter,
         }
 
     def filter_metadata(self, raw_csv: MetadataDataFrame) -> MetadataDataFrame:

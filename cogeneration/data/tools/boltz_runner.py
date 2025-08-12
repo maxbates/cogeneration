@@ -975,12 +975,66 @@ class BoltzRunner(FoldingTool):
         # remove remaining intermediate Boltz-2 input / processing artifacts
         self._cleanup_paths(paths)
 
+        # attempt cleanup / gc
+        self._release_inference_state(writer=writer, data_module=data_module)
+
         end_time = time.time()
         logger.info(
             f"Boltz (native) prediction completed in {end_time - start_time:.2f} seconds"
         )
 
         return BoltzPredictionSet(predictions)
+
+    def _release_inference_state(
+        self, writer: QuietBoltzWriter, data_module: Boltz2InferenceDataModule
+    ) -> None:
+        """
+        post-predict() cleanup to avoid reference retention.
+        """
+        # Detach callbacks to avoid callback list growth
+        try:
+            if self.trainer is not None:
+                self.trainer.callbacks = []
+                # Some PL versions keep a reference to the last used datamodule
+                # Remove strong refs if present
+                if hasattr(self.trainer, "datamodule"):
+                    setattr(self.trainer, "datamodule", None)
+        except Exception:
+            pass
+
+        # Drop local references
+        try:
+            del writer
+        except Exception:
+            pass
+        try:
+            del data_module
+        except Exception:
+            pass
+
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+        try:
+            if (
+                hasattr(torch, "cuda")
+                and torch.cuda.is_available()
+                and self.device.type == "cuda"
+            ):
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            if (
+                hasattr(torch, "mps")
+                and torch.backends.mps.is_available()
+                and self.device.type == "mps"
+            ):
+                torch.mps.empty_cache()
+        except Exception:
+            pass
 
     def fold_fasta(
         self,

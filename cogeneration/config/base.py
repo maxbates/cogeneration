@@ -1063,6 +1063,10 @@ class DatasetConfig(BaseClassConfig):
     # Data processing and sample generation, shared across datasets
     # Filtering
     filter: DatasetFilterConfig = field(default_factory=DatasetFilterConfig)
+    # Whether to drop duplicate sequences based on sequence hash columns in metadata
+    # (prefers `seq_hash_indep` if present; otherwise falls back to `seq_hash`).
+    # Rows without a hash are always retained.
+    dedupe_by_sequence_hash: bool = True
     # trimming chains independently to modeled positions removes non-residues between chains
     modeled_trim_method: DatasetTrimMethod = DatasetTrimMethod.chains_independently
     # plddt mask, only for synthetic structures.

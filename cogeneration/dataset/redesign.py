@@ -361,7 +361,9 @@ class SequenceRedesigner:
                 frac=1, random_state=self.dataset_cfg.seed
             ).reset_index(drop=True)
 
-        self.log.info(f"Found {len(metadata)} structures to redesign")
+        self.log.info(
+            f"Filtered dataset contains {len(metadata)} structures to redesign"
+        )
         assert (
             mc.raw_path in metadata.columns
         ), f"metadata must contain '{mc.raw_path}' column with paths to input PDB files."
@@ -425,7 +427,7 @@ class SequenceRedesigner:
         if self.work_dir.exists():
             existing_redesign_pdbs = self.work_dir.glob("*")
             self.log.warning(
-                f"⚠️ Work directory {self.work_dir} contains {len(list(existing_redesign_pdbs))} redesigned PDBs. Assuming we are resuming..."
+                f"Work directory {self.work_dir} contains {len(list(existing_redesign_pdbs))} redesigned PDBs. Assuming we are resuming..."
             )
 
         metadata = self.load_metadata()
