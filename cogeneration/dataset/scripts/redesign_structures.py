@@ -29,9 +29,10 @@ Use pre-defined candidates to bypass inverse folding:
 import hydra
 from omegaconf import OmegaConf
 
-from cogeneration.config.base import Config
+from cogeneration.config.base import Config, DatasetFilterConfig
 from cogeneration.data.folding_validation import FoldingValidator
 from cogeneration.dataset.redesign import SequenceRedesigner
+from cogeneration.util.mem_debug import register_memory_debugger
 
 
 @hydra.main(version_base=None, config_path="../../config", config_name="base")
@@ -40,7 +41,20 @@ def main(cfg: Config) -> None:
     config = cfg if isinstance(cfg, Config) else OmegaConf.to_object(cfg)
     config = config.interpolate()
 
+    # disable the cache to limit memory usage - structures only used once
+    config.dataset.cache_num_res = 1e6
+
+    # Register memory debugger (send `kill -USR2 <PID>` to dump snapshot)
+    register_memory_debugger()
+
     validator = FoldingValidator(cfg=config.folding)
+
+    if (
+        config.redesign.best_redesigns_csv is not None
+        and config.redesign.use_lenient_filter_with_best_redesigns
+    ):
+        print("Redesigns provided: using lenient dataset filter")
+        config.dataset.filter = DatasetFilterConfig.lenient()
 
     redesigner = SequenceRedesigner(
         cfg=config.redesign, validator=validator, dataset_cfg=config.dataset

@@ -1,4 +1,5 @@
 import csv
+import gc
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,6 +20,7 @@ from cogeneration.config.base import (
 from cogeneration.data.const import CA_IDX, aatype_to_seq
 from cogeneration.data.folding_validation import FoldingValidator
 from cogeneration.data.superimposition import calc_tm_score
+from cogeneration.data.tools.boltz_runner import BoltzPrediction, BoltzPredictionSet
 from cogeneration.dataset.datasets import BaseDataset
 from cogeneration.dataset.process_pdb import process_pdb_file, read_processed_file
 from cogeneration.dataset.scripts.process_pdb_files import safe_process_pdb
@@ -207,7 +209,7 @@ class SequenceRedesigner:
 
     def __post_init__(self):
         # output file for all redesigns
-        self.all_redesigns_path = self.cfg.output_dir / self.cfg.all_csv
+        self.redesigns_path = self.cfg.output_dir / self.cfg.redesigns_csv
 
         # directory for inverse folding / folding intermediates
         self.work_dir = self.cfg.output_dir / "work"
@@ -237,12 +239,35 @@ class SequenceRedesigner:
         pdb_name = metadata_row[mc.pdb_name]
         work_dir = self.work_dir / pdb_name
 
-        # may exist if already attempted to redesign, but none kept
+        # may exist if already attempted to redesign, but failed or interrupted
         if work_dir.exists():
-            self.log.warning(
-                f"Redesign for {pdb_name} work directory {work_dir} already exists. You may wish to delete it. Skipping."
-            )
-            return [], None
+            # If using Boltz2, hacky try to parse the predictions for a more meaningful message
+            # We probably don't want to just delete the work dir if it exists.
+            # But we can't continue, because it needs to be empty.
+            if self.validator.cfg.folding_model == FoldingModel.boltz2:
+                try:
+                    predictions_dir = work_dir / "folding" / "predictions"
+                    if (
+                        os.path.exists(predictions_dir)
+                        and len(os.listdir(predictions_dir)) > 0
+                    ):
+                        self.log.warning(
+                            f"⏩ Skipping {pdb_name}: found {len(os.listdir(predictions_dir))} unprocessed Boltz2 predictions, which will be ignored! You may wish to delete {work_dir}"
+                        )
+                    else:
+                        self.log.warning(
+                            f"⏩ Skipping {pdb_name}: processed but no predictions found. You should delete {work_dir}"
+                        )
+                except Exception as e:
+                    self.log.warning(
+                        f"⏩ Skipping {pdb_name}: incomplete Boltz2 predictions (may have failed or been interrupted). You should delete {work_dir}"
+                    )
+            else:
+                self.log.warning(
+                    f"⏩ Skipping {pdb_name}: redesign work directory already exists. You may wish to delete {work_dir}"
+                )
+
+            return []
 
         work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -345,7 +370,7 @@ class SequenceRedesigner:
             self.log.info(f"Loading metadata from CSV {self.cfg.metadata_csv}...")
             metadata = pd.read_csv(Path(self.cfg.metadata_csv).expanduser())
         else:
-            self.log.info(f"Loading structures from dataset...")
+            self.log.info(f"Loading structures from datasets...")
             dataset = BaseDataset(
                 cfg=self.dataset_cfg,
                 task=DataTask.hallucination,
@@ -370,15 +395,15 @@ class SequenceRedesigner:
 
         # Check for existing redesigns. If they exist, optionally skip existing.
         if (
-            os.path.exists(self.all_redesigns_path)
-            and os.path.getsize(self.all_redesigns_path) > 0
+            os.path.exists(self.redesigns_path)
+            and os.path.getsize(self.redesigns_path) > 0
         ):
             if not self.cfg.skip_existing:
                 raise Exception(
-                    f"Redesigns already exist at {self.all_redesigns_path}. Delete or allow --skip_existing=True"
+                    f"Redesigns already exist at {self.redesigns_path}. Delete or allow --skip_existing=True"
                 )
 
-            existing_redesigns = pd.read_csv(self.all_redesigns_path)
+            existing_redesigns = pd.read_csv(self.redesigns_path)
             redesigned_pdbs = set(existing_redesigns[RedesignColumn.example].unique())
             num_good_redesigns = len(
                 existing_redesigns[
@@ -386,7 +411,7 @@ class SequenceRedesigner:
                 ]
             )
             self.log.info(
-                f"Found {len(existing_redesigns)} redesigns ({num_good_redesigns} < {self.cfg.rmsd_good}) for {len(redesigned_pdbs)} PDBs in {self.all_redesigns_path}, which will be skipped."
+                f"Found {len(existing_redesigns)} redesigns ({num_good_redesigns} < {self.cfg.rmsd_good}) for {len(redesigned_pdbs)} PDBs in {self.redesigns_path}, which will be skipped."
             )
 
             # Basic compatibility check - assume columns match current redesign columns + metadata columns
@@ -408,11 +433,6 @@ class SequenceRedesigner:
         assert best_path.exists(), f"BestRedesigns CSV not found: {best_path}"
 
         df = pd.read_csv(best_path)
-        # normalize `example` to uppercase to match PDB names
-        if BestRedesignColumn.example in df.columns:
-            df[BestRedesignColumn.example] = (
-                df[BestRedesignColumn.example].astype(str).str.upper()
-            )
         self.log.info(f"Found {len(df)} pre-defined redesigns from {best_path}")
 
         # filter to good RMSD options
@@ -437,14 +457,37 @@ class SequenceRedesigner:
         # map pdb_name -> sequence
         provided_seq_map = {}
         if best_redesigns_df is not None:
-            allowed = set(best_redesigns_df[BestRedesignColumn.example])
-            metadata = metadata[
-                metadata[mc.pdb_name].astype(str).str.upper().isin(allowed)
-            ]
-
-            self.log.info(
-                f"ℹ️ {len(metadata[mc.pdb_name].unique())} structures of {len(allowed)} redesign targets present in dataset"
+            # Normalize `BestRedesignColumn.example` and `mc.pdb_name` to uppercase
+            best_redesigns_df[BestRedesignColumn.example] = (
+                best_redesigns_df[BestRedesignColumn.example].astype(str).str.upper()
             )
+            redesign_source_pdb_names = set(
+                best_redesigns_df[BestRedesignColumn.example]
+            )
+            dataset_pdb_names = metadata[mc.pdb_name].astype(str).str.upper()
+
+            # Downselect dataset to redesign targets
+            metadata = metadata[dataset_pdb_names.isin(redesign_source_pdb_names)]
+
+            # Track found / missing redesign targets
+            redesign_source_present_pdb_names = set(metadata[mc.pdb_name].unique())
+            redesign_source_missing_pdb_names = (
+                redesign_source_pdb_names - redesign_source_present_pdb_names
+            )
+            if len(redesign_source_missing_pdb_names) > 0:
+                self.log.warning(
+                    f"ℹ️ {len(redesign_source_present_pdb_names)} redesign targets present in dataset, but {len(redesign_source_missing_pdb_names)} missing"
+                )
+                example_missing = (
+                    list(redesign_source_missing_pdb_names)[:20]
+                    if len(redesign_source_missing_pdb_names) > 20
+                    else list(redesign_source_missing_pdb_names)
+                )
+                self.log.warning(f"Some missing PDB names: {example_missing}")
+            else:
+                self.log.info(
+                    f"ℹ️ {len(metadata[mc.pdb_name].unique())} structures of {len(redesign_source_pdb_names)} redesign targets present in dataset"
+                )
 
             provided_seq_map = dict(
                 zip(
@@ -458,10 +501,10 @@ class SequenceRedesigner:
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
-        self.log.info(f"Writing redesigns to {self.all_redesigns_path}...")
+        self.log.info(f"Writing redesigns to {self.redesigns_path}...")
 
         # Results will be streamed to CSV file as they are generated
-        all_redesigns_handle = open(self.all_redesigns_path, "a", newline="")
+        all_redesigns_handle = open(self.redesigns_path, "a", newline="")
         all_redesigns_writer: Optional[csv.DictWriter] = None
 
         # Counter for tracking good / total redesigns
@@ -470,6 +513,10 @@ class SequenceRedesigner:
 
         # Iterate to redesign structures
         with tqdm(metadata.iterrows(), total=len(metadata), desc="Redesigning") as pbar:
+
+            # garbage collect between iterations
+            gc.collect()
+
             for idx, row in pbar:
                 row: MetadataCSVRow = row
 
@@ -506,7 +553,7 @@ class SequenceRedesigner:
                         provided_seq=provided_seq,
                     )
                 except Exception as e:
-                    self.log.error(f"⚠️ Error redesigning {pdb_name}")
+                    self.log.error(f"❌ Error redesigning {pdb_name}")
                     self.log.error(e)
                     continue
 
@@ -529,14 +576,14 @@ class SequenceRedesigner:
                         processed_redesign_fields = list(processed_redesign.keys())
                         # handle existing file, ensure fields match
                         existing_fieldnames = get_existing_fieldnames(
-                            self.all_redesigns_path
+                            self.redesigns_path
                         )
                         if existing_fieldnames is not None:
                             if set(existing_fieldnames) != set(
                                 processed_redesign_fields
                             ):
                                 raise ValueError(
-                                    f"Existing redesigns CSV at {self.all_redesigns_path} has different fields than current redesign. Existing: {existing_fieldnames}, Current: {processed_redesign_fields}"
+                                    f"Existing redesigns CSV at {self.redesigns_path} has different fields than current redesign. Existing: {existing_fieldnames}, Current: {processed_redesign_fields}"
                                 )
                             processed_redesign_fields = existing_fieldnames
 

@@ -390,6 +390,9 @@ def _process_pdb(
     """
     Process PDB file into concatenated chain features `ProcessedFile` and metadata `MetadataCSVRow`.
 
+    Generating the MetadataCSVRow requires additional processing, which is somewhat slow,
+    and should be bypassed if not needed by passing `generate_metadata=False`.
+
     The metadata file requires access to some intermediates when generating `ProcessedFile`,
     and so we have a unified function for processing the file and generating the metadata.
 

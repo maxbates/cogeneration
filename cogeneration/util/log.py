@@ -53,3 +53,8 @@ warnings.filterwarnings(
     message="Consider setting `persistent_workers=True` in 'predict_dataloader' to speed up the dataloader worker initialization.",
     category=UserWarning,
 )
+warnings.filterwarnings(
+    "ignore",
+    message="The 'predict_dataloader' does not have many workers which may be a bottleneck.*?",
+    category=UserWarning,
+)

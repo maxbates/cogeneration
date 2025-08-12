@@ -157,12 +157,11 @@ class BoltzPrediction:
         # Try to get pLDDT from NPZ file
         if self.path_plddt_npz and self.path_plddt_npz.exists():
             try:
-                plddt_data = np.load(self.path_plddt_npz)
-                # Look for common pLDDT keys in the NPZ file
-                for key in ["plddt", "confidence", "plddt_scores"]:
-                    if key in plddt_data:
-                        scores = plddt_data[key]
-                        return float(np.mean(scores))
+                with np.load(self.path_plddt_npz) as plddt_data:
+                    for key in ["plddt", "confidence", "plddt_scores"]:
+                        if key in plddt_data:
+                            scores = plddt_data[key]
+                            return float(np.mean(scores))
             except (OSError, KeyError, ValueError):
                 pass
 
@@ -553,7 +552,7 @@ class BoltzManifestBuilder:
             sequences=sequences, protein_ids=protein_ids
         )
 
-        logger.info(
+        logger.debug(
             f"Prepared Boltz-2 manifest with {len(records)} records, lengths: {[len(seq) for seq in sequences]}"
         )
         return Manifest(records=records)
@@ -979,7 +978,7 @@ class BoltzRunner(FoldingTool):
         self._release_inference_state(writer=writer, data_module=data_module)
 
         end_time = time.time()
-        logger.info(
+        logger.debug(
             f"Boltz (native) prediction completed in {end_time - start_time:.2f} seconds"
         )
 
@@ -1180,7 +1179,7 @@ class BoltzRunner(FoldingTool):
 
         end_time = time.time()
 
-        logger.info(
+        logger.debug(
             f"Boltz (subprocess) prediction for {len(predictions)}/{len(records)} records completed in {end_time - start_time:.2f} seconds"
         )
         return BoltzPredictionSet(predictions).to_df()

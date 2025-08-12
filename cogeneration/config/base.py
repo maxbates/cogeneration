@@ -855,7 +855,9 @@ class DatasetFilterConfig(BaseClassConfig):
     # radius of gyration quantile
     rog_quantile: float = 0.96
     # max percent of unknown residues in the structure of total sequence
-    max_percent_residues_unknown: float = 0.5  # 0.5 in public MultiFlow
+    max_percent_residues_unknown: float = (
+        0.25  # 0.5 in MultiFlow; trim independently -> lower.
+    )
     # pLDDT filter for synthetic structures
     min_plddt: float = 0.8
     # PDB date filter, converted to `pd.datetime`
@@ -904,7 +906,7 @@ class DatasetFilterConfig(BaseClassConfig):
             max_percent_residues_unknown=0.75,
             min_date=None,
             max_date=None,
-            min_plddt=0.5,
+            min_plddt=0.25,
             oligomeric=None,
             num_chains=None,
         )
@@ -1423,7 +1425,9 @@ class BoltzConfig(BaseClassConfig):
     diffusion_samples: int = 1
 
     # Hardware and output settings
-    num_workers: int = 2  # generally only processing 1 at a time with current setup
+    # Number of workers for boltz dataloader. Recommend 0 to avoid memory bloat
+    # (keep on main process, slightly slower, but always 1 at a time anyways).
+    num_workers: int = 0
     accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'cuda'}"
     use_kernels: bool = "${shared.kernels}"
     # Output format for structures ("pdb", "mmcif").
@@ -1476,14 +1480,15 @@ class RedesignConfig(BaseClassConfig):
     skip_existing: bool = True
     # Shuffle the metadata rows before redesigning
     shuffle: bool = True
-    # Filename for all redesigns CSV
-    all_csv: str = "redesigned_all.csv"
-    # Filename for best redesigns CSV
-    best_csv: str = "redesigned.csv"
+    # Filename for redesigns CSV
+    redesigns_csv: str = "redesigns.csv"
     # Optionally, provide a BestRedesigns CSV (with columns example, best_seq)
     # If provided, redesign will be folded and inverse folding will be skipped.
     # This allows creating a new dataset folding pre-specified sequences.
     best_redesigns_csv: Optional[Path] = None
+    # When using `best_redesigns_csv`, override dataset filtering to be lenient so
+    # we do not accidentally filter out target structures before matching.
+    use_lenient_filter_with_best_redesigns: bool = True
 
 
 @dataclass
