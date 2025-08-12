@@ -1,8 +1,9 @@
 import csv
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import pandas as pd
 from mpmath.libmp.libintmath import ifac2
@@ -37,14 +38,10 @@ from cogeneration.type.task import DataTask
 from cogeneration.util.log import rank_zero_logger
 
 """
-There are two notions of redesigns:
+Redesigns represent sequences folded from an original structure with predicted structure and RMSD.
 
-1) Redesign - any redesigned sequence from an original structure, with predicted structure and RMSD.
-2) BestRedesigns (MulitFlow style) - single sequence that replaces original sequence.
-
-SequenceRedesigner generates both:
-1) A new dataset of redesigns, which contains all redesigns meeting RMSD threshold (or can be filtered later)
-2) Best rdesigns CSV, which augments original dataset by replacing the original sequence with the best redesign sequence.
+BestRedesigns (MultiFlow style) can be provided as an input, to bypass inverse folding. 
+BestRedesigns are a deprecated output. We only write the full redesigns dataset. Filter using RMSD.
 """
 
 
@@ -76,7 +73,7 @@ class Redesign:
     rmsd: float  # RMSD to the original structure
     tm_score: float  # TM-score to the original structure (normalized by example)
     # generation metadata
-    inverse_folding_tool: LigandMPNNModelType  # NOTE assumes using LigandMPNN
+    inverse_folding_tool: Union[LigandMPNNModelType, str]
     folding_tool: FoldingModel
 
     @property
@@ -109,11 +106,15 @@ class Redesign:
 
     def to_dict(self) -> dict:
         """CSV row"""
+        # redesign gets unique name (from inverse folding) that should differ from source PDB
+        redesign_pdb_name = self.sequence_id
         source_pdb_name = self.orig_metadata[mc.pdb_name]
+        assert (
+            redesign_pdb_name != source_pdb_name
+        ), f"Sequence ID {redesign_pdb_name} should differ from source PDB {source_pdb_name}"
 
         return {
-            # redesign gets unique name
-            mc.pdb_name: f"{source_pdb_name}_{self.sequence_id}",
+            mc.pdb_name: redesign_pdb_name,
             # source PDB
             RedesignColumn.example: source_pdb_name,
             # structure
@@ -126,6 +127,7 @@ class Redesign:
             RedesignColumn.sequence: self.sequence,
             RedesignColumn.sequence_id: self.sequence_id,
             # provenance
+            mc.date: datetime.now().strftime("%Y-%m-%d"),  # YYYY-MM-DD
             RedesignColumn.example_sequence: self.example_seq,
             RedesignColumn.example_pdb_path: self.orig_metadata[mc.raw_path],
             RedesignColumn.fasta_path: self.fasta_path,
@@ -204,9 +206,8 @@ class SequenceRedesigner:
     dataset_cfg: DatasetConfig
 
     def __post_init__(self):
-        # output files
+        # output file for all redesigns
         self.all_redesigns_path = self.cfg.output_dir / self.cfg.all_csv
-        self.best_redesigns_path = self.cfg.output_dir / self.cfg.best_csv
 
         # directory for inverse folding / folding intermediates
         self.work_dir = self.cfg.output_dir / "work"
@@ -224,9 +225,15 @@ class SequenceRedesigner:
         return folded_feats[dpc.atom_positions][:, :3, :]
 
     def redesign_structure(
-        self, metadata_row: MetadataCSVRow, processed_file: ProcessedFile
-    ) -> Tuple[List[Redesign], Optional[BestRedesign]]:
-        """Generate multiple redesigns for one structure and pick the best."""
+        self,
+        metadata_row: MetadataCSVRow,
+        processed_file: ProcessedFile,
+        provided_seq: Optional[str] = None,
+    ) -> List[Redesign]:
+        """Generate redesigns for one structure.
+
+        If `provided_seq` is given, bypass inverse folding and fold only the provided sequence.
+        """
         pdb_name = metadata_row[mc.pdb_name]
         work_dir = self.work_dir / pdb_name
 
@@ -239,17 +246,25 @@ class SequenceRedesigner:
 
         work_dir.mkdir(parents=True, exist_ok=True)
 
-        # Redesign the structure using inverse folding
-        # Keep top `fold_per_sample` of `seqs_per_sample` in fasta to fold. The others will be dropped.
-        redesign_fasta_path = self.validator.inverse_fold_pdb(
-            pdb_path=metadata_row[mc.raw_path],
-            diffuse_mask=None,
-            output_dir=work_dir,
-            num_sequences=self.cfg.seqs_per_sample,
-            retain_top_n=self.cfg.fold_per_sample,
-        )
+        # Either inverse fold to generate sequences, or use provided sequence
+        if provided_seq is None:
+            # Redesign the structure using inverse folding
+            # Keep top `fold_per_sample` of `seqs_per_sample` in fasta to fold. The others will be dropped.
+            redesign_fasta_path = self.validator.inverse_fold_pdb(
+                pdb_path=metadata_row[mc.raw_path],
+                diffuse_mask=None,
+                output_dir=work_dir,
+                num_sequences=self.cfg.seqs_per_sample,
+                retain_top_n=self.cfg.fold_per_sample,
+            )
+        else:
+            # Create a fasta file containing only the provided sequence
+            # The name in the fasta will become the pdb_name for the redesign.
+            redesign_fasta_path = work_dir / f"{pdb_name}.fa"
+            with open(redesign_fasta_path, "w") as f:
+                f.write(f">{pdb_name}_redesign\n{provided_seq}\n")
 
-        # Fold the redesigned sequences
+        # Fold the sequence(s)
         folding_df = self.validator.fold_fasta(
             fasta_path=redesign_fasta_path,
             output_dir=(work_dir / "folding"),
@@ -314,20 +329,16 @@ class SequenceRedesigner:
                     pred_pdb_path=folding_row[MetricName.folded_pdb_path],
                     rmsd=rmsd,
                     tm_score=float(tm_norm_chain1),
-                    inverse_folding_tool=self.validator.cfg.protein_mpnn.model_type,
+                    inverse_folding_tool=(
+                        self.validator.cfg.protein_mpnn.model_type
+                        if provided_seq is None
+                        else "provided"
+                    ),
                     folding_tool=self.validator.cfg.folding_model,
                 )
             )
 
-        if not redesigns:
-            self.log.info(f"No redesigns for {pdb_name}. Skipping.")
-            return [], None
-
-        # Track best redesign
-        best_redesign = sorted(redesigns, key=lambda x: x.rmsd)[0]
-        best = BestRedesign.from_redesign(redesign=best_redesign)
-
-        return redesigns, best
+        return redesigns
 
     def load_metadata(self) -> MetadataDataFrame:
         if self.cfg.metadata_csv is not None:
@@ -366,9 +377,7 @@ class SequenceRedesigner:
                 )
 
             existing_redesigns = pd.read_csv(self.all_redesigns_path)
-            redesigned_pdbs = set(
-                existing_redesigns[BestRedesignColumn.example].unique()
-            )
+            redesigned_pdbs = set(existing_redesigns[RedesignColumn.example].unique())
             num_good_redesigns = len(
                 existing_redesigns[
                     existing_redesigns["rmsd"].apply(float) <= self.cfg.rmsd_good
@@ -389,6 +398,29 @@ class SequenceRedesigner:
 
         return metadata
 
+    def _maybe_load_best_redesigns(self) -> Optional[pd.DataFrame]:
+        """Load BestRedesigns CSV if configured, adjusting the example casing."""
+        if self.cfg.best_redesigns_csv is None:
+            return None
+        best_path = Path(self.cfg.best_redesigns_csv).expanduser()
+        assert best_path.exists(), f"BestRedesigns CSV not found: {best_path}"
+
+        df = pd.read_csv(best_path)
+        # normalize `example` to uppercase to match PDB names
+        if BestRedesignColumn.example in df.columns:
+            df[BestRedesignColumn.example] = (
+                df[BestRedesignColumn.example].astype(str).str.upper()
+            )
+        self.log.info(f"Found {len(df)} pre-defined redesigns from {best_path}")
+
+        # filter to good RMSD options
+        df = df[df[BestRedesignColumn.best_rmsd].apply(float) <= self.cfg.rmsd_good]
+        self.log.info(
+            f"Using {len(df)} pre-defined redesigns with RMSD < {self.cfg.rmsd_good}"
+        )
+
+        return df
+
     def run(self) -> None:
         if self.work_dir.exists():
             existing_redesign_pdbs = self.work_dir.glob("*")
@@ -398,6 +430,27 @@ class SequenceRedesigner:
 
         metadata = self.load_metadata()
 
+        # BestRedesigns CSV supersedes inverse folding.
+        best_redesigns_df = self._maybe_load_best_redesigns()
+        # map pdb_name -> sequence
+        provided_seq_map = {}
+        if best_redesigns_df is not None:
+            allowed = set(best_redesigns_df[BestRedesignColumn.example])
+            metadata = metadata[
+                metadata[mc.pdb_name].astype(str).str.upper().isin(allowed)
+            ]
+
+            self.log.info(
+                f"ℹ️ {len(metadata[mc.pdb_name].unique())} structures of {len(allowed)} redesign targets present in dataset"
+            )
+
+            provided_seq_map = dict(
+                zip(
+                    best_redesigns_df[BestRedesignColumn.example],
+                    best_redesigns_df[BestRedesignColumn.best_seq],
+                )
+            )
+
         # setup directories
         self.cfg.output_dir.mkdir(parents=True, exist_ok=True)
         self.processed_dir.mkdir(parents=True, exist_ok=True)
@@ -405,11 +458,9 @@ class SequenceRedesigner:
 
         self.log.info(f"Writing redesigns to {self.all_redesigns_path}...")
 
-        # Results will be streamed to CSV files as they are generated
+        # Results will be streamed to CSV file as they are generated
         all_redesigns_handle = open(self.all_redesigns_path, "a", newline="")
         all_redesigns_writer: Optional[csv.DictWriter] = None
-        best_redesigns_handle = open(self.best_redesigns_path, "a", newline="")
-        best_redesigns_writer: Optional[csv.DictWriter] = None
 
         # Counter for tracking good / total redesigns
         good_redesigns = 0
@@ -444,9 +495,13 @@ class SequenceRedesigner:
                         trim_chains_independently=True,
                     )
 
-                    redesigns, best = self.redesign_structure(
+                    # check for pre-defined sequence
+                    provided_seq = provided_seq_map.get(str(row[mc.pdb_name]).upper())
+
+                    redesigns = self.redesign_structure(
                         metadata_row=row,
                         processed_file=processed_file,
+                        provided_seq=provided_seq,
                     )
                 except Exception as e:
                     self.log.error(f"⚠️ Error redesigning {pdb_name}")
@@ -454,7 +509,7 @@ class SequenceRedesigner:
                     continue
 
                 if not redesigns or len(redesigns) == 0:
-                    self.log.info(f"No redesigns retained for {pdb_name}.")
+                    self.log.info(f"No redesigns for {pdb_name}.")
                     continue
 
                 # Initialize CSV writers if necessary and write redesigns
@@ -500,17 +555,5 @@ class SequenceRedesigner:
                     f"{row[mc.pdb_name]} Redesigns RMSD = {', '.join([str(r.rmsd) for r in redesigns])}"
                 )
 
-                if best is not None:
-                    if best_redesigns_writer is None:
-                        best_redesign = best.to_dict()
-                        # setup writer if needed
-                        best_redesigns_writer = csv.DictWriter(
-                            best_redesigns_handle, fieldnames=list(best_redesign.keys())
-                        )
-                        if best_redesigns_handle.tell() == 0:
-                            best_redesigns_writer.writeheader()
-                    best_redesigns_writer.writerow(best_redesign)
-
-        # Close CSV files
+        # Close CSV file
         all_redesigns_handle.close()
-        best_redesigns_handle.close()

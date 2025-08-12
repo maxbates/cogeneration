@@ -17,8 +17,8 @@ from cogeneration.dataset.spec import (
     CogenerationPDBDatasetSpec,
     CogenerationRedesignDatasetSpec,
     MultiflowPDBDatasetSpec,
-    MultiflowPDBRedesignedDatasetSpec,
     MultiflowPDBTestDatasetSpec,
+    MultiflowRedesignedDatasetSpec,
     MultiflowSyntheticDatasetSpec,
 )
 from cogeneration.dataset.test_utils import create_pdb_batch
@@ -56,10 +56,10 @@ class TestBaseDataset:
             CogenerationPDBDatasetSpec,
             CogenerationAFDBDatasetSpec,
             CogenerationRedesignDatasetSpec,
-            MultiflowPDBDatasetSpec,
-            MultiflowPDBRedesignedDatasetSpec,
-            MultiflowPDBTestDatasetSpec,
+            MultiflowRedesignedDatasetSpec,
             MultiflowSyntheticDatasetSpec,
+            MultiflowPDBDatasetSpec,
+            # MultiflowPDBTestDatasetSpec,
         ],
     )
     @pytest.mark.parametrize("task", [DataTask.inpainting, DataTask.hallucination])

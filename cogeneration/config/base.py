@@ -20,7 +20,7 @@ from cogeneration.dataset.spec import (  # CogenerationAFDBDatasetSpec,
     CogenerationPDBDatasetSpec,
     CogenerationRedesignDatasetSpec,
     DatasetSpec,
-    MultiflowPDBRedesignedDatasetSpec,
+    MultiflowRedesignedDatasetSpec,
     MultiflowSyntheticDatasetSpec,
 )
 from cogeneration.type.dataset import MetadataColumn
@@ -1051,7 +1051,7 @@ class DatasetConfig(BaseClassConfig):
             CogenerationPDBDatasetSpec,
             CogenerationAFDBDatasetSpec,
             CogenerationRedesignDatasetSpec,
-            MultiflowPDBRedesignedDatasetSpec,
+            MultiflowRedesignedDatasetSpec,
             # MultiflowSyntheticDatasetSpec,  # TODO enable if desired, unsure of quailty
         ]
     )
@@ -1476,6 +1476,10 @@ class RedesignConfig(BaseClassConfig):
     all_csv: str = "redesigned_all.csv"
     # Filename for best redesigns CSV
     best_csv: str = "redesigned.csv"
+    # Optionally, provide a BestRedesigns CSV (with columns example, best_seq)
+    # If provided, redesign will be folded and inverse folding will be skipped.
+    # This allows creating a new dataset folding pre-specified sequences.
+    best_redesigns_csv: Optional[Path] = None
 
 
 @dataclass

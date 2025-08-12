@@ -25,12 +25,7 @@ from cogeneration.dataset.spec import DatasetSpec
 from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import InferenceFeatures
-from cogeneration.type.dataset import (
-    BestRedesignColumn,
-    DatasetColumn,
-    DatasetCSVRow,
-    DatasetDataFrame,
-)
+from cogeneration.type.dataset import DatasetColumn, DatasetCSVRow, DatasetDataFrame
 from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.dataset import MetadataDataFrame, ProcessedFile
 from cogeneration.type.structure import StructureExperimentalMethod
@@ -209,16 +204,6 @@ class BaseDataset(Dataset):
             metadata=metadata,
         )
 
-        # Replace sequences using best redesigns, if provided.
-        # Redesigned data is not filtered except for RMSD requirement.
-        if spec.best_redesigns_path is not None:
-            redesigns_df = pd.read_csv(spec.best_redesigns_path)
-            metadata = metadata.merge(
-                redesigns_df,
-                left_on=mc.pdb_name,
-                right_on=BestRedesignColumn.example,
-            )
-
         return metadata
 
     def _dedupe_by_sequence_hash(
@@ -226,7 +211,7 @@ class BaseDataset(Dataset):
     ) -> MetadataDataFrame:
         """
         Drop exact duplicate sequences, keeping the first, using sequence hash columns.
-        Redesigns should not have the same sequence, and will not be filtered unless they do.
+        Redesign datasets should not have the same sequence, and will not be filtered unless they do.
         TODO - handle same sequence, different structure conformations (e.g. trajectory).
         - If `seq_hash_indep` exists, dedupe by it; else if `seq_hash` exists, use it.
         - Rows missing the hash are treated as unique and will not be dropped as duplicates.

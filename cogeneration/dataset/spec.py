@@ -21,8 +21,6 @@ class DatasetSpec:
     metadata_path: Path
     # directory where processed data is stored, esp if relative paths defined in CSV
     processed_root_path: Path
-    # BestRedesigns CSV (MultiFlow style). Always replaces original sequence with redesign sequence.
-    best_redesigns_path: Optional[Path] = None
     # cluster file
     cluster_path: Optional[Path] = None
 
@@ -35,10 +33,6 @@ class DatasetSpec:
             if not self.processed_root_path.exists():
                 raise FileNotFoundError(
                     f"Processed data root path for {self.name} not found: {self.processed_root_path}"
-                )
-            if self.best_redesigns_path and not self.best_redesigns_path.exists():
-                raise FileNotFoundError(
-                    f"BestRedesigns CSV for {self.name} not found: {self.best_redesigns_path}"
                 )
             if self.cluster_path and not self.cluster_path.exists():
                 raise FileNotFoundError(
@@ -54,7 +48,7 @@ class DatasetSpec:
 
 
 # cogeneration data pipeline generated datasets
-# TODO - generate shared clusters file for these datasets
+# TODO - generate shared clusters file for these datasets (but they arent really used for anything...)
 
 cogeneration_datasets_path = Path("~/pdb/").expanduser().resolve()
 
@@ -79,11 +73,28 @@ CogenerationRedesignDatasetSpec = DatasetSpec(
     metadata_path=cogeneration_datasets_path / "redesigned" / "redesigned_all.csv",
 )
 
-# multiflow metadata paths
+# MultiFlow `BestRedesigns` CSV is refolded to generate a new redesign dataset
+MultiflowRedesignedDatasetSpec = DatasetSpec(
+    name="MultiflowRedesigns",
+    processed_root_path=cogeneration_datasets_path / "redesigned" / "multiflow",
+    metadata_path=cogeneration_datasets_path
+    / "redesigned"
+    / "multiflow"
+    / "redesigned_all.csv",
+)
 
+# multiflow metadata paths
 
 multiflow_datasets_path = PATH_PROJECT_ROOT / "cogeneration" / "datasets"
 multiflow_metadata = multiflow_datasets_path / "multiflow"
+
+MultiflowSyntheticDatasetSpec = DatasetSpec(
+    name="MultiFlowSynthetic",
+    processed_root_path=multiflow_datasets_path,
+    metadata_path=multiflow_metadata / "distillation_metadata.csv",
+    cluster_path=multiflow_metadata / "distillation.clusters",
+)
+
 
 # NOTE - Multiflow PDB datasets are superseded by CogenerationPDBDatasetSpec
 
@@ -99,19 +110,4 @@ MultiflowPDBTestDatasetSpec = DatasetSpec(
     processed_root_path=multiflow_datasets_path,
     metadata_path=multiflow_metadata / "test_set_metadata.csv",
     cluster_path=multiflow_metadata / "test_set_clusters.csv",
-)
-
-MultiflowPDBRedesignedDatasetSpec = DatasetSpec(
-    name="MultiflowPDBRedesigned",
-    processed_root_path=multiflow_datasets_path,
-    metadata_path=multiflow_metadata / "pdb_metadata.csv",
-    best_redesigns_path=multiflow_metadata / "pdb_redesigned.csv",
-    cluster_path=multiflow_metadata / "pdb.clusters",
-)
-
-MultiflowSyntheticDatasetSpec = DatasetSpec(
-    name="MultiFlowSynthetic",
-    processed_root_path=multiflow_datasets_path,
-    metadata_path=multiflow_metadata / "distillation_metadata.csv",
-    cluster_path=multiflow_metadata / "distillation.clusters",
 )

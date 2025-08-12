@@ -226,7 +226,7 @@ class MetadataUpdater:
                 ].mean()
                 row_updates[mc.mean_plddt_modeled_bb] = _chain_independent_trimmed[
                     dpc.b_factors
-                ][:, :3][_chain_independent_trimmed[dpc.modeled_idx]].mean()
+                ][:, :3].mean()
 
         # interactions / clashes
         if (

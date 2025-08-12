@@ -21,6 +21,9 @@ Use AlphaFold2 only for monomers:
 
 Specify dataset and output:
     python redesign_structures.py dataset.datasets=[dataset_spec] redesign.output_dir=/path/to/redesigns
+
+Use pre-defined candidates to bypass inverse folding:
+    python redesign_structures.py redesign.best_redesigns_csv=/path/to/best_redesigns.csv redesign.all_csv=/path/to/redesigns_prespecified.csv
 """
 
 import hydra
