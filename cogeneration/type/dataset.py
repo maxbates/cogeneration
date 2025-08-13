@@ -81,10 +81,8 @@ class MetadataColumn(StrEnum):
     num_chains_clashing = "num_chains_clashing"
 
     # (new) Non-residue chains + interactions
-    # non-residue entity counts
-    num_non_residue_chains = (
-        "num_non_residue_chains"  # legacy - prefer fields below TODO deprecate
-    )
+    # total non-residue entity counts (technically not chains - entity may have same chain id)
+    num_non_residue_chains = "num_non_residue_chains"
     num_single_atom_chains = "num_single_atom_chains"
     num_solution_molecules = "num_solution_molecules"
     num_metal_atoms = "num_metal_atoms"

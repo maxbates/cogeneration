@@ -855,9 +855,7 @@ class DatasetFilterConfig(BaseClassConfig):
     # radius of gyration quantile
     rog_quantile: float = 0.96
     # max percent of unknown residues in the structure of total sequence
-    max_percent_residues_unknown: float = (
-        0.25  # 0.5 in MultiFlow; trim independently -> lower.
-    )
+    max_percent_residues_unknown: float = 0.25  # trim independently -> expect lower
     # pLDDT filter for synthetic structures
     min_plddt: float = 0.8
     # PDB date filter, converted to `pd.datetime`
@@ -875,6 +873,12 @@ class DatasetFilterConfig(BaseClassConfig):
     oligomeric_skip: Optional[List[str]] = None
     num_chains: Optional[List[int]] = field(default_factory=lambda: [1])
     num_chains_skip: Optional[List[int]] = field(default_factory=lambda: [0])
+    # non-residue entities (requires information in metadata CSV)
+    max_non_residue_entities: Optional[int] = None
+    max_metal_ions: Optional[int] = None
+    max_small_molecules: Optional[int] = None
+    max_nucleic_acids: Optional[int] = None
+    max_other_polymers: Optional[int] = None
     # Redesigns
     redesigned_rmsd_threshold: float = 2.0  # remove redesigns >RMSD
 
@@ -1434,6 +1438,9 @@ class BoltzConfig(BaseClassConfig):
     output_format: str = "pdb"
     # Boltz-2 Trainer precision, Boltz-2 defaults to bf16-mixed
     precision: Optional[str] = "${shared.precision}"
+    # Periodically teardown + reload native Boltz model. None to disable.
+    # On MPS, teardown helps reclaim compiled-graph/cache memory.
+    reload_every_n: Optional[int] = 25 if torch.mps.is_available() else None
 
 
 class FoldingModel(StrEnum):
@@ -1471,6 +1478,8 @@ class RedesignConfig(BaseClassConfig):
     output_dir: Path = field(
         default_factory=lambda: Path("~/pdb/redesigned").expanduser()
     )
+    # Filename for redesigns CSV
+    redesigns_csv: str = "redesigns.csv"
     # Sequences generated per example, number to keep and fold (sorted by score)
     seqs_per_sample: int = 10
     fold_per_sample: Optional[int] = 2
@@ -1479,9 +1488,9 @@ class RedesignConfig(BaseClassConfig):
     # Skip existing redesigned sequences
     skip_existing: bool = True
     # Shuffle the metadata rows before redesigning
-    shuffle: bool = True
-    # Filename for redesigns CSV
-    redesigns_csv: str = "redesigns.csv"
+    shuffle: bool = False
+    # Sort by length (shuffling takes precedence)
+    sort_by_length: bool = True
     # Optionally, provide a BestRedesigns CSV (with columns example, best_seq)
     # If provided, redesign will be folded and inverse folding will be skipped.
     # This allows creating a new dataset folding pre-specified sequences.

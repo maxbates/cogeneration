@@ -9,7 +9,7 @@ from typing import List, Optional, Tuple, Union
 import pandas as pd
 from mpmath.libmp.libintmath import ifac2
 from numpy import typing as npt
-from tqdm.asyncio import tqdm
+from tqdm.auto import tqdm
 
 from cogeneration.config.base import (
     DatasetConfig,
@@ -385,6 +385,9 @@ class SequenceRedesigner:
             metadata = metadata.sample(
                 frac=1, random_state=self.dataset_cfg.seed
             ).reset_index(drop=True)
+        elif self.cfg.sort_by_length:
+            self.log.info(f"Sorting metadata by length...")
+            metadata = metadata.sort_values(by=mc.modeled_seq_len, ascending=True)
 
         self.log.info(
             f"Filtered dataset contains {len(metadata)} structures to redesign"
@@ -444,6 +447,8 @@ class SequenceRedesigner:
         return df
 
     def run(self) -> None:
+        self.log.info(f"Writing redesigns to {self.redesigns_path}...")
+
         if self.work_dir.exists():
             existing_redesign_pdbs = self.work_dir.glob("*")
             self.log.warning(
@@ -501,8 +506,6 @@ class SequenceRedesigner:
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
-        self.log.info(f"Writing redesigns to {self.redesigns_path}...")
-
         # Results will be streamed to CSV file as they are generated
         all_redesigns_handle = open(self.redesigns_path, "a", newline="")
         all_redesigns_writer: Optional[csv.DictWriter] = None
@@ -513,10 +516,6 @@ class SequenceRedesigner:
 
         # Iterate to redesign structures
         with tqdm(metadata.iterrows(), total=len(metadata), desc="Redesigning") as pbar:
-
-            # garbage collect between iterations
-            gc.collect()
-
             for idx, row in pbar:
                 row: MetadataCSVRow = row
 
@@ -603,6 +602,10 @@ class SequenceRedesigner:
                 self.log.info(
                     f"{row[mc.pdb_name]} Redesigns RMSD = {', '.join([str(r.rmsd) for r in redesigns])}"
                 )
+
+                # garbage collect between iterations
+                del redesigns, processed_file
+                gc.collect()
 
         # Close CSV file
         all_redesigns_handle.close()

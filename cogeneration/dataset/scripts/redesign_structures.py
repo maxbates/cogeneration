@@ -22,6 +22,9 @@ Use AlphaFold2 only for monomers:
 Specify dataset and output:
     python redesign_structures.py dataset.datasets=[dataset_spec] redesign.output_dir=/path/to/redesigns
 
+Filter structures to pure proteins:
+    python redesign_structures.py dataset.filter.max_non_residue_entities=0
+
 Use pre-defined candidates to bypass inverse folding:
     python redesign_structures.py redesign.best_redesigns_csv=/path/to/best_redesigns.csv redesign.all_csv=/path/to/redesigns_prespecified.csv
 """
@@ -41,20 +44,22 @@ def main(cfg: Config) -> None:
     config = cfg if isinstance(cfg, Config) else OmegaConf.to_object(cfg)
     config = config.interpolate()
 
+    # Register memory debugger
+    register_memory_debugger()
+
     # disable the cache to limit memory usage - structures only used once
     config.dataset.cache_num_res = 1e6
 
-    # Register memory debugger (send `kill -USR2 <PID>` to dump snapshot)
-    register_memory_debugger()
-
-    validator = FoldingValidator(cfg=config.folding)
-
+    # modify dataset cfg if providing redesigns
     if (
         config.redesign.best_redesigns_csv is not None
         and config.redesign.use_lenient_filter_with_best_redesigns
     ):
-        print("Redesigns provided: using lenient dataset filter")
         config.dataset.filter = DatasetFilterConfig.lenient()
+        # don't dedupe to keep all targets
+        config.dataset.dedupe_by_sequence_hash = False
+
+    validator = FoldingValidator(cfg=config.folding)
 
     redesigner = SequenceRedesigner(
         cfg=config.redesign, validator=validator, dataset_cfg=config.dataset

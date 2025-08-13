@@ -742,6 +742,10 @@ class BoltzRunner(FoldingTool):
 
         self.checkpoint_path = self.cfg.checkpoint_path
 
+        # Optional periodic teardown to mitigate native MPS compiled-graph/cache growth.
+        self.reload_every_n = getattr(self.cfg, "reload_every_n", None)
+        self._predictions_since_load = 0
+
         # Configure model parameters
         self.diffusion_params = Boltz2DiffusionParams()
         self.diffusion_params.step_scale = self.cfg.step_scale
@@ -977,6 +981,22 @@ class BoltzRunner(FoldingTool):
         # attempt cleanup / gc
         self._release_inference_state(writer=writer, data_module=data_module)
 
+        # Periodically tear down model/trainer to reclaim native caches if configured
+        try:
+            self._predictions_since_load += len(manifest.records)
+        except Exception:
+            pass
+        if (
+            self.reload_every_n is not None
+            and self.reload_every_n > 0
+            and self._predictions_since_load >= self.reload_every_n
+        ):
+            logger.info(
+                f"🗑️ Tearing down Boltz model after {self._predictions_since_load} predictions"
+            )
+            self._predictions_since_load = 0
+            self._teardown_model()
+
         end_time = time.time()
         logger.debug(
             f"Boltz (native) prediction completed in {end_time - start_time:.2f} seconds"
@@ -1002,20 +1022,22 @@ class BoltzRunner(FoldingTool):
             pass
 
         # Drop local references
-        try:
-            del writer
-        except Exception:
-            pass
-        try:
-            del data_module
-        except Exception:
-            pass
+        if writer is not None:
+            try:
+                del writer
+            except Exception:
+                pass
+        if data_module is not None:
+            try:
+                del data_module
+            except Exception:
+                pass
 
+        # GC and empty caches
         try:
             gc.collect()
         except Exception:
             pass
-
         try:
             if (
                 hasattr(torch, "cuda")
@@ -1034,6 +1056,31 @@ class BoltzRunner(FoldingTool):
                 torch.mps.empty_cache()
         except Exception:
             pass
+
+    def _teardown_model(self) -> None:
+        """
+        Fully tear down model and trainer to encourage native cache release.
+        Next prediction will lazily reload the model.
+        """
+        # Drop model and trainer reference
+        try:
+            if self.model is not None:
+                del self.model
+        except Exception:
+            pass
+        finally:
+            self.model = None
+
+        try:
+            if self.trainer is not None:
+                try:
+                    self.trainer.callbacks = []
+                except Exception:
+                    pass
+        finally:
+            self.trainer = None
+
+        self._release_inference_state(writer=None, data_module=None)
 
     def fold_fasta(
         self,

@@ -155,6 +155,47 @@ class DatasetFilterer:
 
         return df
 
+    @_log_filter("non-residue entities filter")
+    def _non_residue_entities_filter(self, df: MetadataDataFrame) -> MetadataDataFrame:
+        if self.cfg.max_non_residue_entities is not None:
+            if mc.num_non_residue_chains not in df.columns:
+                self._log.warning(
+                    "num_non_residue_chains not found, skipping non-residue entities filter"
+                )
+            else:
+                df = df[
+                    df[mc.num_non_residue_chains] <= self.cfg.max_non_residue_entities
+                ]
+        if self.cfg.max_metal_ions is not None:
+            if mc.num_metal_atoms not in df.columns:
+                self._log.warning(
+                    "num_metal_atoms not found, skipping non-residue entities filter"
+                )
+            else:
+                df = df[df[mc.num_metal_atoms] <= self.cfg.max_metal_ions]
+        if self.cfg.max_small_molecules is not None:
+            if mc.num_small_molecules not in df.columns:
+                self._log.warning(
+                    "num_small_molecules not found, skipping non-residue entities filter"
+                )
+            else:
+                df = df[df[mc.num_small_molecules] <= self.cfg.max_small_molecules]
+        if self.cfg.max_nucleic_acids is not None:
+            if mc.num_nucleic_acid_polymers not in df.columns:
+                self._log.warning(
+                    "num_nucleic_acid_polymers not found, skipping non-residue entities filter"
+                )
+            else:
+                df = df[df[mc.num_nucleic_acid_polymers] <= self.cfg.max_nucleic_acids]
+        if self.cfg.max_other_polymers is not None:
+            if mc.num_other_polymers not in df.columns:
+                self._log.warning(
+                    "num_other_polymers not found, skipping non-residue entities filter"
+                )
+            else:
+                df = df[df[mc.num_other_polymers] <= self.cfg.max_other_polymers]
+        return df
+
     @_log_filter("Redesign RMSD filter")
     def _redesign_rmsd_filter(self, df: MetadataDataFrame) -> MetadataDataFrame:
         if BestRedesignColumn.best_rmsd not in df.columns:
@@ -178,6 +219,7 @@ class DatasetFilterer:
             "max_coil": self._max_coil_filter,
             "rog": self._rog_filter,
             "plddt": self._plddt_filter,
+            "non_residue_entities": self._non_residue_entities_filter,
             "redesign_rmsd": self._redesign_rmsd_filter,
         }
 
