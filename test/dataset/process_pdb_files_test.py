@@ -127,6 +127,10 @@ class TestProcessPDBFiles:
             write_dir=str(tmp_path),
         )
         assert len(np.unique(processed_file[dpc.chain_index])) == 8
+        # ATP molecules should show up as non-residue chains
+        assert metadata[mc.num_non_residue_chains] >= 1
+        # granular fields should be populated (ATP as small molecule)
+        assert metadata[mc.num_small_molecules] >= 1
 
     def test_parsing_2pdz(self, tmp_path, pdb_2pdz_path):
         metadata, processed_file = process_pdb_with_metadata(
@@ -135,6 +139,33 @@ class TestProcessPDBFiles:
         )
         assert len(processed_file[dpc.chain_index]) == 91
         assert len(np.unique(processed_file[dpc.chain_index])) == 2
+        # capture trajectory information
+        assert metadata[mc.num_frames] == 15
+
+    def test_parsing_4q2v(self, tmp_path, pdb_4q2v_path):
+        metadata, processed_file = process_pdb_with_metadata(
+            pdb_file_path=str(pdb_4q2v_path.absolute()),
+            write_dir=str(tmp_path),
+        )
+        assert metadata[mc.num_all_chains] == 1
+        # small molecule inhibit shold show up as non-residue chain (not as a solvent)
+        assert metadata[mc.num_non_residue_chains] == 1
+        assert metadata[mc.num_small_molecules] == 1
+        assert metadata[mc.num_nucleic_acid_polymers] == 0
+
+    def test_parsing_1odh(self, tmp_path, pdb_1odh_path):
+        metadata, processed_file = process_pdb_with_metadata(
+            pdb_file_path=str(pdb_1odh_path.absolute()),
+            write_dir=str(tmp_path),
+        )
+        assert (
+            metadata[mc.num_all_chains] == 3
+        )  # protein, 2 DNA, (metals and water not chains)
+        # expect two nucleic-acid components (DNA strands)
+        assert metadata[mc.num_nucleic_acid_polymers] == 2
+        # zn ions
+        assert metadata[mc.num_metal_atoms] == 2
+        assert metadata[mc.num_metal_interactions] == 2
 
     def test_dataset_using_processed_file(self, tmp_path, pdb_2qlw_path):
         metadata, _ = process_pdb_with_metadata(

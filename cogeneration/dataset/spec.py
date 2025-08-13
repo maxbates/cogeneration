@@ -40,7 +40,7 @@ class DatasetSpec:
                 )
             self._enabled = True
         except FileNotFoundError as e:
-            logger.warning(f"Dataset {self.name} is disabled: {e}")
+            logger.warning(f"⚠️ Dataset {self.name} is disabled: {e}")
             self._enabled = False
 
     def is_enabled(self) -> bool:
@@ -70,7 +70,7 @@ CogenerationAFDBDatasetSpec = DatasetSpec(
 CogenerationRedesignDatasetSpec = DatasetSpec(
     name="CogenerationRedesigns",
     processed_root_path=cogeneration_datasets_path,
-    metadata_path=cogeneration_datasets_path / "redesigned" / "redesigned_all.csv",
+    metadata_path=cogeneration_datasets_path / "redesigned" / "redesigns.csv",
 )
 
 # MultiFlow `BestRedesigns` CSV is refolded to generate a new redesign dataset
@@ -80,7 +80,7 @@ MultiflowRedesignedDatasetSpec = DatasetSpec(
     metadata_path=cogeneration_datasets_path
     / "redesigned"
     / "multiflow"
-    / "redesigned_all.csv",
+    / "redesigns.csv",
 )
 
 # multiflow metadata paths

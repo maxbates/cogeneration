@@ -760,6 +760,25 @@ ligands_excluded = {
     "3SY",  # Bis(hydroxymethyl)propane-1,3-diol
 }
 
+# Nucleic-acid residue name sets (DNA/RNA common codes)
+nucleotide_resnames = {
+    # DNA
+    "DA",
+    "DT",
+    "DG",
+    "DC",
+    # RNA
+    "A",
+    "U",
+    "G",
+    "C",
+    "I",
+    "ADE",
+    "URI",
+    "GUA",
+    "CYT",
+}
+
 # A compact atom encoding with 14 columns
 # pylint: disable=line-too-long
 # pylint: disable=bad-whitespace

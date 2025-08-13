@@ -31,7 +31,7 @@ class MetadataColumn(StrEnum):
     chain_lengths_modeled = "chain_lengths_modeled"
     # number of chains in protein (ignores non-residue chains)
     num_chains = "num_chains"
-    # (new) number of all chains (includes non-residue chains)
+    # (new) number of all chains (includes non-residue chains) according to biopython
     num_all_chains = "num_all_chains"
     # total number of residues
     seq_len = "seq_len"
@@ -60,9 +60,12 @@ class MetadataColumn(StrEnum):
     radius_gyration = "radius_gyration"
 
     # structure metadata if provided
-    date = "date"  # date of structure deposition
+    # (new) date of structure deposition
+    date = "date"
+    # (new) resolution of structure
     resolution = "resolution"
-    structure_method = "structure_method"  # StructureExperimentalMethod enum
+    # (new) structure method, StructureExperimentalMethod enum
+    structure_method = "structure_method"
 
     # (new, multimer-only) interactions / clashes
     # chain-chain interactions: "<chain_a>:<chain_b>:<num_bb_res_xing_a>:<num_bb_res_xing_b>,...."
@@ -78,16 +81,24 @@ class MetadataColumn(StrEnum):
     num_chains_clashing = "num_chains_clashing"
 
     # (new) Non-residue chains + interactions
-    # [Can only be added on initial processing, because processed feats omit such chains.]
-    # count of non-residue or empty chains (atoms, metals, molecules, DNA)
-    num_non_residue_chains = "num_non_residue_chains"
+    # non-residue entity counts
+    num_non_residue_chains = (
+        "num_non_residue_chains"  # legacy - prefer fields below TODO deprecate
+    )
     num_single_atom_chains = "num_single_atom_chains"
     num_solution_molecules = "num_solution_molecules"
+    num_metal_atoms = "num_metal_atoms"
+    num_small_molecules = "num_small_molecules"
+    num_nucleic_acid_polymers = "num_nucleic_acid_polymers"
+    num_other_polymers = "num_other_polymers"
     # interactions require the chain in proximity to 3+ residues
     num_metal_interactions = "num_metal_interactions"
     num_macromolecule_interactions = "num_macromolecule_interactions"
     # count of protein chain-chain interactions potentially mediated by non-residue chains
     num_mediated_interactions = "num_mediated_interactions"
+    # interaction counts (components/chains with >= threshold residue contacts)
+    num_small_molecule_interactions = "num_small_molecule_interactions"
+    num_nucleic_acid_interactions = "num_nucleic_acid_interactions"
 
 
 class RedesignColumn(StrEnum):

@@ -188,7 +188,7 @@ class BaseDataset(Dataset):
             max_rows=cfg.debug_head_samples,
         )
 
-        # Processed paths should be complete paths
+        # Processed paths should be complete paths (they may already be absolute)
         base_processed_path = Path(spec.processed_root_path)
         metadata[mc.processed_path] = metadata[mc.processed_path].apply(
             lambda rel_path: base_processed_path / rel_path

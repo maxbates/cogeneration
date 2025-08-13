@@ -276,9 +276,15 @@ class MetadataUpdater:
             mc.num_non_residue_chains not in row_metadata
             or mc.num_single_atom_chains not in row_metadata
             or mc.num_solution_molecules not in row_metadata
+            or mc.num_metal_atoms not in row_metadata
             or mc.num_metal_interactions not in row_metadata
             or mc.num_macromolecule_interactions not in row_metadata
             or mc.num_mediated_interactions not in row_metadata
+            or mc.num_small_molecules not in row_metadata
+            or mc.num_nucleic_acid_polymers not in row_metadata
+            or mc.num_other_polymers not in row_metadata
+            or mc.num_small_molecule_interactions not in row_metadata
+            or mc.num_nucleic_acid_interactions not in row_metadata
         ):
             structure = get_pdb_structure()
             struct_feats = pdb_structure_to_chain_feats(structure)

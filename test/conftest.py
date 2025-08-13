@@ -473,6 +473,36 @@ def pdb_8y2h_path():
 
 
 @pytest.fixture
+def pdb_4q2v_path():
+    """
+    https://www2.rcsb.org/structure/4Q2V
+    Ricin protein with small molecule inhibitor (in chain A)
+    """
+    return Path(__file__).parent / "dataset" / "4q2v.pdb"
+
+
+@pytest.fixture
+def pdb_1odh_path():
+    """
+    https://www2.rcsb.org/structure/1ODH
+    DNA duplex example for nucleic-acid counting
+    """
+    path = Path(__file__).parent / "dataset" / "1odh.pdb"
+    if not path.exists():
+        pytest.skip("1ODH PDB file not present in test dataset")
+    return path
+
+
+@pytest.fixture
+def pdb_1odh_path():
+    """
+    https://www2.rcsb.org/structure/1ODH
+    Protein bound to DNA (2 chains, 1 per strand)
+    """
+    return Path(__file__).parent / "dataset" / "1odh.pdb"
+
+
+@pytest.fixture
 def pdb_2qlw_processed_feats(pdb_2qlw_path, mock_cfg):
     """Generate features from the 2QLW PDB file. Note includes centering, chain randomization, etc."""
     processed_file = process_pdb_file(str(pdb_2qlw_path), "2qlw")

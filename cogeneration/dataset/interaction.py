@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import Enum
 from itertools import combinations, product
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
@@ -16,6 +17,7 @@ from cogeneration.data.residue_constants import (
     atom_order,
     ligands_excluded,
     metal_types,
+    nucleotide_resnames,
     unk_restype_index,
 )
 from cogeneration.type.batch import BatchFeatures, BatchProp
@@ -35,10 +37,28 @@ RESIDUE_CONTACT_THRESHOLD = 3  # interacts with >=3 distinct residues
 # non-residue molecule constants
 LARGE_MOLECULE_ATOM_THRESHOLD = 10  # DNA, fatty acids, small peptides etc.
 
+# ComponentKey for atom groupings
+ComponentKey = Tuple[int, Tuple[str, int, str]]  # (chain_id, (hetflag, resseq, icode))
+
+
+def is_solution_resname(resname: str) -> bool:
+    """Return True if residue name is considered solvent/buffer and should be excluded."""
+    return resname.strip().upper() in ligands_excluded
+
+
+def is_nucleotide_resname(resname: str) -> bool:
+    """Return True if residue name represents a DNA/RNA nucleotide (3-letter code)."""
+    return resname.strip().upper() in nucleotide_resnames
+
 
 @dataclass(frozen=True)
 class ChainAtom:
-    """struct for atoms in a (non-residue or residue) chain"""
+    """
+    struct for atoms in a (non-residue or residue) chain
+
+    note atoms don't know about their containing residue/molecule,
+    so can't safely know if they are solvent, nucleic, etc.
+    """
 
     chain_id: int
     res_index: int
@@ -46,6 +66,8 @@ class ChainAtom:
     atom_name: str
     atom_element: str
     coord: npt.NDArray
+    # Unique residue identifier from PDB (hetflag, resseq, icode)
+    res_uid: Tuple[str, int, str]
 
     def __post_init__(self):
         # ensure clean names
@@ -56,16 +78,35 @@ class ChainAtom:
     def is_metal(self) -> bool:
         return self.atom_element in metal_types
 
-    @property
-    def atom_type(self) -> Optional[int]:
-        if self.is_metal:
-            return None
-        if self.atom_name not in atom_order:
-            return None
-        return atom_order[self.atom_name]
-
     def __hash__(self):
-        return hash((self.chain_id, self.res_index, self.atom_index, self.atom_name))
+        return hash(
+            (
+                self.chain_id,
+                self.res_index,
+                self.atom_index,
+                self.atom_name,
+                self.atom_element,
+                self.res_uid[0],
+                self.res_uid[1],
+                self.res_uid[2],
+            )
+        )
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        if not isinstance(other, ChainAtom):
+            return NotImplemented
+        # Compare identity fields exactly and coordinates approximately
+        return (
+            self.chain_id == other.chain_id
+            and self.res_index == other.res_index
+            and self.atom_index == other.atom_index
+            and self.atom_name == other.atom_name
+            and self.atom_element == other.atom_element
+            and self.res_uid == other.res_uid
+            and np.allclose(self.coord, other.coord, atol=1e-2)
+        )
 
 
 @dataclass(frozen=True)
@@ -461,6 +502,27 @@ class AtomInteraction(Interaction):
         return False
 
 
+class NonResidueEntityType(Enum):
+    METAL_ATOM = "metal_atom"
+    SMALL_MOLECULE = "small_molecule"
+    NUCLEIC_ACID_POLYMER = "nucleic_acid_polymer"
+    OTHER_POLYMER = "other_polymer"
+
+
+@dataclass
+class NonProteinEntity:
+    """Collection of atoms that belong to a non-residue component (e.g. metal ion, small molecule, DNA, RNA)"""
+
+    entity_type: NonResidueEntityType
+    components: Set[Tuple[int, Tuple[str, int, str]]]
+    atoms: List[ChainAtom]
+    chain_ids: Set[int]
+
+    @property
+    def num_atoms(self) -> int:
+        return len(self.atoms)
+
+
 @dataclass
 class NonResidueInteractions:
     """
@@ -471,20 +533,36 @@ class NonResidueInteractions:
     complex_feats: ChainFeatures
 
     def __post_init__(self):
-        # Determine non-residue chains
-        # valid chains are already present in `complex_feats`.
-        all_chain_ids = [
-            chain_str_to_int(chain.id.upper()) for chain in self.structure.get_chains()
-        ]
-        valid_chain_ids = set(self.complex_feats[dpc.chain_index])
-        self._non_res_chain_ids = {
-            cid for cid in all_chain_ids if cid not in valid_chain_ids
-        }
+        """
+        Initialize non-protein entity detection and interaction counting.
 
-        # count all atoms per non-residue chain
+        Steps overview:
+        1) Collect all atoms that belong to non-protein residues (including ligands, nucleotides, and ions),
+           excluding solution molecules (e.g., water, buffers). This captures ligands even if they share a
+           PDB chain with protein residues.
+        2) Index these atoms into "components" using a stable PDB residue identifier per chain:
+           component_key := (chain_id, res_uid), where res_uid = (hetflag, resseq, icode). This enables
+           counting per small-molecule residue and detection of nucleic-acid strands.
+        3) Classify components into entities: metal ions (atoms), small molecules (components),
+           nucleic acids (grouped per chain), and other polymers (grouped per chain).
+        4) Build entity-residue contacts to count entity-level interactions (>= 3 unique residues).
+        """
+
+        # 1) Collect atoms from non-residue components (excluding solution molecules).
         self.all_non_res_chain_atoms = NonResidueInteractions.get_all_chain_atoms(
-            structure=self.structure, chain_ids=self.non_res_chain_ids
+            structure=self.structure,
+            chain_ids=None,
+            filter_solution=True,
+            only_non_residues=True,
         )
+
+        # Chain IDs that contain at least one non-residue component
+        self.chains_containing_nonres = set(
+            atom.chain_id for atom in self.all_non_res_chain_atoms
+        )
+
+        # count metal atoms
+        self.metal_atoms = self.get_all_metal_atoms(self.structure)
 
         # count solution atoms
         self.num_solution_molecules = self.count_solution_molecules(self.structure)
@@ -495,14 +573,14 @@ class NonResidueInteractions:
             complex_feats=self.complex_feats,
         )
 
-        # count atoms per chain
-        self.non_res_chain_atom_counts = {}
-        for atom in self.all_non_res_chain_atoms:
-            self.non_res_chain_atom_counts.setdefault(atom.chain_id, 0)
-            self.non_res_chain_atom_counts[atom.chain_id] += 1
+        # Build simplified entity view for external consumption (index entities and classifies components)
+        self.entities = NonResidueInteractions.build_entities(
+            structure=self.structure,
+            atoms=self.all_non_res_chain_atoms,
+        )
 
-        # count ChainAtom -> unique residue interactions
-        # { ChainAtom:  { other_id: set(res_index) } }
+        # aggregate ChainAtom -> unique residue interactions
+        # { ChainAtom:  { res_chain_id: set(res_index) } }
         self.atom_res_contacts: Dict[ChainAtom, Dict[int, Set[int]]] = {}
         for inter in self.non_res_interactions:
             self.atom_res_contacts.setdefault(inter.atom, {})
@@ -511,10 +589,11 @@ class NonResidueInteractions:
                 inter.other_res_index
             )
 
-        # count chain_id -> unique residue interactions
-        # { non_res_chain_id: { other_id: set(res_index) } }
+        # aggregate chain_id -> unique residue interactions
+        # { non_res_chain_id: { res_chain_id: set(res_index) } }
+        # TODO - ensure accounts for entities in chains that contain residues
         self.chain_res_contacts: Dict[int, Dict[int, Set[int]]] = {
-            cid: {} for cid in self.non_res_chain_ids
+            cid: {} for cid in self.chains_containing_nonres
         }
         for atom, res_contacts in self.atom_res_contacts.items():
             for other_id, res_idx_set in res_contacts.items():
@@ -522,32 +601,30 @@ class NonResidueInteractions:
                     other_id, set()
                 ).update(res_idx_set)
 
-        # count metal interactions, includes metal in residue chains
-        # keep separate, because includes metals in valid chains
-        metal_atoms = self.get_all_metal_atoms(self.structure)
-        metal_interactions = NonResidueInteractions.get_residue_interactions(
-            atoms=metal_atoms,
-            complex_feats=self.complex_feats,
-        )
-        self.metal_res_contacts: Dict[ChainAtom, Dict[int, Set[int]]] = {}
-        for inter in metal_interactions:
-            self.metal_res_contacts.setdefault(inter.atom, {})
-            self.metal_res_contacts[inter.atom].setdefault(inter.other_id, set())
-            self.metal_res_contacts[inter.atom][inter.other_id].add(
-                inter.other_res_index
-            )
-
-    @property
-    def non_res_chain_ids(self) -> Set[int]:
-        return self._non_res_chain_ids
-
     @property
     def num_non_residue_chains(self) -> int:
-        return len(self.non_res_chain_ids)
+        """Number of non-atom entities, i.e. small molecules, nucleic acids, polymers"""
+        return len([e for e in self.entities if len(e.atoms) > 1])
+
+    @property
+    def num_small_molecules(self) -> int:
+        return len(self.entities_by_type(NonResidueEntityType.SMALL_MOLECULE))
+
+    @property
+    def num_nucleic_acid_polymers(self) -> int:
+        return len(self.entities_by_type(NonResidueEntityType.NUCLEIC_ACID_POLYMER))
+
+    @property
+    def num_other_polymers(self) -> int:
+        """Count OTHER polymers (not including nucleic acids)"""
+        return len(self.entities_by_type(NonResidueEntityType.OTHER_POLYMER))
 
     @property
     def num_single_atom_chains(self) -> int:
-        return sum(1 for count in self.non_res_chain_atom_counts.values() if count == 1)
+        chain_counts: Dict[int, int] = {}
+        for atom in self.all_non_res_chain_atoms:
+            chain_counts[atom.chain_id] = chain_counts.get(atom.chain_id, 0) + 1
+        return sum(1 for count in chain_counts.values() if count == 1)
 
     def count_solution_molecules(self, structure: Structure) -> int:
         """
@@ -558,7 +635,7 @@ class NonResidueInteractions:
         for chain in structure.get_chains():
             for res in chain:
                 # count water / solution atoms
-                if res.get_resname().strip() in ligands_excluded:
+                if is_solution_resname(res.get_resname()):
                     count += 1
 
         return count
@@ -568,9 +645,11 @@ class NonResidueInteractions:
         structure: Structure,
         chain_ids: Optional[Iterable[int]],
         filter_solution: bool = True,
+        only_non_residues: bool = False,
     ) -> List[ChainAtom]:
         """
-        Get all atoms in `chain_ids`, e.g. atoms in non-valid chains
+        Get all atoms in `chain_ids`, e.g. atoms in non-valid chains.
+        Optionally filter to only non-residue atoms.
         """
         struct_chains = {
             chain_str_to_int(chain.id.upper()): chain
@@ -591,25 +670,29 @@ class NonResidueInteractions:
         for chain_id, chain in struct_chains.items():
             for res_idx, res in enumerate(chain):
                 # drop water / solution atoms
-                if filter_solution and res.get_resname().strip() in ligands_excluded:
+                if filter_solution and is_solution_resname(res.get_resname()):
                     continue
 
-                # allow residues to fall through, in case getting atoms for entire structure,
-                # even though not expected for non-res chains.
-                # Also continue with nucleotides, which also have res.id[0] == " ".
-                # if res.id[0] == " ":
-                #     if not is_aa(res, standard=True):
-                #         pass
+                # If requested, only include non-amino-acid residues (hetero, nucleotides, metals, etc.)
+                if only_non_residues and is_aa(res, standard=True):
+                    continue
+
+                # stable residue identifiers from PDB
+                hetflag, resseq, icode = res.get_id()
 
                 for atom_idx, atom in enumerate(res.get_atoms()):
+                    # prefer PDB using PDB residue index for stability / correctness
+                    pdb_res_index = int(resseq) if isinstance(resseq, int) else res_idx
+
                     all_non_res_chain_atoms.append(
                         ChainAtom(
                             chain_id=chain_id,
-                            res_index=res_idx,
+                            res_index=pdb_res_index,
                             atom_index=atom_idx,
                             atom_name=atom.name.strip().upper(),
                             atom_element=atom.element.strip().upper(),
                             coord=atom.coord,
+                            res_uid=(hetflag, pdb_res_index, icode),
                         )
                     )
 
@@ -683,51 +766,179 @@ class NonResidueInteractions:
 
         return non_res_chain_interactions
 
+    @staticmethod
+    def build_entities(
+        structure: Structure, atoms: List[ChainAtom]
+    ) -> List[NonProteinEntity]:
+        """
+        Group non-protein content into clean entities:
+        - Metals: one entity per metal-only component
+        - Small molecules: one entity per non-metal, non-nucleotide component
+        - Nucleic acids: one entity per chain, merging all nucleotide components
+        - Other polymers: one entity per chain containing non-protein components not classified as nucleic acids
+        """
+        # Build components, i.e. atoms associated with a (chain_id, res_uid)
+        component_atoms: Dict[ComponentKey, List[ChainAtom]] = {}
+        for atom in atoms:
+            component_atoms.setdefault((atom.chain_id, atom.res_uid), []).append(atom)
+
+        # Map components to resname
+        component_resname: Dict[ComponentKey, str] = {}
+        for chain in structure.get_chains():
+            cid = chain_str_to_int(chain.id.upper())
+            for res in chain:
+                hetflag, resseq, icode = res.get_id()
+                resname = res.get_resname().strip().upper()
+                key: ComponentKey = (
+                    cid,
+                    (
+                        hetflag,
+                        int(resseq) if isinstance(resseq, int) else resseq,
+                        icode,
+                    ),
+                )
+                if key in component_atoms and not is_solution_resname(resname):
+                    component_resname[key] = resname
+
+        entities: List[NonProteinEntity] = []
+
+        processed_components: Set[ComponentKey] = set()
+        nucleotide_keys: Set[ComponentKey] = set()
+
+        # First pass: classify per-component entities (metals and small molecules) and collect nucleotide keys
+        for key, comp_atoms in component_atoms.items():
+            if len(comp_atoms) == 0:
+                continue
+            resname = component_resname.get(key, "")
+            if is_nucleotide_resname(resname):
+                nucleotide_keys.add(key)
+                continue
+            if all(a.is_metal for a in comp_atoms):
+                entities.append(
+                    NonProteinEntity(
+                        entity_type=NonResidueEntityType.METAL_ATOM,
+                        components={key},
+                        atoms=list(comp_atoms),
+                        chain_ids={key[0]},
+                    )
+                )
+                processed_components.add(key)
+                continue
+            # default to small molecule component (non-nucleotide, non-metal)
+            entities.append(
+                NonProteinEntity(
+                    entity_type=NonResidueEntityType.SMALL_MOLECULE,
+                    components={key},
+                    atoms=list(comp_atoms),
+                    chain_ids={key[0]},
+                )
+            )
+            processed_components.add(key)
+
+        # Second pass: nucleic acids grouped per chain (polymer entity)
+        chain_to_na_components: Dict[int, List[ComponentKey]] = {}
+        for key in nucleotide_keys:
+            chain_to_na_components.setdefault(key[0], []).append(key)
+        for chain_id, comp_keys in chain_to_na_components.items():
+            chain_atoms: List[ChainAtom] = []
+            for ck in comp_keys:
+                chain_atoms.extend(component_atoms.get(ck, []))
+            if len(chain_atoms) == 0:
+                continue
+            entities.append(
+                NonProteinEntity(
+                    entity_type=NonResidueEntityType.NUCLEIC_ACID_POLYMER,
+                    components=set(comp_keys),
+                    atoms=chain_atoms,
+                    chain_ids={chain_id},
+                )
+            )
+            processed_components.update(comp_keys)
+
+        # Third pass: other polymers per chain (unclassified non-protein components that aren't metals, small molecules, or nucleic acids)
+        all_component_keys = set(component_atoms.keys())
+        leftover_by_chain: Dict[int, List[ComponentKey]] = {}
+        for key in all_component_keys:
+            if key in processed_components or key in nucleotide_keys:
+                continue
+            comp_atoms = component_atoms.get(key, [])
+            if len(comp_atoms) == 0:
+                continue
+            leftover_by_chain.setdefault(key[0], []).append(key)
+
+        for chain_id, comp_keys in leftover_by_chain.items():
+            chain_atoms: List[ChainAtom] = []
+            for ck in comp_keys:
+                chain_atoms.extend(component_atoms.get(ck, []))
+            if len(chain_atoms) == 0:
+                continue
+            entities.append(
+                NonProteinEntity(
+                    entity_type=NonResidueEntityType.OTHER_POLYMER,
+                    components=set(comp_keys),
+                    atoms=chain_atoms,
+                    chain_ids={chain_id},
+                )
+            )
+
+        return entities
+
+    def entities_by_type(
+        self, entity_type: NonResidueEntityType
+    ) -> List[NonProteinEntity]:
+        """Get entities by type"""
+        return [e for e in self.entities if e.entity_type == entity_type]
+
+    def _entity_residue_contacts(
+        self, entity: NonProteinEntity
+    ) -> Set[Tuple[int, int]]:
+        """Get contacts for all atoms in entity"""
+        contacts: Set[Tuple[int, int]] = set()
+        for atom in entity.atoms:
+            if atom in self.atom_res_contacts:
+                for other_id, res_idx_set in self.atom_res_contacts[atom].items():
+                    for res_idx in res_idx_set:
+                        contacts.add((other_id, res_idx))
+        return contacts
+
     @property
     def metals_interacting(self) -> List[ChainAtom]:
-        """return ChainAtoms for metals across all chains with sufficient residue contacts"""
-        metal_atoms = self.get_all_metal_atoms(self.structure)
+        """Return metal atoms with sufficient unique residue contacts (>= threshold)."""
         result: List[ChainAtom] = []
-
-        for metal_atom in metal_atoms:
-            contacts = self.metal_res_contacts.get(metal_atom, {})
-            res_interactions = sum(len(res_set) for res_set in contacts.values())
-            if res_interactions >= RESIDUE_CONTACT_THRESHOLD:
-                result.append(metal_atom)
-
+        for entity in self.entities_by_type(NonResidueEntityType.METAL_ATOM):
+            contacts = self._entity_residue_contacts(entity)
+            if len(contacts) >= RESIDUE_CONTACT_THRESHOLD:
+                result.extend(entity.atoms)
         return result
 
     @property
-    def macromolecule_chains_interacting(self) -> List[int]:
-        """
-        Return chain_ids for non-res chains with:
-           - sufficient atoms to be a macromolecule
-           - sufficient residue contacts
-        """
-        result: List[int] = []
-
-        for cid in self.non_res_chain_ids:
-            # filter to large molecules
-            chain_atom_count = self.non_res_chain_atom_counts.get(cid, 0)
-            if chain_atom_count < LARGE_MOLECULE_ATOM_THRESHOLD:
+    def num_macromolecule_interactions(self) -> int:
+        """Count interacting macromolecule entities (entity-level count)."""
+        count = 0
+        for entity in self.entities:
+            if len(entity.atoms) < LARGE_MOLECULE_ATOM_THRESHOLD:
                 continue
+            if len(self._entity_residue_contacts(entity)) >= RESIDUE_CONTACT_THRESHOLD:
+                count += 1
+        return count
 
-            # count unique residue interactions for atoms in the chain
-            chain_uniq_res_interactions: Set[Tuple[int, int]] = set()
-            for atom in self.all_non_res_chain_atoms:
-                if atom.chain_id != cid:
-                    continue
-                if atom not in self.atom_res_contacts:
-                    continue
+    @property
+    def num_small_molecule_interactions(self) -> int:
+        """Count interacting small-molecule components using entities."""
+        count = 0
+        for entity in self.entities_by_type(NonResidueEntityType.SMALL_MOLECULE):
+            if len(self._entity_residue_contacts(entity)) >= RESIDUE_CONTACT_THRESHOLD:
+                count += 1
+        return count
 
-                for other_id, other_res_idx_set in self.atom_res_contacts[atom].items():
-                    for other_res_idx in other_res_idx_set:
-                        chain_uniq_res_interactions.add((other_id, other_res_idx))
-
-            if len(chain_uniq_res_interactions) >= RESIDUE_CONTACT_THRESHOLD:
-                result.append(cid)
-
-        return result
+    @property
+    def num_nucleic_acid_interactions(self) -> int:
+        """Count interacting nucleic-acid polymer entities using entities."""
+        count = 0
+        for entity in self.entities_by_type(NonResidueEntityType.NUCLEIC_ACID_POLYMER):
+            if len(self._entity_residue_contacts(entity)) >= RESIDUE_CONTACT_THRESHOLD:
+                count += 1
+        return count
 
     @property
     def mediated_chain_interactions(self) -> List[Tuple[int, int, int]]:
@@ -739,7 +950,7 @@ class NonResidueInteractions:
 
         # for each non-res chain, find protein chains with sufficient contacts
         for chain_id, prot_contacts in self.chain_res_contacts.items():
-            if not chain_id in self.non_res_chain_ids:
+            if not chain_id in self.chains_containing_nonres:
                 continue
             valid_prots = [
                 prot_id
@@ -764,14 +975,24 @@ class NonResidueInteractions:
         )
 
     def update_metadata(self, metadata: MetadataCSVRow):
-        # tally non-residue interactions
+        # tally non-residue counts
         metadata[mc.num_non_residue_chains] = self.num_non_residue_chains
         metadata[mc.num_single_atom_chains] = self.num_single_atom_chains
         metadata[mc.num_solution_molecules] = self.num_solution_molecules
+        metadata[mc.num_metal_atoms] = len(self.metal_atoms)
+        metadata[mc.num_small_molecules] = self.num_small_molecules
+        metadata[mc.num_nucleic_acid_polymers] = self.num_nucleic_acid_polymers
+        metadata[mc.num_other_polymers] = self.num_other_polymers
+
+        # interacting components
         metadata[mc.num_metal_interactions] = len(self.metals_interacting)
-        metadata[mc.num_macromolecule_interactions] = len(
-            self.macromolecule_chains_interacting
+        metadata[mc.num_macromolecule_interactions] = (
+            self.num_macromolecule_interactions
         )
+        metadata[mc.num_small_molecule_interactions] = (
+            self.num_small_molecule_interactions
+        )
+        metadata[mc.num_nucleic_acid_interactions] = self.num_nucleic_acid_interactions
 
         # check for chain-chain interactions mediated by non-residues
         metadata[mc.num_mediated_interactions] = len(self.mediated_chain_interactions)
