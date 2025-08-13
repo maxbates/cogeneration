@@ -17,7 +17,7 @@ from cogeneration.data.io import write_numpy_json
 from cogeneration.data.metrics import calc_ca_ca_metrics, calc_mdtraj_metrics
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restype_order_with_x, restypes_with_x
-from cogeneration.data.superimposition import superimpose
+from cogeneration.data.superimposition import calc_tm_score, superimpose
 from cogeneration.data.tools.abc import (
     FoldingDataFrame,
     FoldingTool,
@@ -725,6 +725,14 @@ class FoldingValidator:
                         motif_mask, sample_bb_pos, folded_bb_pos
                     )
                 )
+
+            # Calculate TM-score
+            sample_metrics[MetricName.tm_score_folded] = calc_tm_score(
+                pos_1=sample_bb_pos,
+                pos_2=folded_bb_pos,
+                seq_1=df_seq,
+                seq_2=folded_pdb_seq,
+            )
 
             # If provided ground truth bb positions, also compare to them
             if true_bb_positions is not None:

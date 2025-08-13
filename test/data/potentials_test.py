@@ -4,13 +4,14 @@ from typing import Tuple
 import pytest
 import torch
 
-from cogeneration.config.base import InterpolantSteeringConfig
+from cogeneration.config.base import InterpolantSteeringConfig, ProteinMPNNRunnerConfig
 from cogeneration.data.potentials import (
     ChainBreakPotential,
     ContactConditioningPotential,
     FKSteeringCalculator,
     FKSteeringResampler,
     HotSpotPotential,
+    InverseFoldPotential,
 )
 from cogeneration.data.trajectory import SamplingStep
 from cogeneration.dataset.test_utils import MockDataloader
@@ -346,6 +347,143 @@ class TestContactConditioningPotential:
         assert (
             E_weighted.item() > E_unweighted.item()
         ), f"Expected higher energy with inter-chain weighting: {E_weighted.item()} vs {E_unweighted.item()}"
+
+
+class DummyMPNNResult:
+    def __init__(self, logits: torch.Tensor):
+        self.averaged_logits = logits
+
+
+class DummyProteinMPNNRunner:
+    """
+    Dummy runner that returns provided target logits.
+    Expects logits shaped (B, N, 21).
+    """
+
+    def __init__(self, logits: torch.Tensor):
+        self._logits = logits
+
+    def run_batch(
+        self,
+        trans,
+        rotmats,
+        aatypes,
+        res_mask,
+        diffuse_mask,
+        chain_idx,
+        torsions=None,
+        num_passes: int = 1,
+        sequences_per_pass: int = 1,
+        **kwargs,
+    ):
+        return DummyMPNNResult(self._logits)
+
+
+class TestInverseFoldPotential:
+    def _make_simple_batch_and_step(self, B: int = 1, N: int = 8):
+        # Reuse helper but override aatypes for determinism
+        batch, step = _make_batch_and_step(
+            B=B, N=max(20, N), multimer=False, with_break=False
+        )
+        # Trim to N if needed (helper enforces N>=20); keep masks aligned
+        for k in [bp.res_mask, bp.diffuse_mask, bp.chain_idx, bp.res_idx]:
+            batch[k] = batch[k][:, :N]
+        step = SamplingStep(
+            res_mask=batch[bp.res_mask],
+            trans=step.trans[:, :N, :],
+            rotmats=step.rotmats[:, :N, :, :],
+            aatypes=torch.randint(0, 20, (B, N)),
+            torsions=None,
+            logits=None,
+        )
+        return batch, step
+
+    def test_low_energy_when_logits_match_targets(self):
+        B, N = 2, 10
+        batch, step = self._make_simple_batch_and_step(B=B, N=N)
+
+        # Make all residues valid/designed
+        batch[bp.res_mask] = torch.ones(B, N, dtype=torch.int)
+        batch[bp.diffuse_mask] = torch.ones(B, N, dtype=torch.int)
+
+        # Build logits favoring the correct class moderately
+        logits = torch.zeros(B, N, 21, device=step.aatypes.device)
+        for b in range(B):
+            for i in range(N):
+                tgt = int(step.aatypes[b, i].item())
+                logits[b, i, tgt] = 4.0
+
+        potential = InverseFoldPotential(
+            scale=1.0,
+            protein_mpnn_cfg=ProteinMPNNRunnerConfig(),
+        )
+        potential.protein_mpnn_runner = DummyProteinMPNNRunner(logits)
+
+        E = potential.compute_energy(
+            batch=batch, model_pred=step, protein_pred=step, protein_state=step
+        )
+
+        assert E.shape == (B,)
+        # Energy should be low but not ~0 with moderate confidence logits
+        assert torch.all(E > 0.01)
+        assert torch.all(E < 0.2)
+
+    def test_masks_are_respected(self):
+        B, N = 1, 12
+        batch, step = self._make_simple_batch_and_step(B=B, N=N)
+
+        batch[bp.res_mask] = torch.ones(B, N, dtype=torch.int)
+        batch[bp.diffuse_mask] = torch.ones(B, N, dtype=torch.int)
+        batch[bp.diffuse_mask][:, ::2] = 0
+
+        # Build logits: correct on designed positions, wrong elsewhere
+        logits = torch.zeros(B, N, 21, device=step.aatypes.device)
+        for i in range(N):
+            tgt = int(step.aatypes[0, i].item())
+            if batch[bp.diffuse_mask][0, i] > 0:
+                logits[0, i, tgt] = 20.0
+            else:
+                logits[0, i, (tgt + 1) % 20] = 20.0
+
+        potential = InverseFoldPotential(
+            scale=1.0,
+            protein_mpnn_cfg=ProteinMPNNRunnerConfig(),
+        )
+        potential.protein_mpnn_runner = DummyProteinMPNNRunner(logits)
+
+        E = potential.compute_energy(
+            batch=batch, model_pred=step, protein_pred=step, protein_state=step
+        )
+
+        assert E.shape == (B,)
+        assert E.item() < 1e-3
+
+    def test_high_energy_when_logits_wrong(self):
+        B, N = 1, 10
+        batch, step = self._make_simple_batch_and_step(B=B, N=N)
+
+        batch[bp.res_mask] = torch.ones(B, N, dtype=torch.int)
+        batch[bp.diffuse_mask] = torch.ones(B, N, dtype=torch.int)
+
+        # Build logits with high confidence on wrong class
+        logits = torch.zeros(B, N, 21, device=step.aatypes.device)
+        for i in range(N):
+            tgt = int(step.aatypes[0, i].item())
+            logits[0, i, (tgt + 1) % 20] = 10.0
+
+        potential = InverseFoldPotential(
+            scale=1.0,
+            protein_mpnn_cfg=ProteinMPNNRunnerConfig(),
+        )
+        potential.protein_mpnn_runner = DummyProteinMPNNRunner(logits)
+
+        E = potential.compute_energy(
+            batch=batch, model_pred=step, protein_pred=step, protein_state=step
+        )
+
+        assert E.shape == (B,)
+        # Wrong-high logits should yield very large normalized energy
+        assert E.item() > 1.0
 
 
 class TestFKSteeringCalculator:

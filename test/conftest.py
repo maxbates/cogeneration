@@ -447,7 +447,8 @@ def pdb_2qlw_path():
     - has small molcules after chains that should be trimmed
     - has small molecules between chains (MG and FMT)
     - has non-residue atom types (MG atoms)
-    - has some unknown residues (like seleniummethionine)
+    - it has some non-standard residues, like MSE at position 2 (0-indexed)
+    - some residues have multiple conformations (e.g. MSE pos 2)
     - has preceding sequence without atoms
     - glycine starts at position -1 in each chain
     """

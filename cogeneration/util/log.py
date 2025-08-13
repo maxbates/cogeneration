@@ -58,3 +58,8 @@ warnings.filterwarnings(
     message="The 'predict_dataloader' does not have many workers which may be a bottleneck.*?",
     category=UserWarning,
 )
+warnings.filterwarnings(
+    "ignore",
+    message="builtin type SwigPyPacked has no __module__ attribute",
+    category=DeprecationWarning,
+)

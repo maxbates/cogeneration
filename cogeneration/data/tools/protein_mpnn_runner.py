@@ -827,32 +827,15 @@ class ProteinMPNNRunner(InverseFoldingTool):
             seed=seed,
         )
 
-        # Manually enforce fixed positions if diffuse_mask was provided
+        # Enforce fixed positions using original aatypes (Cogen format) from protein_dict
         if diffuse_mask is not None:
-            # Get original sequence from protein_dict for enforcement
-            original_aatypes_mpnn = protein_dict["S"]  # (N,) ProteinMPNN format
-
-            # Convert to project format and add batch dimension
-            original_aatypes_cogen = []
-            data_utils = self._load_ligandmpnn_module("data_utils")
-            for mpnn_aa_idx in original_aatypes_mpnn:
-                # Convert from ProteinMPNN index to amino acid letter
-                mpnn_aa_letter = data_utils.restype_int_to_str.get(
-                    int(mpnn_aa_idx), "A"
-                )
-                # Convert from amino acid letter to project index
-                project_idx = residue_constants.restype_order.get(mpnn_aa_letter, 0)
-                original_aatypes_cogen.append(project_idx)
-
-            original_aatypes_tensor = torch.tensor(original_aatypes_cogen).unsqueeze(
-                0
-            )  # (1, N)
-            diffuse_mask_batch = diffuse_mask.unsqueeze(0)  # (1, N)
-
-            inference_result = self._enforce_fixed_positions(
+            original_aatypes_cogen = self._convert_mpnn_sequences_to_cogen(
+                protein_dict["S"].unsqueeze(0)
+            )[0]
+            inference_result = self._enforce_fixed_positions_with_original(
                 batch_result=inference_result,
-                original_aatypes=original_aatypes_tensor,
-                diffuse_mask=diffuse_mask_batch,
+                original_aatypes_cogen=original_aatypes_cogen,
+                diffuse_mask=diffuse_mask,
             )
 
         # Save results to FASTA using shared method
@@ -1092,7 +1075,21 @@ class ProteinMPNNRunner(InverseFoldingTool):
 
         return protein_dicts
 
-    # TODO run_batch should take `num_logits` or `is_masking` to determine whether 20 or 21 logits are used
+    def _enforce_fixed_positions_with_original(
+        self,
+        batch_result: NativeMPNNResult,
+        original_aatypes_cogen: CogenAATypes,  # (B, N) or (N,)
+        diffuse_mask: torch.Tensor,  # (B, N) or (N,)
+    ) -> NativeMPNNResult:
+        if original_aatypes_cogen.ndim == 1:
+            original_aatypes_cogen = original_aatypes_cogen.unsqueeze(0)
+        if diffuse_mask.ndim == 1:
+            diffuse_mask = diffuse_mask.unsqueeze(0)
+        return self._enforce_fixed_positions(
+            batch_result=batch_result,
+            original_aatypes=original_aatypes_cogen,
+            diffuse_mask=diffuse_mask,
+        )
 
     def run_batch(
         self,
@@ -1112,6 +1109,9 @@ class ProteinMPNNRunner(InverseFoldingTool):
         Run ProteinMPNN inference on a batch of protein structures.
         Return NativeMPNNResult
         """
+        # TODO run_batch should take `num_logits` or `is_masking` to determine whether 20 or 21 logits are used
+        # assumes 21. proteinmpnn supports X so we would have to convert it to A or something.
+
         # Check that native runner is enabled
         if not self.cfg.use_native_runner:
             raise ValueError("run_batch only supports native runner mode")
@@ -1154,7 +1154,15 @@ class ProteinMPNNRunner(InverseFoldingTool):
             seed=seed,
         )
 
-        # batch_result is already in Cogen format from the inference functions
+        # Enforce fixed positions using provided original aatypes (Cogen) when available
+        if diffuse_mask is not None:
+            batch_result = self._enforce_fixed_positions_with_original(
+                batch_result=batch_result,
+                original_aatypes_cogen=aatypes,
+                diffuse_mask=diffuse_mask,
+            )
+
+        # Note: Packing requires PDB context; skip here.
         return batch_result
 
     def _create_protein_dict_from_frames(
@@ -1825,7 +1833,7 @@ class ProteinMPNNRunner(InverseFoldingTool):
                 # Convert from Cogen format amino acid types to amino acid letters
                 seq = "".join(
                     [
-                        residue_constants.restypes[AA]
+                        residue_constants.restypes_with_x[int(AA)]
                         for AA in cogen_aatypes_stack[ix].cpu().numpy()
                     ]
                 )

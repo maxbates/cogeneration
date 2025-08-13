@@ -1641,12 +1641,10 @@ class TestProteinMPNNRunner:
 
         original_aatypes = []
         for mpnn_aa_idx in protein_dict["S"]:
-            # Convert from ProteinMPNN index to amino acid letter
-            mpnn_aa_letter = data_utils.restype_int_to_str.get(int(mpnn_aa_idx), "A")
-            # Convert from amino acid letter to project index
-            project_idx = residue_constants.restype_order.get(
-                mpnn_aa_letter, 0
-            )  # Default to Alanine if not found
+            # Convert from ProteinMPNN index to amino acid letter (must exist)
+            mpnn_aa_letter = data_utils.restype_int_to_str[int(mpnn_aa_idx)]
+            # Convert from amino acid letter (including X) to project index
+            project_idx = residue_constants.restype_order_with_x[mpnn_aa_letter]
             original_aatypes.append(project_idx)
         original_aatypes = torch.tensor(original_aatypes)
 
@@ -1680,7 +1678,7 @@ class TestProteinMPNNRunner:
 
         # Convert original amino acid types to letters for comparison
         original_aa_letters = [
-            residue_constants.restypes[aa] for aa in original_aatypes
+            residue_constants.restypes_with_x[aa] for aa in original_aatypes
         ]
         original_sequence = "".join(original_aa_letters)
 

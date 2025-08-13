@@ -6,7 +6,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from cogeneration.config.base import InterpolantSteeringConfig
+from cogeneration.config.base import InterpolantSteeringConfig, ProteinMPNNRunnerConfig
+from cogeneration.data.tools.protein_mpnn_runner import ProteinMPNNRunner
 from cogeneration.data.trajectory import SamplingStep
 from cogeneration.dataset.interaction import DIST_INTERACTION_BACKBONE
 from cogeneration.type.batch import BatchProp as bp
@@ -402,9 +403,98 @@ class ContactConditioningPotential(Potential):
 
 
 @dataclass
+class InverseFoldPotential(Potential):
+    """
+    Potential that inverse folds predicted structure using ProteinMPNN,
+    and compares predicted sequence to ProteinMPNN logits.
+
+    For now, we always generate a single sequence per sample.
+    """
+
+    protein_mpnn_cfg: ProteinMPNNRunnerConfig = field(
+        default_factory=ProteinMPNNRunnerConfig
+    )
+
+    def __post_init__(self):
+        # initialize logger for optional warnings
+        self.log = logging.getLogger(__name__)
+        self.logged_warning = False
+
+        # Runner won't load model until run inference.
+        self.protein_mpnn_runner = ProteinMPNNRunner(cfg=self.protein_mpnn_cfg)
+
+    def compute_energy(
+        self,
+        batch: NoisyFeatures,
+        model_pred: SamplingStep,
+        protein_pred: SamplingStep,
+        protein_state: SamplingStep,
+    ) -> torch.Tensor:
+        if not self.logged_warning:
+            self.log.warning(
+                f"🐌 InverseFoldPotential is enabled, generating 1 sequence per particle + timestep, and will increase sampling time."
+            )
+            if not self.protein_mpnn_cfg.use_native_runner:
+                self.log.warning(
+                    "🐌 InverseFoldPotential is enabled, but using subprocess runner. This will increase sampling time."
+                )
+            self.logged_warning = True
+
+        trans = protein_pred.trans  # (B, N, 3)
+        rotmats = protein_pred.rotmats  # (B, N, 3, 3)
+        aatypes = protein_pred.aatypes  # (B, N)
+        torsions = protein_pred.torsions  # Optional (B, N, 7, 2)
+        res_mask = batch[bp.res_mask]  # (B, N)
+        diffuse_mask = batch[bp.diffuse_mask]  # (B, N)
+        chain_idx = batch[bp.chain_idx]  # (B, N)
+
+        # Run ProteinMPNN to get sequence logits for the predicted structure
+        mpnn_result = self.protein_mpnn_runner.run_batch(
+            trans=trans,
+            rotmats=rotmats,
+            aatypes=aatypes,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
+            chain_idx=chain_idx,
+            torsions=torsions,
+            num_passes=1,
+            sequences_per_pass=1,
+        )
+
+        # Averaged logits over generated sequences (in case > 1)
+        logits = mpnn_result.averaged_logits  # (B, N, S)
+        logits = logits.to(aatypes.device)
+
+        # Targets are the predicted amino acids (ensure device matches logits)
+        targets = aatypes.long()  # (B, N)
+
+        # Compute per-position negative log likelihood
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # (B, N, S)
+        nll = -log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(
+            -1
+        )  # (B, N)
+
+        # Only score valid, designed residues (move mask to logits device)
+        valid_mask = (res_mask > 0) & (diffuse_mask > 0)  # (B, N)
+        nll = nll * valid_mask.float()
+
+        # Normalize per batch item
+        denom = valid_mask.float().sum(dim=-1).clamp_min(1.0)  # (B,)
+        avg_nll = nll.sum(dim=-1) / denom  # (B,)
+
+        # Scale closer to [0, 1] by dividing by log(medium-high-perplexity)
+        perplexity_cap = 10.0  # less than vocab_size = logits.shape[-1]
+        max_ce = float(torch.log(torch.tensor(perplexity_cap, device=logits.device)))
+        energy = avg_nll / max_ce
+
+        return energy
+
+
+@dataclass
 class FKSteeringCalculator:
     """
-    Helper to implement Feynman-Kac steering potentials for inference.
+    Helper to implement simplified Feynman-Kac steering for inference.
+    We only compute energies for particle resampling, not gradients to guide trajectories.
 
     Feynman-Kac steering is a general framework for diffusion models for tilting sampling at inference,
     and which lends itself nicely to flow matching with stochastic paths.
@@ -445,6 +535,10 @@ class FKSteeringCalculator:
                 inter_chain_weight=cfg.contact_conditioning_inter_chain_weight,
                 max_distance_penalty=cfg.contact_conditioning_max_distance_penalty,
             ),
+            InverseFoldPotential(
+                scale=cfg.inverse_fold_scale,
+                protein_mpnn_cfg=cfg.protein_mpnn,
+            ),
         ]
 
     def compute_energy(
@@ -468,6 +562,7 @@ class FKSteeringCalculator:
                 protein_pred=protein_pred,
                 protein_state=protein_state,
             )
+            energy = energy.to(device)
             energy = energy.clamp(min=0.0, max=1.0)
             total = total + potential.scale * energy
 

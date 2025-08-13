@@ -147,6 +147,9 @@ class SharedConfig(BaseClassConfig):
     kernels: bool = field(default_factory=lambda: torch.cuda.is_available())
 
 
+##### Model #####
+
+
 @dataclass
 class ModelHyperParamsConfig(BaseClassConfig):
     """
@@ -566,6 +569,148 @@ class ModelConfig(BaseClassConfig):
     aa_pred: ModelAAPredConfig = field(default_factory=ModelAAPredConfig)
 
 
+##### Folding #####
+
+
+class LigandMPNNModelType(StrEnum):
+    """Supported LigandMPNN model types."""
+
+    PROTEIN_MPNN = "protein_mpnn"
+    LIGAND_MPNN = "ligand_mpnn"
+    SOLUBLE_MPNN = "soluble_mpnn"
+    MEMBRANE_MPNN = "membrane_mpnn"
+    GLOBAL_MEMBRANE_MPNN = "global_membrane_mpnn"
+
+
+@dataclass
+class ProteinMPNNRunnerConfig(BaseClassConfig):
+    """Configuration for ProteinMPNN runner."""
+
+    # Path to ProteinMPNN installation (sibling to project root), used for subprocess mode
+    protein_mpnn_path: Path = PATH_PROJECT_ROOT.parent / "ProteinMPNN"
+    # Path to LigandMPNN installation (sibling to project root), used for native mode
+    ligand_mpnn_path: Path = PATH_PROJECT_ROOT.parent / "LigandMPNN"
+    # Path to directory containing ProteinMPNN model weights, "" for same directory
+    pmpnn_weights_dir: Path = ""
+    # Seed for ProteinMPNN
+    # each `num_passes` will get a unique seed but otherwise set every inference call.
+    pmpnn_seed: Optional[int] = None
+    # Number of inverse folds to run per sample during inference.
+    # Note that only 1 inverse fold is generated during validation.
+    # Note that each is folded by default, which increases prediction time.
+    seq_per_sample: int = 4
+
+    # Native runner options
+    use_native_runner: bool = True  # Use native runner instead of subprocess
+    accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'cuda'}"
+    model_type: LigandMPNNModelType = LigandMPNNModelType.PROTEIN_MPNN
+    temperature: float = 0.15  # Sampling temperature
+
+    # Advanced features from LigandMPNN
+    ligand_mpnn_use_atom_context: bool = True  # For ligand_mpnn
+    ligand_mpnn_cutoff_for_score: float = 8.0  # Cutoff distance for scoring
+    ligand_mpnn_use_side_chain_context: bool = False  # Use side chain context
+
+    # Side chain packing
+    # does not work on MPS (requires VonMises sampling, which hard-codes torch.double cast)
+    pack_side_chains: bool = False  # Enable side chain packing
+    checkpoint_path_sc: Optional[Path] = None  # Side chain packer checkpoint
+    number_of_packs_per_design: int = 1  # Number of packing samples
+    sc_num_denoising_steps: int = 3  # Denoising steps for packing
+    sc_num_samples: int = 16  # Samples for mixture distribution
+    repack_everything: bool = False  # Repack all residues or just redesigned ones
+
+
+@dataclass
+class AlphaFold2Config(BaseClassConfig):
+    """Configuration for AlphaFold2 runner using ColabFold."""
+
+    # Path to ColabFold executable for local folding
+    # https://github.com/YoshitakaMo/localcolabfold
+    # installation: https://bcrf.biochem.wisc.edu/2023/04/27/alphafold2-on-macintosh-m1/
+    colabfold_path: Path = (
+        PATH_PROJECT_ROOT.parent / "localcolabfold/colabfold-conda/bin/colabfold_batch"
+    )
+    # recommended: "auto" picks "alphafold2_ptm" monomers, "alphafold2_multimer_v3" multimer
+    af2_model_type: str = "auto"
+
+    seed: int = "${shared.seed}"
+
+
+@dataclass
+class BoltzConfig(BaseClassConfig):
+    """Configuration for Boltz-2 runner."""
+
+    # Prefer running in memory vs using subprocess and CLI API
+    run_native: bool = True
+
+    # Directory containing checkpoint, `mols`, etc. Should match boltz default.
+    cache_dir: Path = Path("~/.boltz").expanduser()
+    # Path to Boltz-2 checkpoint. Downloaded file name chosen by Boltz.
+    checkpoint_path: Path = Path("~/.boltz/boltz2_conf.ckpt").expanduser()
+
+    # Inputs and outputs
+    # TODO(boltz) - update directories, standardize checkpoint path, etc (alphafold too)
+    #   better support re-runs, by making sure we have a unique path each time?
+    #   make `targets_dir` and `processed_dir` and `mols` explicit in config
+    # Base directory for all outputs
+    outputs_path: Path = Path("./boltz")
+
+    # Inference parameters
+    # Whether to use potentials for steering during inference (slower but better results)
+    use_potentials: bool = False
+    # Step scale for diffusion sampling (temperature).
+    step_scale: float = 1.5
+    # Number of recycling steps during inference.
+    recycling_steps: int = 3
+    # Number of diffusion sampling steps.
+    sampling_steps: int = 200
+    # Number of diffusion samples to generate.
+    diffusion_samples: int = 1
+
+    # Hardware and output settings
+    # Number of workers for boltz dataloader. Recommend 0 to avoid memory bloat
+    # (keep on main process, slightly slower, but always 1 at a time anyways).
+    num_workers: int = 0
+    accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'cuda'}"
+    use_kernels: bool = "${shared.kernels}"
+    # Output format for structures ("pdb", "mmcif").
+    output_format: str = "pdb"
+    # Boltz-2 Trainer precision, Boltz-2 defaults to bf16-mixed
+    precision: Optional[str] = "${shared.precision}"
+    # Periodically teardown + reload native Boltz model. None to disable.
+    # On MPS, teardown helps reclaim compiled-graph/cache memory.
+    reload_every_n: Optional[int] = 25 if torch.mps.is_available() else None
+
+
+class FoldingModel(StrEnum):
+    """Supported folding models."""
+
+    alphafold2 = "alphafold2"
+    boltz2 = "boltz2"
+    esmf = "esmf"  # ESMFold not actually supported, required by public Multiflow config
+
+
+@dataclass
+class FoldingConfig(BaseClassConfig):
+    folding_model: FoldingModel = FoldingModel.boltz2
+
+    # dedicated device for folding. decrements training devices by 1 if True.
+    own_device: bool = (
+        True if torch.cuda.is_available() and torch.cuda.device_count() > 1 else False
+    )
+
+    # Tools
+    alphafold: AlphaFold2Config = field(default_factory=AlphaFold2Config)
+    boltz: BoltzConfig = field(default_factory=BoltzConfig)
+    protein_mpnn: ProteinMPNNRunnerConfig = field(
+        default_factory=ProteinMPNNRunnerConfig
+    )
+
+
+##### Interpolant #####
+
+
 class InterpolantRotationsScheduleEnum(StrEnum):
     linear = "linear"
     # Note that structures seem to generate better when rotations settle first.
@@ -731,7 +876,7 @@ class InterpolantSamplingConfig(BaseClassConfig):
 
 
 @dataclass
-class InterpolantSteeringConfig:
+class InterpolantSteeringConfig(BaseClassConfig):
     """Feynman-Kac Steering configuration."""
 
     # number of particles per sample; 1 to disable
@@ -748,6 +893,9 @@ class InterpolantSteeringConfig:
     energy_weight_difference: float = 1.0
 
     # potentials
+    # set any scale to 0.0 to disable
+
+    # chain break potential
     chain_break_scale: float = 1.0
     chain_break_allowed_backbone_dist: float = 4.0  # ideal is ~3.8Å
     chain_break_maximum_backbone_dist: float = 12.0  # clamp
@@ -764,6 +912,12 @@ class InterpolantSteeringConfig:
     )
     contact_conditioning_max_distance_penalty: float = (
         10.0  # maximum penalty for distance violations
+    )
+
+    # inverse folding potential
+    inverse_fold_scale: float = 1.0
+    protein_mpnn: ProteinMPNNRunnerConfig = field(
+        default_factory=ProteinMPNNRunnerConfig
     )
 
 
@@ -816,12 +970,17 @@ class InterpolantConfig(BaseClassConfig):
         default_factory=InterpolantTorsionsConfig
     )
     aatypes: InterpolantAATypesConfig = field(default_factory=InterpolantAATypesConfig)
+
+    # sampling
     sampling: InterpolantSamplingConfig = field(
         default_factory=InterpolantSamplingConfig
     )
     steering: InterpolantSteeringConfig = field(
         default_factory=InterpolantSteeringConfig
     )
+
+
+##### Data and Dataset #####
 
 
 @dataclass
@@ -1104,6 +1263,9 @@ class DatasetConfig(BaseClassConfig):
     debug_head_samples: Optional[int] = None
 
 
+##### Training + Experiment #####
+
+
 @dataclass
 class ExperimentTrainingConfig(BaseClassConfig):
     # mask losses to using pLDDT mask
@@ -1260,6 +1422,9 @@ class ExperimentConfig(BaseClassConfig):
     )
 
 
+##### Inference #####
+
+
 @dataclass
 class InferenceSamplesConfig(BaseClassConfig):
     """
@@ -1332,140 +1497,7 @@ class InferenceConfig(BaseClassConfig):
     animation_max_frames: int = 50
 
 
-class LigandMPNNModelType(StrEnum):
-    """Supported LigandMPNN model types."""
-
-    PROTEIN_MPNN = "protein_mpnn"
-    LIGAND_MPNN = "ligand_mpnn"
-    SOLUBLE_MPNN = "soluble_mpnn"
-    MEMBRANE_MPNN = "membrane_mpnn"
-    GLOBAL_MEMBRANE_MPNN = "global_membrane_mpnn"
-
-
-@dataclass
-class ProteinMPNNRunnerConfig(BaseClassConfig):
-    """Configuration for ProteinMPNN runner."""
-
-    # Path to ProteinMPNN installation (sibling to project root), used for subprocess mode
-    protein_mpnn_path: Path = PATH_PROJECT_ROOT.parent / "ProteinMPNN"
-    # Path to LigandMPNN installation (sibling to project root), used for native mode
-    ligand_mpnn_path: Path = PATH_PROJECT_ROOT.parent / "LigandMPNN"
-    # Path to directory containing ProteinMPNN model weights, "" for same directory
-    pmpnn_weights_dir: Path = ""
-    # Seed for ProteinMPNN
-    # each `num_passes` will get a unique seed but otherwise set every inference call.
-    pmpnn_seed: Optional[int] = None
-    # Number of inverse folds to run per sample during inference.
-    # Note that only 1 inverse fold is generated during validation.
-    # Note that each is folded by default, which increases prediction time.
-    seq_per_sample: int = 4
-
-    # Native runner options
-    use_native_runner: bool = True  # Use native runner instead of subprocess
-    accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'cuda'}"
-    model_type: LigandMPNNModelType = LigandMPNNModelType.PROTEIN_MPNN
-    temperature: float = 0.1  # Sampling temperature
-
-    # Advanced features from LigandMPNN
-    ligand_mpnn_use_atom_context: bool = True  # For ligand_mpnn
-    ligand_mpnn_cutoff_for_score: float = 8.0  # Cutoff distance for scoring
-    ligand_mpnn_use_side_chain_context: bool = False  # Use side chain context
-
-    # Side chain packing
-    # does not work on MPS (requires VonMises sampling, which hard-codes torch.double cast)
-    pack_side_chains: bool = False  # Enable side chain packing
-    checkpoint_path_sc: Optional[Path] = None  # Side chain packer checkpoint
-    number_of_packs_per_design: int = 1  # Number of packing samples
-    sc_num_denoising_steps: int = 3  # Denoising steps for packing
-    sc_num_samples: int = 16  # Samples for mixture distribution
-    repack_everything: bool = False  # Repack all residues or just redesigned ones
-
-
-@dataclass
-class AlphaFold2Config(BaseClassConfig):
-    """Configuration for AlphaFold2 runner using ColabFold."""
-
-    # Path to ColabFold executable for local folding
-    # https://github.com/YoshitakaMo/localcolabfold
-    # installation: https://bcrf.biochem.wisc.edu/2023/04/27/alphafold2-on-macintosh-m1/
-    colabfold_path: Path = (
-        PATH_PROJECT_ROOT.parent / "localcolabfold/colabfold-conda/bin/colabfold_batch"
-    )
-    # recommended: "auto" picks "alphafold2_ptm" monomers, "alphafold2_multimer_v3" multimer
-    af2_model_type: str = "auto"
-
-    seed: int = "${shared.seed}"
-
-
-@dataclass
-class BoltzConfig(BaseClassConfig):
-    """Configuration for Boltz-2 runner."""
-
-    # Prefer running in memory vs using subprocess and CLI API
-    run_native: bool = True
-
-    # Directory containing checkpoint, `mols`, etc. Should match boltz default.
-    cache_dir: Path = Path("~/.boltz").expanduser()
-    # Path to Boltz-2 checkpoint. Downloaded file name chosen by Boltz.
-    checkpoint_path: Path = Path("~/.boltz/boltz2_conf.ckpt").expanduser()
-
-    # Inputs and outputs
-    # TODO(boltz) - update directories, standardize checkpoint path, etc (alphafold too)
-    #   better support re-runs, by making sure we have a unique path each time?
-    #   make `targets_dir` and `processed_dir` and `mols` explicit in config
-    # Base directory for all outputs
-    outputs_path: Path = Path("./boltz")
-
-    # Inference parameters
-    # Whether to use potentials for steering during inference.
-    use_potentials: bool = True
-    # Step scale for diffusion sampling (temperature).
-    step_scale: float = 1.5
-    # Number of recycling steps during inference.
-    recycling_steps: int = 3
-    # Number of diffusion sampling steps.
-    sampling_steps: int = 200
-    # Number of diffusion samples to generate.
-    diffusion_samples: int = 1
-
-    # Hardware and output settings
-    # Number of workers for boltz dataloader. Recommend 0 to avoid memory bloat
-    # (keep on main process, slightly slower, but always 1 at a time anyways).
-    num_workers: int = 0
-    accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'cuda'}"
-    use_kernels: bool = "${shared.kernels}"
-    # Output format for structures ("pdb", "mmcif").
-    output_format: str = "pdb"
-    # Boltz-2 Trainer precision, Boltz-2 defaults to bf16-mixed
-    precision: Optional[str] = "${shared.precision}"
-    # Periodically teardown + reload native Boltz model. None to disable.
-    # On MPS, teardown helps reclaim compiled-graph/cache memory.
-    reload_every_n: Optional[int] = 25 if torch.mps.is_available() else None
-
-
-class FoldingModel(StrEnum):
-    """Supported folding models."""
-
-    alphafold2 = "alphafold2"
-    boltz2 = "boltz2"
-    esmf = "esmf"  # ESMFold not actually supported, required by public Multiflow config
-
-
-@dataclass
-class FoldingConfig(BaseClassConfig):
-    folding_model: FoldingModel = FoldingModel.boltz2
-
-    # dedicated device for folding. decrements training devices by 1 if True.
-    own_device: bool = (
-        True if torch.cuda.is_available() and torch.cuda.device_count() > 1 else False
-    )
-
-    # Tools
-    alphafold: AlphaFold2Config = field(default_factory=AlphaFold2Config)
-    boltz: BoltzConfig = field(default_factory=BoltzConfig)
-    protein_mpnn: ProteinMPNNRunnerConfig = field(
-        default_factory=ProteinMPNNRunnerConfig
-    )
+##### Scripts #####
 
 
 @dataclass
@@ -1498,6 +1530,9 @@ class RedesignConfig(BaseClassConfig):
     # When using `best_redesigns_csv`, override dataset filtering to be lenient so
     # we do not accidentally filter out target structures before matching.
     use_lenient_filter_with_best_redesigns: bool = True
+
+
+##### Config #####
 
 
 @dataclass
