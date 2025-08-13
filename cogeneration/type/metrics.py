@@ -61,6 +61,8 @@ class MetricName(StrEnum):
     motif_bb_rmsd_folded_gt = (
         "motif_bb_rmsd_folded_gt"  # RMSD of fixed motifs after folding to ground truth
     )
+    # TM-score of generated sample -> folded structure
+    tm_score_folded = "tm_score"
 
     # sequence recovery
     # gt => ground truth true_aa provided

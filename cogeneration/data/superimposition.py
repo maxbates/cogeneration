@@ -19,6 +19,8 @@ import torch
 from Bio.SVDSuperimposer import SVDSuperimposer
 from tmtools import tm_align
 
+from cogeneration.data.const import CHAIN_BREAK_STR
+
 
 def _superimpose_np(reference, coords):
     """
@@ -115,5 +117,9 @@ def calc_tm_score(
     seq_2: str,
 ) -> Tuple[float, float]:
     """Calculates TM score between two sets of coordinates."""
+    # Remove chain breaks from sequences
+    seq_1 = seq_1.replace(CHAIN_BREAK_STR, "")
+    seq_2 = seq_2.replace(CHAIN_BREAK_STR, "")
+    # Calculate TM score
     tm_results = tm_align(pos_1, pos_2, seq_1, seq_2)
     return tm_results.tm_norm_chain1, tm_results.tm_norm_chain2
