@@ -67,7 +67,7 @@ class TestEvalRunner:
         cfg.inference.also_fold_pmpnn_seq = False
         # write trajectories to inspect
         cfg.inference.write_sample_trajectories = True
-        cfg.inference.write_animations: bool = True
+        cfg.inference.write_animations = True
 
         cfg = cfg.interpolate()
 

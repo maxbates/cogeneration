@@ -50,7 +50,10 @@ class SavedTrajectory:
 
 def _get_anim_writer() -> Tuple[str, matplotlib.animation.AbstractMovieWriter]:
     if animation.writers.is_available("ffmpeg"):
-        return "mp4", animation.FFMpegWriter(fps=10, bitrate=1800)
+        return "mp4", animation.FFMpegWriter(
+            fps=10,
+            codec="libx264",
+        )
     elif animation.writers.is_available("imagemagick"):
         return "gif", animation.ImageMagickWriter(fps=10)
     else:
@@ -489,6 +492,16 @@ def animate_trajectories(
     struct_h_in = fig_w_in * 0.45
     logits_h_in = seq_h_in * 20
     fig_h_in = logits_h_in + seq_h_in + struct_h_in
+
+    # Force even pixel dimensions to satisfy yuv420p requirements
+    fig_w_px = int(round(fig_w_in * dpi))
+    fig_h_px = int(round(fig_h_in * dpi))
+    if fig_w_px % 2 != 0:
+        fig_w_px += 1
+    if fig_h_px % 2 != 0:
+        fig_h_px += 1
+    fig_w_in = fig_w_px / dpi
+    fig_h_in = fig_h_px / dpi
     fig = plt.figure(figsize=(fig_w_in, fig_h_in), dpi=dpi, constrained_layout=False)
 
     # grid: 1 row (logits) + 1 row (seq) + 1 row (structures) / 2 cols (protein, model)
@@ -860,6 +873,14 @@ def save_trajectory(
                     "".join([restypes_with_x[aa] for aa in sample_aa_traj[i]]) + "\n"
                 )
 
+    # Plot FK steering energies, ESS, etc.
+    if fk_steering_traj is not None:
+        fk_steering_traj_path = os.path.join(
+            output_dir, OutputFileName.fk_steering_traj_png
+        )
+        write_fk_steering_traj(fk_steering_traj, file_path=fk_steering_traj_path)
+
+    # Trajectory panel animation
     if (
         write_animations
         and sample_aa_traj is not None
@@ -878,13 +899,6 @@ def save_trajectory(
             animation_max_frames=animation_max_frames,
         )
         log_time("trajectory animation")
-
-    # TODO(fksteering) consider writing FK steering trajectory to animation? steps need to match up.
-    if fk_steering_traj is not None:
-        fk_steering_traj_path = os.path.join(
-            output_dir, OutputFileName.fk_steering_traj_png
-        )
-        write_fk_steering_traj(fk_steering_traj, file_path=fk_steering_traj_path)
 
     return SavedTrajectory(
         sample_pdb_path=sample_pdb_path,
