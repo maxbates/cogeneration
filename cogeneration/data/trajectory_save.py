@@ -53,6 +53,12 @@ def _get_anim_writer() -> Tuple[str, matplotlib.animation.AbstractMovieWriter]:
         return "mp4", animation.FFMpegWriter(
             fps=10,
             codec="libx264",
+            extra_args=[
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+            ],
         )
     elif animation.writers.is_available("imagemagick"):
         return "gif", animation.ImageMagickWriter(fps=10)
@@ -423,17 +429,10 @@ def _update_structure_artists(
     """In‑place update of the scatter collections using public setters."""
     N, CA, CB = positions[:, 0, :], positions[:, 1, :], positions[:, 2, :]
 
-    # update N
-    scats[0].set_offsets(np.c_[N[:, 0], N[:, 1]])
-    scats[0].set_3d_properties(N[:, 2], zdir="z")
-
-    # update CA
-    scats[1].set_offsets(np.c_[CA[:, 0], CA[:, 1]])
-    scats[1].set_3d_properties(CA[:, 2], zdir="z")
-
-    # update CB
-    scats[2].set_offsets(np.c_[CB[:, 0], CB[:, 1]])
-    scats[2].set_3d_properties(CB[:, 2], zdir="z")
+    # Matplotlib 3D scatter updates require setting _offsets3d
+    scats[0]._offsets3d = (N[:, 0], N[:, 1], N[:, 2])
+    scats[1]._offsets3d = (CA[:, 0], CA[:, 1], CA[:, 2])
+    scats[2]._offsets3d = (CB[:, 0], CB[:, 1], CB[:, 2])
 
     return scats
 
@@ -595,7 +594,7 @@ def animate_trajectories(
         frames=_subsample_timesteps(num_timesteps, up_to=animation_max_frames),
         interval=100,
         repeat_delay=1000,  # linger on final frame
-        blit=True,
+        blit=False,
     )
 
     # Save animation

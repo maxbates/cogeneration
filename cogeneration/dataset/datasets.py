@@ -25,13 +25,17 @@ from cogeneration.dataset.spec import DatasetSpec
 from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import InferenceFeatures
-from cogeneration.type.dataset import DatasetColumn, DatasetCSVRow, DatasetDataFrame
+from cogeneration.type.dataset import (
+    DATASET_KEY,
+    DatasetColumn,
+    DatasetCSVRow,
+    DatasetDataFrame,
+)
 from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.dataset import MetadataDataFrame, ProcessedFile
+from cogeneration.type.dataset import RedesignColumn as rc
 from cogeneration.type.structure import StructureExperimentalMethod
 from cogeneration.type.task import DataTask, InferenceTask
-
-DATASET_KEY = "dataset_name"
 
 
 class BaseDataset(Dataset):
@@ -79,7 +83,7 @@ class BaseDataset(Dataset):
             metadata = BaseDataset._dedupe_by_sequence_hash(metadata, logger=self._log)
 
         # Apply date-based train/test split before other filters
-        metadata = self._apply_date_split(metadata)
+        metadata = self._apply_test_split(metadata)
 
         # Filter all structures
         dataset_filterer = DatasetFilterer(
@@ -333,33 +337,45 @@ class BaseDataset(Dataset):
 
         return deduped
 
-    def _apply_date_split(self, metadata: MetadataDataFrame) -> MetadataDataFrame:
+    def _apply_test_split(self, metadata: MetadataDataFrame) -> MetadataDataFrame:
         """
         Split rows by date using cfg.test_date_cutoff and self.use_test.
         - Train: rows with date < cutoff
         - Test: rows with date >= cutoff
         If date column is missing or nan, assigned to training.
+
+        All redesigns can be assigned to training by specifying `cfg.test_ignore_redesigns`.
         """
         if mc.date not in metadata.columns:
             # Assign all rows to training if date column is missing
             # For test split requests, return empty DataFrame
             if self.use_test:
-                self._log.info(
+                self._log.error(
                     "Date column missing; assigning all rows to training and none to test"
                 )
                 return metadata.iloc[0:0]
             return metadata
 
         cutoff = pd.to_datetime(self.cfg.test_date_cutoff, errors="coerce")
-        dates = pd.to_datetime(metadata[mc.date], errors="coerce")
+        dates = pd.to_datetime(metadata[mc.date].fillna("1970-01-01"), errors="coerce")
+
+        # Determine which rows are redesigns, if redesign metadata exists
+        handle_redesigns = (
+            self.cfg.test_ignore_redesigns and rc.example in metadata.columns
+        )
+        is_redesign = metadata[rc.example].notna() if handle_redesigns else None
 
         if self.use_test:
             mask = (dates >= cutoff) & (~dates.isna())
+            if is_redesign is not None:
+                mask = mask & (~is_redesign)
             self._log.info(
                 f"Test date cutoff {self.cfg.test_date_cutoff} split {len(metadata)} -> {mask.sum()} examples"
             )
         else:
-            mask = (dates < cutoff) & (~dates.isna())
+            mask = (dates < cutoff) | (dates.isna())
+            if is_redesign is not None:
+                mask = mask | is_redesign
             self._log.info(
                 f"Train date cutoff {self.cfg.test_date_cutoff} split {len(metadata)} -> {mask.sum()} examples"
             )

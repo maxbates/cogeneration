@@ -739,7 +739,7 @@ class InterpolantRotationsConfig(BaseClassConfig):
     stochastic: bool = "${shared.stochastic}"
     # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
     # Roughly, 0.5 => 11°, 1.0 => 23°, 2.0 => 34° over 500 timesteps
-    stochastic_noise_intensity: float = 0.5  # `g` in FoldFlow SO3SFM
+    stochastic_noise_intensity: float = 1.0  # `g` in FoldFlow SO3SFM
 
 
 class InterpolantTranslationsNoiseTypeEnum(StrEnum):
@@ -859,7 +859,7 @@ class InterpolantAATypesConfig(BaseClassConfig):
     stochastic: bool = "${shared.stochastic}"
     # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
     # Roughly, 0.5 => 0.2 jumps/residue, 1.0 = > 0.4, 1.5 => 0.6 over 500 timesteps
-    stochastic_noise_intensity: float = 0.25
+    stochastic_noise_intensity: float = 1.0
     # temperature smooths logits softmax()
     stochastic_temp: float = 1.5
 
@@ -946,12 +946,12 @@ class InterpolantConfig(BaseClassConfig):
     # `codesign_separate_t` allows separate `t` times for rots / trans / aatypes so fixed domains are at ~t=1.
     codesign_separate_t: bool = True
     # `forward_folding` proportion of codesign samples; requires `codesign_separate_t`
-    codesign_forward_fold_prop: float = 0.2  # default 0.1 in public MultiFlow
+    codesign_forward_fold_prop: float = 0.1  # default 0.1 in public MultiFlow
     # `inverse_folding` proportion of codesign samples; requires `codesign_separate_t`
-    codesign_inverse_fold_prop: float = 0.2  # default 0.1 in public MultiFlow
+    codesign_inverse_fold_prop: float = 0.25  # default 0.1 in public MultiFlow
     # `inpainting_unconditional_prop` in training removes motifs `inpainting` examples,
     # which makes them unconditional, or forward_folding/inverse_folding without motifs.
-    inpainting_unconditional_prop: float = 0.4
+    inpainting_unconditional_prop: float = 0.35
     # enable self-conditioning
     self_condition: bool = "${model.edge_features.self_condition}"
     # during training, portion of time to use self-conditioning (on or off during sampling)
@@ -959,7 +959,7 @@ class InterpolantConfig(BaseClassConfig):
     # kappa allows scaling rotation t exponentially during sampling
     provide_kappa: bool = True
     # non-stochastic proportion in training, i.e. reverting to flow matching. batch level.
-    stochastic_dropout_prop: float = 0.15
+    stochastic_dropout_prop: float = 0.2
 
     # sub-modules
     rots: InterpolantRotationsConfig = field(default_factory=InterpolantRotationsConfig)
@@ -1224,6 +1224,8 @@ class DatasetConfig(BaseClassConfig):
     # Date cutoff used to split train vs test from the unified datasets list.
     # Note AFDB structures (which may be dupes) are mostly dated 2022-06-01.
     test_date_cutoff: str = "2023-01-01"
+    # Redesigns are used for training and not testing
+    test_ignore_redesigns: bool = True
 
     # Data processing and sample generation, shared across datasets
     # Filtering
@@ -1522,7 +1524,7 @@ class RedesignConfig(BaseClassConfig):
     # Shuffle the metadata rows before redesigning
     shuffle: bool = False
     # Sort by length (shuffling takes precedence)
-    sort_by_length: bool = True
+    sort_by_length: bool = False
     # Optionally, provide a BestRedesigns CSV (with columns example, best_seq)
     # If provided, redesign will be folded and inverse folding will be skipped.
     # This allows creating a new dataset folding pre-specified sequences.

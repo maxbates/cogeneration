@@ -63,3 +63,8 @@ warnings.filterwarnings(
     message="builtin type SwigPyPacked has no __module__ attribute",
     category=DeprecationWarning,
 )
+warnings.filterwarnings(
+    "ignore",
+    message="The operator 'aten::linalg_svd' is not currently supported on the MPS backend.*",
+    category=UserWarning,
+)

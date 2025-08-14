@@ -1400,10 +1400,10 @@ class Interpolant:
 
         # clamp the scales, which can be very large (>100) near t=0 and lead to overshooting.
         # TODO make configurable, scale depending on noise strength, maybe proportional to uncond VF
-        scale_trans = torch.clamp(scale_trans, min=0.0, max=10.0).to(
+        scale_trans = torch.clamp(scale_trans, min=0.0, max=20.0).to(
             pred_trans_1.device
         )
-        scale_rotmats = torch.clamp(scale_rotmats, min=0.0, max=10.0).to(
+        scale_rotmats = torch.clamp(scale_rotmats, min=0.0, max=20.0).to(
             pred_rotmats_1.device
         )
 

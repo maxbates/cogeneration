@@ -1,3 +1,4 @@
+import logging
 import os.path
 
 import pytest
@@ -8,6 +9,8 @@ from cogeneration.dataset.datasets import EvalDatasetConstructor
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.predict import EvalRunner
 from cogeneration.type.task import InferenceTask
+
+logger = logging.getLogger(__name__)
 
 
 class TestEvalRunner:
@@ -45,10 +48,11 @@ class TestEvalRunner:
         cfg = Config.public_multiflow()
 
         # specify task
+        # Multiflow not trained to support inpainting but should support using motif guidance
         # cfg.inference.task = InferenceTask.unconditional
         cfg.inference.task = InferenceTask.inpainting
         # stochastic paths (NOTE public multiflow not trained to support, but can force)
-        cfg.shared.stochastic = False
+        cfg.shared.stochastic = True
         cfg.inference.interpolant.trans.stochastic_noise_intensity *= 0.25
         cfg.inference.interpolant.rots.stochastic_noise_intensity *= 0.25
         cfg.inference.interpolant.aatypes.stochastic_noise_intensity *= 0.25
@@ -62,7 +66,9 @@ class TestEvalRunner:
         cfg.inference.samples.samples_per_length = 1
         cfg.inference.samples.num_batch = 1
         cfg.inference.samples.multimer_fraction = 0.0
-        cfg.inference.samples.length_subset = [120]
+        cfg.inference.samples.length_subset = [156]
+        # Consider disabling ProteinMPNN guidance, which is slow
+        cfg.inference.interpolant.steering.inverse_fold_scale = 0.0
         # skip designability? requires folding each ProteinMPNN sequence
         cfg.inference.also_fold_pmpnn_seq = False
         # write trajectories to inspect
@@ -87,7 +93,6 @@ class TestEvalRunner:
 
         eval_constructor = EvalDatasetConstructor(
             cfg=cfg.inference.samples,
-            # Multiflow not trained to support inpainting but should support using motif guidance
             task=cfg.inference.task,
             dataset_cfg=cfg.dataset,
             use_test=False,
@@ -101,6 +106,6 @@ class TestEvalRunner:
         # sample
         top_sample_metrics = module.predict_step(batch, batch_idx=0)
 
-        print("results:")
-        print(cfg.inference.predict_dir)
-        print(top_sample_metrics.to_csv(index=False))
+        logger.info("results:")
+        logger.info(cfg.inference.predict_dir)
+        logger.info(top_sample_metrics.to_csv(index=False))

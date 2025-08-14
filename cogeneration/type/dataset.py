@@ -99,6 +99,10 @@ class MetadataColumn(StrEnum):
     num_nucleic_acid_interactions = "num_nucleic_acid_interactions"
 
 
+# DATASET_KEY tracks each loaded metadata CSV with a column for DatasetSpec.name
+DATASET_KEY = "dataset_name"
+
+
 class RedesignColumn(StrEnum):
     """Columns in redesign CSVs, containing all redesigned sequences"""
 

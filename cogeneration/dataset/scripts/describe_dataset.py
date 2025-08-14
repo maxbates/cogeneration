@@ -26,8 +26,9 @@ from matplotlib.ticker import FuncFormatter
 from omegaconf import OmegaConf
 
 from cogeneration.config.base import Config, DatasetTrimMethod
-from cogeneration.dataset.datasets import BaseDataset, DATASET_KEY
+from cogeneration.dataset.datasets import BaseDataset
 from cogeneration.dataset.filterer import DatasetFilterer
+from cogeneration.type.dataset import DATASET_KEY
 from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.dataset import RedesignColumn
 
@@ -421,6 +422,27 @@ class DatasetDescriber:
             ax2.set_ylabel("TM-score")
             ax2.set_ylim(0, 1)
             figs.append(fig2)
+
+        # RMSD vs TM-score
+        if RedesignColumn.tm_score in df.columns and RedesignColumn.rmsd in df.columns:
+            sub_pair = df.dropna(
+                subset=[RedesignColumn.rmsd, RedesignColumn.tm_score]
+            ).copy()
+            fig3, ax3 = plt.subplots(figsize=(9, 6))
+            sns.scatterplot(
+                data=sub_pair,
+                x=RedesignColumn.rmsd,
+                y=RedesignColumn.tm_score,
+                hue=DATASET_KEY,
+                s=15,
+                alpha=0.25,
+                ax=ax3,
+            )
+            ax3.set_title("Redesigns: RMSD vs TM-score")
+            ax3.set_xlabel("RMSD (Å)")
+            ax3.set_ylabel("TM-score")
+            ax3.set_ylim(0, 1)
+            figs.append(fig3)
 
         return figs
 
