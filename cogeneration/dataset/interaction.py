@@ -167,7 +167,7 @@ class MultimerInteractions:
         max_dist: float = DIST_INTERACTION_ATOM,
     ) -> List[Interaction]:
         """
-        KD‑tree neighbor search of atoms between two chains.
+        KD-tree neighbor search of atoms between two chains.
         """
         # (n, 37, 3)
         chain_i_atoms = complex_feats[dpc.atom_positions][

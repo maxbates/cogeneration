@@ -266,7 +266,7 @@ class PairformerModule(nn.Module):
 
 
 class PairformerNoSeqModule(nn.Module):
-    """Stack of edge‑only Pairformer layers."""
+    """Stack of edge-only Pairformer layers."""
 
     def __init__(self, cfg: ModelPairformerConfig, num_layers: Optional[int] = None):
         super().__init__()

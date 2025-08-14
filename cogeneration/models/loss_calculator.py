@@ -318,7 +318,7 @@ class BatchLossCalculator:
         )
 
         # handle predicting torsion subset
-        # ground‑truth psi torsion: (B, N, 7, 2) -> (B, N, K, 2)
+        # ground-truth psi torsion: (B, N, 7, 2) -> (B, N, K, 2)
         K = pred_torsions.shape[2]
         assert K in (1, 5, 7)
         gt_torsions = self.batch[bp.torsions_1]

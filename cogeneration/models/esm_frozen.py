@@ -179,7 +179,7 @@ ESM_REGISTRY.register_dummy()
 
 @dataclass
 class SequenceData:
-    """Container for an ESM‑formatted sequence and a mask for real residues."""
+    """Container for an ESM-formatted sequence and a mask for real residues."""
 
     aa_sequence: torch.Tensor  # (B, L) - ESM tokens with BOS/EOS/linkers/pad
     non_linker_mask: (
@@ -190,13 +190,13 @@ class SequenceData:
     @classmethod
     def from_af2(
         cls,
-        aatypes: torch.Tensor,  # (B, N) AF2 indices (0‑20, 0==A)
+        aatypes: torch.Tensor,  # (B, N) AF2 indices (0-20, 0==A)
         chain_idx: torch.Tensor,  # (B, N) chain identifiers
         esm_dict: Alphabet,  # alphabet/dictionary from ESM model
         res_mask: torch.Tensor,  # (B, N) 1 for valid residues
     ) -> "SequenceData":
         """
-        End‑to‑end conversion: AF2‑indices → ESM tokens with BOS/EOS/linkers.
+        End-to-end conversion: AF2-indices → ESM tokens with BOS/EOS/linkers.
         adapted from https://github.com/facebookresearch/esm/blob/main/esm/esmfold/v1/esmfold.py
         """
         B, N = aatypes.shape
@@ -210,7 +210,7 @@ class SequenceData:
 
         # Convert AF2 indices to ESM indices
         conv_table = cls._make_af2_to_esm_lookup(esm_dict).to(aatypes.device)
-        # shift by +1 so 0‑based AA becomes 1..20 (0 is padding)
+        # shift by +1 so 0-based AA becomes 1..20 (0 is padding)
         seq = conv_table[aatypes + 1]
 
         # set positions not in res_mask to X, i.e. assume they are residues.
@@ -264,9 +264,9 @@ class SequenceData:
     @lru_cache(maxsize=1)  # expect single esm_dict
     def _make_af2_to_esm_lookup(esm_dict: Alphabet) -> torch.Tensor:
         """
-        Creates a `(22,)` tensor mapping AF2 indices (‑1..20) → ESM tokens.
+        Creates a `(22,)` tensor mapping AF2 indices (-1..20) → ESM tokens.
 
-        AF2: 0‑19 canonical aa, 20 == "X" (unknown).
+        AF2: 0-19 canonical aa, 20 == "X" (unknown).
         store `padding_idx` at 0 so can vectorise lookup with `lut[seq+1]`.
         """
         order = [esm_dict.padding_idx] + [esm_dict.get_idx(v) for v in restypes_with_x]

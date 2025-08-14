@@ -52,7 +52,7 @@ def _log_filter(stage: str) -> Callable[[Callable], Callable]:
 
 @dataclass
 class DatasetFilterer:
-    """Filter PDB‑metadata DataFrames according to *dataset_cfg*."""
+    """Filter PDB-metadata DataFrames according to *dataset_cfg*."""
 
     cfg: DatasetFilterConfig
     modeled_trim_method: DatasetTrimMethod

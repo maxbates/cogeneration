@@ -70,7 +70,7 @@ class Redesign:
     sequence_id: str  # modified ProteinMPNN sequence name
     sequence: str  # redesigned sequence
     fasta_path: str  # redesign fasta
-    fasta_idx: int  # index within the fasta (0‑based)
+    fasta_idx: int  # index within the fasta (0-based)
     pred_pdb_path: str  # path to predicted structure
     rmsd: float  # RMSD to the original structure
     tm_score: float  # TM-score to the original structure (normalized by example)
