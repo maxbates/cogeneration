@@ -1,8 +1,13 @@
 import pytest
 import torch
 
-from cogeneration.config.base import Config, DatasetFilterConfig
+from cogeneration.config.base import (
+    Config,
+    DatasetFilterConfig,
+    InterpolantAATypesInterpolantTypeEnum,
+)
 from cogeneration.data import so3_utils
+from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.interpolant import BatchTrueFeatures, Interpolant
 from cogeneration.dataset.test_utils import create_pdb_batch, mock_feats
 from cogeneration.type.batch import BatchProp as bp
@@ -366,13 +371,14 @@ class TestInterpolantSample:
 
         interp_infer = Interpolant(cfg.inference.interpolant)
         interp_infer.set_device(torch.device("cpu"))
-        trans_vf, rot_vf = interp_infer.motif_potentials(
+        pf = interp_infer.motif_potentials(
             t=t_scalar,
             noisy_batch=noisy,
             pred=pred,
             true_feats=true_feats,
             motif_mask=motif_sel,
         )
+        trans_vf, rot_vf = pf.trans, pf.rotmats
 
         # --- translations: check <VF, (true - current)> > 0 on motif residues ---
         dir_trans = batch[bp.trans_1] - noisy[nbp.trans_t]  # (B, N, 3)
@@ -442,3 +448,110 @@ class TestInterpolantSample:
         assert (
             ang1 < ang0
         ), f"Motif rotational error should decrease after 1 step (before: {float(ang0):.4f}, after: {float(ang1):.4f})"
+
+    @pytest.mark.parametrize("method", ["uniform", "masking", "purity"])
+    def test_aatypes_euler_step_guidance_increases_target_fraction(
+        self, method, mock_cfg_uninterpolated: Config
+    ):
+        torch.manual_seed(0)
+
+        # Configure interpolant for deterministic aatype updates and desired method
+        mock_cfg_uninterpolated.shared.stochastic = False
+        cfg = mock_cfg_uninterpolated.interpolate()
+        cfg.interpolant.aatypes.stochastic = False
+        cfg.interpolant.aatypes.temp = 1.0
+        cfg.interpolant.aatypes.noise = (
+            0.5  # moderate to allow movement without overwhelming effect
+        )
+
+        if method == "uniform":
+            cfg.interpolant.aatypes.interpolant_type = (
+                InterpolantAATypesInterpolantTypeEnum.uniform
+            )
+            cfg.interpolant.aatypes.do_purity = False
+            num_states = 20
+        elif method == "masking":
+            cfg.interpolant.aatypes.interpolant_type = (
+                InterpolantAATypesInterpolantTypeEnum.masking
+            )
+            cfg.interpolant.aatypes.do_purity = False
+            num_states = 21
+        elif method == "purity":
+            cfg.interpolant.aatypes.interpolant_type = (
+                InterpolantAATypesInterpolantTypeEnum.masking
+            )
+            cfg.interpolant.aatypes.do_purity = True
+            num_states = 21
+        else:
+            raise AssertionError("Unknown method")
+
+        interp = Interpolant(cfg.interpolant)
+        interp.set_device(torch.device("cpu"))
+
+        B, N = 3, 64
+        steps = 5
+        d_t = 1.0 / (steps + 1)
+
+        # Fixed model logits (zeros); guidance potential will be added to these
+        logits_1 = torch.zeros(B, N, num_states)
+
+        # Choose target token (non-mask)
+        target_token = 7
+
+        # Initialize aatypes depending on method
+        if method == "uniform":
+            aatypes_t0 = torch.randint(low=0, high=20, size=(B, N))
+        else:
+            aatypes_t0 = torch.full((B, N), fill_value=MASK_TOKEN_INDEX)
+
+        def run_with_potential(potential_scale: float):
+            aatypes_t = aatypes_t0.clone()
+            potential = torch.zeros_like(logits_1)
+            potential[:, :, target_token] = potential_scale
+
+            for i in range(steps):
+                t = float(i + 1) / float(steps + 1)
+                t_tensor = torch.tensor(t)
+                d_t_tensor = torch.tensor(d_t)
+                aatypes_t = interp._aatypes_euler_step(
+                    d_t=d_t_tensor,
+                    t=t_tensor,
+                    logits_1=logits_1,
+                    aatypes_t=aatypes_t,
+                    stochasticity_scale=0.0,
+                    potential=potential,
+                )
+
+            return aatypes_t
+
+        # Baseline (no potential)
+        aatypes_baseline = run_with_potential(potential_scale=0.0)
+        # Low- and high-strength guidance
+        aatypes_low = run_with_potential(potential_scale=1.0)
+        aatypes_high = run_with_potential(potential_scale=4.0)
+
+        # Compute fraction of residues equal to target token (ignoring masks for masking/purity)
+        def target_fraction(aatypes: torch.Tensor) -> float:
+            if num_states == 21:
+                non_mask = aatypes != MASK_TOKEN_INDEX
+                if non_mask.sum() == 0:
+                    return 0.0
+                return float(
+                    ((aatypes == target_token) & non_mask).sum().item()
+                    / non_mask.sum().item()
+                )
+            else:
+                return float((aatypes == target_token).float().mean().item())
+
+        frac_baseline = target_fraction(aatypes_baseline)
+        frac_low = target_fraction(aatypes_low)
+        frac_high = target_fraction(aatypes_high)
+
+        # Guidance should steer toward the target
+        assert (
+            frac_low > frac_baseline + 1e-3
+        ), f"Expected guidance to increase target fraction ({frac_low} > {frac_baseline})"
+        # Stronger guidance should have stronger effect
+        assert (
+            frac_high > frac_low + 1e-3
+        ), f"Expected stronger guidance to have larger effect ({frac_high} > {frac_low})"

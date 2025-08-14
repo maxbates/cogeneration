@@ -886,27 +886,35 @@ class InterpolantSteeringConfig(BaseClassConfig):
     resampling_interval: int = 5
 
     # weighting
-    # Feynman-Kac steering lambda, linear in time
+    # Feynman-Kac particle steering lambda, linear in time
     fk_lambda: float = 2.0
     # particle weighting, abs energy vs energy difference
     energy_weight_absolute: float = 0.5
     energy_weight_difference: float = 1.0
 
+    # cached guidance decay: `guidance_cache_decay ** num_steps_since_resampling`
+    # When guidance is computed intermittently (every `resampling_interval` steps),
+    # reuse the last computed guidance on intermediate steps with per-step decay.
+    # A value of 1.0 means no decay; 0.0 means drop guidance entirely between updates.
+    guidance_cache_decay: float = 0.9
+
     # potentials
-    # set any scale to 0.0 to disable
+    # `_energy_scale` refers to energy for particle resampling.
+    # `_guidance_scale` scales guidance vector field / logits.
+    # set any scale to 0.0 to disable.
 
     # chain break potential
-    chain_break_scale: float = 1.0
+    chain_break_energy_scale: float = 1.0
     chain_break_allowed_backbone_dist: float = 4.0  # ideal is ~3.8Å
     chain_break_maximum_backbone_dist: float = 12.0  # clamp
 
     # hot spot potential parameters
-    hot_spot_scale: float = 1.0
+    hot_spot_energy_scale: float = 1.0
     hot_spot_contact_distance_ang: float = 6.5
     hot_spot_max_distance_penalty: float = 10.0
 
     # contact conditioning potential parameters
-    contact_conditioning_scale: float = 1.0
+    contact_conditioning_energy_scale: float = 1.0
     contact_conditioning_inter_chain_weight: float = (
         2.0  # upweight inter-chain contacts
     )
@@ -915,7 +923,13 @@ class InterpolantSteeringConfig(BaseClassConfig):
     )
 
     # inverse folding potential
-    inverse_fold_scale: float = 1.0
+    inverse_fold_energy_scale: float = 1.0
+    inverse_fold_guidance_scale: float = 1.0
+    # temperature applied post-sampling for logits guidance
+    # ProteinMPNN can be peaky, so can be helpful to smooth them out
+    inverse_fold_logits_temperature: float = 1.0
+    # cap for logits guidance. One way tilt: 4.0 ~ 50x
+    inverse_fold_logits_cap: float = 4.0
     protein_mpnn: ProteinMPNNRunnerConfig = field(
         default_factory=ProteinMPNNRunnerConfig
     )
@@ -1522,7 +1536,7 @@ class RedesignConfig(BaseClassConfig):
     # Skip existing redesigned sequences
     skip_existing: bool = True
     # Shuffle the metadata rows before redesigning
-    shuffle: bool = False
+    shuffle: bool = True
     # Sort by length (shuffling takes precedence)
     sort_by_length: bool = False
     # Optionally, provide a BestRedesigns CSV (with columns example, best_seq)

@@ -68,7 +68,7 @@ class TestEvalRunner:
         cfg.inference.samples.multimer_fraction = 0.0
         cfg.inference.samples.length_subset = [156]
         # Consider disabling ProteinMPNN guidance, which is slow
-        cfg.inference.interpolant.steering.inverse_fold_scale = 0.0
+        cfg.inference.interpolant.steering.inverse_fold_energy_scale = 0.0
         # skip designability? requires folding each ProteinMPNN sequence
         cfg.inference.also_fold_pmpnn_seq = False
         # write trajectories to inspect

@@ -13,14 +13,6 @@ from cogeneration.dataset.interaction import DIST_INTERACTION_BACKBONE
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyFeatures
 
-# TODO(fksteering) reconsider what states to provide to compute_energy().
-#   model output for sure...
-#   Current protein state vs. modified protein prediction...
-
-# TODO(fksteering) additional potentials, e.g.:
-#   - van der waals clashes and interactions
-#   - run ProteinMPNN on to predict the sequence to bias towards designable sequences
-
 
 def _batch_repeat_feat(v: Any, K: int) -> Any:
     """Duplicate the feature K times along batch-dim (dim 0 for tensors)."""
@@ -46,6 +38,80 @@ def _batch_select_feat(v: Any, idx: torch.Tensor) -> Any:
         return v
 
 
+# PotentialEnergy is energy computed by potential: (B,) tensor scaled to [0, 1]
+PotentialEnergy = torch.Tensor
+
+
+@dataclass
+class PotentialField:
+    """
+    Vector fields / logits guidance, e.g. produced by a potential.
+    These will be added to the model prediction in the interpolant.
+
+    The fields/logits should be scaled appropriately and masked when used by interpolant.
+    The interpolant will perform euler step `d_t` using modified fields.
+
+    Potentials are cached by the FKSteeringCalculator, and may be reused on steps without resampling.
+    This is so that the same potential can easily be used across multiple steps,
+    rather than imposing large jumps every re-sampling step.
+    (Also, for aatype logits, unmasking prob is proportional to `d_t`,
+    and not possible to scale logits to influence this, so seems like the simplest workaround.)
+    """
+
+    # trans VF (B, N, 3)
+    trans: Optional[torch.Tensor] = None
+    # rotmats VF tangent to current frame (B, N, 3)
+    rotmats: Optional[torch.Tensor] = None
+    # logits for aatypes (B, N, S)
+    logits: Optional[torch.Tensor] = None
+
+    def decayed(self, scale: float) -> "PotentialField":
+        """Return a new PotentialField with each component scaled by `scale`."""
+        if scale == 1.0:
+            return self
+        if scale == 0.0:
+            return PotentialField()
+
+        return PotentialField(
+            trans=self.trans * scale if self.trans is not None else None,
+            rotmats=self.rotmats * scale if self.rotmats is not None else None,
+            logits=self.logits * scale if self.logits is not None else None,
+        )
+
+    def mask(self, mask: torch.Tensor):
+        """Apply (B, N) mask to each field (broadcast on last dim)."""
+        if self.trans is not None:
+            self.trans = self.trans * mask[..., None]
+        if self.rotmats is not None:
+            self.rotmats = self.rotmats * mask[..., None]
+        if self.logits is not None:
+            self.logits = self.logits * mask[..., None]
+
+    def __add__(self, other: "PotentialField") -> "PotentialField":
+        """Elementwise add two potential fields, treating None as identity."""
+        if other is None:
+            return self
+        if not isinstance(other, PotentialField):
+            raise ValueError(f"Cannot add PotentialField and {type(other)}")
+
+        trans = (
+            other.trans
+            if self.trans is None
+            else self.trans if other.trans is None else self.trans + other.trans
+        )
+        rotmats = (
+            other.rotmats
+            if self.rotmats is None
+            else self.rotmats if other.rotmats is None else self.rotmats + other.rotmats
+        )
+        logits = (
+            other.logits
+            if self.logits is None
+            else self.logits if other.logits is None else self.logits + other.logits
+        )
+        return PotentialField(trans=trans, rotmats=rotmats, logits=logits)
+
+
 @dataclass
 class Potential(ABC):
     """Base class for Feynman-Kac steering potentials.
@@ -53,23 +119,28 @@ class Potential(ABC):
     Potentials compute zero-bottomed energy (rather than rewards) for each member of a batch.
     Energy should be scaled to be in the range [0, 1], where 0 is the best score.
 
-    Each potential receives the clean model prediction `model_pred`,
-    and the modified prediction `protein_pred`, and can calculate using the appropriate one.
+    Potentials can also compute guidance, a vector field to guide translations, rotations, or aatypes logits.
 
-    Fow now, does not support computing gradients for guidance.
+    Each potential receives:
+    - `protein_state` the current protein state
+    - `model_pred` the raw model prediction
+    - `protein_pred` the modified prediction
     """
 
-    scale: float = 1.0  # compute_energy() * scale is the final energy
+    energy_scale: float = 1.0  # compute() energy * energy_scale is the final energy
+    guidance_scale: float = (
+        1.0  # compute() guidance * guidance_scale is the final guidance
+    )
 
     @abstractmethod
-    def compute_energy(
+    def compute(
         self,
         batch: NoisyFeatures,
+        protein_state: SamplingStep,
         model_pred: SamplingStep,
         protein_pred: SamplingStep,
-        protein_state: SamplingStep,
-    ) -> torch.Tensor:  # (B,)
-        """Return the energy per predicted sample in the batch, scaled to [0, 1]."""
+    ) -> Tuple[PotentialEnergy, Optional[PotentialField]]:
+        """Return the energy (B,) scaled to [0, 1] and optional guidance per sample in the batch."""
 
 
 @dataclass
@@ -172,13 +243,13 @@ class ChainBreakPotential(Potential):
     allowed_backbone_dist: float = 4.0  # allowed distance, ideal is 3.8Å
     maximum_backbone_dist: float = 12.0  # upper bound
 
-    def compute_energy(
+    def compute(
         self,
         batch: NoisyFeatures,
+        protein_state: SamplingStep,
         model_pred: SamplingStep,
         protein_pred: SamplingStep,
-        protein_state: SamplingStep,
-    ) -> torch.Tensor:
+    ) -> Tuple[PotentialEnergy, Optional[PotentialField]]:
         num_batch, num_res = batch[bp.res_idx].size()  # (B, N)
         chain_idx = batch[bp.chain_idx]
         res_idx = batch[bp.res_idx]
@@ -205,7 +276,7 @@ class ChainBreakPotential(Potential):
         # aggregate and logistic ramp
         penalty_sum = penalty_pair.sum(dim=1)
         energy = 1.0 - torch.exp(-1 * penalty_sum)  # in [0, 1]
-        return energy
+        return energy, None
 
 
 @dataclass
@@ -223,30 +294,30 @@ class HotSpotPotential(Potential):
         10.0  # maximum distance penalty, beyond contact_distance threshold
     )
 
-    def compute_energy(
+    def compute(
         self,
         batch: NoisyFeatures,
+        protein_state: SamplingStep,
         model_pred: SamplingStep,
         protein_pred: SamplingStep,
-        protein_state: SamplingStep,
-    ) -> torch.Tensor:
+    ) -> Tuple[PotentialEnergy, Optional[PotentialField]]:
         num_batch, num_res = batch[bp.res_idx].size()  # (B, N)
         device = batch[bp.res_idx].device
 
         # Skip if no hot spots marked
         if bp.hot_spots not in batch:
-            return torch.zeros(num_batch, device=device)
+            return torch.zeros(num_batch, device=device), None
 
         hot_spots_mask = batch[bp.hot_spots].bool()  # (B, N) - convert to bool
         hot_spots_present = hot_spots_mask.sum(-1) > 0  # (B,)
         if not hot_spots_present.any():
-            return torch.zeros(num_batch, device=device)
+            return torch.zeros(num_batch, device=device), None
 
         # Only apply to multimers
         chain_idx = batch[bp.chain_idx]  # (B, N)
         multi_chain_mask = chain_idx.max(-1).values != chain_idx.min(-1).values  # (B,)
         if not multi_chain_mask.any():
-            return torch.zeros(num_batch, device=device)
+            return torch.zeros(num_batch, device=device), None
 
         # Use frame translations
         pred_trans = protein_pred.trans  # (B, N, 3)
@@ -313,7 +384,7 @@ class HotSpotPotential(Potential):
         energy = penalty_per_batch / self.max_distance_penalty
         energy = energy.clamp(min=0.0, max=1.0)
 
-        return energy
+        return energy, None
 
 
 @dataclass
@@ -329,24 +400,24 @@ class ContactConditioningPotential(Potential):
     inter_chain_weight: float = 2.0  # upweight factor for inter-chain contacts
     max_distance_penalty: float = 10.0  # maximum distance penalty
 
-    def compute_energy(
+    def compute(
         self,
         batch: NoisyFeatures,
+        protein_state: SamplingStep,
         model_pred: SamplingStep,
         protein_pred: SamplingStep,
-        protein_state: SamplingStep,
-    ) -> torch.Tensor:
+    ) -> Tuple[PotentialEnergy, Optional[PotentialField]]:
         num_batch, num_res = batch[bp.res_idx].size()  # (B, N)
         device = batch[bp.res_idx].device
 
         if bp.contact_conditioning not in batch:
-            return torch.zeros(num_batch, device=device)
+            return torch.zeros(num_batch, device=device), None
 
         contact_conditioning = batch[bp.contact_conditioning]  # (B, N, N)
         contact_mask = contact_conditioning > 0  # (B, N, N)
 
         if not contact_mask.any():
-            return torch.zeros(num_batch, device=device)
+            return torch.zeros(num_batch, device=device), None
 
         # pairwse distances
         pred_trans = protein_pred.trans  # (B, N, 3)
@@ -399,7 +470,9 @@ class ContactConditioningPotential(Potential):
         energy = penalty_per_batch / self.max_distance_penalty
         energy = energy.clamp(min=0.0, max=1.0)
 
-        return energy
+        # TODO(guidance) compute guidance
+
+        return energy, None
 
 
 @dataclass
@@ -411,6 +484,9 @@ class InverseFoldPotential(Potential):
     For now, we always generate a single sequence per sample.
     """
 
+    inverse_fold_logits_temperature: float = 1.0
+    inverse_fold_guidance_scale: float = 1.0
+    inverse_fold_logits_cap: float = 4.0
     protein_mpnn_cfg: ProteinMPNNRunnerConfig = field(
         default_factory=ProteinMPNNRunnerConfig
     )
@@ -423,13 +499,13 @@ class InverseFoldPotential(Potential):
         # Runner won't load model until run inference.
         self.protein_mpnn_runner = ProteinMPNNRunner(cfg=self.protein_mpnn_cfg)
 
-    def compute_energy(
+    def compute(
         self,
         batch: NoisyFeatures,
+        protein_state: SamplingStep,
         model_pred: SamplingStep,
         protein_pred: SamplingStep,
-        protein_state: SamplingStep,
-    ) -> torch.Tensor:
+    ) -> Tuple[PotentialEnergy, Optional[PotentialField]]:
         if not self.logged_warning:
             self.log.warning(
                 f"🐌 InverseFoldPotential is enabled, generating 1 sequence per particle + timestep, and will increase sampling time."
@@ -461,7 +537,7 @@ class InverseFoldPotential(Potential):
             sequences_per_pass=1,
         )
 
-        # Averaged logits over generated sequences (in case > 1)
+        # In practice we only have 1 pass / 1 seq, but use mean over logits
         logits = mpnn_result.averaged_logits  # (B, N, S)
         logits = logits.to(aatypes.device)
 
@@ -487,14 +563,51 @@ class InverseFoldPotential(Potential):
         max_ce = float(torch.log(torch.tensor(perplexity_cap, device=logits.device)))
         energy = avg_nll / max_ce
 
-        return energy
+        # Set up ProteinMPNNlogits for aatypes guidance
+
+        # Ensure logits shapes are in agreement with model prediction
+        if logits.shape != model_pred.logits.shape:
+            # add mask logit to ProteinMPNN logits
+            if logits.shape[-1] == 20 and model_pred.logits.shape[-1] == 21:
+                pad = torch.zeros(
+                    logits.shape[:-1] + (1,), device=logits.device, dtype=logits.dtype
+                )
+                logits = torch.cat([logits, pad], dim=-1)
+            else:
+                raise ValueError(
+                    f"logits.shape {logits.shape} incompatible with protein_pred.aatypes.shape {model_pred.logits.shape}"
+                )
+
+        # Apply temperature
+        T = max(self.inverse_fold_logits_temperature, 1e-4)  # avoid div-by-zero
+        logits = logits / T
+
+        # Scale by logits guidance factor
+        logits = logits * self.guidance_scale
+
+        # Scale and clamp very strong logits
+        cap = float(self.inverse_fold_logits_cap)
+        logits_f = logits.float()  # compute in fp32 for stability
+        max_abs = logits_f.abs().amax(dim=-1, keepdim=True)  # (B, N, 1)
+        scale_down = (cap / (max_abs + 1e-6)).clamp(max=1.0)
+        logits_f = (logits_f * scale_down).clamp(min=-cap, max=cap)
+        logits = logits_f.to(logits.dtype)
+
+        guidance = PotentialField(
+            logits=logits,
+        )
+
+        return energy, guidance
 
 
 @dataclass
 class FKSteeringCalculator:
     """
     Helper to implement simplified Feynman-Kac steering for inference.
-    We only compute energies for particle resampling, not gradients to guide trajectories.
+
+    Several potentials only compute energies for particle resampling,
+    but some also compute "PotentialFields" to guide trajectories.
+    For translations and rotations, these are vector fields, and for aatypes, these are logits.
 
     Feynman-Kac steering is a general framework for diffusion models for tilting sampling at inference,
     and which lends itself nicely to flow matching with stochastic paths.
@@ -521,52 +634,64 @@ class FKSteeringCalculator:
     def default_potentials(cfg: InterpolantSteeringConfig) -> List[Potential]:
         return [
             ChainBreakPotential(
-                scale=cfg.chain_break_scale,
+                energy_scale=cfg.chain_break_energy_scale,
                 allowed_backbone_dist=cfg.chain_break_allowed_backbone_dist,
                 maximum_backbone_dist=cfg.chain_break_maximum_backbone_dist,
             ),
             HotSpotPotential(
-                scale=cfg.hot_spot_scale,
+                energy_scale=cfg.hot_spot_energy_scale,
                 contact_distance_ang=cfg.hot_spot_contact_distance_ang,
                 max_distance_penalty=cfg.hot_spot_max_distance_penalty,
             ),
             ContactConditioningPotential(
-                scale=cfg.contact_conditioning_scale,
+                energy_scale=cfg.contact_conditioning_energy_scale,
                 inter_chain_weight=cfg.contact_conditioning_inter_chain_weight,
                 max_distance_penalty=cfg.contact_conditioning_max_distance_penalty,
             ),
             InverseFoldPotential(
-                scale=cfg.inverse_fold_scale,
+                energy_scale=cfg.inverse_fold_energy_scale,
+                guidance_scale=cfg.inverse_fold_guidance_scale,
+                inverse_fold_logits_temperature=cfg.inverse_fold_logits_temperature,
+                inverse_fold_logits_cap=cfg.inverse_fold_logits_cap,
                 protein_mpnn_cfg=cfg.protein_mpnn,
             ),
         ]
 
-    def compute_energy(
+    def compute(
         self,
         batch: NoisyFeatures,
+        protein_state: SamplingStep,
         model_pred: SamplingStep,
         protein_pred: SamplingStep,
-        protein_state: SamplingStep,
-    ) -> torch.Tensor:  # (B,)
+    ) -> Tuple[PotentialEnergy, PotentialField]:
         """Weighted sum of all configured potentials."""
         num_batch, num_res = batch[bp.res_idx].size()  # (B, N)
         device = batch[bp.res_idx].device
 
-        total = torch.zeros(num_batch, device=device)
+        total_energy = torch.zeros(num_batch, device=device)
+        guidances = []
         for potential in self.potentials:
-            if potential.scale == 0.0:
+            if potential.energy_scale == 0.0:
                 continue
-            energy = potential.compute_energy(
+
+            energy, guidance = potential.compute(
                 batch=batch,
+                protein_state=protein_state,
                 model_pred=model_pred,
                 protein_pred=protein_pred,
-                protein_state=protein_state,
             )
+
             energy = energy.to(device)
             energy = energy.clamp(min=0.0, max=1.0)
-            total = total + potential.scale * energy
+            total_energy = total_energy + potential.energy_scale * energy
 
-        return total
+            guidances.append(guidance)
+
+        # Accumulate guidance fields and mask to valid residues
+        guidance = sum(guidances, start=PotentialField())
+        guidance.mask((batch[bp.res_mask] > 0) & (batch[bp.diffuse_mask] > 0))
+
+        return total_energy, guidance
 
 
 @dataclass
@@ -590,6 +715,9 @@ class FKSteeringResampler:
         self._log_G: Optional[torch.Tensor] = None  # (B * K,)
         # track log G delta (difference at previous step)
         self._log_G_delta: Optional[torch.Tensor] = None  # (B * K,)
+
+        # cache last computed guidance to reuse between resampling intervals
+        self._cached_guidance: Optional[PotentialField] = None
 
     @property
     def enabled(self) -> bool:
@@ -628,10 +756,15 @@ class FKSteeringResampler:
         self,
         step_idx: int,
         batch: NoisyFeatures,
+        protein_state: SamplingStep,
         model_pred: SamplingStep,
         protein_pred: SamplingStep,
-        protein_state: SamplingStep,
-    ) -> Tuple[NoisyFeatures, Optional[torch.Tensor], FKStepMetric]:
+    ) -> Tuple[
+        NoisyFeatures,  # batch with selected particles, if enabled
+        Optional[torch.Tensor],  # reindexing, if enabled
+        FKStepMetric,  # metrics for this step
+        PotentialField,  # guidance for this step
+    ]:
         """
         If enabled, resample particles in a batch according to their energy.
         Updates the batch's particles and returns the resampled indices.
@@ -639,11 +772,19 @@ class FKSteeringResampler:
         Batch is updated to new particles, but caller must update out of scope
         predictions / state with the resampled indices.
         """
-        # escape if disabled or not resampling on this step
+        # escape if disabled
         if not self.enabled:
-            return batch, None, None
+            return batch, None, None, PotentialField()
+
+        # If not resampling at this step, return decayed guidance
         if (step_idx % self.cfg.resampling_interval) != 0:
-            return batch, None, None
+            if self._cached_guidance is None:
+                return batch, None, None, PotentialField()
+
+            steps_since_resampling = step_idx % self.cfg.resampling_interval
+            decay = self.cfg.guidance_cache_decay**steps_since_resampling
+            decayed_guidance = self._cached_guidance.decayed(decay)
+            return batch, None, None, decayed_guidance
 
         assert self._energy_trajectory is not None, "FK Steering not initialized."
 
@@ -653,15 +794,18 @@ class FKSteeringResampler:
         device = batch[bp.res_mask].device
 
         # calculate and track energy
-        energy = self.calculator.compute_energy(
+        energy, guidance = self.calculator.compute(
             batch=batch,
+            protein_state=protein_state,
             model_pred=model_pred,
             protein_pred=protein_pred,
-            protein_state=protein_state,
         )  # (B * K,)
         self._energy_trajectory = torch.cat(
             [self._energy_trajectory, energy.unsqueeze(1)], dim=1
         )
+
+        # cache guidance for use on non-resampling steps
+        self._cached_guidance = guidance
 
         # Compute log G values, weighing particles by improvement
         # Calculate both the running total, and difference from previous step.
@@ -695,7 +839,6 @@ class FKSteeringResampler:
         )
 
         # track metric effective sample size as diagnostic of weight degeneracy
-        # TODO(metrics) expose ESS and energy trajectory
         effective_sample_size = 1.0 / (resampling_weights**2).sum(dim=1)
 
         # draw surviving particle indices
@@ -725,7 +868,7 @@ class FKSteeringResampler:
         self._log_G = self._log_G.index_select(0, idx)
         self._log_G_delta = self._log_G_delta.index_select(0, idx)
 
-        return batch, idx, step_metric
+        return batch, idx, step_metric, guidance
 
     def best_particle_in_batch(
         self, batch: NoisyFeatures

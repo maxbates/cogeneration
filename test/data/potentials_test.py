@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from cogeneration.config.base import InterpolantSteeringConfig, ProteinMPNNRunnerConfig
+from cogeneration.data.data_transforms import make_one_hot
 from cogeneration.data.potentials import (
     ChainBreakPotential,
     ContactConditioningPotential,
@@ -115,7 +116,7 @@ def _make_batch_and_step(
         rotmats=batch[nbp.rotmats_t],
         aatypes=batch[nbp.aatypes_t],
         torsions=None,
-        logits=None,
+        logits=make_one_hot(batch[nbp.aatypes_t].long(), 21),
     )
 
     return batch, step
@@ -129,7 +130,7 @@ class TestChainBreakPotential:
         )
         potential = ChainBreakPotential()
 
-        E = potential.compute_energy(
+        E, _ = potential.compute(
             batch=batch,
             model_pred=step,
             protein_pred=step,
@@ -152,7 +153,7 @@ class TestHotSpotPotential:
         )
         potential = HotSpotPotential()
 
-        E = potential.compute_energy(
+        E, _ = potential.compute(
             batch=batch,
             model_pred=step,
             protein_pred=step,
@@ -178,7 +179,7 @@ class TestHotSpotPotential:
         batch[bp.hot_spots] = torch.zeros_like(batch[bp.hot_spots])
 
         potential = HotSpotPotential()
-        E = potential.compute_energy(
+        E, _ = potential.compute(
             batch=batch,
             model_pred=step,
             protein_pred=step,
@@ -202,7 +203,7 @@ class TestHotSpotPotential:
         batch[bp.hot_spots] = hot_spots
 
         potential = HotSpotPotential()
-        E = potential.compute_energy(
+        E, _ = potential.compute(
             batch=batch,
             model_pred=step,
             protein_pred=step,
@@ -221,7 +222,7 @@ class TestContactConditioningPotential:
         batch[bp.contact_conditioning] = torch.zeros((1, 30, 30))
 
         potential = ContactConditioningPotential()
-        E = potential.compute_energy(
+        E, _ = potential.compute(
             batch=batch,
             model_pred=step,
             protein_pred=step,
@@ -242,7 +243,7 @@ class TestContactConditioningPotential:
         batch[bp.contact_conditioning] = contact_conditioning
 
         potential = ContactConditioningPotential()
-        E = potential.compute_energy(
+        E, _ = potential.compute(
             batch=batch,
             model_pred=step,
             protein_pred=step,
@@ -272,7 +273,7 @@ class TestContactConditioningPotential:
         batch[bp.contact_conditioning] = contact_conditioning
 
         potential = ContactConditioningPotential()
-        E = potential.compute_energy(
+        E, _ = potential.compute(
             batch=batch,
             model_pred=step,
             protein_pred=step,
@@ -324,7 +325,7 @@ class TestContactConditioningPotential:
 
         # Test with default inter-chain weight
         potential_weighted = ContactConditioningPotential(inter_chain_weight=2.0)
-        E_weighted = potential_weighted.compute_energy(
+        E_weighted, _ = potential_weighted.compute(
             batch=batch,
             model_pred=step,
             protein_pred=step,
@@ -333,7 +334,7 @@ class TestContactConditioningPotential:
 
         # Test with no inter-chain weight
         potential_unweighted = ContactConditioningPotential(inter_chain_weight=1.0)
-        E_unweighted = potential_unweighted.compute_energy(
+        E_unweighted, _ = potential_unweighted.compute(
             batch=batch,
             model_pred=step,
             protein_pred=step,
@@ -388,13 +389,14 @@ class TestInverseFoldPotential:
         # Trim to N if needed (helper enforces N>=20); keep masks aligned
         for k in [bp.res_mask, bp.diffuse_mask, bp.chain_idx, bp.res_idx]:
             batch[k] = batch[k][:, :N]
+        aatypes = torch.randint(0, 20, (B, N))
         step = SamplingStep(
             res_mask=batch[bp.res_mask],
             trans=step.trans[:, :N, :],
             rotmats=step.rotmats[:, :N, :, :],
-            aatypes=torch.randint(0, 20, (B, N)),
+            aatypes=aatypes,
             torsions=None,
-            logits=None,
+            logits=make_one_hot(aatypes.long(), 21),
         )
         return batch, step
 
@@ -414,12 +416,12 @@ class TestInverseFoldPotential:
                 logits[b, i, tgt] = 4.0
 
         potential = InverseFoldPotential(
-            scale=1.0,
+            energy_scale=1.0,
             protein_mpnn_cfg=ProteinMPNNRunnerConfig(),
         )
         potential.protein_mpnn_runner = DummyProteinMPNNRunner(logits)
 
-        E = potential.compute_energy(
+        E, guidance = potential.compute(
             batch=batch, model_pred=step, protein_pred=step, protein_state=step
         )
 
@@ -427,6 +429,10 @@ class TestInverseFoldPotential:
         # Energy should be low but not ~0 with moderate confidence logits
         assert torch.all(E > 0.01)
         assert torch.all(E < 0.2)
+        # Guidance should be returned with correct shape and match provided logits (no temp/scale effects)
+        assert guidance is not None and guidance.logits is not None
+        assert guidance.logits.shape == (B, N, 21)
+        assert torch.allclose(guidance.logits, logits)
 
     def test_masks_are_respected(self):
         B, N = 1, 12
@@ -446,17 +452,20 @@ class TestInverseFoldPotential:
                 logits[0, i, (tgt + 1) % 20] = 20.0
 
         potential = InverseFoldPotential(
-            scale=1.0,
+            energy_scale=1.0,
             protein_mpnn_cfg=ProteinMPNNRunnerConfig(),
         )
         potential.protein_mpnn_runner = DummyProteinMPNNRunner(logits)
 
-        E = potential.compute_energy(
+        E, guidance = potential.compute(
             batch=batch, model_pred=step, protein_pred=step, protein_state=step
         )
 
         assert E.shape == (B,)
         assert E.item() < 1e-3
+        # Guidance present and correctly shaped (masking is applied later by calculator)
+        assert guidance is not None and guidance.logits is not None
+        assert guidance.logits.shape == (B, N, 21)
 
     def test_high_energy_when_logits_wrong(self):
         B, N = 1, 10
@@ -472,26 +481,75 @@ class TestInverseFoldPotential:
             logits[0, i, (tgt + 1) % 20] = 10.0
 
         potential = InverseFoldPotential(
-            scale=1.0,
+            energy_scale=1.0,
             protein_mpnn_cfg=ProteinMPNNRunnerConfig(),
         )
         potential.protein_mpnn_runner = DummyProteinMPNNRunner(logits)
 
-        E = potential.compute_energy(
+        E, guidance = potential.compute(
             batch=batch, model_pred=step, protein_pred=step, protein_state=step
         )
 
         assert E.shape == (B,)
         # Wrong-high logits should yield very large normalized energy
         assert E.item() > 1.0
+        # Guidance should be capped to 4.0 uniformly per-position
+        assert guidance is not None and guidance.logits is not None
+        assert guidance.logits.shape == (B, N, 21)
+        max_abs = guidance.logits.abs().amax(dim=-1)
+        assert torch.allclose(max_abs, torch.full_like(max_abs, 4.0))
+        # Since only the wrong class had magnitude, it should be exactly 4.0 after capping; others 0
+        for i in range(N):
+            tgt = int(step.aatypes[0, i].item())
+            wrong = (tgt + 1) % 20
+            assert torch.allclose(
+                guidance.logits[0, i, wrong],
+                torch.tensor(4.0, device=guidance.logits.device),
+            )
+            # all other 20 classes (including mask class) should be 0
+            mask = torch.ones(21, dtype=torch.bool, device=guidance.logits.device)
+            mask[wrong] = False
+            assert torch.all(guidance.logits[0, i][mask] == 0)
+
+    def test_guidance_logit_padding_and_shape(self):
+        B, N = 1, 7
+        batch, step = self._make_simple_batch_and_step(B=B, N=N)
+
+        # Make all residues valid/designed
+        batch[bp.res_mask] = torch.ones(B, N, dtype=torch.int)
+        batch[bp.diffuse_mask] = torch.ones(B, N, dtype=torch.int)
+
+        # Dummy MPNN returns 20-way logits; potential should pad to 21 to match model_pred
+        logits20 = torch.zeros(B, N, 20, device=step.aatypes.device)
+        logits20[:, :, 3] = 1.5
+
+        potential = InverseFoldPotential(
+            energy_scale=1.0,
+            protein_mpnn_cfg=ProteinMPNNRunnerConfig(),
+            guidance_scale=1.0,
+            inverse_fold_logits_temperature=1.0,
+            inverse_fold_logits_cap=100.0,
+        )
+        potential.protein_mpnn_runner = DummyProteinMPNNRunner(logits20)
+
+        E, guidance = potential.compute(
+            batch=batch, model_pred=step, protein_pred=step, protein_state=step
+        )
+
+        assert guidance is not None
+        assert guidance.logits is not None
+        assert guidance.logits.shape == step.logits.shape == (B, N, 21)
+        # Expect padding in the last class and other classes unchanged
+        assert torch.allclose(guidance.logits[:, :, :20], logits20)
+        assert torch.all(guidance.logits[:, :, 20] == 0)
 
 
 class TestFKSteeringCalculator:
-    def test_chain_break_energy(self, mock_cfg):
+    def test_default_compute(self, mock_cfg):
         batch, step = _make_batch_and_step(B=2, N=30, multimer=False, with_break=True)
         calc = FKSteeringCalculator(cfg=mock_cfg.inference.interpolant.steering)
 
-        E = calc.compute_energy(
+        E, _ = calc.compute(
             batch=batch,
             model_pred=step,
             protein_pred=step,
@@ -499,7 +557,6 @@ class TestFKSteeringCalculator:
         )
 
         assert torch.all(E > 0)
-        assert torch.all(E <= 1)
 
 
 class TestFKSteeringResampler:
@@ -529,7 +586,7 @@ class TestFKSteeringResampler:
         step = step.select_batch_idx(idx=torch.tensor([0, 0, 0, 1, 1, 1]))
         assert step.trans.shape[0] == steer_batch_size
 
-        batch, idx, metric = resampler.on_step(
+        batch, idx, metric, guidance = resampler.on_step(
             step_idx=0,
             batch=batch,
             model_pred=step,

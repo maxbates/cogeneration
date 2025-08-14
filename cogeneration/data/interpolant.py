@@ -38,6 +38,7 @@ from cogeneration.data.potentials import (
     FKSteeringResampler,
     FKSteeringTrajectory,
     FKStepMetric,
+    PotentialField,
 )
 from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
 from cogeneration.data.trajectory import SamplingStep, SamplingTrajectory
@@ -859,7 +860,7 @@ class Interpolant:
     def _rots_vf_scaling(self, t: float):
         """Calculate rotmats scaling factor of `d_t` step given `t`, depending on the schedule."""
         if self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.linear:
-            return 1 / (1 - t)
+            return (1 / (1 - t)).clamp(min=1e-4)
         elif self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.exp:
             return self.cfg.rots.exp_rate
         else:
@@ -872,9 +873,7 @@ class Interpolant:
         rotmats_1: torch.Tensor,  # (B, N, 3, 3)
         rotmats_t: torch.Tensor,  # (B, N, 3, 3)
         stochasticity_scale: float = 1.0,
-        potential: Optional[
-            torch.Tensor
-        ] = None,  # (B, N, 3) rot VF (tangent to rotmats_t)
+        potential: Optional[torch.Tensor] = None,  # (B, N, 3) tangent to rotmats_t
     ) -> torch.Tensor:
         scaling = self._rots_vf_scaling(t)
 
@@ -1211,7 +1210,8 @@ class Interpolant:
         (We can't use logits during training without simulation, they are just a one-hot of the sequence.)
         However, this training may slow convergence, or the model may only learn to fix very wrong residues.
 
-        This is different than the `noise` term, which adds noise to the rate matrix in determinsitic interpolation.
+        This is different than the `cfg.aatypes.noise` term,
+        which adds noise to the rate matrix in determinsitic interpolation.
         """
         B, N, S = logits_1.shape
         assert aatypes_t.shape == (B, N)
@@ -1272,6 +1272,7 @@ class Interpolant:
         logits_1: torch.Tensor,  # (B, N, S) unscaled probabilities, S={20, 21}
         aatypes_t: torch.Tensor,  # (B, N) current amino acid types
         stochasticity_scale: float = 1.0,
+        potential: Optional[torch.Tensor] = None,  # (B, N, S)
     ):
         """
         Perform an Euler step to update amino acid types based on the provided logits and interpolation settings.
@@ -1282,21 +1283,39 @@ class Interpolant:
         2. "uniform": Samples new amino acid types uniformly, with the assumption that no MASK tokens are involved.
            Assumes S = 20.
         """
+        # incorporate guidance logits if provided ahead of aatypes euler step method
+        if potential is not None:
+            assert (
+                potential.shape == logits_1.shape
+            ), f"Guidance logits shape {potential.shape} does not match logits_1 shape {logits_1.shape}"
+            logits_1 = logits_1 + potential
+
         if self.cfg.aatypes.do_purity:
-            aatypes_t = self._aatypes_euler_step_purity(d_t, t, logits_1, aatypes_t)
+            aatypes_t = self._aatypes_euler_step_purity(
+                d_t=d_t,
+                t=t,
+                logits_1=logits_1,
+                aatypes_t=aatypes_t,
+            )
         elif (
             self.cfg.aatypes.interpolant_type
             == InterpolantAATypesInterpolantTypeEnum.masking
         ):
             aatypes_t = self._aatypes_euler_step_masking(
-                d_t=d_t, t=t, logits_1=logits_1, aatypes_t=aatypes_t
+                d_t=d_t,
+                t=t,
+                logits_1=logits_1,
+                aatypes_t=aatypes_t,
             )
         elif (
             self.cfg.aatypes.interpolant_type
             == InterpolantAATypesInterpolantTypeEnum.uniform
         ):
             aatypes_t = self._aatypes_euler_step_uniform(
-                d_t=d_t, t=t, logits_1=logits_1, aatypes_t=aatypes_t
+                d_t=d_t,
+                t=t,
+                logits_1=logits_1,
+                aatypes_t=aatypes_t,
             )
         else:
             raise ValueError(
@@ -1326,9 +1345,10 @@ class Interpolant:
         pred: ModelPrediction,
         true_feats: BatchTrueFeatures,
         motif_mask: Optional[torch.Tensor],  # (B, N) bool
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> PotentialField:
         """
         Generate potentials for motif guidance, returning translation and rotation vector fields.
+        `aatypes` are fixed in motifs, so no guidance for them.
 
         Model predicts an unconditional drift, and this VF (masked to motifs) is passed to
         euler steps and modifies those unconditional velocities.
@@ -1345,9 +1365,11 @@ class Interpolant:
 
         See FrameFlow paper for details about motif guidance (sec 3.2):
         https://arxiv.org/pdf/2401.04082
+
+        TODO consider treating completely as a Potential? With larger scale?
         """
         if motif_mask is None or not motif_mask.any():
-            return None, None
+            return PotentialField()
 
         trans_t = noisy_batch[nbp.trans_t]
         rotmats_t = noisy_batch[nbp.rotmats_t]
@@ -1425,7 +1447,7 @@ class Interpolant:
         rotmats_vf[motif_sel] = (rotmats_t_to_true - rotmats_t_to_pred)[motif_sel]
         rotmats_vf *= scale_rotmats
 
-        return trans_vf, rotmats_vf
+        return PotentialField(trans=trans_vf, rotmats=rotmats_vf)
 
     def _rot_sample_kappa(self, t: torch.Tensor):
         """kappa to scale rotation `so3_t` times, so that rotations settle more quickly"""
@@ -1454,7 +1476,6 @@ class Interpolant:
         Returns a batch with noisy features updated to t_2, and model + protein intermediate states.
 
         Note on torsions:
-        Currently, torsions are not an input to the model.
         `torsions_1` are always defined.
         `torsions_t` are always defined by `corrupt_batch`.
         `torsions_t` will always be defined during sampling, but may not be used.
@@ -1481,6 +1502,11 @@ class Interpolant:
         aatypes_t_1 = noisy_batch[nbp.aatypes_t]
         torsions_t_1 = noisy_batch[nbp.torsions_t]
 
+        # Gather protein state before interpolating (we already saved after previous step)
+        prev_protein_state = SamplingStep.from_batch(
+            batch=noisy_batch,
+        )
+
         # Get model output given batch at time `t`
         with torch.no_grad():
             model_out = model(noisy_batch)
@@ -1495,10 +1521,6 @@ class Interpolant:
             res_mask=res_mask,
         )
 
-        # Placeholder: inpainting with motifs may define gradients to modify velocity fields below.
-        grad_trans = None
-        grad_rotmats = None
-
         # Mask fixed values to prepare for integration and update the batch for next step.
         if task == InferenceTask.unconditional:
             pass
@@ -1510,16 +1532,6 @@ class Interpolant:
             )
             pred_aatypes_1 = mask_blend_1d(
                 pred_aatypes_1, true_feats.aatypes, scaffold_mask
-            )
-
-            # For rotations and translations, compute a "potential" scaled by `t=t_1`
-            # to pull the motifs towards their known positions.
-            grad_trans, grad_rotmats = self.motif_potentials(
-                t=t_1,
-                noisy_batch=noisy_batch,
-                pred=model_out,
-                true_feats=true_feats,
-                motif_mask=motif_mask,
             )
 
             # Leave the torsions alone, let the model predict them,
@@ -1549,6 +1561,29 @@ class Interpolant:
             logits=None,
         )
 
+        # For inpainting, compute a potential (scaled by `t=t_1`) to pull the motifs
+        # (trans + rotmats) towards their known positions.
+        # If not inpainting, motif_mask is None, and no guidance.
+        motif_guidance = self.motif_potentials(
+            t=t_1,
+            noisy_batch=noisy_batch,
+            pred=model_out,
+            true_feats=true_feats,
+            motif_mask=motif_mask,
+        )
+
+        # Feynman-Kac steering, if enabled.
+        noisy_batch, resample_idx, step_metrics, guidance = self.resampler.on_step(
+            step_idx=step_idx,
+            batch=noisy_batch,
+            protein_state=prev_protein_state,
+            protein_pred=protein_pred,
+            model_pred=model_pred,
+        )
+
+        # add motif and potential guidance vector fields
+        guidance = motif_guidance + guidance
+
         # During sampling, update the self-conditioned values and take Euler steps for each domain.
         # On the final step, just use the cleaned up model predictions.
         if is_final_step:
@@ -1572,6 +1607,7 @@ class Interpolant:
 
             # Take next step, size `d_t` from `t_1` (current value) to `t_2` (toward predicted value)
             # We are at `t_1` with state `{domain}_t_1`. The model predicted `pred_{domain}_1`.
+            # We use a shared `d_t` across domains, even though each may have its own `t` in the batch.
             d_t = t_2 - t_1
             trans_t_2 = self._trans_euler_step(
                 d_t=d_t,
@@ -1580,7 +1616,7 @@ class Interpolant:
                 trans_t=trans_t_1,
                 chain_idx=chain_idx,
                 stochasticity_scale=stochasticity_scale,
-                potential=grad_trans,
+                potential=guidance.trans,
             )
             rotmats_t_2 = self._rots_euler_step(
                 d_t=d_t,
@@ -1588,7 +1624,7 @@ class Interpolant:
                 rotmats_1=pred_rotmats_1,
                 rotmats_t=rotmats_t_1,
                 stochasticity_scale=stochasticity_scale,
-                potential=grad_rotmats,
+                potential=guidance.rotmats,
             )
             aatypes_t_2 = self._aatypes_euler_step(
                 d_t=d_t,
@@ -1596,6 +1632,7 @@ class Interpolant:
                 logits_1=pred_logits_1,
                 aatypes_t=aatypes_t_1,
                 stochasticity_scale=stochasticity_scale,
+                potential=guidance.logits,
             )
             torsions_t_2 = (
                 self._torsions_euler_step(
@@ -1610,11 +1647,8 @@ class Interpolant:
             )
 
             if task == InferenceTask.inpainting:
-                # Because we already set the motif positions in pred_{trans/rots}_1,
-                # we have already interpolated towards them as guidance.
                 # TODO(inpainting-fixed) to support fixed motifs, fix the t_2 structure motifs.
-
-                # Sequence is fixed for motifs at t=1
+                # Fix the sequence in the motifs
                 aatypes_t_2 = mask_blend_1d(
                     aatypes_t_2, true_feats.aatypes, scaffold_mask
                 )
@@ -1643,15 +1677,7 @@ class Interpolant:
             batch=noisy_batch,
         )
 
-        # Feynman-Kac steering, if enabled.
-        # TODO(FK) Determine if we should expose model states for un-selected particles
-        noisy_batch, resample_idx, step_metrics = self.resampler.on_step(
-            step_idx=step_idx,
-            batch=noisy_batch,
-            protein_pred=protein_pred,
-            model_pred=model_pred,
-            protein_state=protein_state,
-        )
+        # FK Steering particle selection, if enabled
         if resample_idx is not None:
             model_pred = model_pred.select_batch_idx(resample_idx)
             protein_state = protein_state.select_batch_idx(resample_idx)
