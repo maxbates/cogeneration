@@ -60,7 +60,7 @@ warnings.filterwarnings(
 )
 warnings.filterwarnings(
     "ignore",
-    message="builtin type SwigPyPacked has no __module__ attribute",
+    message="builtin type .*? has no __module__ attribute",
     category=DeprecationWarning,
 )
 warnings.filterwarnings(

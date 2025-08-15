@@ -141,13 +141,6 @@ class Interpolant:
     def __init__(self, cfg: InterpolantConfig):
         self.cfg = cfg
 
-        self.resampler = FKSteeringResampler(cfg=self.cfg.steering)
-        if self.resampler.enabled:
-            assert (
-                self.cfg.sampling.num_timesteps % self.resampler.cfg.resampling_interval
-                == 0
-            ), f"Number of sampling timesteps ({self.cfg.sampling.num_timesteps}) must be divisible by the steering resampling interval ({self.resampler.cfg.resampling_interval})"
-
         # TODO - consider building igso3 on instantiation, to simplify device management
         #   (will increase instantiation time slightly)
         self._igso3 = None
@@ -1365,8 +1358,6 @@ class Interpolant:
 
         See FrameFlow paper for details about motif guidance (sec 3.2):
         https://arxiv.org/pdf/2401.04082
-
-        TODO consider treating completely as a Potential? With larger scale?
         """
         if motif_mask is None or not motif_mask.any():
             return PotentialField()
@@ -1464,6 +1455,7 @@ class Interpolant:
         true_feats: BatchTrueFeatures,
         model,
         task: InferenceTask,
+        resampler: FKSteeringResampler,
         step_idx: int,
         t_1: float,  # [scalar Tensor]
         t_2: Optional[float],  # [scalar Tensor] None if final step
@@ -1573,7 +1565,7 @@ class Interpolant:
         )
 
         # Feynman-Kac steering, if enabled.
-        noisy_batch, resample_idx, step_metrics, guidance = self.resampler.on_step(
+        noisy_batch, resample_idx, step_metrics, guidance = resampler.on_step(
             step_idx=step_idx,
             batch=noisy_batch,
             protein_state=prev_protein_state,
@@ -1710,6 +1702,8 @@ class Interpolant:
         structure_method: StructureExperimentalMethod = StructureExperimentalMethod.XRAY_DIFFRACTION,
         hot_spots: Optional[torch.Tensor] = None,
         contact_conditioning: Optional[torch.Tensor] = None,
+        # Optional override for FK steering particles; set to 1 to disable
+        num_particles: Optional[int] = None,
     ) -> Tuple[SamplingTrajectory, SamplingTrajectory, FKSteeringTrajectory]:
         """
         Generate samples by interpolating towards model predictions.
@@ -1778,6 +1772,21 @@ class Interpolant:
         else:
             raise ValueError(f"Unknown task {task}")
 
+        # Set up FK resampler for this sampling run
+        resampler = FKSteeringResampler(
+            cfg=self.cfg.steering, num_particles=num_particles
+        )
+        if resampler.enabled:
+            assert (
+                self.cfg.sampling.num_timesteps % resampler.cfg.resampling_interval == 0
+            ), f"Number of sampling timesteps ({self.cfg.sampling.num_timesteps}) must be divisible by the steering resampling interval ({resampler.cfg.resampling_interval})"
+
+        # fk_trajectory tracks Feynman-Kac steering metrics over time
+        fk_trajectory = FKSteeringTrajectory(
+            num_batch=num_batch,
+            num_particles=resampler.num_particles,
+        )
+
         # model_trajectory tracks model outputs
         model_trajectory = SamplingTrajectory(
             num_batch=num_batch,
@@ -1789,11 +1798,6 @@ class Interpolant:
             num_batch=num_batch,
             num_res=num_res,
             num_tokens=self.num_tokens,
-        )
-        # fk_trajectory tracks Feynman-Kac steering metrics over time
-        fk_trajectory = FKSteeringTrajectory(
-            num_batch=num_batch,
-            num_particles=self.cfg.steering.num_particles,
         )
 
         # for inference, all residues under consideration
@@ -1904,7 +1908,7 @@ class Interpolant:
 
         # Set up Feynman-Kac resampling, which expands each batch member to K particles.
         # Idempotent if not enabled or number of particles is 1.
-        batch = self.resampler.init_particles(batch=batch)  # (B, ...) -> (B * K, ...)
+        batch = resampler.init_particles(batch=batch)  # (B, ...) -> (B * K, ...)
         num_batch = batch[bp.res_mask].shape[0]  # may have changed
 
         # save t=0 state
@@ -1959,6 +1963,7 @@ class Interpolant:
                 true_feats=true_feats,
                 model=model,
                 task=task,
+                resampler=resampler,
                 step_idx=step_idx,
                 t_1=t_1,
                 t_2=t_2,
@@ -1987,6 +1992,7 @@ class Interpolant:
             true_feats=true_feats,
             model=model,
             task=task,
+            resampler=resampler,
             step_idx=self.cfg.sampling.num_timesteps,  # final step
             t_1=t_1,
             t_2=None,  # final step
@@ -2001,7 +2007,7 @@ class Interpolant:
         # TODO(fksteering) - allow passing through all the particles.
         #   Ensure each is handled properly.
         #   Right now we make some assumptions and build directory structure before calling sample().
-        _, best_idx = self.resampler.best_particle_in_batch(batch=batch)
+        _, best_idx = resampler.best_particle_in_batch(batch=batch)
         if best_idx is not None:
             # Select the best particle for each sample
             model_trajectory = model_trajectory.select_batch_idx(best_idx)

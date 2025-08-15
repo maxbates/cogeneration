@@ -704,10 +704,15 @@ class FKSteeringResampler:
     """
 
     cfg: InterpolantSteeringConfig
+    # Optional override for number of particles; if None, cfg.num_particles is used
+    num_particles: Optional[int] = None
 
     def __post_init__(self):
         self.calculator = FKSteeringCalculator(cfg=self.cfg)
         self._log = logging.getLogger(__name__)
+
+        if self.num_particles is None:
+            self.num_particles = self.cfg.num_particles
 
         # track energy trajectory for each particle
         self._energy_trajectory: Optional[torch.Tensor] = None  # (B * K, 0->T)
@@ -721,7 +726,7 @@ class FKSteeringResampler:
 
     @property
     def enabled(self) -> bool:
-        return self.cfg.num_particles > 1
+        return self.num_particles > 1
 
     def log_G_score(self) -> torch.Tensor:
         """
@@ -736,19 +741,18 @@ class FKSteeringResampler:
         if not self.enabled:
             return batch
 
-        self._log.debug(f"Init FK Steering with {self.cfg.num_particles} particles")
+        self._log.debug(f"Init FK Steering with {self.num_particles} particles")
 
         num_batch, num_res = batch[bp.res_mask].shape  # (B, N)
-        num_particles = self.cfg.num_particles  # K
         device = batch[bp.res_mask].device
 
         self._energy_trajectory = torch.empty(
-            num_batch * num_particles, 0, device=device
+            num_batch * self.num_particles, 0, device=device
         )
-        self._log_G = torch.zeros(num_batch * num_particles, device=device)
-        self._log_G_delta = torch.zeros(num_batch * num_particles, device=device)
+        self._log_G = torch.zeros(num_batch * self.num_particles, device=device)
+        self._log_G_delta = torch.zeros(num_batch * self.num_particles, device=device)
 
-        batch = {k: _batch_repeat_feat(v, num_particles) for k, v in batch.items()}
+        batch = {k: _batch_repeat_feat(v, self.num_particles) for k, v in batch.items()}
 
         return batch
 
@@ -789,8 +793,7 @@ class FKSteeringResampler:
         assert self._energy_trajectory is not None, "FK Steering not initialized."
 
         batch_size, num_res = batch[bp.res_mask].shape  # (B * K, N)
-        num_particles = self.cfg.num_particles  # K
-        num_batch = batch_size // num_particles  # B (original batch size)
+        num_batch = batch_size // self.num_particles  # B (original batch size)
         device = batch[bp.res_mask].device
 
         # calculate and track energy
@@ -826,7 +829,7 @@ class FKSteeringResampler:
 
         # calculate log G score
         log_G_score = self.log_G_score()
-        logG_mat = log_G_score.view(num_batch, num_particles)  # (B, K)
+        logG_mat = log_G_score.view(num_batch, self.num_particles)  # (B, K)
 
         # softmax-normalize resampling weights per sample
         # temperature scale log G; <1 = sharpen, 1 = no effect.
@@ -843,12 +846,12 @@ class FKSteeringResampler:
 
         # draw surviving particle indices
         row_idx = [
-            torch.multinomial(w_i, num_particles, replacement=True)
+            torch.multinomial(w_i, self.num_particles, replacement=True)
             for w_i in resampling_weights
         ]
         idx = (
             torch.stack(row_idx)
-            + torch.arange(num_batch, device=device).unsqueeze(1) * num_particles
+            + torch.arange(num_batch, device=device).unsqueeze(1) * self.num_particles
         ).flatten()
 
         step_metric = FKStepMetric(
@@ -881,14 +884,13 @@ class FKSteeringResampler:
             return batch, None
 
         batch_size, num_res = batch[bp.res_mask].shape  # (B * K, N)
-        num_particles = self.cfg.num_particles  # K
-        num_batch = batch_size // num_particles  # B (original batch size)
+        num_batch = batch_size // self.num_particles  # B (original batch size)
         device = batch[bp.res_mask].device
 
         log_G_score = self.log_G_score()
-        logG_mat = log_G_score.view(num_batch, num_particles)  # (B, K)
+        logG_mat = log_G_score.view(num_batch, self.num_particles)  # (B, K)
         idx_best = logG_mat.argmax(dim=1)  # (B,)
-        idx_best += torch.arange(num_batch, device=device) * num_particles  # (B,)
+        idx_best += torch.arange(num_batch, device=device) * self.num_particles  # (B,)
         batch_best = {k: _batch_select_feat(v, idx_best) for k, v in batch.items()}
 
         return batch_best, idx_best

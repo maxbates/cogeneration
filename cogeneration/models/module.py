@@ -530,6 +530,8 @@ class FlowModule(LightningModule):
             torsions_1=batch[bp.torsions_1],
             hot_spots=batch.get(bp.hot_spots, None),
             contact_conditioning=batch.get(bp.contact_conditioning, None),
+            # Disable FK steering during validation
+            num_particles=1,
         )
 
         bb_trajs = to_numpy(sample_traj.structure)
