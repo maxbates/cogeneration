@@ -214,6 +214,26 @@ class TestHotSpotPotential:
 
 
 class TestContactConditioningPotential:
+    def _make_simple_batch_and_step(self, B: int = 1, N: int = 6):
+        # Reuse helper but trim to a small N to isolate pair interactions
+        batch, step = _make_batch_and_step(
+            B=B, N=max(20, N), multimer=False, with_break=False
+        )
+        for k in [bp.res_mask, bp.diffuse_mask, bp.chain_idx, bp.res_idx]:
+            batch[k] = batch[k][:, :N]
+        # Remove motif mask to avoid interfering with guidance tests
+        if bp.motif_mask in batch:
+            del batch[bp.motif_mask]
+        step = SamplingStep(
+            res_mask=batch[bp.res_mask],
+            trans=step.trans[:, :N, :],
+            rotmats=step.rotmats[:, :N, :, :],
+            aatypes=step.aatypes[:, :N],
+            torsions=None,
+            logits=make_one_hot(step.aatypes[:, :N].long(), 21),
+        )
+        return batch, step
+
     def test_no_contacts_defined(self):
         """Test that potential returns zero energy when no contacts are defined."""
         batch, step = _make_batch_and_step(B=1, N=30, multimer=False)
@@ -348,6 +368,85 @@ class TestContactConditioningPotential:
         assert (
             E_weighted.item() > E_unweighted.item()
         ), f"Expected higher energy with inter-chain weighting: {E_weighted.item()} vs {E_unweighted.item()}"
+
+    def test_guidance_pull_toward_target_when_too_far(self):
+        """If current distance > target + tol, guidance should pull residues together (decrease distance)."""
+        B, N = 1, 6
+        batch, step = self._make_simple_batch_and_step(B=B, N=N)
+
+        # Actual ~3.8A; set target much shorter to trigger "too_far"
+        target = 2.0
+        cc = torch.zeros(B, N, N)
+        cc[0, 0, 1] = target
+        cc[0, 1, 0] = target
+        batch[bp.contact_conditioning] = cc
+
+        potential = ContactConditioningPotential(guidance_scale=1.0)
+        _, guidance = potential.compute(
+            batch=batch, model_pred=step, protein_pred=step, protein_state=step
+        )
+
+        assert guidance is not None and guidance.trans is not None
+        v01 = step.trans[0, 1] - step.trans[0, 0]
+        v10 = step.trans[0, 0] - step.trans[0, 1]
+        # Move residue 0 toward residue 1
+        assert (guidance.trans[0, 0] * v01).sum().item() > 0
+        # Move residue 1 toward residue 0
+        assert (guidance.trans[0, 1] * v10).sum().item() > 0
+
+    def test_guidance_push_away_when_too_close(self):
+        """If current distance < target - tol, guidance should push residues apart (increase distance)."""
+        B, N = 1, 6
+        batch, step = self._make_simple_batch_and_step(B=B, N=N)
+
+        # Use a spaced-out pair (0 and 2) with actual ~7.6A; set target slightly longer
+        i, j = 0, 2
+        actual = torch.norm(step.trans[0, j] - step.trans[0, i]).item()
+        target = actual + 1.0  # > 3.8 and > actual + tolerance
+        cc = torch.zeros(B, N, N)
+        cc[0, i, j] = target
+        cc[0, j, i] = target
+        batch[bp.contact_conditioning] = cc
+
+        potential = ContactConditioningPotential(guidance_scale=1.0)
+        _, guidance = potential.compute(
+            batch=batch, model_pred=step, protein_pred=step, protein_state=step
+        )
+
+        assert guidance is not None and guidance.trans is not None
+        v_ij = step.trans[0, j] - step.trans[0, i]
+        v_ji = step.trans[0, i] - step.trans[0, j]
+        # Move residue 0 away from residue 1
+        assert (guidance.trans[0, i] * v_ij).sum().item() < 0
+        # Move residue 1 away from residue 0
+        assert (guidance.trans[0, j] * v_ji).sum().item() < 0
+
+    def test_guidance_zero_on_motif_pairs(self):
+        """When both residues are motifs, guidance should not be applied to them (scaffold-only)."""
+        B, N = 1, 6
+        batch, step = self._make_simple_batch_and_step(B=B, N=N)
+
+        # Define a contact between residues 0 and 1
+        target = 2.0
+        cc = torch.zeros(B, N, N)
+        cc[0, 0, 1] = target
+        cc[0, 1, 0] = target
+        batch[bp.contact_conditioning] = cc
+
+        # Mark both residues as motifs
+        motif_mask = torch.zeros(B, N)
+        motif_mask[:, 0] = 1
+        motif_mask[:, 1] = 1
+        batch[bp.motif_mask] = motif_mask
+
+        potential = ContactConditioningPotential(guidance_scale=1.0)
+        _, guidance = potential.compute(
+            batch=batch, model_pred=step, protein_pred=step, protein_state=step
+        )
+
+        assert guidance is not None and guidance.trans is not None
+        assert torch.all(guidance.trans[0, 0] == 0)
+        assert torch.all(guidance.trans[0, 1] == 0)
 
 
 class DummyMPNNResult:

@@ -1772,7 +1772,7 @@ class Interpolant:
         else:
             raise ValueError(f"Unknown task {task}")
 
-        # Set up FK resampler for this sampling run
+        # Set up Feynman-Kac steering + resampling for this sampling run
         resampler = FKSteeringResampler(
             cfg=self.cfg.steering, num_particles=num_particles
         )
@@ -1781,7 +1781,7 @@ class Interpolant:
                 self.cfg.sampling.num_timesteps % resampler.cfg.resampling_interval == 0
             ), f"Number of sampling timesteps ({self.cfg.sampling.num_timesteps}) must be divisible by the steering resampling interval ({resampler.cfg.resampling_interval})"
 
-        # fk_trajectory tracks Feynman-Kac steering metrics over time
+        # fk_trajectory tracks FK steering metrics over time
         fk_trajectory = FKSteeringTrajectory(
             num_batch=num_batch,
             num_particles=resampler.num_particles,

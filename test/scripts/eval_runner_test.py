@@ -25,13 +25,16 @@ class TestEvalRunner:
         tmp_path,
         task,
     ):
+        # TODO - this test has a known failure for inpainting
+        # because the mock may not be the same length as the sampled structure
+        # (scaffold lengths vary in inpainting)
+
         # This is a end-to-end test that performs sampling and computes metrics
         mock_cfg_uninterpolated.dataset.task = task.to_data_task(task)
         mock_cfg_uninterpolated.inference.task = task
 
         # only sample one sample
-        # TODO(test) - support multiple samples
-        #   We need to mock folding validation for all samples in pred dataloader.
+        # Note testing multiple requires updating the mock to handle multiple
         mock_cfg_uninterpolated.inference.samples.samples_per_length = 1
         mock_cfg_uninterpolated.inference.samples.length_subset = [36]
 
@@ -43,8 +46,6 @@ class TestEvalRunner:
         # set up eval runner
         sampler = EvalRunner(cfg=cfg)
 
-        # TODO(inpainting) - support better inpainting dataset / dataloader cfg
-        #   currently not respecting cfg.inference, just using dataset eval == validation
         # TODO(inpainting) - handle stochasticity when sampling from dataloader
         #   e.g. scaffold lengths change, motif positions change, etc.
         # HACK - truncate dataset to single item for inpainting
@@ -52,6 +53,7 @@ class TestEvalRunner:
             sampler.dataloader.dataset.csv = sampler.dataloader.dataset.csv.head(1)
 
         # for unconditional, we implicitly test that inference config takes priority over checkpoint for LengthSamplingDataset
+        # i.e. because we get a single item from dataloader
         assert (
             len(sampler.dataloader) == 1
         ), f"Expected only one sample in dataloader, got {len(sampler.dataloader)}"

@@ -11,6 +11,7 @@ from cogeneration.data.tools.protein_mpnn_runner import ProteinMPNNRunner
 from cogeneration.data.trajectory import SamplingStep
 from cogeneration.dataset.interaction import DIST_INTERACTION_BACKBONE
 from cogeneration.type.batch import BatchProp as bp
+from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
 
 
@@ -394,11 +395,15 @@ class ContactConditioningPotential(Potential):
     Uses ReLU penalty for distances that exceed the defined contact thresholds.
     Normalizes energy over the number of defined contacts.
     Optionally ignores contacts in motifs and upweights inter-chain contacts.
+
+    TODO - consider supporting a schedule to scale guidance over time
     """
 
     tolerance_dist: float = 0.5  # tolerance distance for contact conditioning
     inter_chain_weight: float = 2.0  # upweight factor for inter-chain contacts
     max_distance_penalty: float = 10.0  # maximum distance penalty
+    ignore_motif_motif_in_energy: bool = True
+    potential_max_force_angstroms: float = 1.0  # maximum force magnitude in angstroms
 
     def compute(
         self,
@@ -407,72 +412,119 @@ class ContactConditioningPotential(Potential):
         model_pred: SamplingStep,
         protein_pred: SamplingStep,
     ) -> Tuple[PotentialEnergy, Optional[PotentialField]]:
-        num_batch, num_res = batch[bp.res_idx].size()  # (B, N)
+        B, N = batch[bp.res_idx].size()
+        chain_idx = batch[bp.chain_idx]  # (B, N)
         device = batch[bp.res_idx].device
 
         if bp.contact_conditioning not in batch:
-            return torch.zeros(num_batch, device=device), None
+            return torch.zeros(B, device=device), None
 
-        contact_conditioning = batch[bp.contact_conditioning]  # (B, N, N)
-        contact_mask = contact_conditioning > 0  # (B, N, N)
+        contact_target_dist = batch[bp.contact_conditioning]  # (B, N, N)
+        contact_cond_mask = contact_target_dist > 0  # (B, N, N)
 
-        if not contact_mask.any():
-            return torch.zeros(num_batch, device=device), None
+        if not contact_cond_mask.any():
+            return torch.zeros(B, device=device), None
 
-        # pairwse distances
+        # Energy, calculated using predicted structure
+
         pred_trans = protein_pred.trans  # (B, N, 3)
-        pairwise_dists = torch.norm(
-            pred_trans.unsqueeze(2) - pred_trans.unsqueeze(1),
-            dim=-1,
+        pred_dists = torch.norm(
+            pred_trans.unsqueeze(2) - pred_trans.unsqueeze(1), dim=-1
         )  # (B, N, N)
 
-        # clamped ReLU penalty
-        shortfall = torch.relu(
-            contact_conditioning - pairwise_dists - self.tolerance_dist
-        )
-        excess = torch.relu(pairwise_dists - contact_conditioning - self.tolerance_dist)
-        contact_penalties = excess + shortfall
-        contact_penalties = contact_penalties.clamp(max=self.max_distance_penalty)
+        # tolerance band penalties (ReLU outside [targets +/- tolerance_dist])
+        shortfall = torch.relu(contact_target_dist - pred_dists - self.tolerance_dist)
+        excess = torch.relu(pred_dists - contact_target_dist - self.tolerance_dist)
+        penalties = (shortfall + excess).clamp(max=self.max_distance_penalty)
 
-        # Only for defined contacts
-        contact_penalties = contact_penalties * contact_mask.float()  # (B, N, N)
-
-        # Ignore contacts in motifs, if defined
+        # If inpainting, drop motif-motif contacts since they are subject to motif guidance
         motif_mask = batch.get(bp.motif_mask, None)
-        if motif_mask is not None:
-            # Create motif edge mask: both residues must NOT be in motifs
-            motif_edge_mask = (~motif_mask.bool()).unsqueeze(2) & (
-                ~motif_mask.bool()
-            ).unsqueeze(1)
-            contact_penalties = contact_penalties * motif_edge_mask.float()
+        if motif_mask is not None and self.ignore_motif_motif_in_energy:
+            mm = motif_mask.bool()
+            motif_mask_2d = (
+                mm.unsqueeze(2) & mm.unsqueeze(1)
+            ).float()  # both residues motif
+            penalties = penalties * (1.0 - motif_mask_2d)  # zero motif-motif only
 
-        # reweight inter-chain contacts if specified
+        # only defined contacts contribute
+        penalties = penalties * contact_cond_mask.float()
+
+        # optional inter-chain upweighting
         if self.inter_chain_weight != 1.0:
-            chain_idx = batch[bp.chain_idx]  # (B, N)
-            chain_i = chain_idx.unsqueeze(2)  # (B, N, 1)
-            chain_j = chain_idx.unsqueeze(1)  # (B, 1, N)
-            inter_chain_mask = chain_i != chain_j  # (B, N, N)
+            inter_chain_mask = (
+                chain_idx.unsqueeze(2) != chain_idx.unsqueeze(1)
+            ) & contact_cond_mask  # (B, N, N)
+            weights = torch.ones_like(penalties)
+            weights[inter_chain_mask] = self.inter_chain_weight
+            penalties = penalties * weights
 
-            contact_weights = torch.ones_like(contact_penalties)
-            contact_weights = torch.where(
-                inter_chain_mask & contact_mask,
-                self.inter_chain_weight,
-                contact_weights,
-            )
-            contact_penalties = contact_penalties * contact_weights
+        # normalize energy to [0, 1]
+        num_contacts = contact_cond_mask.float().sum(dim=(1, 2)).clamp_min(1.0)  # (B,)
+        energy = (penalties.sum(dim=(1, 2)) / num_contacts) / self.max_distance_penalty
+        energy = energy.clamp(0.0, 1.0)
 
-        # Sum penalties and normalize by number of defined contacts
-        penalty_per_batch = contact_penalties.sum(dim=(1, 2))  # (B,)
-        num_contacts = contact_mask.float().sum(dim=(1, 2)).clamp_min(1.0)  # (B,)
-        penalty_per_batch = penalty_per_batch / num_contacts  # (B,)
+        # Guidance vector field, calculated using the current state:
+        # compute current distances, determine errors from conditioning target,
+        # compute force on each residue from other residues, sum, normalize, scale
 
-        # Normalize energy to [0, 1] range
-        energy = penalty_per_batch / self.max_distance_penalty
-        energy = energy.clamp(min=0.0, max=1.0)
+        trans_t = protein_state.trans  # (B, N, 3) current coords
+        dists_t = trans_t.unsqueeze(2) - trans_t.unsqueeze(1)  # (B, N, N, 3)
+        pairwise_dist = torch.linalg.norm(dists_t, dim=-1)  # (B, N, N)
 
-        # TODO(guidance) compute guidance
+        # active outside the tolerance band
+        too_far = pairwise_dist > (
+            contact_target_dist + self.tolerance_dist
+        )  # => shorten
+        too_close = pairwise_dist < (
+            contact_target_dist - self.tolerance_dist
+        )  # => lengthen
+        active = (too_far | too_close) & contact_cond_mask
 
-        return energy, None
+        # error magnitude beyond tolerance, ReLU capped to max_distance_penalty
+        err_far = torch.relu(pairwise_dist - contact_target_dist - self.tolerance_dist)
+        err_close = torch.relu(
+            contact_target_dist - pairwise_dist - self.tolerance_dist
+        )
+        mag = (err_far + err_close).clamp(max=self.max_distance_penalty)  # (B, N, N)
+
+        # VF u_ij points from i -> j
+        # too far => negative => pull res i toward target res j
+        # too close => positive => push res i away from target res j
+        sign = (-1.0) * too_far.float() + (1.0) * too_close.float()  # (B, N, N)
+        coef = (mag * sign) * active.float()  # signed strength per edge
+
+        # optional inter-chain upweighting on guidance too
+        if self.inter_chain_weight != 1.0:
+            inter_chain_mask = (
+                chain_idx.unsqueeze(2) != chain_idx.unsqueeze(1)
+            ) & active
+            coef = torch.where(inter_chain_mask, coef * self.inter_chain_weight, coef)
+
+        # compute unit directions and per-edge forces (on each residue from other residues)
+        u = dists_t / (pairwise_dist.clamp_min(1e-8).unsqueeze(-1))  # (B, N, N, 3)
+        force = coef.unsqueeze(-1) * u  # (B, N, N, 3) force on res i from res j
+
+        # accumulate per-residue forces symmetrically
+        trans_vf = force.sum(dim=2) - force.sum(dim=1)  # (B, N, 3)
+
+        # normalize by number of active interactions to stabilize scale
+        cnt = active.float().sum(dim=2) + active.float().sum(dim=1)  # (B, N)
+        trans_vf = trans_vf / cnt.clamp_min(1.0).unsqueeze(-1)
+
+        # if motif_mask exists, only apply VF to scaffolds
+        if motif_mask is not None:
+            scaffold = (~motif_mask.bool()).float().unsqueeze(-1)  # (B, N, 1)
+            trans_vf = trans_vf * scaffold
+
+        # global guidance scale
+        trans_vf = trans_vf * float(self.guidance_scale)
+
+        # cap max force, clip by norm (equivariant)
+        max_force = self.potential_max_force_angstroms
+        norm = trans_vf.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        trans_vf = trans_vf * (max_force / norm).clamp(max=1.0)
+
+        return energy, PotentialField(trans=trans_vf)
 
 
 @dataclass
