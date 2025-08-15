@@ -5,6 +5,7 @@ from textwrap import dedent
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+from sympy import Float
 
 from cogeneration.config.base import InterpolantSteeringConfig, ProteinMPNNRunnerConfig
 from cogeneration.data.tools.protein_mpnn_runner import ProteinMPNNRunner
@@ -88,6 +89,14 @@ class PotentialField:
         if self.logits is not None:
             self.logits = self.logits * mask[..., None]
 
+    def __getitem__(self, idx) -> "PotentialField":
+        """Slice the potential field to a subset of the batch."""
+        return PotentialField(
+            trans=self.trans[idx] if self.trans is not None else None,
+            rotmats=self.rotmats[idx] if self.rotmats is not None else None,
+            logits=self.logits[idx] if self.logits is not None else None,
+        )
+
     def __add__(self, other: "PotentialField") -> "PotentialField":
         """Elementwise add two potential fields, treating None as identity."""
         if other is None:
@@ -155,8 +164,9 @@ class FKStepMetric:
     log_G: List[float]
     log_G_delta: List[float]
     weights: List[float]
-    effective_sample_size: float
+    effective_sample_size: Float
     keep: List[int]
+    guidance: Optional[PotentialField] = None
 
     def log(self) -> str:
         return dedent(
@@ -202,7 +212,7 @@ class FKSteeringTrajectory:
             batch_idx: Index of the batch member (0-based, in original batch before particle expansion)
 
         Returns:
-            FKSteeringTrajectory containing only metrics for the specified batch member's particles
+            FKSteeringTrajectory containing only metrics & guidance for the specified batch member (metrics for all particles)
         """
         if batch_idx >= self.num_batch:
             raise ValueError(f"batch_idx {batch_idx} >= num_batch {self.num_batch}")
@@ -224,6 +234,7 @@ class FKSteeringTrajectory:
                 weights=weights_slice,
                 effective_sample_size=metric.effective_sample_size,  # scalar, keep as-is
                 keep=metric.keep[start_idx:end_idx],
+                guidance=metric.guidance[start_idx:end_idx],
             )
             sliced_metrics.append(sliced_metric)
 
@@ -827,6 +838,11 @@ class FKSteeringResampler:
 
         Batch is updated to new particles, but caller must update out of scope
         predictions / state with the resampled indices.
+
+        We output sample indices and metrics if this is a resampling step.
+
+        However, guidance potential field may be output on all steps, if enabled.
+        Guidance is cached and reused (with optional decay) on non-resampling steps.
         """
         # escape if disabled
         if not self.enabled:
@@ -914,6 +930,7 @@ class FKSteeringResampler:
             weights=resampling_weights.tolist(),
             effective_sample_size=effective_sample_size.mean().item(),
             keep=idx.tolist(),
+            guidance=guidance,
         )
         self._log.debug(step_metric.log())
 

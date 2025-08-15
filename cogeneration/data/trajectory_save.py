@@ -10,20 +10,25 @@ import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
+import torch
 from matplotlib.axes import Axes
 from matplotlib.colors import to_rgb
 from matplotlib.patches import Rectangle
 from matplotlib.text import Text
 from mpl_toolkits.mplot3d.art3d import Path3DCollection
 
-from cogeneration.data.potentials import FKSteeringTrajectory
+from cogeneration.data.potentials import (
+    FKSteeringTrajectory,
+    FKStepMetric,
+    PotentialField,
+)
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.type.metrics import OutputFileName
 from cogeneration.util.log import rank_zero_logger
 
 """
-Blitting-friendly trajectory visualization.
+Trajectory visualization.
 Most of the complexity here is to avoid redrawing the entire figure on each frame.
 Artists are created once (`_init` methods), and then updated in plate (`_update` methods).
 """
@@ -46,6 +51,9 @@ class SavedTrajectory:
     logits_traj_path: Optional[str] = None  # OutputFileName.logits_traj_{gif/mp4}
     traj_panel_path: Optional[str] = None  # OutputFileName.traj_panel_{gif/mp4}
     fk_steering_traj_path: Optional[str] = None  # OutputFileName.fk_steering_traj_png
+    fk_steering_potential_logits_path: Optional[str] = (
+        None  # OutputFileName.fk_steering_potential_logits_{gif/mp4}
+    )
 
 
 def _get_anim_writer() -> Tuple[str, matplotlib.animation.AbstractMovieWriter]:
@@ -213,21 +221,18 @@ def _init_logits_borders(
     return rects
 
 
-def save_logits_traj(
+def _save_logits_traj(
     logits_traj: npt.NDArray,  # (T, N, S) where S = 20 or 21
     aa_traj: npt.NDArray,  # (T, N)
     motif_mask: Optional[npt.NDArray],  # (N,)
-    output_dir: str,
+    file_path: str,
+    writer: matplotlib.animation.AbstractMovieWriter,
     animation_interval_ms: float = 100,
 ) -> str:
     """
-    Writes logits trajectory as a heatmap animation, one frame per step in the trajectory.
+    Writes logits trajectory as a heatmap animation, one frame per step in the trajectory, up to 50 frames.
     Returns the path to the animation.
     """
-
-    # Create output directory if it doesn't exist.
-    os.makedirs(output_dir, exist_ok=True)
-
     # Create figure and axis.
     num_timesteps, num_res = logits_traj.shape[:2]
     fig, ax = plt.subplots(figsize=(int(num_res * 0.15), 5), dpi=100)
@@ -255,18 +260,102 @@ def save_logits_traj(
         blit=True,
     )
 
-    # Save animation
+    anim.save(file_path, writer=writer)
+    plt.close(fig)
+
+    return file_path
+
+
+def save_logits_traj(
+    logits_traj: npt.NDArray,  # (T, N, S) where S = 20 or 21
+    aa_traj: npt.NDArray,  # (T, N)
+    motif_mask: Optional[npt.NDArray],  # (N,)
+    output_dir: str,
+    animation_interval_ms: float = 100,
+) -> str:
+    """Write sampled logits trajectory"""
     ext, writer = _get_anim_writer()
+
     if ext == "gif":
         anim_path = os.path.join(output_dir, OutputFileName.logits_traj_gif)
     elif ext == "mp4":
         anim_path = os.path.join(output_dir, OutputFileName.logits_traj_mp4)
     else:
         raise ValueError(f"Unknown animation format: {ext}")
-    anim.save(anim_path, writer=writer)
-    plt.close(fig)
 
-    return anim_path
+    os.makedirs(output_dir, exist_ok=True)
+
+    return _save_logits_traj(
+        logits_traj=logits_traj,
+        aa_traj=aa_traj,
+        motif_mask=motif_mask,
+        file_path=anim_path,
+        writer=writer,
+        animation_interval_ms=animation_interval_ms,
+    )
+
+
+def save_potential_logits_traj(
+    metrics: List[FKStepMetric],
+    sample_aa_traj: Optional[npt.NDArray],  # (T, N)
+    motif_mask: Optional[npt.NDArray],  # (N,)
+    output_dir: str,
+    animation_interval_ms: float = 100,
+) -> Optional[str]:
+    """Write FK steering potential logits trajectory if logits guidance present.
+
+    Returns path to saved animation, or None if logits guidance not present.
+    """
+    # Check if any metric has logits guidance
+    if metrics is None or len(metrics) == 0 or sample_aa_traj is None:
+        return None
+
+    first_guidance = metrics[0].guidance
+    if first_guidance is None or first_guidance.logits is None:
+        return None
+
+    # Build logits trajectory across FK resampling steps
+    fk_logits_guidance: List[npt.NDArray] = []
+    for m in metrics:
+        if m.guidance is None or m.guidance.logits is None:
+            continue
+        logits_t = m.guidance.logits  # (K, N, S) or (N, S)
+        if logits_t.dim() == 3:
+            logits_t = logits_t.mean(dim=0)
+        logits_np = logits_t.detach().cpu().to(torch.float32).numpy()  # (N, S)
+        fk_logits_guidance.append(logits_np)
+
+    if len(fk_logits_guidance) == 0:
+        return None
+
+    logits_traj = np.stack(fk_logits_guidance, axis=0)  # (T, N, S)
+
+    # Build AA trajectory across FK resampling steps
+    aa_traj = np.stack([sample_aa_traj[m.step] for m in metrics], axis=0)  # (T, N)
+
+    # Determine output path and writer
+    ext, writer = _get_anim_writer()
+    if ext == "gif":
+        anim_path = os.path.join(
+            output_dir, OutputFileName.fk_steering_potential_logits_gif
+        )
+    elif ext == "mp4":
+        anim_path = os.path.join(
+            output_dir, OutputFileName.fk_steering_potential_logits_mp4
+        )
+    else:
+        raise ValueError(f"Unknown animation format: {ext}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    return _save_logits_traj(
+        logits_traj=logits_traj,
+        aa_traj=aa_traj,
+        motif_mask=motif_mask,
+        file_path=anim_path,
+        writer=writer,
+        animation_interval_ms=animation_interval_ms,
+    )
 
 
 def _init_seq_artists(
@@ -611,12 +700,12 @@ def animate_trajectories(
     return anim_path
 
 
-def write_fk_steering_traj(
+def write_fk_steering_energy_traj(
     fk_steering_traj: FKSteeringTrajectory,
     file_path: str,
 ):
     """
-    Write FK steering trajectory as a multi-panel plot showing particle metrics over time.
+    Write FK steering particle energy trajectory as a multi-panel plot showing particle metrics over time.
 
     Args:
         fk_steering_traj: FKSteeringTrajectory containing metrics for each step
@@ -859,7 +948,8 @@ def save_trajectory(
     aa_traj_fasta_path = None
     model_logits_traj_path = None
     traj_panel_path = None
-    fk_steering_traj_path = None
+    fk_steering_energy_traj_path = None
+    fk_steering_potential_logits_path = None
 
     # Write amino acids trajectory, if provided.
     if sample_aa_traj is not None:
@@ -872,12 +962,23 @@ def save_trajectory(
                     "".join([restypes_with_x[aa] for aa in sample_aa_traj[i]]) + "\n"
                 )
 
-    # Plot FK steering energies, ESS, etc.
     if fk_steering_traj is not None:
-        fk_steering_traj_path = os.path.join(
-            output_dir, OutputFileName.fk_steering_traj_png
+        # Plot FK steering energies, ESS, etc.
+        fk_steering_energy_traj_path = os.path.join(
+            output_dir, OutputFileName.fk_steering_energy_traj_png
         )
-        write_fk_steering_traj(fk_steering_traj, file_path=fk_steering_traj_path)
+        write_fk_steering_energy_traj(
+            fk_steering_traj, file_path=fk_steering_energy_traj_path
+        )
+
+        # Plot logits guidance
+        if write_animations:
+            fk_steering_potential_logits_path = save_potential_logits_traj(
+                metrics=fk_steering_traj.metrics,
+                sample_aa_traj=sample_aa_traj,
+                motif_mask=motif_mask,
+                output_dir=output_dir,
+            )
 
     # Trajectory panel animation
     if (
@@ -907,5 +1008,6 @@ def save_trajectory(
         aa_traj_fasta_path=aa_traj_fasta_path,
         logits_traj_path=model_logits_traj_path,
         traj_panel_path=traj_panel_path,
-        fk_steering_traj_path=fk_steering_traj_path,
+        fk_steering_traj_path=fk_steering_energy_traj_path,
+        fk_steering_potential_logits_path=fk_steering_potential_logits_path,
     )

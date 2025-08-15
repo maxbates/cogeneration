@@ -1565,7 +1565,7 @@ class Interpolant:
         )
 
         # Feynman-Kac steering, if enabled.
-        noisy_batch, resample_idx, step_metrics, guidance = resampler.on_step(
+        noisy_batch, resample_idx, step_metrics, potential_guidance = resampler.on_step(
             step_idx=step_idx,
             batch=noisy_batch,
             protein_state=prev_protein_state,
@@ -1574,7 +1574,7 @@ class Interpolant:
         )
 
         # add motif and potential guidance vector fields
-        guidance = motif_guidance + guidance
+        guidance = motif_guidance + potential_guidance
 
         # During sampling, update the self-conditioned values and take Euler steps for each domain.
         # On the final step, just use the cleaned up model predictions.

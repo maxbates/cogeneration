@@ -3,17 +3,27 @@ import os
 from pathlib import Path
 
 import pytest
+import torch
 
-from cogeneration.data.potentials import FKSteeringTrajectory, FKStepMetric
-from cogeneration.data.trajectory_save import write_fk_steering_traj
+from cogeneration.data.potentials import (
+    FKSteeringTrajectory,
+    FKStepMetric,
+    PotentialField,
+)
+from cogeneration.data.trajectory_save import (
+    save_potential_logits_traj,
+    write_fk_steering_energy_traj,
+)
 
 
 class TestWriteFKSteeringTraj:
     def test_write_fk_steering_traj(self, tmp_path):
         """Test that write_fk_steering_traj creates a plot file with dummy FK steering data."""
         # Create dummy FK steering trajectory with 10 steps and 4 particles
-        num_steps = 10
+        num_batch = 1
+        num_res = 10
         num_particles = 4
+        num_steps = 10
 
         # Create dummy metrics for each step
         metrics = []
@@ -32,6 +42,13 @@ class TestWriteFKSteeringTraj:
             effective_sample_size = 3.5 - 0.1 * step  # Decreasing ESS over time
             keep = list(range(num_particles))  # All particles kept
 
+            # guidance just saves the logits, they are converted when plotting
+            guidance = PotentialField(
+                trans=torch.randn(num_particles, num_res, 3),
+                rotmats=torch.randn(num_particles, num_res, 3),
+                logits=torch.randn(num_particles, num_res, 21),  # assume masking
+            )
+
             metric = FKStepMetric(
                 step=step,
                 energy=energy,
@@ -40,24 +57,36 @@ class TestWriteFKSteeringTraj:
                 weights=weights,
                 effective_sample_size=effective_sample_size,
                 keep=keep,
+                guidance=guidance,
             )
             metrics.append(metric)
 
         # Create FK steering trajectory
         fk_traj = FKSteeringTrajectory(
-            num_batch=1,
+            num_batch=num_batch,
             num_particles=num_particles,
             metrics=metrics,
         )
 
         # Write the trajectory plot
         output_path = tmp_path / "test_fk_steering_traj.png"
-        write_fk_steering_traj(fk_traj, str(output_path))
+        write_fk_steering_energy_traj(fk_traj, str(output_path))
 
         # Verify the file was created
         assert output_path.exists()
         assert output_path.stat().st_size > 0  # File should have content
 
+        # Write the logits trajectory animation
+        aa_traj = torch.randint(low=0, high=21, size=(num_steps, num_res))
+        logits_anim_path = save_potential_logits_traj(
+            metrics=fk_traj.metrics,
+            sample_aa_traj=aa_traj.numpy(),
+            motif_mask=None,
+            output_dir=str(tmp_path),
+        )
+
+        assert logits_anim_path is not None
+        assert os.path.exists(logits_anim_path)
+
         # Log the path for manual inspection
-        logging.info(f"FK steering trajectory plot saved to: {output_path}")
         print(f"FK steering trajectory plot saved to: {output_path}")
