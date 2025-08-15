@@ -436,12 +436,13 @@ class SequenceRedesigner:
         assert best_path.exists(), f"BestRedesigns CSV not found: {best_path}"
 
         df = pd.read_csv(best_path)
-        self.log.info(f"Found {len(df)} pre-defined redesigns from {best_path}")
+        orig_n = len(df)
+        self.log.info(f"BestRedesigns: {orig_n} provided from {best_path}")
 
         # filter to good RMSD options
         df = df[df[BestRedesignColumn.best_rmsd].apply(float) <= self.cfg.rmsd_good]
         self.log.info(
-            f"Using {len(df)} pre-defined redesigns with RMSD < {self.cfg.rmsd_good}"
+            f"BestRedesigns: kept {len(df)} with best_rmsd <= {self.cfg.rmsd_good} (removed {orig_n - len(df)} by RMSD filter)"
         )
 
         return df
@@ -479,9 +480,10 @@ class SequenceRedesigner:
             redesign_source_missing_pdb_names = (
                 redesign_source_pdb_names - redesign_source_present_pdb_names
             )
+            total_targets = len(redesign_source_pdb_names)
             if len(redesign_source_missing_pdb_names) > 0:
                 self.log.warning(
-                    f"ℹ️ {len(redesign_source_present_pdb_names)} redesign targets present in dataset, but {len(redesign_source_missing_pdb_names)} missing"
+                    f"BestRedesigns: in-dataset {len(redesign_source_present_pdb_names)}/{total_targets} with best_rmsd <= {self.cfg.rmsd_good} (missing {len(redesign_source_missing_pdb_names)})"
                 )
                 example_missing = (
                     list(redesign_source_missing_pdb_names)[:20]
@@ -491,7 +493,7 @@ class SequenceRedesigner:
                 self.log.warning(f"Some missing PDB names: {example_missing}")
             else:
                 self.log.info(
-                    f"ℹ️ {len(metadata[mc.pdb_name].unique())} structures of {len(redesign_source_pdb_names)} redesign targets present in dataset"
+                    f"BestRedesigns: in-dataset {len(metadata[mc.pdb_name].unique())}/{total_targets} with best_rmsd <= {self.cfg.rmsd_good}"
                 )
 
             provided_seq_map = dict(

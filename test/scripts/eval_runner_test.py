@@ -33,6 +33,9 @@ class TestEvalRunner:
         mock_cfg_uninterpolated.dataset.task = task.to_data_task(task)
         mock_cfg_uninterpolated.inference.task = task
 
+        # Disable scaffold length scaling during evaluation so mocks match lengths
+        mock_cfg_uninterpolated.dataset.inpainting.scaffold_length_scale = 1.0
+
         # only sample one sample
         # Note testing multiple requires updating the mock to handle multiple
         mock_cfg_uninterpolated.inference.samples.samples_per_length = 1

@@ -1189,6 +1189,11 @@ class DatasetInpaintingConfig(BaseClassConfig):
     interaction_dist_threshold_ang: float = 6.0
     proximity_dist_threshold_ang: float = 10.0
 
+    # Scaffold scaling during evaluation: multiplicative scale for scaffold lengths.
+    # The scaling factor is sampled uniformly from [1/scale, scale].
+    # Set to 1.0 to disable scaling (range becomes [1.0, 1.0]).
+    scaffold_length_scale: float = 2.0
+
 
 class DatasetTrimMethod(StrEnum):
     """

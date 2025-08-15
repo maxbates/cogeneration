@@ -142,12 +142,12 @@ class MotifFactory:
         self,
         motif_mask: torch.Tensor,
         chain_idx: torch.Tensor,
-        random_scale_range=(0.5, 2),
+        random_scale_range: Optional[Tuple[float, float]] = None,
     ):
         """
         Generate segments from a diffuse mask.
         Motifs are defined by diffuse_mask == 0, scaffolds are defined by diffuse_mask == 1
-        Scaffold regions are randomly scaled by a factor in random_scale_range.
+        Scaffold regions are randomly scaled by a factor in random_scale_range or cfg.scaffold_length_scale
         Chain breaks are inserted when `chain_idx` changes.
         """
         N = motif_mask.shape[0]
@@ -165,11 +165,14 @@ class MotifFactory:
                 seg_end = i - 1
                 # scaffold: randomly scale length of original segment span
                 orig_len = seg_end - seg_start + 1
-                new_len = (
-                    orig_len
-                    if orig_len <= 5
-                    else int(round(orig_len * self.rng.uniform(*random_scale_range)))
-                )
+                # Determine scaling: explicit range takes precedence; otherwise use config jitter if available
+                if random_scale_range is not None:
+                    scale = self.rng.uniform(*random_scale_range)
+                else:
+                    scaffold_scale = float(self.cfg.scaffold_length_scale)
+                    assert scaffold_scale >= 1.0, "scaffold_length_scale must be >= 1.0"
+                    scale = self.rng.uniform(1.0 / scaffold_scale, scaffold_scale)
+                new_len = orig_len if orig_len <= 5 else int(round(orig_len * scale))
 
                 # append motif or scaffold segment
                 if current_is_motif:
@@ -203,11 +206,14 @@ class MotifFactory:
         seg_end_inclusive = N - 1
         # scaffold: randomly scale length
         orig_len = seg_end_inclusive - seg_start + 1
-        new_length = (
-            orig_len
-            if orig_len <= 5
-            else int(round(orig_len * self.rng.uniform(*random_scale_range)))
-        )
+        if random_scale_range is not None:
+            scale = self.rng.uniform(*random_scale_range)
+        else:
+            scaffold_scale = float(self.cfg.scaffold_length_scale)
+            assert scaffold_scale >= 1.0, "scaffold_length_scale must be >= 1.0"
+            scale = self.rng.uniform(1.0 / scaffold_scale, scaffold_scale)
+        new_length = orig_len if orig_len <= 5 else int(round(orig_len * scale))
+
         if current_is_motif:
             segments.append(
                 Motif(start=seg_start, end=seg_end_inclusive, chain_idx=current_chain)
