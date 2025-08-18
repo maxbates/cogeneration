@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from cogeneration.config.base import ModelESMCombinerConfig
-from cogeneration.models.esm_frozen import FrozenEsmModel
+from cogeneration.models.esm_frozen import get_frozen_esm
 
 
 def _mlp(in_dim: int, out_dim: int, hidden_dim: int) -> nn.Module:
@@ -26,9 +26,8 @@ class ESMCombinerNetwork(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        self.esm = FrozenEsmModel(
-            model_key=cfg.esm_model_key,
-            use_esm_attn_map=not self.cfg.only_single,
+        self.esm = get_frozen_esm(
+            model_key=cfg.esm_model_key, use_esm_attn_map=not self.cfg.only_single
         )
 
         # learn a scalar mix over all single layers

@@ -42,9 +42,19 @@ ESMRegistryFactory = Callable[[bool], ESMRegistryReturn]
 
 @dataclass
 class EsmRegistry:
-    """Singleton holding factories that return ESMRegistryReturn=(model, alphabet)"""
+    """
+    Singleton holding factories that return ESMRegistryReturn=(model, alphabet)
+
+    And a cache of loaded models, so callers can share the same underlying model.
+    """
 
     registry: Dict[ESMRegistryKey, ESMRegistryFactory] = field(default_factory=dict)
+    # Cache created model instances per key so all callers share the same underlying model
+    _loaded_models: Dict[ESMRegistryKey, ESMRegistryReturn] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    # Cache alphabet since it's independent of model size
+    _alphabet: Optional[Alphabet] = field(default=None, init=False, repr=False)
 
     def register(self, key: ESMRegistryKey, factory: ESMRegistryFactory) -> None:
         self.registry[key] = factory
@@ -55,15 +65,22 @@ class EsmRegistry:
                 f"Model key '{key}' is not registered in EsmRegistry, have: {list(self.registry.keys())}"
             )
 
-        use_flash_attention = torch.cuda.is_available()
+        # Return cached instance if available so multiple wrappers share weights and device
+        if key in self._loaded_models:
+            return self._loaded_models[key]
 
-        return self.registry[key](use_flash_attention)
+        use_flash_attention = torch.cuda.is_available()
+        model = self.registry[key](use_flash_attention)
+        self._loaded_models[key] = model
+        return model
 
     def load_alphabet(self) -> Alphabet:
-        _, alphabet = esm.pretrained.load_model_and_alphabet(
-            ModelESMKey.esm2_t6_8M_UR50D
-        )
-        return alphabet
+        if self._alphabet is None:
+            _, alphabet = esm.pretrained.load_model_and_alphabet(
+                ModelESMKey.esm2_t6_8M_UR50D
+            )
+            self._alphabet = alphabet
+        return self._alphabet
 
     # helper to register a dummy model for testing
     def register_dummy(
@@ -123,7 +140,7 @@ class _DummyRandomFAPLM(nn.Module):
         self.embed_dim = embed_dim
         self.num_layers = n_layers
         self.attention_heads = n_heads
-        self.vocab_size = len(ESM_REGISTRY.load_alphabet())
+        self.vocab_size = len(_ESM_REGISTRY.load_alphabet())
 
     @torch.no_grad()
     def forward(
@@ -156,8 +173,8 @@ class _DummyRandomFAPLM(nn.Module):
         return {"hidden_states": reps, "attentions": attn, "logits": logits}
 
 
-# ESM registry singleton
-ESM_REGISTRY = EsmRegistry(
+# ESM registry singleton, factory for actual ESM models
+_ESM_REGISTRY = EsmRegistry(
     registry={
         ModelESMKey.esm2_t6_8M_UR50D: lambda use_fa: FAEsmForMaskedLM.from_pretrained(
             "facebook/esm2_t6_8M_UR50D", use_fa=use_fa
@@ -179,7 +196,7 @@ ESM_REGISTRY = EsmRegistry(
         ),
     }
 )
-ESM_REGISTRY.register_dummy()
+_ESM_REGISTRY.register_dummy()
 
 
 @dataclass
@@ -300,10 +317,11 @@ class SequenceData:
 
 
 # Shared cache across all FrozenEsmModel instances.
-# (e.g. so model's ESMCombiner and ESMLogitsPotential share cache easily)
-# Keyed by (model_key, use_esm_attn_map). 
+# Keyed only by model_key.
 # Matches on exact `aatypes` tensor on CPU.
-_SHARED_ESM_CACHE: Dict[Tuple[str, bool], Dict[str, Any]] = {}
+# If attn_map required but not in cache, trigger recompute.
+# If attns present and not needed, still a cache hit.
+_SHARED_ESM_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 class FrozenEsmModel(nn.Module):
@@ -313,6 +331,13 @@ class FrozenEsmModel(nn.Module):
         use_esm_attn_map: bool = True,  # return pair repr
         caching: bool = True,  # enable caching the last call
     ):
+        """
+        FrozenEsmModel wraps ESM, sets to eval, supports caching,
+        and moves inputs/cached outputs to the input aatypes device
+
+        Use `get_frozen_esm` to get a singleton instance.
+        Construct explicitly if want isolated instance.
+        """
         super().__init__()
 
         logger.info(f"Loading ESM model: {model_key}...")
@@ -320,8 +345,8 @@ class FrozenEsmModel(nn.Module):
         # May see a warning about some parameters not being initialized,
         # this is fine, because we aren't using the MaskedLM head.
         self._model_key = model_key
-        self.esm = ESM_REGISTRY.load_model(model_key)
-        self.esm_dict = ESM_REGISTRY.load_alphabet()
+        self.esm = _ESM_REGISTRY.load_model(model_key)
+        self.esm_dict = _ESM_REGISTRY.load_alphabet()
         self.use_esm_attn_map = use_esm_attn_map
         self.caching = caching
         self.repr_layers = tuple(range(self.num_layers + 1))
@@ -392,7 +417,7 @@ class FrozenEsmModel(nn.Module):
 
         # Shared last-call cache across instances
         if self.caching:
-            shared_key = (self._model_key, self.use_esm_attn_map)
+            shared_key = str(self._model_key)
             prev = _SHARED_ESM_CACHE.get(shared_key)
             if prev is not None:
                 prev_inputs = prev.get("aatypes")
@@ -401,10 +426,17 @@ class FrozenEsmModel(nn.Module):
                     and tuple(prev.get("shape", ())) == tuple(aatypes.shape)
                     and torch.equal(prev_inputs, aatypes.detach().cpu())
                 ):
-                    # ensure on same device as input
-                    return tree.map_structure(
-                        lambda x: x.to(aatypes.device), prev["outputs"]
-                    )
+                    cached_single, cached_pair, cached_logits = prev["outputs"]
+                    # If pair reps requested but not present, fall through to recompute with attentions
+                    # If pair reps is present but not requested, drop it
+                    if cached_pair is None and self.use_esm_attn_map:
+                        pass
+                    else:
+                        pair_out = cached_pair if self.use_esm_attn_map else None
+                        return tuple(
+                            x.to(aatypes.device) if x is not None else None
+                            for x in (cached_single, pair_out, cached_logits)
+                        )
 
         residue_mask = sequence_data.non_linker_mask  # (B, L)
         padding_mask = sequence_data.aa_sequence == self.esm_dict.padding_idx  # (B, L)
@@ -494,7 +526,7 @@ class FrozenEsmModel(nn.Module):
         logits = logits[residue_mask].view(B, N, logits.shape[-1])  # (B, N, 21)
 
         if self.caching:
-            shared_key = (self._model_key, self.use_esm_attn_map, str(aatypes.device))
+            shared_key = str(self._model_key)
             _SHARED_ESM_CACHE[shared_key] = {
                 "shape": tuple(aatypes.shape),
                 "aatypes": aatypes.detach().cpu().clone(),
@@ -506,3 +538,31 @@ class FrozenEsmModel(nn.Module):
 
         # (B, N, nLayers, C), (B, N, N, nLayers*nHeads), (B, N, 21)
         return single_repns, pair_repns, logits
+
+
+# Singleton accessor so different callers share the same wrapper and underlying model
+_FROZEN_ESM_SINGLETONS: Dict[Tuple[str, bool], FrozenEsmModel] = {}
+
+
+def get_frozen_esm(
+    model_key: str,
+    use_esm_attn_map: bool,
+    caching: bool = True,
+) -> FrozenEsmModel:
+    """
+    Factory for singleton (of same model key + outputs) FrozenEsmModel instances.
+
+    For example, if a model's module and interpolant potential share the same instances,
+    only one set of weights are loaded, and caching is shared between them.
+    (Note the model device will be set by the containing model,
+    and potential will just run on that device.
+    FrozenEsmModel will move the inputs / cached outputs to the input device.)
+    """
+    key = (str(model_key), bool(use_esm_attn_map), bool(caching))
+    if key not in _FROZEN_ESM_SINGLETONS:
+        _FROZEN_ESM_SINGLETONS[key] = FrozenEsmModel(
+            model_key=model_key,
+            use_esm_attn_map=use_esm_attn_map,
+            caching=caching,
+        )
+    return _FROZEN_ESM_SINGLETONS[key]

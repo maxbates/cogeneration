@@ -16,7 +16,7 @@ from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.tools.protein_mpnn_runner import ProteinMPNNRunner
 from cogeneration.data.trajectory import SamplingStep
 from cogeneration.dataset.interaction import DIST_INTERACTION_BACKBONE
-from cogeneration.models.esm_frozen import FrozenEsmModel
+from cogeneration.models.esm_frozen import get_frozen_esm
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
@@ -686,8 +686,8 @@ class ESMLogitsPotential(Potential):
     esm_logits_cap: float = 4.0
 
     def __post_init__(self):
-        # Do not compute pair attentions; only logits are required
-        self.esm = FrozenEsmModel(model_key=self.esm_model_key, use_esm_attn_map=False)
+        # only logits are required
+        self.esm = get_frozen_esm(model_key=self.esm_model_key, use_esm_attn_map=False)
 
     def compute(
         self,
@@ -697,7 +697,7 @@ class ESMLogitsPotential(Potential):
         protein_pred: SamplingStep,
     ) -> Tuple[PotentialEnergy, Optional[PotentialField]]:
         # Inputs for ESM
-        aatypes = protein_pred.aatypes  # (B, N)
+        aatypes = protein_pred.aatypes.long()  # (B, N)
         chain_idx = batch[bp.chain_idx]  # (B, N)
         res_mask = batch[bp.res_mask]  # (B, N)
         diffuse_mask = batch[bp.diffuse_mask]  # (B, N)
@@ -710,7 +710,7 @@ class ESMLogitsPotential(Potential):
         )
 
         # Energy: average NLL over valid positions
-        targets = aatypes.long()  # (B, N)
+        targets = aatypes  # (B, N)
         log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # (B, N, 21)
         nll = -log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
 

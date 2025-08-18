@@ -14,6 +14,7 @@ This project collects several ideas from other work and includes several extensi
   - **2D constraints** to guide structure, e.g. of the binder 
   - Specifying RFDiffusion style **hot spot** residues
 - **Feynman-Kac steering** for sequential monte-carlo sampling guided by potentials, defined only at inference time
+  - **Logit guidance** from ESM and ProteinMPNN potentials, demonstrating how language models can guide sequence generation
 - **existing protein language models (e.g. ESM)** to get frozen embeddings, enriching the node and edge representations
   - particularly for sequence-conditioned tasks like inpainting
 - **Improved sequence prediction** and inverse folding, using a deeper sequence prediction network

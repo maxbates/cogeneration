@@ -4,11 +4,16 @@ from typing import Tuple
 import pytest
 import torch
 
-from cogeneration.config.base import InterpolantSteeringConfig, ProteinMPNNRunnerConfig
+from cogeneration.config.base import (
+    InterpolantSteeringConfig,
+    ModelESMKey,
+    ProteinMPNNRunnerConfig,
+)
 from cogeneration.data.data_transforms import make_one_hot
 from cogeneration.data.potentials import (
     ChainBreakPotential,
     ContactConditioningPotential,
+    ESMLogitsPotential,
     FKSteeringCalculator,
     FKSteeringResampler,
     HotSpotPotential,
@@ -643,6 +648,29 @@ class TestInverseFoldPotential:
         assert torch.all(guidance.logits[:, :, 20] == 0)
 
 
+class TestESMLogitsPotential:
+    def test_returns_logits(self):
+        B, N = 2, 20
+        batch, step = _make_batch_and_step(B=B, N=N, multimer=False, with_break=False)
+
+        potential = ESMLogitsPotential(
+            esm_model_key=ModelESMKey.DUMMY,
+            guidance_scale=1.0,
+            esm_logits_temperature=1.0,
+            esm_logits_cap=100.0,
+        )
+
+        E, guidance = potential.compute(
+            batch=batch, model_pred=step, protein_pred=step, protein_state=step
+        )
+
+        assert E.shape == (B,)
+        assert torch.all(E >= 0.0) and torch.all(E <= 1.0)
+
+        assert guidance is not None and guidance.logits is not None
+        assert guidance.logits.shape == (B, N, 21)
+
+
 class TestFKSteeringCalculator:
     def test_default_compute(self, mock_cfg):
         batch, step = _make_batch_and_step(B=2, N=30, multimer=False, with_break=True)
@@ -659,26 +687,26 @@ class TestFKSteeringCalculator:
 
 
 class TestFKSteeringResampler:
-    def test_resample_collapses_particles(self):
+    def test_resample_collapses_particles(self, mock_cfg):
         batch, step = _make_batch_and_step(B=2, N=30, multimer=False)
 
         orig_batch_size = batch[bp.res_mask].shape[0]
         assert orig_batch_size == 2
 
-        cfg = InterpolantSteeringConfig(
-            num_particles=3,
-            resampling_interval=1,
-            fk_lambda=1.0,
-            energy_weight_difference=1.0,
-            energy_weight_absolute=0.0,
-        )
-        resampler = FKSteeringResampler(cfg=cfg)
+        steering_cfg = mock_cfg.inference.interpolant.steering
+        steering_cfg.num_particles = 3
+        steering_cfg.resampling_interval = 1
+        steering_cfg.fk_lambda = 1.0
+        steering_cfg.energy_weight_difference = 1.0
+        steering_cfg.energy_weight_absolute = 0.0
+
+        resampler = FKSteeringResampler(cfg=steering_cfg)
         assert resampler.enabled
 
         batch = resampler.init_particles(batch)
 
         # should have expanded to B * K
-        steer_batch_size = orig_batch_size * cfg.num_particles
+        steer_batch_size = orig_batch_size * steering_cfg.num_particles
         assert batch[bp.res_mask].shape[0] == steer_batch_size
 
         # expand the step to match the batch size

@@ -6,9 +6,16 @@ from esm.pretrained import esm2_t6_8M_UR50D
 
 from cogeneration.config.base import ModelESMKey
 from cogeneration.data.const import MASK_TOKEN_INDEX
+from cogeneration.data.potentials import ESMLogitsPotential
 from cogeneration.data.residue_constants import restypes, restypes_with_x
+from cogeneration.data.trajectory import SamplingStep
 from cogeneration.dataset.test_utils import create_single_item_batch
-from cogeneration.models.esm_frozen import ESM_REGISTRY, FrozenEsmModel, SequenceData
+from cogeneration.models.esm_frozen import (
+    _ESM_REGISTRY,
+    FrozenEsmModel,
+    SequenceData,
+    get_frozen_esm,
+)
 from cogeneration.type.batch import BatchProp as bp
 
 
@@ -192,3 +199,71 @@ class TestFrozenEsmModel:
 
         # Expect a strong fraction of positions to have the true AA in top-5
         assert successes_top5 >= math.floor(k * 0.8)
+
+    def test_caching_across_instances(self, monkeypatch):
+        """Cache should avoid calling underlying ESM forward twice for identical inputs, including across instances with same model key."""
+        B, N = 1, 8
+        aatypes = torch.randint(0, 21, (B, N))
+        chain_idx = torch.ones_like(aatypes)
+        res_mask = torch.ones_like(aatypes, dtype=torch.bool)
+
+        model1 = get_frozen_esm(
+            model_key=ModelESMKey.DUMMY, use_esm_attn_map=False, caching=True
+        )
+
+        # Patch the underlying singleton ESM model; all wrappers should share this instance
+        call_counter = {"n": 0}
+        orig_forward_singleton = model1.esm.forward
+
+        def wrapped_forward_singleton(*args, **kwargs):
+            call_counter["n"] += 1
+            return orig_forward_singleton(*args, **kwargs)
+
+        monkeypatch.setattr(
+            model1.esm, "forward", wrapped_forward_singleton, raising=True
+        )
+
+        _ = model1(aatypes, chain_idx, res_mask)
+        assert call_counter["n"] == 1
+
+        _ = model1(aatypes, chain_idx, res_mask)
+        assert call_counter["n"] == 1
+
+        # should be the same instance and cached
+        model2 = get_frozen_esm(ModelESMKey.DUMMY, use_esm_attn_map=False, caching=True)
+        _ = model2(aatypes, chain_idx, res_mask)
+        assert call_counter["n"] == 1
+
+        # Also ensure the FK potential that uses a singleton FrozenESM reuses the shared cache
+        potential = ESMLogitsPotential(
+            esm_model_key=ModelESMKey.DUMMY,
+            guidance_scale=1.0,
+            esm_logits_temperature=1.0,
+            esm_logits_cap=100.0,
+        )
+
+        # ensure have same underlying instance
+        assert potential.esm is model1
+
+        # minimal batch and step using the same inputs
+        batch = {
+            bp.res_mask: res_mask.clone().int(),
+            bp.diffuse_mask: torch.ones_like(aatypes).int(),
+            bp.chain_idx: chain_idx.clone().long(),
+        }
+        zeros_trans = torch.zeros(B, N, 3)
+        eye_rot = torch.eye(3).view(1, 1, 3, 3).repeat(B, N, 1, 1)
+        step = SamplingStep(
+            res_mask=res_mask.clone(),
+            trans=zeros_trans,
+            rotmats=eye_rot,
+            aatypes=aatypes.clone().long(),
+            torsions=None,
+            logits=None,
+        )
+
+        _E, guidance = potential.compute(
+            batch=batch, model_pred=step, protein_pred=step, protein_state=step
+        )
+        # should not invoke the underlying esm.forward again
+        assert call_counter["n"] == 1
