@@ -299,6 +299,13 @@ class SequenceData:
         )
 
 
+# Shared cache across all FrozenEsmModel instances.
+# (e.g. so model's ESMCombiner and ESMLogitsPotential share cache easily)
+# Keyed by (model_key, use_esm_attn_map). 
+# Matches on exact `aatypes` tensor on CPU.
+_SHARED_ESM_CACHE: Dict[Tuple[str, bool], Dict[str, Any]] = {}
+
+
 class FrozenEsmModel(nn.Module):
     def __init__(
         self,
@@ -317,7 +324,6 @@ class FrozenEsmModel(nn.Module):
         self.esm_dict = ESM_REGISTRY.load_alphabet()
         self.use_esm_attn_map = use_esm_attn_map
         self.caching = caching
-        self._previous_call = None
         self.repr_layers = tuple(range(self.num_layers + 1))
 
         # freeze ESM
@@ -384,13 +390,21 @@ class FrozenEsmModel(nn.Module):
             res_mask=res_mask,
         )
 
-        if (
-            self.caching
-            and self._previous_call is not None
-            and self._previous_call["inputs"].shape == sequence_data.aa_sequence.shape
-            and torch.all(self._previous_call["inputs"] == sequence_data.aa_sequence)
-        ):
-            return self._previous_call["outputs"]
+        # Shared last-call cache across instances
+        if self.caching:
+            shared_key = (self._model_key, self.use_esm_attn_map)
+            prev = _SHARED_ESM_CACHE.get(shared_key)
+            if prev is not None:
+                prev_inputs = prev.get("aatypes")
+                if (
+                    prev_inputs is not None
+                    and tuple(prev.get("shape", ())) == tuple(aatypes.shape)
+                    and torch.equal(prev_inputs, aatypes.detach().cpu())
+                ):
+                    # ensure on same device as input
+                    return tree.map_structure(
+                        lambda x: x.to(aatypes.device), prev["outputs"]
+                    )
 
         residue_mask = sequence_data.non_linker_mask  # (B, L)
         padding_mask = sequence_data.aa_sequence == self.esm_dict.padding_idx  # (B, L)
@@ -480,8 +494,10 @@ class FrozenEsmModel(nn.Module):
         logits = logits[residue_mask].view(B, N, logits.shape[-1])  # (B, N, 21)
 
         if self.caching:
-            self._previous_call = {
-                "inputs": sequence_data.aa_sequence.clone().detach(),
+            shared_key = (self._model_key, self.use_esm_attn_map, str(aatypes.device))
+            _SHARED_ESM_CACHE[shared_key] = {
+                "shape": tuple(aatypes.shape),
+                "aatypes": aatypes.detach().cpu().clone(),
                 "outputs": tree.map_structure(
                     lambda x: x.clone().detach() if x is not None else None,
                     (single_repns, pair_repns, logits),

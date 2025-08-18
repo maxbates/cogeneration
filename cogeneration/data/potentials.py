@@ -7,10 +7,16 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 from sympy import Float
 
-from cogeneration.config.base import InterpolantSteeringConfig, ProteinMPNNRunnerConfig
+from cogeneration.config.base import (
+    InterpolantSteeringConfig,
+    ModelESMKey,
+    ProteinMPNNRunnerConfig,
+)
+from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.tools.protein_mpnn_runner import ProteinMPNNRunner
 from cogeneration.data.trajectory import SamplingStep
 from cogeneration.dataset.interaction import DIST_INTERACTION_BACKBONE
+from cogeneration.models.esm_frozen import FrozenEsmModel
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
@@ -622,7 +628,7 @@ class InverseFoldPotential(Potential):
         avg_nll = nll.sum(dim=-1) / denom  # (B,)
 
         # Scale closer to [0, 1] by dividing by log(medium-high-perplexity)
-        perplexity_cap = 10.0  # less than vocab_size = logits.shape[-1]
+        perplexity_cap = 7.0  # less than vocab_size = logits.shape[-1]
         max_ce = float(torch.log(torch.tensor(perplexity_cap, device=logits.device)))
         energy = avg_nll / max_ce
 
@@ -659,6 +665,79 @@ class InverseFoldPotential(Potential):
         guidance = PotentialField(
             logits=logits,
         )
+
+        return energy, guidance
+
+
+@dataclass
+class ESMLogitsPotential(Potential):
+    """
+    Potential that runs a frozen ESM model on the current sequence and produces
+    amino-acid logits guidance. Energy is the average negative log likelihood of
+    the current sequence under ESM logits, normalized to [0, 1].
+
+    Only residues with `res_mask & diffuse_mask` and that are not masked tokens
+    contribute to energy. Guidance logits are returned for all residues; they
+    will be masked by FK steering to designed positions.
+    """
+
+    esm_model_key: ModelESMKey = ModelESMKey.esm2_t30_150M_UR50D
+    esm_logits_temperature: float = 1.0
+    esm_logits_cap: float = 4.0
+
+    def __post_init__(self):
+        # Do not compute pair attentions; only logits are required
+        self.esm = FrozenEsmModel(model_key=self.esm_model_key, use_esm_attn_map=False)
+
+    def compute(
+        self,
+        batch: NoisyFeatures,
+        protein_state: SamplingStep,
+        model_pred: SamplingStep,
+        protein_pred: SamplingStep,
+    ) -> Tuple[PotentialEnergy, Optional[PotentialField]]:
+        # Inputs for ESM
+        aatypes = protein_pred.aatypes  # (B, N)
+        chain_idx = batch[bp.chain_idx]  # (B, N)
+        res_mask = batch[bp.res_mask]  # (B, N)
+        diffuse_mask = batch[bp.diffuse_mask]  # (B, N)
+
+        # Run ESM to get logits (B, N, 21)
+        _, _, logits = self.esm(
+            aatypes=aatypes,
+            chain_index=chain_idx,
+            res_mask=res_mask,
+        )
+
+        # Energy: average NLL over valid positions
+        targets = aatypes.long()  # (B, N)
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # (B, N, 21)
+        nll = -log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+
+        # nll valid if real residue and not masked token
+        valid_mask = (res_mask > 0) & (aatypes != MASK_TOKEN_INDEX)  # (B, N)
+        nll = nll * valid_mask.float()
+
+        denom = valid_mask.float().sum(dim=-1).clamp_min(1.0)  # (B,)
+        avg_nll = nll.sum(dim=-1) / denom  # (B,)
+
+        perplexity_cap = 7.0
+        max_ce = float(torch.log(torch.tensor(perplexity_cap, device=logits.device)))
+        energy = (avg_nll / max_ce).clamp(min=0.0, max=1.0)
+
+        # Guidance: temperature scale and cap logits magnitude
+        T = max(self.esm_logits_temperature, 1e-4)
+        logits = logits / T
+        logits = logits * float(self.guidance_scale)
+
+        cap = float(self.esm_logits_cap)
+        logits_f = logits.float()
+        max_abs = logits_f.abs().amax(dim=-1, keepdim=True)
+        scale_down = (cap / (max_abs + 1e-6)).clamp(max=1.0)
+        logits_f = (logits_f * scale_down).clamp(min=-cap, max=cap)
+        logits = logits_f.to(logits.dtype)
+
+        guidance = PotentialField(logits=logits)
 
         return energy, guidance
 
@@ -717,6 +796,13 @@ class FKSteeringCalculator:
                 inverse_fold_logits_temperature=cfg.inverse_fold_logits_temperature,
                 inverse_fold_logits_cap=cfg.inverse_fold_logits_cap,
                 protein_mpnn_cfg=cfg.protein_mpnn,
+            ),
+            ESMLogitsPotential(
+                energy_scale=cfg.esm_logits_energy_scale,
+                guidance_scale=cfg.esm_logits_guidance_scale,
+                esm_logits_temperature=cfg.esm_logits_temperature,
+                esm_logits_cap=cfg.esm_logits_cap,
+                esm_model_key=cfg.esm_model_key,
             ),
         ]
 

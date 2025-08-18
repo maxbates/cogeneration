@@ -929,11 +929,20 @@ class InterpolantSteeringConfig(BaseClassConfig):
     # temperature applied post-sampling for logits guidance
     # ProteinMPNN can be peaky, so can be helpful to smooth them out
     inverse_fold_logits_temperature: float = 1.0
-    # cap for logits guidance. One way tilt: 4.0 ~ 50x
+    # cap for logits guidance
     inverse_fold_logits_cap: float = 4.0
     protein_mpnn: ProteinMPNNRunnerConfig = field(
         default_factory=ProteinMPNNRunnerConfig
     )
+
+    # ESM logits potential
+    esm_logits_energy_scale: float = 0.5
+    esm_logits_guidance_scale: float = 1.0
+    esm_logits_temperature: float = 1.0
+    # cap for logits guidance
+    esm_logits_cap: float = 4.0
+    # use same ESM model as in combiner (sequence cached per pass)
+    esm_model_key: ModelESMKey = "${model.esm_combiner.esm_model_key}"
 
 
 @dataclass
