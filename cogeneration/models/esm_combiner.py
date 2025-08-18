@@ -61,8 +61,8 @@ class ESMCombinerNetwork(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         edge_mask = res_mask[:, None] * res_mask[:, :, None]
 
-        # get ESM single and pair representations
-        esm_single, esm_pair = self.esm(
+        # get ESM single and (optional) pair representations
+        esm_single, esm_pair, _ = self.esm(
             aatypes=aatypes_t,
             chain_index=chain_index,
             res_mask=res_mask,

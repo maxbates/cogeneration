@@ -442,10 +442,11 @@ class ModelESMCombinerConfig(BaseClassConfig):
 
     # Whether ESM is enabled. If so, representations will be combined.
     enabled: bool = True
-    # only get single rep, which can use speed up e.g. using flash attention
+    # flash attention cannot output attentions (for pair representation),
+    # so only using single representation allows faster pass through model
     only_single: bool = True
     # which ESM model size to use
-    esm_model_key: ModelESMKey = ModelESMKey.esm2_t12_35M_UR50D
+    esm_model_key: ModelESMKey = ModelESMKey.esm2_t30_150M_UR50D
     # dims coming from simple node/edge networks
     node_embed_size: int = "${model.hyper_params.node_embed_size}"
     edge_embed_size: int = "${model.hyper_params.edge_embed_size}"

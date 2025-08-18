@@ -11,7 +11,8 @@ from faesm.esm import FAEsmForMaskedLM
 from torch import nn
 
 from cogeneration.config.base import ModelESMKey
-from cogeneration.data.residue_constants import restypes_with_x
+from cogeneration.data.const import MASK_TOKEN_INDEX
+from cogeneration.data.residue_constants import restypes, restypes_with_x
 from cogeneration.models.utils import get_model_size_str
 from cogeneration.util.log import rank_zero_logger
 
@@ -122,6 +123,7 @@ class _DummyRandomFAPLM(nn.Module):
         self.embed_dim = embed_dim
         self.num_layers = n_layers
         self.attention_heads = n_heads
+        self.vocab_size = len(ESM_REGISTRY.load_alphabet())
 
     @torch.no_grad()
     def forward(
@@ -148,7 +150,10 @@ class _DummyRandomFAPLM(nn.Module):
                     )
                 )
 
-        return {"hidden_states": reps, "attentions": attn}
+        # random logits over a ESM alphabet
+        logits = torch.randn(B, L, self.vocab_size, device=tokens.device)
+
+        return {"hidden_states": reps, "attentions": attn, "logits": logits}
 
 
 # ESM registry singleton
@@ -209,15 +214,15 @@ class SequenceData:
         linker = eos  # use <eos> as linker (ESM authors' recommendation)
 
         # Convert AF2 indices to ESM indices
+        # Note X is converted to [MASK], since we are likely using the masking interpolant (TODO check)
+        # And below non-residues are set to X.
         conv_table = cls._make_af2_to_esm_lookup(esm_dict).to(aatypes.device)
         # shift by +1 so 0-based AA becomes 1..20 (0 is padding)
         seq = conv_table[aatypes + 1]
 
-        # set positions not in res_mask to X, i.e. assume they are residues.
+        # Set positions not in res_mask to X, i.e. assume they are non-canonical or non-residues.
         # with chain-independent trimming, this is probably a reasonable assumption.
         # (also, avoid using <pad> for simplicity with flash attention, which drops it.)
-        # TODO(model) - ideally differentiate non-canonical residues from non-residues (e.g. metal ion)
-        #   So that residues in the chain are set to X. We don't differentiate in res_mask.
         seq = seq.masked_fill(~res_mask.bool(), X)
 
         device, dtype = seq.device, seq.dtype
@@ -265,11 +270,19 @@ class SequenceData:
     def _make_af2_to_esm_lookup(esm_dict: Alphabet) -> torch.Tensor:
         """
         Creates a `(22,)` tensor mapping AF2 indices (-1..20) → ESM tokens.
-
-        AF2: 0-19 canonical aa, 20 == "X" (unknown).
         store `padding_idx` at 0 so can vectorise lookup with `lut[seq+1]`.
+
+        AF2: 0-19 canonical aa, 20 == "X" (used as both unknown and mask).
+
+        We convert X to [MASK].
+        Usually X means masked sequence, though it does also mean unknown residue.
+        After translating from AF2 to ESM tokens, positions not in `res_mask` are set to `X`.
         """
-        order = [esm_dict.padding_idx] + [esm_dict.get_idx(v) for v in restypes_with_x]
+        order = (
+            [esm_dict.padding_idx]
+            + [esm_dict.get_idx(v) for v in restypes]
+            + [esm_dict.mask_idx]
+        )
         return torch.tensor(order, dtype=torch.long)
 
     @classmethod
@@ -299,6 +312,7 @@ class FrozenEsmModel(nn.Module):
 
         # May see a warning about some parameters not being initialized,
         # this is fine, because we aren't using the MaskedLM head.
+        self._model_key = model_key
         self.esm = ESM_REGISTRY.load_model(model_key)
         self.esm_dict = ESM_REGISTRY.load_alphabet()
         self.use_esm_attn_map = use_esm_attn_map
@@ -398,6 +412,7 @@ class FrozenEsmModel(nn.Module):
         )
 
         # postprocess
+        # We extract single reps (per layer), pair reps (per layer), and logits (final layer)
         # for single chains, we could just take `[1:-1]` (remove BOS, EOS)
         # but to support chain breaks / linkers use `non_linker_mask`
 
@@ -450,14 +465,28 @@ class FrozenEsmModel(nn.Module):
         else:
             pair_repns = None
 
+        # Extract logits
+        logits = res["logits"]
+        if logits.dim() == 3 and logits.shape[0] == 1:
+            logits = logits.squeeze(0).view(B, L, -1)
+        # Convert to AF2 ordering, use 'X' token for AF2 'X' class
+        lut_logits = torch.tensor(
+            [self.esm_dict.get_idx(a) for a in restypes] + [self.esm_dict.get_idx("X")],
+            device=logits.device,
+            dtype=torch.long,
+        )
+        logits = logits.index_select(dim=-1, index=lut_logits)  # (B, L, 21)
+        # Pull out residues, drop linkers, pad, etc.
+        logits = logits[residue_mask].view(B, N, logits.shape[-1])  # (B, N, 21)
+
         if self.caching:
             self._previous_call = {
                 "inputs": sequence_data.aa_sequence.clone().detach(),
                 "outputs": tree.map_structure(
                     lambda x: x.clone().detach() if x is not None else None,
-                    (single_repns, pair_repns),
+                    (single_repns, pair_repns, logits),
                 ),
             }
 
-        # (B, N, nLayers, C), (B, N, N, nLayers*nHeads)
-        return single_repns, pair_repns
+        # (B, N, nLayers, C), (B, N, N, nLayers*nHeads), (B, N, 21)
+        return single_repns, pair_repns, logits

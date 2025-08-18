@@ -27,6 +27,9 @@ PDB_CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 PDB_MAX_CHAINS = len(PDB_CHAIN_IDS)  # := 62.
 
 NUM_TOKENS = residue_constants.restype_num  # := 20.
+
+# X is used for masking to match MultiFlow,
+# but technically could have separate mask token.
 MASK_TOKEN_INDEX = residue_constants.restypes_with_x.index("X")  # := 20
 
 CA_IDX = residue_constants.atom_order["CA"]

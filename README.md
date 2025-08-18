@@ -24,12 +24,14 @@ This project collects several ideas from other work and includes several extensi
 - Support for **Boltz-2 (in memory)or AlphaFold2** for structure prediction during validation / redesigning sequences
 - **Complete PDB processing data pipeline** to generate or augment training data, with several fields added to metadata
   - Scripts to download and process **AlphaFold Database** (by default, only part of it)
-  - Track information about chains, multimer interactions, presence of non-residues, etc.
+  - **Redesign scripts** to generate a redesign dataset using supported inverse folding and folding tools 
+  - Track information about chains, multimer interactions, presence and interaction with non-residues, etc.
+  - Generate report describing complete dataset
 - Adds a trunk with **choice of attention mechanisms, e.g. IPA, Pairformer** (triangle attention)
 - **Harmonic prior** instead of only gaussian prior
 - Enables **recyling** through the trunk + IPA
 - **CUDA optimizations + kernels**, e.g. Flash Attention (and Flash IPA), cuEquivariant triangle attention
-- **Unified Config** with structured configs, in code using dataclasses instead of YAML
+- **Unified and Strutured Configs**, in code using dataclasses instead of YAML
 - many improvements to code base: typing, enums, documentation, tests, etc.
 - Many of these **new features and modules are optional**
   - everything is easily **reverse compatible with MultiFlow, i.e. can use public Multiflow weights** with a config preset
