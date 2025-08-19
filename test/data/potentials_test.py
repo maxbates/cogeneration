@@ -676,7 +676,7 @@ class TestFKSteeringCalculator:
         batch, step = _make_batch_and_step(B=2, N=30, multimer=False, with_break=True)
         calc = FKSteeringCalculator(cfg=mock_cfg.inference.interpolant.steering)
 
-        E, _ = calc.compute(
+        E, guidance = calc.compute(
             batch=batch,
             model_pred=step,
             protein_pred=step,
@@ -684,9 +684,11 @@ class TestFKSteeringCalculator:
         )
 
         assert torch.all(E > 0)
+        assert guidance is not None
 
 
 class TestFKSteeringResampler:
+    @pytest.mark.slow
     def test_resample_collapses_particles(self, mock_cfg):
         batch, step = _make_batch_and_step(B=2, N=30, multimer=False)
 

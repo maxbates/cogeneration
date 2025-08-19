@@ -184,10 +184,9 @@ class TestProcessPDBFiles:
             metadata_path=csv_path,
         )
 
-        # Use BaseDataset because does not require clusters
         dataset = BaseDataset(
             cfg=DatasetConfig(
-                datasets=[dataset_spec],
+                metadata_csv_override=csv_path,
                 seed=0,
                 filter=DatasetFilterConfig(
                     # allow oligomers for our example PDB

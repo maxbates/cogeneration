@@ -139,6 +139,7 @@ class TestProteinMPNNRunner:
         avg_logits_per_pass = result.average_logits_per_pass
         assert avg_logits_per_pass.shape == (batch_size, num_passes, num_res, 21)
 
+    @pytest.mark.slow
     def test_run_batch_2qlw(self, mock_cfg, pdb_2qlw_processed_feats):
         """Test run_batch on 2qlw structure"""
         runner = ProteinMPNNRunner(mock_cfg.folding.protein_mpnn)
@@ -503,6 +504,7 @@ class TestProteinMPNNRunner:
                 diffuse_mask=torch.ones(216),  # 2qlw has 216 modeled residues
             )
 
+    @pytest.mark.slow
     def test_run_native_real_execution(
         self, mock_cfg_uninterpolated, pdb_2qlw_path, tmp_path
     ):
@@ -1523,6 +1525,7 @@ class TestProteinMPNNRunner:
             result1.logits, result3.logits, atol=1e-3, rtol=1e-3
         ), "Logits should be different with different seed"
 
+    @pytest.mark.slow
     def test_diffuse_mask_respected_run_batch(
         self, mock_cfg_uninterpolated, pdb_2qlw_processed_feats
     ):
@@ -1619,6 +1622,7 @@ class TestProteinMPNNRunner:
             "model may not be working properly or temperature too low"
         )
 
+    @pytest.mark.slow
     def test_diffuse_mask_respected_inverse_fold_pdb_native(
         self, mock_cfg_uninterpolated, pdb_2qlw_path, tmp_path
     ):
@@ -1742,6 +1746,7 @@ class TestProteinMPNNRunner:
             "model may not be working properly or all sequences identical"
         )
 
+    @pytest.mark.slow
     def test_diffuse_mask_respected_inverse_fold_pdb_subprocess(
         self, mock_cfg_uninterpolated, pdb_2qlw_path, tmp_path
     ):
@@ -1947,6 +1952,7 @@ class TestProteinMPNNRunnerPool:
         if torch.cuda.is_available():
             assert pool.runners[0].device.type == "cuda"
 
+    @pytest.mark.slow
     def test_single_run_batch_2qlw(self, mock_cfg, pdb_2qlw_processed_feats):
         """Test pool run_batch on 2qlw structure"""
         pool = ProteinMPNNRunnerPool(mock_cfg.folding.protein_mpnn, num_models=2)

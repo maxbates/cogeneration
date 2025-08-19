@@ -167,6 +167,7 @@ ckpt
 - Tests are in `/test`
 - Test by running `pytest`
 - Test directory structure should ~ match the `/cogeneration` directory structure, with `_test.py` suffix.
+- Many long-running tests are marked as slow and can be skipped by running `pytest -m "not slow"`
 
 ## License
 

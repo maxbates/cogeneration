@@ -366,6 +366,7 @@ class TestBoltzRunner:
         parsed_seq = aatype_to_seq(parsed_file[DatasetProteinColumn.aatype])
         assert parsed_seq == multimer_sequence.replace(CHAIN_BREAK_STR, "")
 
+    @pytest.mark.slow
     def test_predict_handles_missing_processed_files(self, mock_cfg, tmp_path):
         """Test that predict raises error when processed files don't exist in the BoltzPaths structure."""
         # Create manifest but delete the processed directory to simulate missing processed files

@@ -85,6 +85,7 @@ class TestFlowModule:
         module = FlowModule(mock_cfg)
         module.training_step(pdb_noisy_batch)
 
+    @pytest.mark.slow
     def test_training_step_inpainting_multimers_stochastic(
         self, mock_cfg_uninterpolated
     ):
