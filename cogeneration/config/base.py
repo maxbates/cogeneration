@@ -15,14 +15,7 @@ from cogeneration.config.dict_utils import (
     flatten_dict,
     prune_unknown_dataclass_fields,
 )
-from cogeneration.dataset.spec import (  # CogenerationAFDBDatasetSpec,
-    CogenerationAFDBDatasetSpec,
-    CogenerationPDBDatasetSpec,
-    CogenerationRedesignDatasetSpec,
-    DatasetSpec,
-    MultiflowRedesignedDatasetSpec,
-    MultiflowSyntheticDatasetSpec,
-)
+from cogeneration.dataset.spec import DatasetSpec
 from cogeneration.type.dataset import MetadataColumn
 from cogeneration.type.embed import PositionalEmbeddingMethod
 from cogeneration.type.metrics import MetricName
@@ -1235,20 +1228,24 @@ class DatasetTrimMethod(StrEnum):
 class DatasetConfig(BaseClassConfig):
     """
     Information about the Dataset of protein structures and sequences.
+
+    You may enable/disable pre-defined datasets, and/or specify a new override CSV.
     New datasets can be generated using `dataset/scripts` pipeline.
     """
 
-    # TODO(cfg) determine if there is a reasonable way to support CLI-friendly spec
-    # All datasets (train + test will be split by date)
-    datasets: List[DatasetSpec] = field(
-        default_factory=lambda: [
-            CogenerationPDBDatasetSpec,
-            CogenerationAFDBDatasetSpec,
-            CogenerationRedesignDatasetSpec,
-            MultiflowRedesignedDatasetSpec,
-            # MultiflowSyntheticDatasetSpec,  # TODO enable if desired, unsure of quailty
-        ]
-    )
+    # Enable/disable predefined datasets. All default to True.
+    enable_cogeneration_pdb: bool = True
+    enable_cogeneration_afdb: bool = True
+    enable_cogeneration_redesigns: bool = True
+    enable_multiflow_redesigned: bool = True
+    enable_multiflow_synthetic: bool = True  # low-ish quality
+
+    # Metadata CSV override: if set, overrides all predefined datasets.
+    # The processed_root defaults to the CSV's parent directory if not provided.
+    metadata_csv_override: Optional[Path] = None
+    metadata_csv_override_processed_root: Optional[Path] = None
+    # By default, disable all predefined datasets if an override is provided.
+    metadata_csv_override_disables_predefined: bool = True
 
     # Date cutoff used to split train vs test from the unified datasets list.
     # Note AFDB structures (which may be dupes) are mostly dated 2022-06-01.

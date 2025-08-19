@@ -21,7 +21,16 @@ from cogeneration.config.base import (
 from cogeneration.dataset.featurizer import BatchFeaturizer
 from cogeneration.dataset.filterer import DatasetFilterer
 from cogeneration.dataset.process_pdb import read_processed_file
-from cogeneration.dataset.spec import DatasetSpec
+from cogeneration.dataset.spec import (
+    CogenerationAFDBDatasetSpec,
+    CogenerationPDBDatasetSpec,
+    CogenerationRedesignDatasetSpec,
+    DatasetSpec,
+    MultiflowPDBDatasetSpec,
+    MultiflowPDBTestDatasetSpec,
+    MultiflowRedesignedDatasetSpec,
+    MultiflowSyntheticDatasetSpec,
+)
 from cogeneration.type.batch import BatchFeatures
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import InferenceFeatures
@@ -219,8 +228,41 @@ class BaseDataset(Dataset):
         dataset_cfg: DatasetConfig, logger: logging.Logger
     ) -> MetadataDataFrame:
         """Load datasets specified by cfg.datasets, and concat them into a single DataFrame."""
+        specs: List[DatasetSpec] = []
+
+        # Use override spec if provided
+        if dataset_cfg.metadata_csv_override is not None:
+            override_root = (
+                dataset_cfg.metadata_csv_override_processed_root
+                if dataset_cfg.metadata_csv_override_processed_root is not None
+                else dataset_cfg.metadata_csv_override.parent
+            )
+            specs.append(
+                DatasetSpec(
+                    name="MetadataCSVOverride",
+                    metadata_path=Path(dataset_cfg.metadata_csv_override),
+                    processed_root_path=Path(override_root),
+                )
+            )
+
+        # Use pre-defined specs, unless override specifies disabling
+        if (
+            not dataset_cfg.metadata_csv_override
+            or not dataset_cfg.metadata_csv_override_disables_predefined
+        ):
+            if dataset_cfg.enable_cogeneration_pdb:
+                specs.append(CogenerationPDBDatasetSpec)
+            if dataset_cfg.enable_cogeneration_afdb:
+                specs.append(CogenerationAFDBDatasetSpec)
+            if dataset_cfg.enable_cogeneration_redesigns:
+                specs.append(CogenerationRedesignDatasetSpec)
+            if dataset_cfg.enable_multiflow_redesigned:
+                specs.append(MultiflowRedesignedDatasetSpec)
+            if dataset_cfg.enable_multiflow_synthetic:
+                specs.append(MultiflowSyntheticDatasetSpec)
+
         dfs = []
-        for spec in dataset_cfg.datasets:
+        for spec in specs:
             if not spec.is_enabled():
                 continue
 
