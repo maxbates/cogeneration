@@ -2,13 +2,13 @@ import datetime
 import os
 import re
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, field
+from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TypeVar, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 import torch
 from hydra.core.config_store import ConfigStore
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf, SCMode
 
 from cogeneration.config.dict_utils import (
     deep_merge_dicts,
@@ -46,69 +46,114 @@ GenericConfig = TypeVar("GenericConfig", bound="BaseClassConfig")
 class BaseClassConfig:
     """
     Base class for *Config objects. Can be nested.
+
+     OmegaConf supports template fields like `my_field: int = "${my_other_field}"`.
+    "Interpolation" resolves those fields in the new BaseClassConfig instance.
+
+    These templates must be resolved before use of the Config,
+    but likely should not be resolved before updating or merging
+    (so template fields use the updated config).
+
+    Note that before resolution, the values may not match the dataclass's specified type,
+    and the template values are likely unusable.
+
+    Also note that it may not be possible to interpolate a nested config independently,
+    if its template defines on values elsewhere in the Config
     """
+
+    @classmethod
+    def from_dict_config(cls: Type[GenericConfig], cfg: DictConfig) -> GenericConfig:
+        """
+        Create a typed config instance from a DictConfig.
+        """
+        # Build a new dataclass instance tree without resolving interpolations.
+        # We avoid SCMode.INSTANTIATE because it resolves interpolations implicitly.
+        instance_plain: Dict[str, Any] = OmegaConf.to_container(
+            cfg, resolve=False, structured_config_mode=SCMode.DICT
+        )
+
+        def _build_from(default_obj: Any, data: Dict[str, Any]) -> Any:
+            cls = type(default_obj)
+            kwargs: Dict[str, Any] = {}
+            for f in fields(cls):
+                if f.name in data:
+                    v = data[f.name]
+                else:
+                    # fall back to value from default_obj (already a dataclass or primitive)
+                    v = getattr(default_obj, f.name)
+
+                default_field_val = getattr(default_obj, f.name)
+                if is_dataclass(default_field_val) and isinstance(v, dict):
+                    kwargs[f.name] = _build_from(default_field_val, v)
+                else:
+                    kwargs[f.name] = v
+
+            return cls(**kwargs)
+
+        defaults_obj = cls()
+        return _build_from(defaults_obj, instance_plain)
 
     def interpolate(self: GenericConfig) -> GenericConfig:
         """
-        Interpolate Config with OmegaConf, yielding an interpolated Config class
-
-        OmegaConf supports interpolated fields like `my_field: int = "${my_other_field}"`.
-        This function interpolates those fields, yielding a new Config object.
-
-        Intermediate fields are dataclasses, not DictConfig.
+        Interpolate Config with OmegaConf, yielding an interpolated Config class whose
+        intermediate fields are dataclasses, not DictConfig.
         """
         # use `to_object()` so intermediate fields are dataclasses, not DictConfig
-        # `create()` interpolates the fields
+        # `to_object()` interpolates (resolves) the fields
         return OmegaConf.to_object(OmegaConf.create(self))
 
-    def asdict(self, interpolate: bool = False) -> Dict[str, Any]:
-        if interpolate:
-            return asdict(self.interpolate())
+    def asdict(self: GenericConfig) -> Dict[str, Any]:
+        """
+        Convert the dataclass to a dictionary.
+        If `interpolate` is True, resolve templates before converting.
+        """
         return asdict(self)
 
-    def flatdict(self, interpolate: bool = False) -> Dict[str, Any]:
+    def flatdict(self: GenericConfig) -> Dict[str, Any]:
         """
         Flatten the dataclass into a dictionary.
         """
         # Use flatten_dict to flatten the dataclass
-        return dict(flatten_dict(self.asdict(interpolate=interpolate)))
+        return dict(flatten_dict(self.asdict()))
 
     def merge_dict(
         self: GenericConfig,
         other: Dict[str, Any],
-        interpolate: bool = True,
     ) -> GenericConfig:
         """
-        Merge a dictionary config with the current config, optionally interpolating `self` first.
-        Returns a new config of the same type as self.
+        Merge a dictionary config with the current config.
+        If `interpolate` is True, resolve after merging.
         """
-        # merge configs as dictionary, interpolating self if requested
-        merged_dict = deep_merge_dicts(self.asdict(interpolate=interpolate), other)
+        # Always merge using unresolved dicts so templates remain intact until the end
+        merged_dict = deep_merge_dicts(self.asdict(), other)
 
         # Rebuild a typed config of the same class as self
         schema = OmegaConf.structured(type(self))
         merged_conf = OmegaConf.merge(schema, OmegaConf.create(merged_dict))
-        return OmegaConf.to_object(merged_conf)
+
+        return self.from_dict_config(merged_conf)
 
     def merge(
         self: GenericConfig,
         other: GenericConfig,
-        interpolate: bool = True,
     ) -> GenericConfig:
         """
         Standard overwriting merge of two configs: fields in `other` override those in `self`.
+
+        `interpolate` controls final resolution only (i.e. so templates can be merged).
+        Pass `other.interpolate()` to interpolate it before merge.
+
         Returns new instance of same class as `self`.
         """
-        other_cfg = other.interpolate() if interpolate else other
         return self.merge_dict(
-            other=other_cfg.asdict(),
+            other=other.asdict(),
         )
 
-    def clone(self: GenericConfig, interpolate: bool = True) -> GenericConfig:
+    def clone(self: GenericConfig) -> GenericConfig:
         """
         Clone the config, returning a new instance of the same class.
         """
-        return self.merge_dict(other={}, interpolate=interpolate)
+        return self.merge_dict(other={})
 
 
 @dataclass
@@ -125,7 +170,7 @@ class SharedConfig(BaseClassConfig):
     local: bool = field(default_factory=lambda: not torch.cuda.is_available())
     # estimated GPU memory in GB, used to control batch sizes etc.
     # Requires key,values defined in relevant tables.
-    gpu_memory_gb: int = 40
+    gpu_memory_gb: int = 80
     # randomness / stochastic paths
     stochastic: bool = True
     # project root path
@@ -153,7 +198,7 @@ class ModelHyperParamsConfig(BaseClassConfig):
     """
 
     # dimensions
-    node_embed_size: int = 256
+    node_embed_size: int = 512
     edge_embed_size: int = 128
     aa_num_tokens: int = 21  # number of amino acid types (if masking), 21 = mask/UNK
     pos_embed_size: int = 128
@@ -393,7 +438,9 @@ class ModelAttentionConfig(BaseClassConfig):
 @dataclass
 class ModelAttentionTrunkConfig(BaseClassConfig):
     """
-    Configuration for attention trunks. Note more than 1 trunk.
+    Configuration for attention trunks.
+    Note model may contain more than 1 trunk (i.e. main and sequence trunks).
+    `num_layers` etc. may be specified by model hyperparameters, per trunk.
     """
 
     attn_type: AttentionType = AttentionType.PAIRFORMER
@@ -418,12 +465,12 @@ class ModelAttentionTrunkConfig(BaseClassConfig):
 class ModelESMKey(StrEnum):
     """Keys for ESM model selection."""
 
-    esm2_t6_8M_UR50D = "esm2_t6_8M_UR50D"
-    esm2_t12_35M_UR50D = "esm2_t12_35M_UR50D"
-    esm2_t30_150M_UR50D = "esm2_t30_150M_UR50D"
-    esm2_t33_650M_UR50D = "esm2_t33_650M_UR50D"
-    esm2_t36_3B_UR50D = "esm2_t36_3B_UR50D"
-    esm2_t48_15B_UR50D = "esm2_t48_15B_UR50D"
+    esm2_t6_8M_UR50D = "esm2_t6_8M_UR50D"  # 320 dim
+    esm2_t12_35M_UR50D = "esm2_t12_35M_UR50D"  # 480 dim
+    esm2_t30_150M_UR50D = "esm2_t30_150M_UR50D"  # 640 dim
+    esm2_t33_650M_UR50D = "esm2_t33_650M_UR50D"  # 1280 dim
+    esm2_t36_3B_UR50D = "esm2_t36_3B_UR50D"  # 2560 dim
+    esm2_t48_15B_UR50D = "esm2_t48_15B_UR50D"  # 5120 dim
     DUMMY = "dummy"  # dummy model for testing
 
 
@@ -592,7 +639,7 @@ class ProteinMPNNRunnerConfig(BaseClassConfig):
     # Number of inverse folds to run per sample during inference.
     # Note that only 1 inverse fold is generated during validation.
     # Note that each is folded by default, which increases prediction time.
-    seq_per_sample: int = 4
+    seq_per_sample: int = 8
 
     # Native runner options
     use_native_runner: bool = True  # Use native runner instead of subprocess
@@ -733,7 +780,7 @@ class InterpolantRotationsConfig(BaseClassConfig):
     stochastic: bool = "${shared.stochastic}"
     # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
     # Roughly, 0.5 => 11°, 1.0 => 23°, 2.0 => 34° over 500 timesteps
-    stochastic_noise_intensity: float = 1.0  # `g` in FoldFlow SO3SFM
+    stochastic_noise_intensity: float = 1.0
 
 
 class InterpolantTranslationsNoiseTypeEnum(StrEnum):
@@ -784,7 +831,7 @@ class InterpolantTranslationsConfig(BaseClassConfig):
     stochastic: bool = "${shared.stochastic}"
     # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
     # Roughly, 0.5 => 0.2Å, 1.0 => 0.4Å, 2.0 => 0.6Å over 500 timesteps
-    stochastic_noise_intensity: float = 1.0  # `g` in FoldFlow SO3SFM
+    stochastic_noise_intensity: float = 1.0
 
 
 @dataclass
@@ -866,7 +913,7 @@ class InterpolantTrainTimeSamplingEnum(StrEnum):
 @dataclass
 class InterpolantSamplingConfig(BaseClassConfig):
     # training takes a random t. Sampling runs over t timestemps.
-    num_timesteps: int = 500
+    num_timesteps: int = 200
 
 
 @dataclass
@@ -1038,17 +1085,10 @@ class DatasetFilterConfig(BaseClassConfig):
     min_date: Optional[str] = None
     max_date: Optional[str] = None
     # oligmers / multimers
-    oligomeric: Optional[List[str]] = field(
-        default_factory=lambda: [
-            "monomer",
-            "monomeric",
-            "monomeric,monomeric",
-            "homomer",
-        ]
-    )
+    oligomeric: Optional[List[str]] = None
     oligomeric_skip: Optional[List[str]] = None
-    num_chains: Optional[List[int]] = field(default_factory=lambda: [1])
-    num_chains_skip: Optional[List[int]] = field(default_factory=lambda: [0])
+    num_chains: Optional[List[int]] = None
+    num_chains_skip: Optional[List[int]] = None
     # non-residue entities (requires information in metadata CSV)
     max_non_residue_entities: Optional[int] = None
     max_metal_ions: Optional[int] = None
@@ -1065,13 +1105,8 @@ class DatasetFilterConfig(BaseClassConfig):
             max_num_res=1024,
             oligomeric=None,
             num_chains=None,
-            # skip monomers
-            oligomeric_skip=[
-                "monomer",
-                "monomeric",
-                "monomeric,monomeric",
-                "homomer",
-            ],
+            # skip single chain structures, allow homo-oligomers
+            oligomeric_skip=None,
             num_chains_skip=[0, 1],
         )
 
@@ -1084,11 +1119,7 @@ class DatasetFilterConfig(BaseClassConfig):
             max_coil_percent=0.99,
             rog_quantile=1,
             max_percent_residues_unknown=0.75,
-            min_date=None,
-            max_date=None,
             min_plddt=0.25,
-            oligomeric=None,
-            num_chains=None,
         )
 
 
@@ -1540,8 +1571,9 @@ class RedesignConfig(BaseClassConfig):
     )
     # Filename for redesigns CSV
     redesigns_csv: str = "redesigns.csv"
-    # Sequences generated per example, number to keep and fold (sorted by score)
+    # Sequences generated per example
     seqs_per_sample: int = 10
+    # Number inverse folds to keep and fold (sorted by score). None for all.
     fold_per_sample: Optional[int] = 2
     # RMSD threshold for good redesigns. Has no impact to dataset filtering.
     rmsd_good: float = 2.0
@@ -1654,7 +1686,7 @@ class Config(BaseClassConfig):
         orig_cfg = self.interpolate()
 
         # Merge the checkpoint config into the current config
-        merged_cfg = self.merge_dict(ckpt_cfg_dict, interpolate=True)
+        merged_cfg = self.merge_dict(ckpt_cfg_dict).interpolate()
 
         # For inference, overwrite certain fields from the checkpoint config.
         # We want to inherit the model specification etc. to match what was saved

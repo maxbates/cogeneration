@@ -1,6 +1,6 @@
 import pytest
 from hydra.utils import instantiate
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
 from cogeneration.config.base import Config, ModelConfig, ModelNodeFeaturesConfig
 
@@ -82,7 +82,7 @@ class TestBaseClassConfig:
         assert isinstance(raw_cs, str)
 
         # interpolated flatdict yields int value for same key
-        f_i = cfg.flatdict(interpolate=True)
+        f_i = cfg.interpolate().flatdict()
         interp_cs = f_i.get("model:node_features:c_s")
         assert isinstance(interp_cs, int)
 
@@ -92,7 +92,7 @@ class TestBaseClassConfig:
         assert cfg.shared.local is True
 
         # merge_dict overrides via dict
-        merged = cfg.merge_dict({"shared": {"local": False}}, interpolate=False)
+        merged = cfg.merge_dict({"shared": {"local": False}})
         assert isinstance(merged, Config)
         assert merged.shared.local is False
         # original unchanged
@@ -101,10 +101,32 @@ class TestBaseClassConfig:
         # merge overrides via another Config instance
         other = Config()
         other.shared.local = False
-        merged2 = cfg.merge(other, interpolate=False)
+        merged2 = cfg.merge(other)
         assert isinstance(merged2, Config)
         assert merged2.shared.local is False
         assert cfg.shared.local is True
+
+    def test_merge_dict_interpolate_flag_controls_resolution(self):
+        # Build a dict override that changes a referenced field, then verify
+        # interpolate resolves templates while default preserves them.
+        base = Config()
+        # Before, template field is a string
+        assert isinstance(base.model.node_features.c_s, str)
+
+        # Override hyperparameter used by template and merge WITHOUT resolution
+        overrides = {"model": {"hyper_params": {"node_embed_size": 777}}}
+        merged_unresolved = base.merge_dict(overrides)
+        # Still a dataclass and template remains unresolved (string)
+        assert isinstance(merged_unresolved.model.node_features.c_s, str)
+        # But after explicit interpolate(), it should reflect the override
+        resolved = merged_unresolved.interpolate()
+        assert isinstance(resolved.model.node_features.c_s, int)
+        assert resolved.model.node_features.c_s == 777
+
+        # Now merge WITH resolution immediately
+        merged_resolved = base.merge_dict(overrides).interpolate()
+        assert isinstance(merged_resolved.model.node_features.c_s, int)
+        assert merged_resolved.model.node_features.c_s == 777
 
     def test_load_from_file(self, tmp_path):
         # create a yaml config with overrides for nested fields
@@ -119,7 +141,7 @@ data:
         loaded, is_multiflow = Config.load_dict_from_file(str(cfg_file))
         assert isinstance(loaded, dict)
         # convert to Config
-        loaded = Config().merge_dict(loaded, interpolate=True)
+        loaded = Config().merge_dict(loaded).interpolate()
         # check overrides applied
         assert loaded.shared.local is False
         from cogeneration.type.task import DataTask
@@ -163,3 +185,24 @@ shared:
         # path must end with .ckpt
         with pytest.raises(ValueError):
             orig.merge_checkpoint_cfg("not_a_ckpt.txt")
+
+    def test_from_dict_config_interpolate_flag_controls_resolution(self):
+        # Build a DictConfig schema and apply an override
+        schema = OmegaConf.structured(Config)
+        cfg = OmegaConf.merge(
+            schema, {"model": {"hyper_params": {"node_embed_size": 321}}}
+        )
+        assert isinstance(cfg, DictConfig)
+
+        # Default (no interpolate): templates remain unresolved
+        unresolved = Config.from_dict_config(cfg)
+        assert isinstance(unresolved, Config)
+        assert isinstance(unresolved.model, ModelConfig)
+        assert isinstance(unresolved.model.node_features, ModelNodeFeaturesConfig)
+        assert isinstance(unresolved.model.node_features.c_s, str)
+
+        # Explicit interpolate: templates are resolved
+        resolved = unresolved.interpolate()
+        assert isinstance(resolved, Config)
+        assert isinstance(resolved.model.node_features.c_s, int)
+        assert resolved.model.node_features.c_s == 321
