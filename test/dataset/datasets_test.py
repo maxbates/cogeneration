@@ -12,6 +12,7 @@ from cogeneration.data.noise_mask import torsions_empty
 from cogeneration.dataset.datasets import BaseDataset, LengthSamplingDataset
 from cogeneration.dataset.featurizer import BatchFeaturizer
 from cogeneration.dataset.motif_factory import ChainBreak, Motif, Scaffold
+from cogeneration.dataset.process_pdb import process_chain_feats, process_pdb_file
 from cogeneration.dataset.spec import (
     CogenerationAFDBDatasetSpec,
     CogenerationPDBDatasetSpec,
@@ -21,11 +22,12 @@ from cogeneration.dataset.spec import (
     MultiflowRedesignedDatasetSpec,
     MultiflowSyntheticDatasetSpec,
 )
-from cogeneration.dataset.test_utils import create_pdb_batch
+from cogeneration.dataset.test_utils import create_pdb_batch, create_single_item_batch
 from cogeneration.type.batch import METADATA_BATCH_PROPS
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import empty_feats
+from cogeneration.type.dataset import MetadataColumn as mc
 from cogeneration.type.task import DataTask
 
 
@@ -90,7 +92,7 @@ class TestBaseDataset:
         item = dataset[0]
 
     @pytest.mark.parametrize("task", [DataTask.inpainting, DataTask.hallucination])
-    def test_features_defined(self, task, mock_cfg_uninterpolated):
+    def test_features_defined(self, task, mock_cfg_uninterpolated, pdb_2qlw_path):
         """
         Ensure that certain features are present in the batch esp. when their generation probabilities are set to 0 (i.e. always on).
         """
@@ -116,7 +118,24 @@ class TestBaseDataset:
 
         cfg = mock_cfg_uninterpolated.interpolate()
 
-        batch = create_pdb_batch(cfg=cfg, training=False)
+        # Build a deterministic batch from a known multimer (2qlw)
+        processed_file = process_pdb_file(str(pdb_2qlw_path), "2qlw")
+        processed_file = process_chain_feats(
+            processed_file,
+            center=True,
+            trim_to_modeled_residues=True,
+            trim_chains_independently=True,
+        )
+
+        featurizer = BatchFeaturizer(cfg=cfg.dataset, task=task, eval=True)
+        feats = featurizer.featurize_processed_file(
+            processed_file=processed_file,
+            csv_row={
+                mc.pdb_name: "2qlw",
+                mc.processed_path: "",
+            },
+        )
+        batch = create_single_item_batch(feats)
 
         assert bp.contact_conditioning in batch
         assert (batch[bp.contact_conditioning] > 0).any()

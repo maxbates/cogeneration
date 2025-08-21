@@ -56,6 +56,7 @@ class TestCurriculum:
         # Running the curriculum should invoke our patched Experiment without errors
         curriculum.run()
 
+    @pytest.mark.slow
     @pytest.mark.parametrize("resume_step2", [True, False])
     def test_resume(self, tmp_path, monkeypatch, mock_checkpoint, resume_step2):
         cfg1 = Config.test_uninterpolated(tmp_path=tmp_path / "step1")

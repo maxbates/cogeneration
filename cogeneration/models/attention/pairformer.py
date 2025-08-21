@@ -243,14 +243,15 @@ class PairformerModule(nn.Module):
 
         for layer in self.layers:
             if self.cfg.checkpointing and self.training:
+                # cannot use kwargs with checkpoint
                 node_embed, edge_embed = torch.utils.checkpoint.checkpoint(
                     layer,
-                    node_embed=node_embed,
-                    edge_embed=edge_embed,
-                    node_mask=node_mask,
-                    edge_mask=edge_mask,
-                    chunk_size_tri_attn=chunk_size_tri_attn,
-                    use_kernels=self.cfg.use_kernels,
+                    node_embed,
+                    edge_embed,
+                    node_mask,
+                    edge_mask,
+                    chunk_size_tri_attn,
+                    self.cfg.use_kernels,
                 )
             else:
                 node_embed, edge_embed = layer(
@@ -293,12 +294,13 @@ class PairformerNoSeqModule(nn.Module):
 
         for layer in self.layers:
             if self.cfg.checkpointing and self.training:
+                # cannot use kwargs with checkpoint
                 edge_embed = torch.utils.checkpoint.checkpoint(
                     layer,
-                    edge_embed=edge_embed,
-                    edge_mask=edge_mask,
-                    chunk_size_tri_attn=chunk_size_tri_attn,
-                    use_kernels=self.cfg.use_kernels,
+                    edge_embed,
+                    edge_mask,
+                    chunk_size_tri_attn,
+                    self.cfg.use_kernels,
                 )
             else:
                 edge_embed = layer(

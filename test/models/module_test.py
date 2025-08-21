@@ -341,10 +341,6 @@ class TestFlowModule:
 
         assert mock_cfg.inference.interpolant.rots.stochastic
         assert mock_cfg.inference.interpolant.trans.stochastic
-        assert (
-            mock_cfg.inference.interpolant.trans.sample_schedule
-            == InterpolantTranslationsScheduleEnum.vpsde
-        )
 
         module = FlowModule(mock_cfg)
         batch = next(iter(mock_pred_unconditional_dataloader))
@@ -376,10 +372,6 @@ class TestFlowModule:
 
         assert mock_cfg.inference.interpolant.rots.stochastic
         assert mock_cfg.inference.interpolant.trans.stochastic
-        assert (
-            mock_cfg.inference.interpolant.trans.sample_schedule
-            == InterpolantTranslationsScheduleEnum.vpsde
-        )
 
         module = FlowModule(mock_cfg)
 

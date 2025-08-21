@@ -726,13 +726,13 @@ class FoldingValidator:
                     )
                 )
 
-            # Calculate TM-score
+            # Calculate TM-score, normed to sample
             sample_metrics[MetricName.tm_score_folded] = calc_tm_score(
                 pos_1=sample_bb_pos,
                 pos_2=folded_bb_pos,
                 seq_1=df_seq,
                 seq_2=folded_pdb_seq,
-            )
+            )[0]
 
             # If provided ground truth bb positions, also compare to them
             if true_bb_positions is not None:
