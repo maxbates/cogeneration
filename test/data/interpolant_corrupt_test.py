@@ -423,8 +423,8 @@ class TestInterpolant:
         interpolant.set_device(torch.device("cpu"))
 
         noisy_aatypes_t = interpolant._aatype_jump_step(
-            d_t=d_t,
-            t=t,
+            d_t=torch.tensor(d_t),
+            t=torch.tensor(t),
             logits_1=logits_1,
             aatypes_t=aatypes_t,
         )

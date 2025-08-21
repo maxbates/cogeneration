@@ -155,12 +155,22 @@ class Interpolant:
     @property
     def igso3(self):
         if self._igso3 is None:
-            sigma_grid = torch.linspace(0.1, self.cfg.rots.igso3_sigma, 1000)
-            self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=".cache")
+            # Build in float64 for accuracy at small sigma, then cast for runtime.
+            steps = 1000
+            sigma_grid = torch.logspace(
+                math.log10(self.cfg.rots.igso3_sigma_min),
+                math.log10(self.cfg.rots.igso3_sigma),
+                steps=steps,
+                dtype=torch.float64,
+            )
+            self._igso3 = so3_utils.SampleIGSO3(steps, sigma_grid, cache_dir=".cache")
 
             # on CUDA, move to GPU, so can be broadcasted. on MPS, leave on CPU.
             if self._device is not None and self._device.type != "mps":
                 self._igso3.to(self._device)
+
+            # store tables in fp32
+            self._igso3 = self._igso3.float()
 
         return self._igso3
 
@@ -229,14 +239,20 @@ class Interpolant:
         """
         return torch.sqrt(scale**2 * t * (1 - t) + min_sigma**2)  # (B,)
 
-    def _trans_noise(self, chain_idx: torch.Tensor) -> torch.Tensor:
+    def _trans_noise(
+        self, chain_idx: torch.Tensor, is_intermediate: bool
+    ) -> torch.Tensor:
         """
         sample t=0 noise for translations, scaled to angstroms
         """
-        if (
-            self.cfg.trans.noise_type
-            == InterpolantTranslationsNoiseTypeEnum.centered_gaussian
-        ):
+        # Determine noise type, depending on whether sampling from t=0 base distribution
+        # or adding noise to intermediate sample
+        if is_intermediate:
+            noise_type = self.cfg.trans.intermediate_noise_type
+        else:
+            noise_type = self.cfg.trans.initial_noise_type
+
+        if noise_type == InterpolantTranslationsNoiseTypeEnum.centered_gaussian:
             return (
                 centered_gaussian(
                     *chain_idx.shape,
@@ -244,10 +260,7 @@ class Interpolant:
                 )
                 * NM_TO_ANG_SCALE
             )
-        elif (
-            self.cfg.trans.noise_type
-            == InterpolantTranslationsNoiseTypeEnum.centered_harmonic
-        ):
+        elif noise_type == InterpolantTranslationsNoiseTypeEnum.centered_harmonic:
             # For harmonic noise, each Brownian increment has covariance J^{-1}
             # (the harmonic prior) instead of identity.
             return (
@@ -258,9 +271,7 @@ class Interpolant:
                 * NM_TO_ANG_SCALE
             )
         else:
-            raise ValueError(
-                f"Unknown translation noise type {self.cfg.trans.noise_type}"
-            )
+            raise ValueError(f"Unknown translation noise type {noise_type}")
 
     def _rotmats_noise(self, res_mask: torch.Tensor):
         """
@@ -351,7 +362,9 @@ class Interpolant:
         """
         Corrupt translations from t=1 to t using Gaussian noise.
         """
-        trans_0 = self._trans_noise(chain_idx=chain_idx)  # (B, N, 3)
+        trans_0 = self._trans_noise(
+            chain_idx=chain_idx, is_intermediate=False
+        )  # (B, N, 3)
 
         # compute batch OT, or aligning, to enable learning straighter paths.
         # Expect no need to re-center as noise and t=1 should already be.
@@ -389,7 +402,9 @@ class Interpolant:
                 t.squeeze(1),  # (B,)
                 scale=self.cfg.trans.stochastic_noise_intensity * stochasticity_scale,
             )
-            intermediate_noise = self._trans_noise(chain_idx=chain_idx)  # (B, N, 3)
+            intermediate_noise = self._trans_noise(
+                chain_idx=chain_idx, is_intermediate=True
+            )  # (B, N, 3)
             intermediate_noise = intermediate_noise * sigma_t[..., None, None]
             trans_t += intermediate_noise
 
@@ -785,7 +800,10 @@ class Interpolant:
         return noisy_batch
 
     def _trans_vector_field(
-        self, t: float, trans_1: torch.Tensor, trans_t: torch.Tensor
+        self,
+        t: torch.Tensor,  # scalar Tensor (0-d) or (B,)
+        trans_1: torch.Tensor,  # (B, N, 3)
+        trans_t: torch.Tensor,  # (B, N, 3)
     ):
         if self.cfg.trans.sample_schedule == InterpolantTranslationsScheduleEnum.linear:
             trans_vf = (trans_1 - trans_t) / (1 - t)
@@ -809,13 +827,13 @@ class Interpolant:
 
     def _trans_euler_step(
         self,
-        d_t: float,
-        t: float,
+        d_t: torch.Tensor,  # scalar Tensor (0-d)
+        t: torch.Tensor,  # scalar Tensor (0-d) or (B,)
         trans_1: torch.Tensor,  # (B, N, 3)
         trans_t: torch.Tensor,  # (B, N, 3)
         chain_idx: torch.Tensor,  # (B, N)
         stochasticity_scale: float = 1.0,
-        potential: Optional[torch.Tensor] = None,  # (B, N, 3)
+        potential: Optional[torch.Tensor] = None,  # (B, N, 3) vector field
     ) -> torch.Tensor:
         # unconditional vector field
         trans_vf = self._trans_vector_field(t=t, trans_1=trans_1, trans_t=trans_t)
@@ -826,18 +844,22 @@ class Interpolant:
             and self.cfg.trans.stochastic_noise_intensity > 0.0
             and stochasticity_scale > 0.0
         ):
-            # Sample from either Gaussian or Harmonic prior (zero‐mean, correct covariance)
-            base_noise = self._trans_noise(
-                chain_idx=chain_idx
+            # Sample from either Gaussian or Harmonic prior
+            intermediate_noise = self._trans_noise(
+                chain_idx=chain_idx,
+                is_intermediate=True,
             )  # (B, N, 3) in Angstroms
             sigma_t = self._compute_sigma_t(
-                torch.ones(trans_1.shape[0]) * t,  # (B)
+                torch.ones(trans_1.shape[0], device=self._device)
+                * t.to(self._device),  # (B)
                 scale=self.cfg.trans.stochastic_noise_intensity * stochasticity_scale,
             )
             sigma_t = sigma_t.to(trans_t.device)
-            noise = base_noise * math.sqrt(d_t) * sigma_t[..., None, None]
+            intermediate_noise = (
+                intermediate_noise * math.sqrt(d_t) * sigma_t[..., None, None]
+            )
         else:
-            noise = torch.zeros_like(trans_t)
+            intermediate_noise = torch.zeros_like(trans_t)
 
         # potential, if provided, modifies the vector field
         if potential is not None:
@@ -846,23 +868,45 @@ class Interpolant:
             ), f"potential {potential.shape} != trans_vf {trans_vf.shape}"
             trans_vf += potential
 
-        trans_next = trans_t + trans_vf * d_t + noise
+        trans_next = trans_t + trans_vf * d_t + intermediate_noise
 
         return trans_next
 
-    def _rots_vf_scaling(self, t: float):
+    def _rots_vf_scaling(self, t: torch.Tensor):
         """Calculate rotmats scaling factor of `d_t` step given `t`, depending on the schedule."""
         if self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.linear:
             return (1 / (1 - t)).clamp(min=1e-4)
         elif self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.exp:
-            return self.cfg.rots.exp_rate
+            # Ensure tensor math even if t is a float
+            t = (
+                t.to(self._device)
+                if torch.is_tensor(t)
+                else torch.tensor(
+                    t, dtype=torch.get_default_dtype(), device=self._device
+                )
+            )
+
+            # exp_rate is expected > 0
+            # Exact complementary scaling for exp τ(t):
+            # τ(t) = (1 - exp(-r t)) / (1 - exp(-r))
+            # so s(t) = (dτ/dt) / (1 - τ)
+            # => s(t) = r / (1 - exp(-r * (1 - t)))
+            r = torch.tensor(
+                self.cfg.rots.exp_rate, dtype=torch.get_default_dtype(), device=t.device
+            )
+
+            # 1 - e^{-r(1-t)}, avoid div-by-zero at t≈1, match linear clamp min
+            denom = 1.0 - torch.exp(-r * (1.0 - t))
+            denom = torch.clamp(denom, min=1e-8)
+            scale = r / denom
+            return scale.clamp(min=1e-4)
         else:
             raise ValueError(f"Unknown sample schedule {self.cfg.rots.sample_schedule}")
 
     def _rots_euler_step(
         self,
-        d_t: float,
-        t: float,
+        d_t: torch.Tensor,  # scalar Tensor (0-d)
+        t: torch.Tensor,  # scalar Tensor (0-d) or (B,)
         rotmats_1: torch.Tensor,  # (B, N, 3, 3)
         rotmats_t: torch.Tensor,  # (B, N, 3, 3)
         stochasticity_scale: float = 1.0,
@@ -890,18 +934,26 @@ class Interpolant:
             and self.cfg.rots.stochastic_noise_intensity > 0.0
             and stochasticity_scale > 0.0
         ):
-            # Brownian increment: σ(t) · √dt with σ(t)=intensity·√(t(1–t))
+            # Brownian increment: sigma_t * sqrt(dt), with sigma_t = intensity * sqrt(t(1–t))
             # Sample IGSO(3) noise with a time-independent sigma_t, scaled by sqrt(dt)
             # Add IGSO(3) noise to stay on SO(3).
             num_batch, num_res, _, _ = rotmats_t.shape
 
             sigma_t = self._compute_sigma_t(
-                torch.ones(num_batch) * t,  # (B)
+                torch.ones(num_batch, device=rotmats_t.device)
+                * t.to(rotmats_t.device),  # (B)
                 scale=self.cfg.rots.stochastic_noise_intensity * stochasticity_scale,
             ) * math.sqrt(
                 d_t
             )  # (B,)
             sigma_t = sigma_t.to(self.igso3.sigma_grid.device)
+
+            # check sigma_t within IGSO3 grid spec
+            if sigma_t.min() < self.igso3.sigma_grid.min():
+                print(
+                    f"WARNING: rots sigma_t < igso3 grid min, noise will be larger than desired. Lower igso3_sigma_min."
+                )
+
             intermediate_noise = self.igso3.sample(sigma_t, num_res)
             intermediate_noise = intermediate_noise.to(rotmats_t.device)
             intermediate_noise = intermediate_noise.reshape(num_batch, num_res, 3, 3)
@@ -913,8 +965,8 @@ class Interpolant:
 
     def _torsions_euler_step(
         self,
-        d_t: float,
-        t: float,
+        d_t: torch.Tensor,  # scalar Tensor (0-d)
+        t: torch.Tensor,  # scalar Tensor (0-d) or (B,)
         torsions_1: torch.Tensor,  # (B, N, 7, 2)
         torsions_t: torch.Tensor,  # (B, N, K, 2)
         stochasticity_scale: float = 1.0,
@@ -937,6 +989,7 @@ class Interpolant:
         angles_1 = torch.atan2(torsions_1[..., 0], torsions_1[..., 1])  # (B, N, 7)
         angles_t = torch.atan2(torsions_t[..., 0], torsions_t[..., 1])  # (B, N, 7)
 
+        t = t.to(self._device)
         angles_vf = (angles_1 - angles_t) / (1 - t)
         angles_next = angles_t + angles_vf * d_t
 
@@ -995,8 +1048,8 @@ class Interpolant:
 
     def _aatypes_euler_step_uniform(
         self,
-        d_t: float,
-        t: float,
+        d_t: torch.Tensor,  # scalar Tensor (0-d)
+        t: torch.Tensor,  # scalar Tensor (0-d) or (B,)
         logits_1: torch.Tensor,  # (B, N, S=20)
         aatypes_t: torch.Tensor,  # (B, N)
     ):
@@ -1036,8 +1089,8 @@ class Interpolant:
 
     def _aatypes_euler_step_masking(
         self,
-        d_t: float,
-        t: float,
+        d_t: torch.Tensor,  # scalar Tensor (0-d)
+        t: torch.Tensor,  # scalar Tensor (0-d) or (B,)
         logits_1: torch.Tensor,  # (B, N, S=21)
         aatypes_t: torch.Tensor,  # (B, N)
     ):
@@ -1080,8 +1133,8 @@ class Interpolant:
 
     def _aatypes_euler_step_purity(
         self,
-        d_t: float,
-        t: float,
+        d_t: torch.Tensor,  # scalar Tensor (0-d)
+        t: torch.Tensor,  # scalar Tensor (0-d) or (B,)
         logits_1: torch.Tensor,  # (B, N, S=21)
         aatypes_t: torch.Tensor,  # (B, N)
     ):
@@ -1186,8 +1239,8 @@ class Interpolant:
 
     def _aatype_jump_step(
         self,
-        d_t: float,
-        t: float,  # t in [0,1]
+        d_t: torch.Tensor,  # scalar Tensor (0-d)
+        t: torch.Tensor,  # scalar Tensor (0-d) or (B,) in [0,1]
         logits_1: torch.Tensor,  # (B, N, S)
         aatypes_t: torch.Tensor,  # (B, N)
         stochasticity_scale: float = 1.0,
@@ -1227,7 +1280,7 @@ class Interpolant:
         # Multiply by sigma_t so amount of noise mirrors other domains.
         # Multiplying the whole rate matrix by the same value preserves valid rate matrix.
         sigma_t = self._compute_sigma_t(
-            torch.ones(aatypes_t.shape[0], device=device) * t,
+            torch.ones(aatypes_t.shape[0], device=device) * t.to(device),
             scale=self.cfg.aatypes.stochastic_noise_intensity * stochasticity_scale,
         )
         step_rates = step_rates * sigma_t[..., None, None]  # (B, N, S)
@@ -1260,8 +1313,8 @@ class Interpolant:
 
     def _aatypes_euler_step(
         self,
-        d_t: float,
-        t: float,  # t in [0,1]
+        d_t: torch.Tensor,  # scalar Tensor (0-d)
+        t: torch.Tensor,  # scalar Tensor (0-d) or (B,) in [0,1]
         logits_1: torch.Tensor,  # (B, N, S) unscaled probabilities, S={20, 21}
         aatypes_t: torch.Tensor,  # (B, N) current amino acid types
         stochasticity_scale: float = 1.0,
@@ -1457,8 +1510,8 @@ class Interpolant:
         task: InferenceTask,
         resampler: FKSteeringResampler,
         step_idx: int,
-        t_1: float,  # [scalar Tensor]
-        t_2: Optional[float],  # [scalar Tensor] None if final step
+        t_1: torch.Tensor,  # scalar Tensor (0-d)
+        t_2: Optional[torch.Tensor],  # scalar Tensor (0-d) or None if final step
         stochasticity_scale: float = 1.0,
     ) -> Tuple[NoisyFeatures, SamplingStep, SamplingStep, Optional[FKStepMetric]]:
         """
@@ -1854,8 +1907,8 @@ class Interpolant:
         # Initialize t=0 prior samples i.e. noise (technically `t=cfg.min_t`)
 
         if trans_0 is None:
-            # Generate centered Gaussian noise for translations (B, N, 3)
-            trans_0 = self._trans_noise(chain_idx=chain_idx)
+            # Generate centered Gaussian noise / Harmonic prior for translations (B, N, 3)
+            trans_0 = self._trans_noise(chain_idx=chain_idx, is_intermediate=False)
         if rotmats_0 is None:
             # Generate uniform SO(3) rotation matrices (B, N, 3, 3)
             rotmats_0 = self._rotmats_noise(res_mask=res_mask)
@@ -1915,7 +1968,9 @@ class Interpolant:
         sample_trajectory.append(SamplingStep.from_batch(batch=batch))
 
         # Set-up time steps
-        ts = torch.linspace(self.cfg.min_t, 1.0, self.cfg.sampling.num_timesteps)
+        ts = torch.linspace(
+            self.cfg.min_t, 1.0, self.cfg.sampling.num_timesteps, device=self._device
+        )
         step_idx = 0
 
         # We will integrate in a loop over ts, handling the last step after the loop.
@@ -1924,7 +1979,7 @@ class Interpolant:
         t_1 = ts[0]
         for t_2 in ts[1:]:
             # Determine time for each domain
-            t = torch.ones((num_batch, 1), device=self._device) * t_1
+            t = torch.ones((num_batch, 1), device=self._device) * t_1.to(self._device)
             if t_nn is not None:
                 (
                     batch[nbp.r3_t],

@@ -402,7 +402,8 @@ class TestInterpolantSample:
         """1 deterministic step should reduce motif translation RMSD and SO(3) geodesic error."""
         mock_cfg_uninterpolated.shared.stochastic = False
         mock_cfg_uninterpolated.inference.task = InferenceTask.inpainting
-        mock_cfg_uninterpolated.interpolant.sampling.num_timesteps = 3
+        # don't take too big of steps of may overshoot and confuse test results
+        mock_cfg_uninterpolated.interpolant.sampling.num_timesteps = 10
         cfg = mock_cfg_uninterpolated.interpolate()
 
         batch = next(iter(mock_pred_inpainting_dataloader))

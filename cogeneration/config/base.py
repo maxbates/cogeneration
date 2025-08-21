@@ -198,18 +198,21 @@ class ModelHyperParamsConfig(BaseClassConfig):
     """
 
     # dimensions
-    node_embed_size: int = 512
-    edge_embed_size: int = 128
-    aa_num_tokens: int = 21  # number of amino acid types (if masking), 21 = mask/UNK
+    # node embedings are O(N • node_embed_size • layers)
+    node_embed_size: int = 384  # aka c_s
+    # edge embedings are O(N^2 • edge_embed_size • layers)
+    edge_embed_size: int = 128  # aka c_z
+    # number of amino acid types (if masking), 21 = mask/UNK
+    aa_num_tokens: int = 21
     pos_embed_size: int = 128
     pos_embed_method: PositionalEmbeddingMethod = PositionalEmbeddingMethod.rotary
     pos_embed_max_len: int = 2048
     timestep_embed_size: int = 128
     # layers
-    num_recycles: int = 2  # of trunk + IPA. 0 for single pass
-    trunk_num_layers: int = 8  # 0 to disable
+    num_recycles: int = 1  # of trunk + IPA. 0 for single pass
+    trunk_num_layers: int = 4  # 0 to disable
     ipa_num_layers: int = 4  # >= 1
-    seq_trunk_num_layers: int = 2  # 0 to disable
+    seq_trunk_num_layers: int = 1  # 0 to disable
 
     @classmethod
     def tiny(cls):
@@ -234,7 +237,7 @@ class ModelHyperParamsConfig(BaseClassConfig):
             pos_embed_size=64,
             timestep_embed_size=64,
             num_recycles=0,
-            trunk_num_layers=4,
+            trunk_num_layers=2,
             ipa_num_layers=2,
             seq_trunk_num_layers=1,
         )
@@ -382,7 +385,8 @@ class ModelPairformerConfig(BaseClassConfig):
     post_layer_norm: bool = False
     chunk_size_tri_attn: int = 512  # chunking/tiling for large sequences
     use_kernels: bool = "${shared.kernels}"
-    checkpointing: bool = False  # torch.utils.checkpoint on every layer
+    # torch.utils.checkpoint on every layer. True trades speed for memory.
+    checkpointing: bool = True
 
 
 @dataclass
@@ -555,9 +559,7 @@ class ModelPAEConfig(BaseClassConfig):
 
 @dataclass
 class ModelConfig(BaseClassConfig):
-    hyper_params: ModelHyperParamsConfig = field(
-        default_factory=ModelHyperParamsConfig.poc
-    )
+    hyper_params: ModelHyperParamsConfig = field(default_factory=ModelHyperParamsConfig)
     node_features: ModelNodeFeaturesConfig = field(
         default_factory=ModelNodeFeaturesConfig
     )
@@ -766,21 +768,26 @@ class InterpolantRotationsConfig(BaseClassConfig):
     corrupt: bool = (
         "${ternary:${equals: ${inference.task}, 'inverse_folding'}, False, True}"
     )
-    # sampled noise std dev
-    igso3_sigma: float = 1.5  # 1.5 in public multiflow
+    # IGSO3 grid std deviation range, in log space.
+    # Need grid to support small sigma (5e-3) for stochastic paths intermediate noise
+    # and initial noise (~igso3_sigma).
+    # If sigma_t > the minimum value in the grid,
+    # it will map to the min std dev value, and be too large.
+    igso3_sigma_min: float = 1e-3
+    igso3_sigma: float = 1.5
     train_schedule: InterpolantRotationsScheduleEnum = (
         InterpolantRotationsScheduleEnum.linear
     )
     sample_schedule: InterpolantRotationsScheduleEnum = (
         InterpolantRotationsScheduleEnum.exp
     )
-    exp_rate: float = 10
+    exp_rate: float = 3  # 10 in public multiflow code
     # stochastic paths
     # TODO(stochastic) consider min_t for stochastic rotations, so field can settle before injecting noise.
     stochastic: bool = "${shared.stochastic}"
     # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
     # Roughly, 0.5 => 11°, 1.0 => 23°, 2.0 => 34° over 500 timesteps
-    stochastic_noise_intensity: float = 1.0
+    stochastic_noise_intensity: float = 2.0
 
 
 class InterpolantTranslationsNoiseTypeEnum(StrEnum):
@@ -803,8 +810,11 @@ class InterpolantTranslationsConfig(BaseClassConfig):
         "${ternary:${equals: ${inference.task}, 'inverse_folding'}, False, True}"
     )
     # noise source distribution
-    noise_type: InterpolantTranslationsNoiseTypeEnum = (
+    initial_noise_type: InterpolantTranslationsNoiseTypeEnum = (
         InterpolantTranslationsNoiseTypeEnum.centered_harmonic
+    )
+    intermediate_noise_type: InterpolantTranslationsNoiseTypeEnum = (
+        InterpolantTranslationsNoiseTypeEnum.centered_gaussian
     )
     # batch_ot: enable minibatch optimal transport, otherwise enable aligning noise to sampled data
     batch_ot: bool = True
@@ -815,7 +825,7 @@ class InterpolantTranslationsConfig(BaseClassConfig):
     )
     # sample_schedule: sampling schedule for interpolant.
     sample_schedule: InterpolantTranslationsScheduleEnum = (
-        "${ternary:${equals: ${shared.stochastic}, True}, 'vpsde', 'linear'}"
+        InterpolantTranslationsScheduleEnum.linear
     )
     # vpsde_bmin: variance-preserving SDE minimum
     vpsde_bmin: float = 0.1
@@ -831,7 +841,7 @@ class InterpolantTranslationsConfig(BaseClassConfig):
     stochastic: bool = "${shared.stochastic}"
     # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
     # Roughly, 0.5 => 0.2Å, 1.0 => 0.4Å, 2.0 => 0.6Å over 500 timesteps
-    stochastic_noise_intensity: float = 1.0
+    stochastic_noise_intensity: float = 1.5
 
 
 @dataclass
@@ -847,7 +857,7 @@ class InterpolantTorsionsConfig(BaseClassConfig):
     # stochastic paths
     stochastic: bool = "${shared.stochastic}"
     # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
-    stochastic_noise_intensity: float = 1.0
+    stochastic_noise_intensity: float = 1.5
 
 
 class InterpolantAATypesScheduleEnum(StrEnum):
@@ -900,9 +910,9 @@ class InterpolantAATypesConfig(BaseClassConfig):
     stochastic: bool = "${shared.stochastic}"
     # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
     # Roughly, 0.5 => 0.2 jumps/residue, 1.0 = > 0.4, 1.5 => 0.6 over 500 timesteps
-    stochastic_noise_intensity: float = 1.0
+    stochastic_noise_intensity: float = 1.75
     # temperature smooths logits softmax()
-    stochastic_temp: float = 1.5
+    stochastic_temp: float = 1.7
 
 
 class InterpolantTrainTimeSamplingEnum(StrEnum):
@@ -913,7 +923,7 @@ class InterpolantTrainTimeSamplingEnum(StrEnum):
 @dataclass
 class InterpolantSamplingConfig(BaseClassConfig):
     # training takes a random t. Sampling runs over t timestemps.
-    num_timesteps: int = 200
+    num_timesteps: int = 400
 
 
 @dataclass
@@ -1840,10 +1850,10 @@ class Config(BaseClassConfig):
         # stochastic paths not part of public MultiFlow
         raw_cfg.shared.stochastic = False
         # use simple gaussian prior for translations
-        raw_cfg.interpolant.trans.noise_type = (
+        raw_cfg.interpolant.trans.initial_noise_type = (
             InterpolantTranslationsNoiseTypeEnum.centered_gaussian
         )
-        raw_cfg.inference.interpolant.trans.noise_type = (
+        raw_cfg.inference.interpolant.trans.initial_noise_type = (
             InterpolantTranslationsNoiseTypeEnum.centered_gaussian
         )
         # Don't predict torsion angles
