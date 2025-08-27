@@ -626,7 +626,7 @@ class FlowModule(LightningModule):
         return batch_metrics_df
 
     def predict_step(
-        self, batch: InferenceFeatures, batch_idx: Any
+        self, batch: InferenceFeatures, batch_idx: Any, show_progress: bool = False
     ) -> Optional[pd.DataFrame]:
         task = self.cfg.inference.task
         res_mask = batch[bp.res_mask]
@@ -771,6 +771,7 @@ class FlowModule(LightningModule):
             aatypes_1=aatypes_1,
             hot_spots=batch.get(bp.hot_spots, None),
             contact_conditioning=batch.get(bp.contact_conditioning, None),
+            show_progress=show_progress,
         )
 
         model_bb_trajs = to_numpy(model_traj.structure)
@@ -817,6 +818,7 @@ class FlowModule(LightningModule):
                 write_sample_trajectories=self.cfg.inference.write_sample_trajectories,
                 write_animations=self.cfg.inference.write_animations,
                 animation_max_frames=self.cfg.inference.animation_max_frames,
+                animation_take_last_frames=self.cfg.inference.animation_take_last_frames,
             )
 
             all_top_sample_metrics.append(top_sample_metrics)
@@ -844,6 +846,7 @@ class FlowModule(LightningModule):
         write_sample_trajectories: bool,
         write_animations: bool,
         animation_max_frames: int = 50,
+        animation_take_last_frames: int = 1,
         n_inverse_folds: Optional[int] = None,
     ) -> Tuple[Dict[str, Any], SavedTrajectory, SavedFoldingValidation]:
         """
@@ -911,6 +914,7 @@ class FlowModule(LightningModule):
             write_trajectories=write_sample_trajectories,
             write_animations=write_animations,
             animation_max_frames=animation_max_frames,
+            animation_take_last_frames=animation_take_last_frames,
         )
         time_to_save_trajectory = time.time() - start_time
 

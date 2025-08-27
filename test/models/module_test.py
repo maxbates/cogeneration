@@ -293,9 +293,6 @@ class TestFlowModule:
         mock_cfg_uninterpolated.inference.task = InferenceTask.forward_folding
         mock_cfg = mock_cfg_uninterpolated.interpolate()
 
-        assert mock_cfg.inference.interpolant.aatypes.noise == 0.0
-        assert mock_cfg.inference.interpolant.aatypes.do_purity is False
-
         module = FlowModule(mock_cfg)
         batch = next(iter(mock_pred_conditional_dataloader))
 

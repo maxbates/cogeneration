@@ -143,10 +143,11 @@ class Potential(ABC):
     - `protein_pred` the modified prediction
     """
 
-    energy_scale: float = 1.0  # compute() energy * energy_scale is the final energy
-    guidance_scale: float = (
-        1.0  # compute() guidance * guidance_scale is the final guidance
-    )
+    # default scales to 0.0 so disabled unless specified
+    # compute() energy * energy_scale is the final energy
+    energy_scale: float = 0.0
+    # compute() guidance * guidance_scale is the final guidance
+    guidance_scale: float = 0.0
 
     @abstractmethod
     def compute(
@@ -686,8 +687,16 @@ class ESMLogitsPotential(Potential):
     esm_logits_cap: float = 4.0
 
     def __post_init__(self):
-        # only logits are required
-        self.esm = get_frozen_esm(model_key=self.esm_model_key, use_esm_attn_map=False)
+        # model is loaded when needed
+        self._esm = None
+
+    @property
+    def esm(self):
+        if self._esm is None:
+            self._esm = get_frozen_esm(
+                model_key=self.esm_model_key, use_esm_attn_map=False
+            )
+        return self._esm
 
     def compute(
         self,
@@ -820,7 +829,7 @@ class FKSteeringCalculator:
         total_energy = torch.zeros(num_batch, device=device)
         guidances = []
         for potential in self.potentials:
-            if potential.energy_scale == 0.0:
+            if potential.energy_scale == 0.0 and potential.guidance_scale == 0.0:
                 continue
 
             energy, guidance = potential.compute(

@@ -8,6 +8,7 @@ from cogeneration.config.base import Config, InferenceSamplesConfig
 from cogeneration.dataset.datasets import EvalDatasetConstructor
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.predict import EvalRunner
+from cogeneration.type.metrics import MetricName
 from cogeneration.type.task import InferenceTask
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,7 @@ class TestEvalRunner:
         cfg.shared.stochastic = True
         cfg.inference.interpolant.trans.stochastic_noise_intensity *= 0.25
         cfg.inference.interpolant.rots.stochastic_noise_intensity *= 0.25
-        cfg.inference.interpolant.aatypes.stochastic_noise_intensity *= 0.25
+        cfg.inference.interpolant.aatypes.stochastic_noise_intensity *= 1.0
         # FK Steering
         cfg.inference.interpolant.steering.num_particles = 4
         # set up predict_dir to tmp_path
@@ -67,8 +68,12 @@ class TestEvalRunner:
         cfg.inference.samples.num_batch = 1
         cfg.inference.samples.multimer_fraction = 0.0
         cfg.inference.samples.length_subset = [156]
-        # Consider disabling ProteinMPNN guidance, which is slow
+        # Consider disabling ESM and ProteinMPNN guidance, which is slow
+        # (since ESM not used in the model, nothing cached, have to compute each resampling step)
         cfg.inference.interpolant.steering.inverse_fold_energy_scale = 0.0
+        cfg.inference.interpolant.steering.inverse_fold_guidance_scale = 0.0
+        cfg.inference.interpolant.steering.esm_logits_energy_scale = 0.0
+        cfg.inference.interpolant.steering.esm_logits_guidance_scale = 0.0
         # skip designability? requires folding each ProteinMPNN sequence
         cfg.inference.also_fold_pmpnn_seq = False
         # write trajectories to inspect
@@ -104,8 +109,10 @@ class TestEvalRunner:
         batch = next(iter(dataloader))
 
         # sample
-        top_sample_metrics = module.predict_step(batch, batch_idx=0)
+        top_sample_metrics = module.predict_step(batch, batch_idx=0, show_progress=True)
 
         logger.info("results:")
         logger.info(cfg.inference.predict_dir)
         logger.info(top_sample_metrics.to_csv(index=False))
+        logger.info(f"PDB: {top_sample_metrics[MetricName.sample_pdb_path].iloc[0]}")
+        logger.info(f"RMSD: {top_sample_metrics[MetricName.bb_rmsd_folded].iloc[0]}")

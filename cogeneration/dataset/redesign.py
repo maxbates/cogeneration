@@ -377,7 +377,7 @@ class SequenceRedesigner:
                 eval=False,
                 use_test=False,
             )
-            metadata = dataset.csv.copy()
+            metadata = dataset.csv
 
         # Optionally shuffle before processing
         if self.cfg.shuffle:
@@ -476,6 +476,7 @@ class SequenceRedesigner:
             metadata = metadata[dataset_pdb_names.isin(redesign_source_pdb_names)]
 
             # Track found / missing redesign targets
+            # TODO - merge before filtering metadata, or it looks like already-processed PDBs are missing
             redesign_source_present_pdb_names = set(metadata[mc.pdb_name].unique())
             redesign_source_missing_pdb_names = (
                 redesign_source_pdb_names - redesign_source_present_pdb_names
@@ -515,9 +516,16 @@ class SequenceRedesigner:
         # Counter for tracking good / total redesigns
         good_redesigns = 0
         total_redesigns = 0
+        last_rmsd = ""
 
         # Iterate to redesign structures
-        with tqdm(metadata.iterrows(), total=len(metadata), desc="Redesigning") as pbar:
+        with tqdm(
+            metadata.iterrows(),
+            total=len(metadata),
+            desc="Redesigning",
+            leave=False,
+            smoothing=0.05,
+        ) as pbar:
             for idx, row in pbar:
                 row: MetadataCSVRow = row
 
@@ -528,11 +536,11 @@ class SequenceRedesigner:
                     else row[mc.modeled_seq_len]
                 )
 
+                # it's a little confusing to show the last RMSD with the current PDB name, but its just a progress bar...
                 pbar.set_postfix(
                     {
-                        "pdb": pdb_name,
-                        "length": pdb_length,
-                        "redesigns": f"{good_redesigns}/{total_redesigns} < {self.cfg.rmsd_good}",
+                        "pdb": f"{pdb_name} ({pdb_length})",
+                        f"rmsd": f"{last_rmsd} ({good_redesigns}/{total_redesigns} < {self.cfg.rmsd_good})",
                     }
                 )
 
@@ -559,7 +567,7 @@ class SequenceRedesigner:
                     continue
 
                 if not redesigns or len(redesigns) == 0:
-                    self.log.info(f"No redesigns for {pdb_name}.")
+                    # handled error
                     continue
 
                 # Initialize CSV writers if necessary and write redesigns
@@ -568,8 +576,8 @@ class SequenceRedesigner:
                         write_dir=str(self.processed_dir)
                     )
 
-                    # skip if error processing
                     if processed_redesign is None:
+                        # skip if error processing
                         continue
 
                     # setup writer if needed
@@ -601,9 +609,12 @@ class SequenceRedesigner:
                     if redesign.rmsd < self.cfg.rmsd_good:
                         good_redesigns += 1
 
-                self.log.info(
-                    f"{row[mc.pdb_name]} Redesigns RMSD = {', '.join([str(r.rmsd) for r in redesigns])}"
-                )
+                # RMSD string, depending on number of redesigns
+                rmsds = list(sorted([r.rmsd for r in redesigns]))
+                if len(rmsds) > 1:
+                    last_rmsd = f"{pdb_name}: 1={rmsds[0]:.2f} µ={sum(rmsds) / (len(rmsds)):.2f}"
+                else:
+                    last_rmsd = f"{pdb_name}={rmsds[0]:.2f}"
 
                 # garbage collect between iterations
                 del redesigns, processed_file

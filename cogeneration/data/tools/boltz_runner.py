@@ -743,7 +743,7 @@ class BoltzRunner(FoldingTool):
         self.checkpoint_path = self.cfg.checkpoint_path
 
         # Optional periodic teardown to mitigate native MPS compiled-graph/cache growth.
-        self.reload_every_n = getattr(self.cfg, "reload_every_n", None)
+        self.reload_every_n = self.cfg.reload_every_n
         self._predictions_since_load = 0
 
         # Configure model parameters

@@ -74,11 +74,21 @@ def _get_anim_writer() -> Tuple[str, matplotlib.animation.AbstractMovieWriter]:
         return "gif", animation.PillowWriter(fps=10)
 
 
-def _subsample_timesteps(num_timesteps: int, up_to: int = 50) -> List[int]:
+def _subsample_timesteps(
+    num_timesteps: int, up_to: int = 50, take_last: int = 1
+) -> List[int]:
     """Subsample timesteps to limit animation size/time."""
     timesteps = np.arange(0, num_timesteps, math.ceil(num_timesteps / up_to))
 
-    # ensure we include the final timestep
+    # take last N timesteps
+    if take_last > 1:
+        timesteps = np.concatenate(
+            [timesteps, np.arange(num_timesteps - take_last, num_timesteps)]
+        )
+        timesteps = np.unique(timesteps)
+        timesteps = np.sort(timesteps)
+
+    # regardless of take_last,ensure we include the final timestep
     if timesteps[-1] != num_timesteps - 1:
         timesteps = np.append(timesteps, num_timesteps - 1)
 
@@ -558,6 +568,7 @@ def animate_trajectories(
     motif_mask: Optional[npt.NDArray],  # [N]
     output_dir: str,
     animation_max_frames: int,
+    animation_take_last_frames: int,
 ):
     """
     Animates the protein and model trajectories side by side.
@@ -607,8 +618,9 @@ def animate_trajectories(
     ax_structure_prot = fig.add_subplot(gs[2, 0], projection="3d")
     ax_structure_model = fig.add_subplot(gs[2, 1], projection="3d")
 
-    # tighten outside padding
-    fig.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01)
+    # tighten outside padding but reserve bottom space for figure-level title
+    fig.subplots_adjust(left=0.01, right=0.99, top=0.98, bottom=0.06)
+    title_text = fig.text(0.5, 0.02, "", ha="center", va="bottom", fontsize=20)
 
     # initialise artists
     logits_im = _init_logits_heatmap(ax_logits_model, model_logits_traj[0])
@@ -648,12 +660,13 @@ def animate_trajectories(
         + scat_r
         + (logits_im,)
         + tuple(logits_rects)
+        + (title_text,)
     )
 
     def update(timestep):
         # timestep in protein trajectory == timestep - 1 in model trajectory
         t = float(timestep) / (num_timesteps - 1)
-        fig.suptitle(f"t = {t:.2f}", fontsize=9, y=0.99)
+        title_text.set_text(f"t = {t:.2f}")
 
         _update_seq_artists(
             sample_aa_traj[timestep],
@@ -680,7 +693,11 @@ def animate_trajectories(
     anim = animation.FuncAnimation(
         fig,
         update,
-        frames=_subsample_timesteps(num_timesteps, up_to=animation_max_frames),
+        frames=_subsample_timesteps(
+            num_timesteps,
+            up_to=animation_max_frames,
+            take_last=animation_take_last_frames,
+        ),
         interval=100,
         repeat_delay=1000,  # linger on final frame
         blit=False,
@@ -828,6 +845,7 @@ def save_trajectory(
     write_trajectories: bool = True,
     write_animations: bool = True,
     animation_max_frames: int = 50,
+    animation_take_last_frames: int = 1,
 ) -> SavedTrajectory:
     """
     Writes final sample and reverse diffusion trajectory.
@@ -848,6 +866,7 @@ def save_trajectory(
         write_trajectories: bool Whether to also write the PDB trajectories
         write_animations: bool Whether to create animation of the trajectory (slow, ~10-15s for 50 frames)
         animation_max_frames: int Max number of frames of all timesteps to include in animation.
+        animation_take_last_frames: int Number of final frames to include in animation (in addition to animation_max_frames)
     Returns:
         SavedTrajectory with paths to saved samples:
             sample_pdb_path: PDB file of final structure
@@ -997,6 +1016,7 @@ def save_trajectory(
             motif_mask=motif_mask,
             output_dir=output_dir,
             animation_max_frames=animation_max_frames,
+            animation_take_last_frames=animation_take_last_frames,
         )
         log_time("trajectory animation")
 
