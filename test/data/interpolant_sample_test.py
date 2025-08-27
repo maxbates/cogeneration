@@ -469,19 +469,19 @@ class TestInterpolantSample:
             cfg.interpolant.aatypes.interpolant_type = (
                 InterpolantAATypesInterpolantTypeEnum.uniform
             )
-            cfg.interpolant.aatypes.do_purity = False
+            cfg.interpolant.aatypes.purity_selection = False
             num_states = 20
         elif method == "masking":
             cfg.interpolant.aatypes.interpolant_type = (
                 InterpolantAATypesInterpolantTypeEnum.masking
             )
-            cfg.interpolant.aatypes.do_purity = False
+            cfg.interpolant.aatypes.purity_selection = False
             num_states = 21
         elif method == "purity":
             cfg.interpolant.aatypes.interpolant_type = (
                 InterpolantAATypesInterpolantTypeEnum.masking
             )
-            cfg.interpolant.aatypes.do_purity = True
+            cfg.interpolant.aatypes.purity_selection = True
             num_states = 21
         else:
             raise AssertionError("Unknown method")

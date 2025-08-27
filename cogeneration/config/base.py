@@ -862,9 +862,7 @@ class InterpolantTorsionsConfig(BaseClassConfig):
 
 class InterpolantAATypesScheduleEnum(StrEnum):
     linear = "linear"
-    exp = (
-        "exp"  # TODO(interpolant) re-introduce, 'exp' not used in public MultiFlow code
-    )
+    exp = "exp"
 
 
 class InterpolantAATypesInterpolantTypeEnum(StrEnum):
@@ -877,42 +875,45 @@ class InterpolantAATypesConfig(BaseClassConfig):
     """
     Interpolant for amino acids.
 
-    Note that there are two interpolants: one for training and one for inference
-    TODO(cfg) reconsider ternary use to differentiate training and inference interpolants
-        or, consider a subclass which handles default arguments accordingly
+    There is a drift component (guided by logits predicted by model, and potentials),
+    and optional stochastic component (logits-free).
     """
 
     # corrupt amino acid types (unless forward folding)
     corrupt: bool = (
         "${ternary:${equals: ${inference.task}, 'forward_folding'}, False, True}"
     )
-    # schedule: training schedule for interpolant
-    schedule: InterpolantAATypesScheduleEnum = InterpolantAATypesScheduleEnum.linear
-    # schedule_exp_rate: exponential rate for schedule
-    # in multiflow, exp rate was 10 in base.yaml, but -3 elsewhere
-    schedule_exp_rate: float = -3
     # interpolant_type: noise distribution and type of interpolant
     interpolant_type: InterpolantAATypesInterpolantTypeEnum = (
         InterpolantAATypesInterpolantTypeEnum.masking
     )
-    # temp: temperature
-    temp: float = 0.1
-    # noise: AA type change noise. No noise for forward_folding.
-    noise: float = (
-        "${ternary:${equals: ${inference.task}, 'forward_folding'}, 0.0, 20.0}"
-    )
-    # do_purity: enable purity, allows for unmasking by max log probs and for re-masking by `noise`
-    # purity requires masking interpolant
-    do_purity: bool = (
-        "${ternary:${equals: ${inference.task}, 'forward_folding'}, False, True}"
-    )
-    # stochastic CTMC
+    # schedule: training + sampling schedule for interpolant
+    schedule: InterpolantAATypesScheduleEnum = InterpolantAATypesScheduleEnum.linear
+    schedule_exp_rate: float = 3.0  # for exp schedule
+    # logits softmax temperature for drift
+    # lower temp sharpens logits
+    # lower temp reduces uncertainty -> lowers uncertainty-gated exit rates
+    drift_temp: float = 0.25
+    # drift rate scales (note each component follows a different schedule)
+    # rate magnitudes determine probability of transition per step
+    # relative rates determine relative probability of transition type
+    # mask -> AA (masking only)
+    unmask_rate: float = 1.0
+    # AA -> AA' (disabled by purity)
+    change_rate: float = 1.0
+    # AA -> MASK via drift
+    remask_rate: float = 1.0
+    # uncertainty gate exit rates (1 - p_current), so confident logits less likely to exit
+    uncertainty_gating: bool = True
+    # purity_selection is a selction policy enabling similar to Multiflow "purity" sampling,
+    # which only unmasks masked positions, and ranks top-logit AAs for targets.
+    # unlike MultiFlow it is not a separate sampling strategy.
+    purity_selection: bool = False
+    # enable stochastic CTMC rates
+    # Note that change and re-masking + stochastic rates are additive but noise is logits-free
     stochastic: bool = "${shared.stochastic}"
-    # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
-    # Roughly, 0.5 => 0.2 jumps/residue, 1.0 = > 0.4, 1.5 => 0.6 over 500 timesteps
-    stochastic_noise_intensity: float = 1.75
-    # temperature smooths logits softmax()
-    stochastic_temp: float = 1.7
+    # sigma_t * stochastic_noise_intensity, where sigma_t is a function of `t` and schedule
+    stochastic_noise_intensity: float = 1.0
 
 
 class InterpolantTrainTimeSamplingEnum(StrEnum):
@@ -940,7 +941,7 @@ class InterpolantSteeringConfig(BaseClassConfig):
     # Feynman-Kac particle steering lambda, linear in time
     fk_lambda: float = 2.0
     # particle weighting, abs energy vs energy difference
-    energy_weight_absolute: float = 0.5
+    energy_weight_absolute: float = 1.0
     energy_weight_difference: float = 1.0
 
     # cached guidance decay: `guidance_cache_decay ** num_steps_since_resampling`
@@ -952,7 +953,7 @@ class InterpolantSteeringConfig(BaseClassConfig):
     # potentials
     # `_energy_scale` refers to energy for particle resampling.
     # `_guidance_scale` scales guidance vector field / logits.
-    # set any scale to 0.0 to disable.
+    # set the scale (or both scales) to 0.0 to disable.
 
     # chain break potential
     chain_break_energy_scale: float = 1.0
@@ -966,12 +967,10 @@ class InterpolantSteeringConfig(BaseClassConfig):
 
     # contact conditioning potential parameters
     contact_conditioning_energy_scale: float = 1.0
-    contact_conditioning_inter_chain_weight: float = (
-        2.0  # upweight inter-chain contacts
-    )
-    contact_conditioning_max_distance_penalty: float = (
-        10.0  # maximum penalty for distance violations
-    )
+    # upweight inter-chain contacts
+    contact_conditioning_inter_chain_weight: float = 2.0
+    # maximum penalty for distance violations
+    contact_conditioning_max_distance_penalty: float = 10.0
 
     # inverse folding potential
     inverse_fold_energy_scale: float = 1.0
@@ -1564,6 +1563,11 @@ class InferenceConfig(BaseClassConfig):
     # whether to include animations, which are slow to generate (~10-15s for 50 frames)
     write_animations: bool = True
     animation_max_frames: int = 50
+    # number of final frames to include in animation
+    # by default, take 10 last frames if stochastic, 1 otherwise
+    animation_take_last_frames: int = (
+        "${ternary:${equals: ${shared.stochastic}, True}, 10, 1}"
+    )
 
 
 ##### Scripts #####
