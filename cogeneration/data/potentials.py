@@ -13,6 +13,7 @@ from cogeneration.config.base import (
     ProteinMPNNRunnerConfig,
 )
 from cogeneration.data.const import MASK_TOKEN_INDEX
+from cogeneration.data.logits import center_logits, clamp_logits, combine_logits
 from cogeneration.data.tools.protein_mpnn_runner import ProteinMPNNRunner
 from cogeneration.data.trajectory import SamplingStep
 from cogeneration.dataset.interaction import DIST_INTERACTION_BACKBONE
@@ -70,7 +71,7 @@ class PotentialField:
     trans: Optional[torch.Tensor] = None
     # rotmats VF tangent to current frame (B, N, 3)
     rotmats: Optional[torch.Tensor] = None
-    # logits for aatypes (B, N, S)
+    # logits (centered!) for aatypes (B, N, S)
     logits: Optional[torch.Tensor] = None
 
     def decayed(self, scale: float) -> "PotentialField":
@@ -123,7 +124,11 @@ class PotentialField:
         logits = (
             other.logits
             if self.logits is None
-            else self.logits if other.logits is None else self.logits + other.logits
+            else (
+                self.logits
+                if other.logits is None
+                else combine_logits(logits=[self.logits, other.logits])
+            )
         )
         return PotentialField(trans=trans, rotmats=rotmats, logits=logits)
 
@@ -648,20 +653,16 @@ class InverseFoldPotential(Potential):
                     f"logits.shape {logits.shape} incompatible with protein_pred.aatypes.shape {model_pred.logits.shape}"
                 )
 
-        # Apply temperature
-        T = max(self.inverse_fold_logits_temperature, 1e-4)  # avoid div-by-zero
+        # Center logits
+        logits = center_logits(logits)
+
+        # Apply temperature + scale
+        T = max(self.inverse_fold_logits_temperature, 1e-4)
         logits = logits / T
+        logits = logits * float(self.guidance_scale)
 
-        # Scale by logits guidance factor
-        logits = logits * self.guidance_scale
-
-        # Scale and clamp very strong logits
-        cap = float(self.inverse_fold_logits_cap)
-        logits_f = logits.float()  # compute in fp32 for stability
-        max_abs = logits_f.abs().amax(dim=-1, keepdim=True)  # (B, N, 1)
-        scale_down = (cap / (max_abs + 1e-6)).clamp(max=1.0)
-        logits_f = (logits_f * scale_down).clamp(min=-cap, max=cap)
-        logits = logits_f.to(logits.dtype)
+        # clamp very strong logits
+        logits = clamp_logits(logits, abs_cap=self.inverse_fold_logits_cap)
 
         guidance = PotentialField(
             logits=logits,
@@ -735,16 +736,17 @@ class ESMLogitsPotential(Potential):
         energy = (avg_nll / max_ce).clamp(min=0.0, max=1.0)
 
         # Guidance: temperature scale and cap logits magnitude
+
+        # Center logits
+        logits = center_logits(logits)
+
+        # Apply temperature + scale
         T = max(self.esm_logits_temperature, 1e-4)
         logits = logits / T
         logits = logits * float(self.guidance_scale)
 
-        cap = float(self.esm_logits_cap)
-        logits_f = logits.float()
-        max_abs = logits_f.abs().amax(dim=-1, keepdim=True)
-        scale_down = (cap / (max_abs + 1e-6)).clamp(max=1.0)
-        logits_f = (logits_f * scale_down).clamp(min=-cap, max=cap)
-        logits = logits_f.to(logits.dtype)
+        # clamp logits
+        logits = clamp_logits(logits, abs_cap=self.esm_logits_cap)
 
         guidance = PotentialField(logits=logits)
 

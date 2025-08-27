@@ -22,6 +22,7 @@ from cogeneration.config.base import (
 )
 from cogeneration.data import so3_utils
 from cogeneration.data.const import MASK_TOKEN_INDEX, NM_TO_ANG_SCALE
+from cogeneration.data.logits import combine_logits
 from cogeneration.data.noise_mask import (
     angles_noise,
     centered_gaussian,
@@ -1636,7 +1637,15 @@ class Interpolant:
         interpolant_type = self.cfg.aatypes.interpolant_type
 
         # combine model logits and potential logits
-        drift_logits = logits_1 + (potential if potential is not None else 0.0)
+        if potential is not None:
+            # Note that the potential logits is already the combination of all the potentials,
+            # and has been centered. Combining the potential logits with the predicted logits
+            # yields the same softmax probs as if they had been added all at once, but the logits
+            # themselves differ by a row-wise constant. So, if in the future we are interested in
+            # some logits-loss, the logits should be normalized, or use probabilities instead.
+            drift_logits = combine_logits(logits=[logits_1, potential])
+        else:
+            drift_logits = logits_1
 
         # in masking, forbid MASK as drift target
         if interpolant_type == InterpolantAATypesInterpolantTypeEnum.masking:
@@ -2368,12 +2377,11 @@ class Interpolant:
                 else None
             )
 
-            if task == InferenceTask.inpainting:
-                # TODO(inpainting-fixed) to support fixed motifs, fix the t_2 structure motifs.
-                # Fix the sequence in the motifs
-                aatypes_t_2 = mask_blend_1d(
-                    aatypes_t_2, true_feats.aatypes, scaffold_mask
-                )
+        # for inpainting, at all steps (including final step), motif sequence is fixed
+        if task == InferenceTask.inpainting:
+            # TODO(inpainting-fixed) to support fixed motifs, fix the t_2 structure motifs.
+            # Fix the sequence in the motifs
+            aatypes_t_2 = mask_blend_1d(aatypes_t_2, true_feats.aatypes, scaffold_mask)
 
         # Center diffused residues to maintain translation invariance
         # Definitely should center if inpainting or stochastic, but might as well if unconditional too

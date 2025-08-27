@@ -75,7 +75,7 @@ class NoisyBatchProp(StrEnum):
     torsions_t = "torsions_t"  # (B, N, 7, 2) tensor, torsions @ t
     aatypes_t = "aatypes_t"  # (B, N) tensor, predicted amino acids @ t as ints (0-20)
     trans_sc = "trans_sc"  # (B, N, 3) tensor, self-conditioned pred translations @ t
-    aatypes_sc = "aatypes_sc"  # (B, N, 21) tensor, self-conditioned pred sequence @ t, including mask token
+    aatypes_sc = "aatypes_sc"  # (B, N, 21) tensor, self-conditioned pred logits @ t, including mask token
 
 
 class PredBatchProp(StrEnum):

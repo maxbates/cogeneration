@@ -10,6 +10,7 @@ from cogeneration.config.base import (
     ProteinMPNNRunnerConfig,
 )
 from cogeneration.data.data_transforms import make_one_hot
+from cogeneration.data.logits import center_logits
 from cogeneration.data.potentials import (
     ChainBreakPotential,
     ContactConditioningPotential,
@@ -647,8 +648,46 @@ class TestInverseFoldPotential:
         assert torch.allclose(guidance.logits[:, :, :20], logits20)
         assert torch.all(guidance.logits[:, :, 20] == 0)
 
+    def test_guidance_logits_are_centered(self):
+        B, N = 1, 9
+        batch, step = self._make_simple_batch_and_step(B=B, N=N)
+
+        # Make all residues valid/designed
+        batch[bp.res_mask] = torch.ones(B, N, dtype=torch.int)
+        batch[bp.diffuse_mask] = torch.ones(B, N, dtype=torch.int)
+
+        # Provide 20-way logits; potential pads MASK column, then centers
+        logits20 = torch.randn(B, N, 20, device=step.aatypes.device)
+
+        potential = InverseFoldPotential(
+            energy_scale=0.0,
+            protein_mpnn_cfg=ProteinMPNNRunnerConfig(),
+            guidance_scale=1.0,
+            inverse_fold_logits_temperature=1.0,
+            inverse_fold_logits_cap=100.0,
+        )
+        potential.protein_mpnn_runner = DummyProteinMPNNRunner(logits20)
+
+        _, guidance = potential.compute(
+            batch=batch, model_pred=step, protein_pred=step, protein_state=step
+        )
+
+        assert guidance is not None and guidance.logits is not None
+        # Compute expected centered logits using helper and compare
+        pad = torch.zeros(B, N, 1, device=step.aatypes.device, dtype=logits20.dtype)
+        logits21 = torch.cat([logits20, pad], dim=-1)
+        expected = center_logits(logits21)
+        assert torch.allclose(guidance.logits, expected, atol=1e-6, rtol=0)
+
 
 class TestESMLogitsPotential:
+    class DummyESM:
+        def __init__(self, logits: torch.Tensor):
+            self._logits = logits
+
+        def __call__(self, aatypes, chain_index, res_mask):
+            return None, None, self._logits
+
     def test_returns_logits(self):
         B, N = 2, 20
         batch, step = _make_batch_and_step(B=B, N=N, multimer=False, with_break=False)
@@ -669,6 +708,28 @@ class TestESMLogitsPotential:
 
         assert guidance is not None and guidance.logits is not None
         assert guidance.logits.shape == (B, N, 21)
+
+    def test_logits_are_centered(self):
+        B, N = 2, 20
+        batch, step = _make_batch_and_step(B=B, N=N, multimer=False, with_break=False)
+
+        potential = ESMLogitsPotential(
+            esm_model_key=ModelESMKey.DUMMY,
+            guidance_scale=1.0,
+            esm_logits_temperature=1.0,
+            esm_logits_cap=100.0,
+        )
+
+        logits = torch.randn(B, N, 21, device=step.aatypes.device)
+        potential._esm = self.DummyESM(logits)
+
+        _, guidance = potential.compute(
+            batch=batch, model_pred=step, protein_pred=step, protein_state=step
+        )
+
+        assert guidance is not None and guidance.logits is not None
+        expected = center_logits(logits)
+        assert torch.allclose(guidance.logits, expected, atol=1e-6, rtol=0)
 
 
 class TestFKSteeringCalculator:
