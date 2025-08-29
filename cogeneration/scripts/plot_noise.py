@@ -8,6 +8,7 @@ AI-generated.
 
 import argparse
 import math
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
@@ -16,12 +17,83 @@ import torch
 
 from cogeneration.config.base import Config
 from cogeneration.data import so3_utils
-from cogeneration.data.const import NM_TO_ANG_SCALE
+from cogeneration.data.const import MASK_TOKEN_INDEX, NM_TO_ANG_SCALE
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import uniform_so3
 from cogeneration.data.rigid import batch_center_of_mass
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyBatchProp as nbp
+
+
+@dataclass
+class TrainingNoiseResult:
+    t: List[float] = field(default_factory=list)
+    trans_noise_mean: List[float] = field(default_factory=list)
+    trans_noise_std: List[float] = field(default_factory=list)
+    rots_noise_mean_rad: List[float] = field(default_factory=list)
+    rots_noise_std_rad: List[float] = field(default_factory=list)
+    aa_noise_mean_frac: List[float] = field(default_factory=list)
+    aa_noise_std_frac: List[float] = field(default_factory=list)
+    trans_sigma: List[float] = field(default_factory=list)
+    rots_sigma: List[float] = field(default_factory=list)
+    aa_sigma: List[float] = field(default_factory=list)
+
+
+@dataclass
+class SamplingNoiseDriftResult:
+    t: List[float] = field(default_factory=list)
+    # noise
+    trans_noise_mean: List[float] = field(default_factory=list)
+    trans_noise_std: List[float] = field(default_factory=list)
+    rots_noise_mean_rad: List[float] = field(default_factory=list)
+    rots_noise_std_rad: List[float] = field(default_factory=list)
+    aa_noise_mean_frac: List[float] = field(default_factory=list)
+    aa_noise_std_frac: List[float] = field(default_factory=list)
+    # aatypes noise breakdown
+    aa_noise_unmask_frac: List[float] = field(default_factory=list)
+    aa_noise_remask_frac: List[float] = field(default_factory=list)
+    aa_noise_change_frac: List[float] = field(default_factory=list)
+    # drift
+    trans_drift_mean: List[float] = field(default_factory=list)
+    trans_drift_std: List[float] = field(default_factory=list)
+    rots_drift_mean_rad: List[float] = field(default_factory=list)
+    rots_drift_std_rad: List[float] = field(default_factory=list)
+    aa_drift_mean_frac: List[float] = field(default_factory=list)
+    aa_drift_std_frac: List[float] = field(default_factory=list)
+    # aatypes drift breakdown
+    aa_drift_unmask_frac: List[float] = field(default_factory=list)
+    aa_drift_remask_frac: List[float] = field(default_factory=list)
+    aa_drift_change_frac: List[float] = field(default_factory=list)
+    # ratios
+    trans_noise_to_drift: List[float] = field(default_factory=list)
+    rots_noise_to_drift: List[float] = field(default_factory=list)
+    aa_noise_to_drift: List[float] = field(default_factory=list)
+    # velocity-level ratios
+    trans_noise_to_drift_vel: List[float] = field(default_factory=list)
+    rots_noise_to_drift_vel: List[float] = field(default_factory=list)
+    # theory sigma*sqrt(dt)
+    trans_sigma_step: List[float] = field(default_factory=list)
+    rots_sigma_step: List[float] = field(default_factory=list)
+    # aatypes jump rates
+    aa_jump_rate_theory: List[float] = field(default_factory=list)
+    aa_jump_rate_empirical: List[float] = field(default_factory=list)
+    aa_sigma_step: List[float] = field(default_factory=list)
+    # aatypes theoretical component rates (1/time)
+    aa_drift_rate_unmask: List[float] = field(default_factory=list)
+    aa_drift_rate_remask: List[float] = field(default_factory=list)
+    aa_drift_rate_change: List[float] = field(default_factory=list)
+    aa_noise_rate_unmask: List[float] = field(default_factory=list)
+    aa_noise_rate_remask: List[float] = field(default_factory=list)
+    aa_noise_rate_change: List[float] = field(default_factory=list)
+    # aatypes per-component scales (dimensionless)
+    aa_scale_unmask: List[float] = field(default_factory=list)
+    aa_scale_remask: List[float] = field(default_factory=list)
+    aa_scale_change: List[float] = field(default_factory=list)
+    # cumulative RSS curves
+    trans_noise_cum_rss: List[float] = field(default_factory=list)
+    rots_noise_cum_rss: List[float] = field(default_factory=list)
+    trans_theory_cum_rss: List[float] = field(default_factory=list)
+    rots_theory_cum_rss: List[float] = field(default_factory=list)
 
 
 def get_device() -> torch.device:
@@ -82,7 +154,7 @@ def measure_training_noise(
     num_timesteps: int,
     step_stride: int,
     trans1_scale: float,
-) -> Dict[str, List[float]]:
+) -> TrainingNoiseResult:
     device = interpolant._device
     res_mask, diffuse_mask, chain_idx, _, trans_1, rotmats_1, aatypes_1 = (
         prepare_base_inputs(interpolant, num_batch, num_res, trans1_scale)
@@ -105,18 +177,7 @@ def measure_training_noise(
     cal_rot_mean_angle = so3_utils.angle_from_rotmat(cal_rot_noise)[0].mean().item()
 
     # storage
-    results = {
-        "t": [],
-        "trans_noise_mean": [],
-        "trans_noise_std": [],
-        "rots_noise_mean_rad": [],
-        "rots_noise_std_rad": [],
-        "aa_noise_mean_frac": [],
-        "aa_noise_std_frac": [],
-        "trans_sigma": [],
-        "rots_sigma": [],
-        "aa_sigma": [],
-    }
+    results = TrainingNoiseResult()
 
     for i in eval_indices:
         t = ts[i]
@@ -143,8 +204,8 @@ def measure_training_noise(
         )
         trans_delta = (trans_st - trans_no) * res_mask[..., None]
         trans_delta_norm = torch.linalg.norm(trans_delta, dim=-1)  # (B, N)
-        results["trans_noise_mean"].append(trans_delta_norm.mean().item())
-        results["trans_noise_std"].append(trans_delta_norm.std().item())
+        results.trans_noise_mean.append(trans_delta_norm.mean().item())
+        results.trans_noise_std.append(trans_delta_norm.std().item())
 
         # rotations: measure geodesic angle between with/without stochasticity
         seed_all(22340 + i)
@@ -166,8 +227,8 @@ def measure_training_noise(
         # delta rotation = rot_st @ rot_no^T
         rot_delta = torch.matmul(rot_st, rot_no.transpose(-1, -2))
         angles, _, _ = so3_utils.angle_from_rotmat(rot_delta)
-        results["rots_noise_mean_rad"].append(angles.mean().item())
-        results["rots_noise_std_rad"].append(angles.std().item())
+        results.rots_noise_mean_rad.append(angles.mean().item())
+        results.rots_noise_std_rad.append(angles.std().item())
 
         # aatypes: fraction of positions changed by stochastic jump
         seed_all(32340 + i)
@@ -187,8 +248,8 @@ def measure_training_noise(
             stochasticity_scale=1.0,
         )
         aa_changed = (aa_st != aa_no).float()
-        results["aa_noise_mean_frac"].append(aa_changed.mean().item())
-        results["aa_noise_std_frac"].append(aa_changed.float().std().item())
+        results.aa_noise_mean_frac.append(aa_changed.mean().item())
+        results.aa_noise_std_frac.append(aa_changed.float().std().item())
 
         # theoretical sigma(t)
         sigma_t_trans = interpolant._compute_sigma_t(
@@ -213,12 +274,10 @@ def measure_training_noise(
         )
 
         # scale theory by calibration constants
-        results["trans_sigma"].append(
-            (sigma_t_trans.mean().item()) * cal_trans_mean_norm
-        )
-        results["rots_sigma"].append((sigma_t_rots.mean().item()) * cal_rot_mean_angle)
-        results["aa_sigma"].append(sigma_t_aa.mean().item())
-        results["t"].append(t.item())
+        results.trans_sigma.append((sigma_t_trans.mean().item()) * cal_trans_mean_norm)
+        results.rots_sigma.append((sigma_t_rots.mean().item()) * cal_rot_mean_angle)
+        results.aa_sigma.append(sigma_t_aa.mean().item())
+        results.t.append(t.item())
 
     return results
 
@@ -231,7 +290,7 @@ def measure_sampling_noise_and_drift(
     num_timesteps: int,
     step_stride: int,
     trans1_scale: float,
-) -> Dict[str, List[float]]:
+) -> SamplingNoiseDriftResult:
     device = interpolant._device
     res_mask, diffuse_mask, chain_idx, res_idx, trans_1, rotmats_1, aatypes_1 = (
         prepare_base_inputs(interpolant, num_batch, num_res, trans1_scale)
@@ -257,42 +316,7 @@ def measure_sampling_noise_and_drift(
     cal_rot_mean_angle = so3_utils.angle_from_rotmat(cal_rot_noise)[0].mean().item()
     # not used directly; rotations use per-step MC to capture nonlinearity
 
-    out = {
-        "t": [],
-        # noise
-        "trans_noise_mean": [],
-        "trans_noise_std": [],
-        "rots_noise_mean_rad": [],
-        "rots_noise_std_rad": [],
-        "aa_noise_mean_frac": [],
-        "aa_noise_std_frac": [],
-        # drift
-        "trans_drift_mean": [],
-        "trans_drift_std": [],
-        "rots_drift_mean_rad": [],
-        "rots_drift_std_rad": [],
-        "aa_drift_mean_frac": [],
-        "aa_drift_std_frac": [],
-        # ratios noise/drift
-        "trans_noise_to_drift": [],
-        "rots_noise_to_drift": [],
-        "aa_noise_to_drift": [],
-        # velocity-level ratios (dt-invariant)
-        "trans_noise_to_drift_vel": [],
-        "rots_noise_to_drift_vel": [],
-        # theory sigma*sqrt(dt)
-        "trans_sigma_step": [],
-        "rots_sigma_step": [],
-        # aatypes jump rates
-        "aa_jump_rate_theory": [],
-        "aa_jump_rate_empirical": [],
-        "aa_sigma_step": [],
-        # cumulative RSS curves (sampling vs theory)
-        "trans_noise_cum_rss": [],
-        "rots_noise_cum_rss": [],
-        "trans_theory_cum_rss": [],
-        "rots_theory_cum_rss": [],
-    }
+    out = SamplingNoiseDriftResult()
 
     # cumulative trackers for expected squared increments
     cum_trans_e2 = 0.0
@@ -321,8 +345,8 @@ def measure_sampling_noise_and_drift(
             t=t1, trans_1=trans_1, trans_t=trans_t
         )
         trans_drift_step = torch.linalg.norm(trans_vf * dt_f, dim=-1)
-        out["trans_drift_mean"].append(trans_drift_step.mean().item())
-        out["trans_drift_std"].append(trans_drift_step.std().item())
+        out.trans_drift_mean.append(trans_drift_step.mean().item())
+        out.trans_drift_std.append(trans_drift_step.std().item())
 
         seed_all(41340 + i)
         trans_next_noise = interpolant._trans_euler_step(
@@ -336,21 +360,19 @@ def measure_sampling_noise_and_drift(
         )
         trans_noise_comp = trans_next_noise - (trans_t + trans_vf * dt_f)
         trans_noise_norm = torch.linalg.norm(trans_noise_comp, dim=-1)
-        out["trans_noise_mean"].append(trans_noise_norm.mean().item())
-        out["trans_noise_std"].append(trans_noise_norm.std().item())
+        out.trans_noise_mean.append(trans_noise_norm.mean().item())
+        out.trans_noise_std.append(trans_noise_norm.std().item())
         # accumulate mean squared norm per step
         cum_trans_e2 += trans_noise_norm.square().mean().item()
-        out["trans_noise_cum_rss"].append(math.sqrt(cum_trans_e2))
+        out.trans_noise_cum_rss.append(math.sqrt(cum_trans_e2))
         # ratio noise/drift
-        out["trans_noise_to_drift"].append(
+        out.trans_noise_to_drift.append(
             (trans_noise_norm.mean().item()) / (trans_drift_step.mean().item() + 1e-8)
         )
         # velocity-level ratio
         trans_noise_vel = trans_noise_norm.mean().item() / max(math.sqrt(dt_f), 1e-12)
         trans_drift_vel = trans_drift_step.mean().item() / (dt_f + 1e-12)
-        out["trans_noise_to_drift_vel"].append(
-            trans_noise_vel / (trans_drift_vel + 1e-12)
-        )
+        out.trans_noise_to_drift_vel.append(trans_noise_vel / (trans_drift_vel + 1e-12))
 
         # update state (drift-only) for next iteration
         trans_t = trans_next_drift
@@ -361,10 +383,10 @@ def measure_sampling_noise_and_drift(
             scale=interpolant.cfg.trans.stochastic_noise_intensity,
         ) * math.sqrt(dt_f)
         sig_step_trans = sigma_t_trans.mean().item()
-        out["trans_sigma_step"].append(sig_step_trans * cal_trans_mean_norm)
+        out.trans_sigma_step.append(sig_step_trans * cal_trans_mean_norm)
         # theory cumulative (sum sigma^2 dt scaled to expected squared norm)
         cum_theory_trans_sigma2 += (sig_step_trans**2) * cal_trans_mean_norm2
-        out["trans_theory_cum_rss"].append(math.sqrt(cum_theory_trans_sigma2))
+        out.trans_theory_cum_rss.append(math.sqrt(cum_theory_trans_sigma2))
 
         # ----- rotations -----
         rot_next_drift = interpolant._rots_euler_step(
@@ -378,8 +400,8 @@ def measure_sampling_noise_and_drift(
         # drift angle from current state
         delta_drift = torch.matmul(rot_next_drift, rotmats_t.transpose(-1, -2))
         drift_angles, _, _ = so3_utils.angle_from_rotmat(delta_drift)
-        out["rots_drift_mean_rad"].append(drift_angles.mean().item())
-        out["rots_drift_std_rad"].append(drift_angles.std().item())
+        out.rots_drift_mean_rad.append(drift_angles.mean().item())
+        out.rots_drift_std_rad.append(drift_angles.std().item())
 
         seed_all(51340 + i)
         rot_next_noise = interpolant._rots_euler_step(
@@ -393,18 +415,18 @@ def measure_sampling_noise_and_drift(
         # noise angle between noise and drift-only outputs
         delta_noise = torch.matmul(rot_next_noise, rot_next_drift.transpose(-1, -2))
         noise_angles, _, _ = so3_utils.angle_from_rotmat(delta_noise)
-        out["rots_noise_mean_rad"].append(noise_angles.mean().item())
-        out["rots_noise_std_rad"].append(noise_angles.std().item())
+        out.rots_noise_mean_rad.append(noise_angles.mean().item())
+        out.rots_noise_std_rad.append(noise_angles.std().item())
         cum_rots_e2 += noise_angles.square().mean().item()
-        out["rots_noise_cum_rss"].append(math.sqrt(cum_rots_e2))
+        out.rots_noise_cum_rss.append(math.sqrt(cum_rots_e2))
         # ratio noise/drift
-        out["rots_noise_to_drift"].append(
+        out.rots_noise_to_drift.append(
             (noise_angles.mean().item()) / (drift_angles.mean().item() + 1e-8)
         )
         # velocity-level ratio (angles)
         noise_ang_vel = noise_angles.mean().item() / max(math.sqrt(dt_f), 1e-12)
         drift_ang_vel = drift_angles.mean().item() / (dt_f + 1e-12)
-        out["rots_noise_to_drift_vel"].append(noise_ang_vel / (drift_ang_vel + 1e-12))
+        out.rots_noise_to_drift_vel.append(noise_ang_vel / (drift_ang_vel + 1e-12))
 
         # update state (drift-only)
         rotmats_t = rot_next_drift
@@ -424,11 +446,12 @@ def measure_sampling_noise_and_drift(
         mc_angles, _, _ = so3_utils.angle_from_rotmat(mc_noise)
         e_angle = mc_angles.mean().item()
         e_angle2 = mc_angles.square().mean().item()
-        out["rots_sigma_step"].append(e_angle)  # step magnitude in radians
+        out.rots_sigma_step.append(e_angle)  # step magnitude in radians
         cum_theory_rots_sigma2 += e_angle2
-        out["rots_theory_cum_rss"].append(math.sqrt(cum_theory_rots_sigma2))
+        out.rots_theory_cum_rss.append(math.sqrt(cum_theory_rots_sigma2))
 
         # ----- aatypes -----
+        seed_all(61340 + i)
         aa_next_drift = interpolant._aatypes_euler_step(
             d_t=dt,
             t=t1,
@@ -441,8 +464,22 @@ def measure_sampling_noise_and_drift(
         )
         # drift fraction changed (relative to previous state)
         aa_drift_changed = (aa_next_drift != aatypes_t).float()
-        out["aa_drift_mean_frac"].append(aa_drift_changed.mean().item())
-        out["aa_drift_std_frac"].append(aa_drift_changed.std().item())
+        out.aa_drift_mean_frac.append(aa_drift_changed.mean().item())
+        out.aa_drift_std_frac.append(aa_drift_changed.std().item())
+
+        # drift breakdown: unmask/remask/change
+        prev_is_mask = aatypes_t == MASK_TOKEN_INDEX
+        prev_is_aa = ~prev_is_mask
+        drift_unmask = (prev_is_mask & (aa_next_drift != MASK_TOKEN_INDEX)).float()
+        drift_remask = (prev_is_aa & (aa_next_drift == MASK_TOKEN_INDEX)).float()
+        drift_change = (
+            prev_is_aa
+            & (aa_next_drift != MASK_TOKEN_INDEX)
+            & (aa_next_drift != aatypes_t)
+        ).float()
+        out.aa_drift_unmask_frac.append(drift_unmask.mean().item())
+        out.aa_drift_remask_frac.append(drift_remask.mean().item())
+        out.aa_drift_change_frac.append(drift_change.mean().item())
 
         seed_all(61340 + i)
         aa_next_noise = interpolant._aatypes_euler_step(
@@ -457,10 +494,23 @@ def measure_sampling_noise_and_drift(
         )
         # noise-only fraction changed (difference between with and without extra CTMC jump)
         aa_noise_changed = (aa_next_noise != aa_next_drift).float()
-        out["aa_noise_mean_frac"].append(aa_noise_changed.mean().item())
-        out["aa_noise_std_frac"].append(aa_noise_changed.std().item())
+        out.aa_noise_mean_frac.append(aa_noise_changed.mean().item())
+        out.aa_noise_std_frac.append(aa_noise_changed.std().item())
+        # noise breakdown: compare to drift baseline
+        base_is_mask = aa_next_drift == MASK_TOKEN_INDEX
+        base_is_aa = ~base_is_mask
+        noise_unmask = (base_is_mask & (aa_next_noise != MASK_TOKEN_INDEX)).float()
+        noise_remask = (base_is_aa & (aa_next_noise == MASK_TOKEN_INDEX)).float()
+        noise_change = (
+            base_is_aa
+            & (aa_next_noise != MASK_TOKEN_INDEX)
+            & (aa_next_noise != aa_next_drift)
+        ).float()
+        out.aa_noise_unmask_frac.append(noise_unmask.mean().item())
+        out.aa_noise_remask_frac.append(noise_remask.mean().item())
+        out.aa_noise_change_frac.append(noise_change.mean().item())
         # ratio noise/drift
-        out["aa_noise_to_drift"].append(
+        out.aa_noise_to_drift.append(
             (aa_noise_changed.mean().item()) / (aa_drift_changed.mean().item() + 1e-8)
         )
 
@@ -480,8 +530,7 @@ def measure_sampling_noise_and_drift(
         )  # (B,)
         S = interpolant.num_tokens
         logits_uniform = torch.zeros(num_batch, num_res, S, device=device)
-        temp = interpolant.cfg.aatypes.stochastic_temp
-        prob_rows = torch.softmax(logits_uniform / temp, dim=-1).clamp(min=1e-8)
+        prob_rows = torch.softmax(logits_uniform, dim=-1).clamp(min=1e-8)
         current_idx = aatypes_t.unsqueeze(-1).long()
         exit_rates = prob_rows.scatter(-1, current_idx, 0.0)
         exit_sums = exit_rates.sum(-1, keepdim=True)
@@ -491,8 +540,8 @@ def measure_sampling_noise_and_drift(
         step_rates = step_rates * sigma_no_sqrt.view(-1, 1, 1)
         lam = -step_rates.gather(-1, current_idx).squeeze(-1)  # (B,N)
         p_jump = 1.0 - torch.exp(-lam * dt_f)
-        out["aa_jump_rate_theory"].append(p_jump.mean().item())
-        out["aa_sigma_step"].append(p_jump.mean().item())
+        out.aa_jump_rate_theory.append(p_jump.mean().item())
+        out.aa_sigma_step.append(p_jump.mean().item())
 
         # empirical jump rate by calling jump-step directly
         aa_after_jump = interpolant._aatype_jump_step(
@@ -504,31 +553,103 @@ def measure_sampling_noise_and_drift(
             aatypes_t=aatypes_t,
             stochasticity_scale=1.0,
         )
-        out["aa_jump_rate_empirical"].append(
+        out.aa_jump_rate_empirical.append(
             (aa_after_jump != aatypes_t).float().mean().item()
         )
 
-        out["t"].append(t1.item())
+        # theoretical drift/noise rate components (mean over sites)
+        logits_zeros = torch.zeros(
+            num_batch, num_res, interpolant.num_tokens, device=device
+        )
+        rates_drift, _ = interpolant._aatypes_build_rates_drift(
+            aatypes_t=aatypes_t, logits_1=logits_zeros, t=t1, potential=None
+        )
+        rates_noise = interpolant._aatypes_build_rates_noise(
+            aatypes_t=aatypes_t, t=t1, stochasticity_scale=1.0
+        )
+        S = rates_drift.shape[-1]
+        has_mask_col = S > MASK_TOKEN_INDEX
+        aa_cols = torch.ones(S, dtype=torch.bool, device=device)
+        if has_mask_col:
+            aa_cols[MASK_TOKEN_INDEX] = False
+
+        # masks relative to current state aatypes_t
+        is_mask_now = aatypes_t == MASK_TOKEN_INDEX
+        is_aa_now = ~is_mask_now
+
+        # Drift
+        if is_mask_now.any():
+            drift_unmask_rate = (
+                rates_drift[is_mask_now][..., aa_cols].sum(dim=-1).mean().item()
+            )
+        else:
+            drift_unmask_rate = 0.0
+        if has_mask_col and is_aa_now.any():
+            drift_remask_rate = (
+                rates_drift[is_aa_now][..., MASK_TOKEN_INDEX].mean().item()
+            )
+        else:
+            drift_remask_rate = 0.0
+        if is_aa_now.any():
+            drift_change_rate = (
+                rates_drift[is_aa_now][..., aa_cols].sum(dim=-1).mean().item()
+            )
+        else:
+            drift_change_rate = 0.0
+        out.aa_drift_rate_unmask.append(drift_unmask_rate)
+        out.aa_drift_rate_remask.append(drift_remask_rate)
+        out.aa_drift_rate_change.append(drift_change_rate)
+
+        # Noise
+        if is_mask_now.any():
+            noise_unmask_rate = (
+                rates_noise[is_mask_now][..., aa_cols].sum(dim=-1).mean().item()
+            )
+        else:
+            noise_unmask_rate = 0.0
+        if has_mask_col and is_aa_now.any():
+            noise_remask_rate = (
+                rates_noise[is_aa_now][..., MASK_TOKEN_INDEX].mean().item()
+            )
+        else:
+            noise_remask_rate = 0.0
+        if is_aa_now.any():
+            noise_change_rate = (
+                rates_noise[is_aa_now][..., aa_cols].sum(dim=-1).mean().item()
+            )
+        else:
+            noise_change_rate = 0.0
+        out.aa_noise_rate_unmask.append(noise_unmask_rate)
+        out.aa_noise_rate_remask.append(noise_remask_rate)
+        out.aa_noise_rate_change.append(noise_change_rate)
+
+        # Per-component scales as a function of time (dimensionless)
+        scale_change, scale_unmask, scale_remask = (
+            interpolant._aatypes_component_scales(t=t1)
+        )
+        out.aa_scale_change.append(scale_change.mean().item())
+        out.aa_scale_unmask.append(scale_unmask.mean().item())
+        out.aa_scale_remask.append(scale_remask.mean().item())
+
+        out.t.append(t1.item())
 
     return out
 
 
-def plot_results(train_res: dict, samp_res: dict):
+def plot_results(train_res: TrainingNoiseResult, samp_res: SamplingNoiseDriftResult):
     # Convert angles to degrees for readability
-    rots_train_mean_deg = np.array(train_res["rots_noise_mean_rad"]) * (180.0 / math.pi)
-    rots_train_std_deg = np.array(train_res["rots_noise_std_rad"]) * (180.0 / math.pi)
-    rots_samp_mean_deg = np.array(samp_res["rots_noise_mean_rad"]) * (180.0 / math.pi)
-    rots_samp_std_deg = np.array(samp_res["rots_noise_std_rad"]) * (180.0 / math.pi)
-    rots_samp_drift_mean_deg = np.array(samp_res["rots_drift_mean_rad"]) * (
+    rots_train_mean_deg = np.array(train_res.rots_noise_mean_rad) * (180.0 / math.pi)
+    rots_train_std_deg = np.array(train_res.rots_noise_std_rad) * (180.0 / math.pi)
+    rots_samp_mean_deg = np.array(samp_res.rots_noise_mean_rad) * (180.0 / math.pi)
+    rots_samp_std_deg = np.array(samp_res.rots_noise_std_rad) * (180.0 / math.pi)
+    rots_samp_drift_mean_deg = np.array(samp_res.rots_drift_mean_rad) * (
         180.0 / math.pi
     )
-    rots_samp_drift_std_deg = np.array(samp_res["rots_drift_std_rad"]) * (
-        180.0 / math.pi
-    )
+    rots_samp_drift_std_deg = np.array(samp_res.rots_drift_std_rad) * (180.0 / math.pi)
 
     # Normalize t to [0,1] so plots start at 0 and end at 1
-    t_train = np.array(train_res["t"], dtype=float)
-    t_samp = np.array(samp_res["t"], dtype=float)
+    t_train = np.array(train_res.t, dtype=float)
+    t_samp = np.array(samp_res.t, dtype=float)
 
     def _norm_t(t):
         if len(t) < 2:
@@ -543,31 +664,92 @@ def plot_results(train_res: dict, samp_res: dict):
     color_right1 = "#ff7f0e"  # orange (sampling noise/theory)
     color_right2 = "#2ca02c"  # green (sampling drift)
 
-    fig, axes = plt.subplots(5, 1, figsize=(10, 22), sharex=True)
+    # Two-column layout with an extra top row for sigma_t plots
+    fig, axes = plt.subplots(5, 2, figsize=(14, 40), sharex="col")
 
-    # Translations (Å)
-    ax = axes[0]
+    # Top row: sigma_t curves grouped by variable type
+    # Left: AATypes (fraction) — training σ(t) vs sampling σ√dt
+    ax = axes[0, 0]
+    ax.set_title("AATypes σ(t): training vs sampling (fraction)")
+    if len(train_res.aa_sigma) > 0:
+        ax.plot(t_train_n, train_res.aa_sigma, label="aa train σ(t)", color=color_left)
+    if len(samp_res.aa_sigma_step) > 0:
+        ax.plot(
+            t_samp_n,
+            samp_res.aa_sigma_step,
+            linestyle="--",
+            color=color_right1,
+            label="aa samp σ√dt",
+        )
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left")
+
+    # Right: Translations [Å] (left axis) and Rotations [deg] (right axis) — training vs sampling
+    ax = axes[0, 1]
+    ax.set_title("Trans/Rot σ(t): training vs sampling")
+    ax_r = ax.twinx()
+    # Translations on left axis (Å)
+    if len(train_res.trans_sigma) > 0:
+        ax.plot(
+            t_train_n,
+            train_res.trans_sigma,
+            label="trans train σ(t) [Å]",
+            color=color_left,
+        )
+    if len(samp_res.trans_sigma_step) > 0:
+        ax.plot(
+            t_samp_n,
+            samp_res.trans_sigma_step,
+            linestyle="--",
+            color=color_left,
+            alpha=0.8,
+            label="trans samp σ√dt [Å]",
+        )
+    ax.tick_params(axis="y", colors=color_left)
+    # Rotations on right axis (degrees)
+    if len(train_res.rots_sigma) > 0:
+        ax_r.plot(
+            t_train_n,
+            np.array(train_res.rots_sigma) * (180.0 / math.pi),
+            label="rots train σ(t) [deg]",
+            color=color_right1,
+        )
+    if len(samp_res.rots_sigma_step) > 0:
+        ax_r.plot(
+            t_samp_n,
+            np.array(samp_res.rots_sigma_step) * (180.0 / math.pi),
+            linestyle="--",
+            color=color_right1,
+            alpha=0.8,
+            label="rots samp σ√dt [deg]",
+        )
+    ax_r.tick_params(axis="y", colors=color_right1)
+    # Legend combining both axes
+    lines_l, labels_l = ax.get_legend_handles_labels()
+    lines_r, labels_r = ax_r.get_legend_handles_labels()
+    ax.legend(lines_l + lines_r, labels_l + labels_r, loc="upper left")
+
+    # Right column, row 1: Translations (Å)
+    ax = axes[1, 1]
     ax.set_title("Translations noise and drift (Å)")
     ax_r = ax.twinx()
     # training (left axis)
     ax.plot(
         t_train_n,
-        train_res["trans_noise_mean"],
+        train_res.trans_noise_mean,
         label="train noise mean [L]",
         color=color_left,
     )
     ax.fill_between(
         t_train_n,
-        np.array(train_res["trans_noise_mean"])
-        - np.array(train_res["trans_noise_std"]),
-        np.array(train_res["trans_noise_mean"])
-        + np.array(train_res["trans_noise_std"]),
+        np.array(train_res.trans_noise_mean) - np.array(train_res.trans_noise_std),
+        np.array(train_res.trans_noise_mean) + np.array(train_res.trans_noise_std),
         color=color_left,
         alpha=0.2,
     )
     ax.plot(
         t_train_n,
-        train_res["trans_sigma"],
+        train_res.trans_sigma,
         linestyle="--",
         color=color_left,
         alpha=0.7,
@@ -577,20 +759,20 @@ def plot_results(train_res: dict, samp_res: dict):
     # sampling (right axis)
     ax_r.plot(
         t_samp_n,
-        samp_res["trans_noise_mean"],
+        samp_res.trans_noise_mean,
         label="sample noise mean [R]",
         color=color_right1,
     )
     ax_r.fill_between(
         t_samp_n,
-        np.array(samp_res["trans_noise_mean"]) - np.array(samp_res["trans_noise_std"]),
-        np.array(samp_res["trans_noise_mean"]) + np.array(samp_res["trans_noise_std"]),
+        np.array(samp_res.trans_noise_mean) - np.array(samp_res.trans_noise_std),
+        np.array(samp_res.trans_noise_mean) + np.array(samp_res.trans_noise_std),
         color=color_right1,
         alpha=0.2,
     )
     ax_r.plot(
         t_samp_n,
-        samp_res["trans_sigma_step"],
+        samp_res.trans_sigma_step,
         linestyle="--",
         color=color_right1,
         alpha=0.7,
@@ -598,7 +780,7 @@ def plot_results(train_res: dict, samp_res: dict):
     )
     ax_r.plot(
         t_samp_n,
-        samp_res["trans_drift_mean"],
+        samp_res.trans_drift_mean,
         label="sample drift mean [R]",
         color=color_right2,
     )
@@ -609,8 +791,8 @@ def plot_results(train_res: dict, samp_res: dict):
     lines_r, labels_r = ax_r.get_legend_handles_labels()
     ax.legend(lines_l + lines_r, labels_l + labels_r, loc="upper left")
 
-    # Rotations (deg)
-    ax = axes[1]
+    # Right column, row 2: Rotations (deg)
+    ax = axes[2, 1]
     ax.set_title("Rotations noise and drift (degrees)")
     ax_r = ax.twinx()
     # training (left)
@@ -626,7 +808,7 @@ def plot_results(train_res: dict, samp_res: dict):
     )
     ax.plot(
         t_train_n,
-        np.array(train_res["rots_sigma"]) * (180.0 / math.pi),
+        np.array(train_res.rots_sigma) * (180.0 / math.pi),
         linestyle="--",
         color=color_left,
         alpha=0.7,
@@ -652,7 +834,7 @@ def plot_results(train_res: dict, samp_res: dict):
     )
     ax_r.plot(
         t_samp_n,
-        np.array(samp_res["rots_sigma_step"]) * (180.0 / math.pi),
+        np.array(samp_res.rots_sigma_step) * (180.0 / math.pi),
         linestyle="--",
         color=color_right1,
         alpha=0.7,
@@ -664,29 +846,27 @@ def plot_results(train_res: dict, samp_res: dict):
     lines_r, labels_r = ax_r.get_legend_handles_labels()
     ax.legend(lines_l + lines_r, labels_l + labels_r, loc="upper left")
 
-    # AATypes (fraction)
-    ax = axes[2]
+    # Left column, row 1: AATypes (fraction)
+    ax = axes[1, 0]
     ax.set_title("AATypes noise and drift (fraction changed)")
     ax_r = ax.twinx()
     # training (left)
     ax.plot(
         t_train_n,
-        train_res["aa_noise_mean_frac"],
+        train_res.aa_noise_mean_frac,
         label="train noise mean [L]",
         color=color_left,
     )
     ax.fill_between(
         t_train_n,
-        np.array(train_res["aa_noise_mean_frac"])
-        - np.array(train_res["aa_noise_std_frac"]),
-        np.array(train_res["aa_noise_mean_frac"])
-        + np.array(train_res["aa_noise_std_frac"]),
+        np.array(train_res.aa_noise_mean_frac) - np.array(train_res.aa_noise_std_frac),
+        np.array(train_res.aa_noise_mean_frac) + np.array(train_res.aa_noise_std_frac),
         color=color_left,
         alpha=0.2,
     )
     ax.plot(
         t_train_n,
-        train_res["aa_sigma"],
+        train_res.aa_sigma,
         linestyle="--",
         color=color_left,
         alpha=0.7,
@@ -696,38 +876,36 @@ def plot_results(train_res: dict, samp_res: dict):
     # sampling (right)
     ax_r.plot(
         t_samp_n,
-        samp_res["aa_noise_mean_frac"],
+        samp_res.aa_noise_mean_frac,
         label="sample noise mean [R]",
         color=color_right1,
     )
     ax_r.fill_between(
         t_samp_n,
-        np.array(samp_res["aa_noise_mean_frac"])
-        - np.array(samp_res["aa_noise_std_frac"]),
-        np.array(samp_res["aa_noise_mean_frac"])
-        + np.array(samp_res["aa_noise_std_frac"]),
+        np.array(samp_res.aa_noise_mean_frac) - np.array(samp_res.aa_noise_std_frac),
+        np.array(samp_res.aa_noise_mean_frac) + np.array(samp_res.aa_noise_std_frac),
         color=color_right1,
         alpha=0.2,
     )
     ax_r.plot(
         t_samp_n,
-        samp_res["aa_drift_mean_frac"],
+        samp_res.aa_drift_mean_frac,
         label="sample drift mean [R]",
         color=color_right2,
     )
-    if "aa_jump_rate_theory" in samp_res:
+    if len(samp_res.aa_jump_rate_theory) > 0:
         ax_r.plot(
             t_samp_n,
-            samp_res["aa_jump_rate_theory"],
+            samp_res.aa_jump_rate_theory,
             linestyle="--",
             color=color_right1,
             alpha=0.7,
             label="theory jump rate [R]",
         )
-    if "aa_jump_rate_empirical" in samp_res:
+    if len(samp_res.aa_jump_rate_empirical) > 0:
         ax_r.plot(
             t_samp_n,
-            samp_res["aa_jump_rate_empirical"],
+            samp_res.aa_jump_rate_empirical,
             linestyle=":",
             color=color_right1,
             alpha=0.9,
@@ -739,22 +917,102 @@ def plot_results(train_res: dict, samp_res: dict):
     lines_r, labels_r = ax_r.get_legend_handles_labels()
     ax.legend(lines_l + lines_r, labels_l + labels_r, loc="upper left")
 
-    # Cumulative RSS reconciliation (sampling vs theory)
-    ax = axes[3]
+    # Left column, row 2: AATypes per-step breakdown (fractions): drift (solid) vs noise (dashed)
+    ax = axes[2, 0]
+    ax.set_title("AATypes per-step transitions: drift (solid) vs noise (dashed)")
+    c_unmask = "#1f77b4"
+    c_remask = "#ff7f0e"
+    c_change = "#2ca02c"
+    if len(samp_res.aa_drift_unmask_frac) > 0:
+        ax.plot(
+            t_samp_n,
+            samp_res.aa_drift_unmask_frac,
+            label="drift unmask",
+            color=c_unmask,
+        )
+        ax.plot(
+            t_samp_n,
+            samp_res.aa_drift_remask_frac,
+            label="drift remask",
+            color=c_remask,
+        )
+        ax.plot(
+            t_samp_n,
+            samp_res.aa_drift_change_frac,
+            label="drift change",
+            color=c_change,
+        )
+    if len(samp_res.aa_noise_unmask_frac) > 0:
+        ax.plot(
+            t_samp_n,
+            samp_res.aa_noise_unmask_frac,
+            linestyle="--",
+            color=c_unmask,
+            alpha=0.8,
+            label="noise unmask",
+        )
+        ax.plot(
+            t_samp_n,
+            samp_res.aa_noise_remask_frac,
+            linestyle="--",
+            color=c_remask,
+            alpha=0.8,
+            label="noise remask",
+        )
+        ax.plot(
+            t_samp_n,
+            samp_res.aa_noise_change_frac,
+            linestyle="--",
+            color=c_change,
+            alpha=0.8,
+            label="noise change",
+        )
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left")
+
+    # Left column, row 3: AATypes component scales vs t (dimensionless)
+    ax = axes[3, 0]
+    ax.set_title("AATypes component scales vs t (dimensionless)")
+    if len(samp_res.aa_scale_unmask) > 0:
+        ax.plot(
+            t_samp_n,
+            samp_res.aa_scale_unmask,
+            color=c_unmask,
+            label="unmask scale",
+        )
+    if len(samp_res.aa_scale_remask) > 0:
+        ax.plot(
+            t_samp_n,
+            samp_res.aa_scale_remask,
+            color=c_remask,
+            label="remask scale",
+        )
+    if len(samp_res.aa_scale_change) > 0:
+        ax.plot(
+            t_samp_n,
+            samp_res.aa_scale_change,
+            color=c_change,
+            label="change scale",
+        )
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left")
+
+    # Right column, row 3: Cumulative RSS reconciliation (sampling vs theory)
+    ax = axes[3, 1]
     ax.set_title("Cumulative noise (RSS): trans [L] vs rots [R]")
     ax_r = ax.twinx()
     # translations on left
-    if "trans_noise_cum_rss" in samp_res:
+    if len(samp_res.trans_noise_cum_rss) > 0:
         ax.plot(
             t_samp_n,
-            samp_res["trans_noise_cum_rss"],
+            samp_res.trans_noise_cum_rss,
             label="trans RSS (sample) [L]",
             color=color_left,
         )
-    if "trans_theory_cum_rss" in samp_res:
+    if len(samp_res.trans_theory_cum_rss) > 0:
         ax.plot(
             t_samp_n,
-            samp_res["trans_theory_cum_rss"],
+            samp_res.trans_theory_cum_rss,
             label="trans RSS (theory) [L]",
             linestyle="--",
             color=color_left,
@@ -762,17 +1020,17 @@ def plot_results(train_res: dict, samp_res: dict):
         )
     ax.tick_params(axis="y", colors=color_left)
     # rotations on right (degrees)
-    if "rots_noise_cum_rss" in samp_res:
+    if len(samp_res.rots_noise_cum_rss) > 0:
         ax_r.plot(
             t_samp_n,
-            np.array(samp_res["rots_noise_cum_rss"]) * (180.0 / math.pi),
+            np.array(samp_res.rots_noise_cum_rss) * (180.0 / math.pi),
             label="rots RSS deg (sample) [R]",
             color=color_right1,
         )
-    if "rots_theory_cum_rss" in samp_res:
+    if len(samp_res.rots_theory_cum_rss) > 0:
         ax_r.plot(
             t_samp_n,
-            np.array(samp_res["rots_theory_cum_rss"]) * (180.0 / math.pi),
+            np.array(samp_res.rots_theory_cum_rss) * (180.0 / math.pi),
             label="rots RSS deg (theory) [R]",
             linestyle="--",
             color=color_right1,
@@ -784,37 +1042,44 @@ def plot_results(train_res: dict, samp_res: dict):
     ax.legend(lines_l + lines_r, labels_l + labels_r, loc="upper left")
     ax.grid(True, alpha=0.3)
 
-    # Noise-to-drift ratios (left: step-level, right: velocity-level)
-    ax = axes[4]
-    ax.set_title("Noise-to-drift ratio: step [L] vs velocity [R]")
-    ax_r = ax.twinx()
-    if "trans_noise_to_drift" in samp_res:
+    # Left column, row 4: Noise-to-drift ratio for AATypes (step-level)
+    ax = axes[4, 0]
+    ax.set_title("AATypes noise-to-drift ratio (step)")
+    if len(samp_res.aa_noise_to_drift) > 0:
         ax.plot(
             t_samp_n,
-            samp_res["trans_noise_to_drift"],
+            samp_res.aa_noise_to_drift,
+            label="aa step",
+            color=color_right2,
+        )
+    ax.tick_params(axis="y")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left")
+
+    # Right column, row 4: Noise-to-drift ratios for Trans/Rot (step [L] vs velocity [R])
+    ax = axes[4, 1]
+    ax.set_title("Trans/Rot noise-to-drift: step [L] vs velocity [R]")
+    ax_r = ax.twinx()
+    if len(samp_res.trans_noise_to_drift) > 0:
+        ax.plot(
+            t_samp_n,
+            samp_res.trans_noise_to_drift,
             label="trans step [L]",
             color=color_left,
         )
-    if "rots_noise_to_drift" in samp_res:
+    if len(samp_res.rots_noise_to_drift) > 0:
         ax.plot(
             t_samp_n,
-            samp_res["rots_noise_to_drift"],
+            samp_res.rots_noise_to_drift,
             label="rots step [L]",
             color=color_right1,
         )
-    if "aa_noise_to_drift" in samp_res:
-        ax.plot(
-            t_samp_n,
-            samp_res["aa_noise_to_drift"],
-            label="aa diff-vs-drift step [L]",
-            color=color_right2,
-        )
     ax.tick_params(axis="y", colors=color_left)
     # velocity ratios on right
-    if "trans_noise_to_drift_vel" in samp_res:
+    if len(samp_res.trans_noise_to_drift_vel) > 0:
         ax_r.plot(
             t_samp_n,
-            samp_res["trans_noise_to_drift_vel"],
+            samp_res.trans_noise_to_drift_vel,
             linestyle="--",
             color=color_left,
             alpha=0.6,
@@ -822,10 +1087,10 @@ def plot_results(train_res: dict, samp_res: dict):
             zorder=3,
             label="trans vel [R]",
         )
-    if "rots_noise_to_drift_vel" in samp_res:
+    if len(samp_res.rots_noise_to_drift_vel) > 0:
         ax_r.plot(
             t_samp_n,
-            samp_res["rots_noise_to_drift_vel"],
+            samp_res.rots_noise_to_drift_vel,
             linestyle="--",
             color=color_right1,
             alpha=0.6,
@@ -839,8 +1104,24 @@ def plot_results(train_res: dict, samp_res: dict):
     ax.legend(lines_l + lines_r, labels_l + labels_r, loc="upper left")
     ax.grid(True, alpha=0.3)
 
-    axes[-1].set_xlabel("t (normalized)")
-    for axx in axes:
+    # X labels on bottom row for both columns
+    axes[4, 0].set_xlabel("t (normalized)")
+    axes[4, 1].set_xlabel("t (normalized)")
+
+    # Set consistent x-limits for used primary axes
+    used_axes = [
+        axes[0, 0],
+        axes[1, 0],
+        axes[2, 0],
+        axes[3, 0],
+        axes[4, 0],
+        axes[0, 1],
+        axes[1, 1],
+        axes[2, 1],
+        axes[3, 1],
+        axes[4, 1],
+    ]
+    for axx in used_axes:
         axx.set_xlim(0.0, 1.0)
     plt.tight_layout()
     plt.show()
@@ -851,7 +1132,7 @@ def main():
         description="Plot stochastic noise scales for training and sampling."
     )
     parser.add_argument("--num_batch", type=int, default=10)
-    parser.add_argument("--num_res", type=int, default=64)
+    parser.add_argument("--num_res", type=int, default=128)
     parser.add_argument(
         "--num_timesteps",
         type=int,
@@ -859,7 +1140,7 @@ def main():
         help="Override number of timesteps; defaults to cfg.interpolant.sampling.num_timesteps",
     )
     parser.add_argument(
-        "--step_stride", type=int, default=10, help="Evaluate every N steps"
+        "--step_stride", type=int, default=5, help="Evaluate every N steps"
     )
     parser.add_argument(
         "--trans1_scale",

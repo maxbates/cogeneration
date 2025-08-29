@@ -556,3 +556,42 @@ class TestInterpolantSample:
         assert (
             frac_high > frac_low + 1e-3
         ), f"Expected stronger guidance to have larger effect ({frac_high} > {frac_low})"
+
+
+@pytest.mark.parametrize(
+    "interpolant_type",
+    [
+        InterpolantAATypesInterpolantTypeEnum.uniform,
+        InterpolantAATypesInterpolantTypeEnum.masking,
+    ],
+)
+def test_aatypes_base_rates_noise_rows_sum_to_one(
+    interpolant_type, mock_cfg_uninterpolated
+):
+    cfg = mock_cfg_uninterpolated.interpolate()
+    cfg.interpolant.aatypes.interpolant_type = interpolant_type
+
+    interp = Interpolant(cfg.interpolant)
+    device = torch.device("cpu")
+    interp.set_device(device)
+
+    B, N = 3, 16
+
+    if interpolant_type == InterpolantAATypesInterpolantTypeEnum.uniform:
+        aatypes_t = torch.randint(
+            low=0, high=20, size=(B, N), dtype=torch.long, device=device
+        )
+    else:
+        # For masking mode, include some MASK tokens and some AA tokens
+        aatypes_t = torch.randint(
+            low=0, high=21, size=(B, N), dtype=torch.long, device=device
+        )
+        # ensure at least one mask and one AA are present
+        aatypes_t[0, 0] = MASK_TOKEN_INDEX
+        aatypes_t[0, 1] = 0
+
+    rates = interp._aatypes_base_rates_noise(aatypes_t=aatypes_t)
+    row_sum = rates.sum(-1)
+    assert torch.allclose(
+        row_sum.mean(), torch.tensor(1.0, device=device), rtol=1e-5, atol=1e-3
+    )

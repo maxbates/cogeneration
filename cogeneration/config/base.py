@@ -905,6 +905,8 @@ class InterpolantAATypesConfig(BaseClassConfig):
     remask_rate: float = 2.0
     # uncertainty gate exit rates (1 - p_current), so confident logits less likely to exit
     uncertainty_gating: bool = True
+    # uncertain gating gamma, > 1 sharpens: (1 - p_current) ** gamma
+    uncertainty_gating_gamma: float = 1.0
     # purity_selection is a selction policy enabling similar to Multiflow "purity" sampling,
     # which only unmasks masked positions, and ranks top-logit AAs for targets.
     # unlike MultiFlow it is not a separate sampling strategy.

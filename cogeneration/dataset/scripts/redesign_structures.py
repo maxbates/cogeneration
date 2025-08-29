@@ -27,6 +27,9 @@ Filter structures to pure proteins:
 
 Use pre-defined candidates to bypass inverse folding:
     python redesign_structures.py redesign.best_redesigns_csv=/path/to/best_redesigns.csv redesign.all_csv=/path/to/redesigns_prespecified.csv
+
+Re-run missing structures:
+    python redesign_structures.py redesign.rerun_missing=True
 """
 
 import hydra

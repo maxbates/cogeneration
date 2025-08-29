@@ -235,10 +235,10 @@ class Interpolant:
         min_t = self.cfg.min_t
         return t * (1 - 2 * min_t) + min_t
 
-    def _compute_sigma_t(self, t: torch.Tensor, scale: float, min_sigma: float = 0.0):
+    def _compute_sigma_t(self, t: torch.Tensor, scale: float = 1.0, min_sigma: float = 0.0):
         """
-        Compute the standard deviation of the noise at time `t` (B,)
-        The standard deviation is a parabolic function of t, and is zero at t=0 and t=1.
+        Compute the instantaneous standard deviation of the noise at time `t` (B,)
+        The standard deviation is a sqrt parabolic function of t, and is zero at t=0 and t=1.
         """
         return torch.sqrt(scale**2 * t * (1 - t) + min_sigma**2)  # (B,)
 
@@ -556,9 +556,7 @@ class Interpolant:
 
             # probability a residue jumps
             p_jump = sigma_t.clamp(max=1.0)  # (B, 1)
-            jump_mask = (
-                torch.rand(num_batch, num_res, device=self._device) < p_jump
-            ).int()
+            jump_mask = torch.rand(num_batch, num_res, device=self._device) < p_jump
 
             # TODO - include non-mask AA in "noise" for stochasticity
             if jump_mask.any():
@@ -615,9 +613,7 @@ class Interpolant:
             p_jump = (
                 sigma_t.unsqueeze(1).expand(num_batch, num_res).clamp(max=1.0)
             )  # (B, N)
-            jump_mask = (
-                torch.rand(num_batch, num_res, device=self._device) < p_jump
-            ).int()
+            jump_mask = torch.rand(num_batch, num_res, device=self._device) < p_jump
 
             if jump_mask.any():
                 # For uniform interpolant, convert AA -> AA' (not allowing self)
@@ -989,7 +985,7 @@ class Interpolant:
             and self.cfg.trans.stochastic_noise_intensity > 0.0
             and stochasticity_scale > 0.0
         ):
-            # Sample from either Gaussian or Harmonic prior
+            # Sample from intermediate noise type (either Gaussian or Harmonic prior)
             intermediate_noise = self._trans_noise(
                 chain_idx=chain_idx,
                 is_intermediate=True,
@@ -1181,7 +1177,7 @@ class Interpolant:
         # set the probabilities corresponding to the current amino acid types to 0.0
         probs[batch_idx, residue_idx, curr_states] = 0.0
 
-        # adjust the probabilities at the current positions to be the negative sum of all other values in the row
+        # adjust the probabilities at the current positions to be 1 - sum of all other values in the row
         row_sums = torch.sum(probs, dim=-1).flatten()
         probs[batch_idx, residue_idx, curr_states] = 1.0 - row_sums
 
@@ -1245,7 +1241,9 @@ class Interpolant:
 
         device = logits_1.device
         temp = self.cfg.aatypes.drift_temp
-        noise = self.cfg.aatypes.stochastic_noise_intensity
+        noise = (
+            self.cfg.aatypes.stochastic_noise_intensity
+        )  # used to be its own value, ~20.0
 
         # set mask to small negative so won't be picked in softmax
         logits_1[:, :, MASK_TOKEN_INDEX] = -1e9
@@ -1536,14 +1534,13 @@ class Interpolant:
         Schedule for aatypes drift rate per-component scales
 
         Returns `sched` and `tau` (mapped t -> y),
-        where `sched` is (1 + kappa * tau) / (1 - tau + eps)
+        where `sched` is (1 + kappa * tau + eps) / (1 - tau + eps)
 
-        eps prevents blowup at t=1
+        eps smooths blowup at t=1
         kappa > 0 adds some mass early on
         """
-        # eps prevents blowup at t=1
         if eps is None:
-            eps = float(self.cfg.min_t)
+            eps = self.cfg.min_t
 
         if self.cfg.aatypes.schedule == InterpolantAATypesScheduleEnum.linear:
             y = t
@@ -1554,7 +1551,7 @@ class Interpolant:
         else:
             raise ValueError(f"Unknown aatypes schedule {self.cfg.aatypes.schedule}")
 
-        sched = (1.0 + kappa * y) / (1.0 - y + eps)
+        sched = (1.0 + kappa * y + eps) / (1.0 - y + eps)
         sched = sched.clamp_min(0.0)
 
         return sched, y
@@ -1567,9 +1564,9 @@ class Interpolant:
         Time-only aatypes drift rate per-component scales
 
         Returns:
-        change_scale (AA->AA')  : (B, 1, 1)  ~ cfg.change_rate * s_sched(t) + sigma(t)
+        change_scale (AA->AA')  : (B, 1, 1)  ~ cfg.change_rate * s_sched(t)
         unmask_scale (mask->AA) : (B, 1, 1)  ~ cfg.unmask_rate * s_sched(t)
-        remask_scale (AA->MASK) : (B, 1, 1)  ~ cfg.remask_rate * (1/s_sched(t) + sigma(t))
+        remask_scale (AA->MASK) : (B, 1, 1)  ~ cfg.remask_rate * 1/s_sched(t) - eps [->0 @ t=1]
         """
         t = t.to(self._device)
         if t.dim() == 0:
@@ -1577,24 +1574,16 @@ class Interpolant:
         else:
             t_b = t.view(-1)  # (B,)
 
-        sched, _ = self._aatypes_schedule(t=t_b)
+        # aggressively smooth out near t=1
+        eps = 0.25
+        sched, _ = self._aatypes_schedule(t=t_b, eps=eps)
+        sched = sched.view(-1, 1, 1)
+        inv_sched = (1.0 / sched).view(-1, 1, 1)
 
         # multiply base component weight * schedule
-
-        change_sigma_t = self._compute_sigma_t(
-            t_b, scale=self.cfg.aatypes.change_rate, min_sigma=0.0
-        ).view(-1, 1, 1)
-        change_scale = (self.cfg.aatypes.change_rate * sched).view(-1, 1, 1)
-        change_scale += change_sigma_t
-
-        unmask_scale = (self.cfg.aatypes.unmask_rate * sched).view(-1, 1, 1)
-
-        remask_sigma_t = self._compute_sigma_t(
-            t_b, scale=self.cfg.aatypes.remask_rate, min_sigma=0.0
-        ).view(-1, 1, 1)
-        remask_scale = (
-            self.cfg.aatypes.remask_rate * (1 / sched + remask_sigma_t)
-        ).view(-1, 1, 1)
+        change_scale = self.cfg.aatypes.change_rate * sched
+        unmask_scale = self.cfg.aatypes.unmask_rate * sched
+        remask_scale = self.cfg.aatypes.remask_rate * inv_sched - eps
 
         return (
             change_scale.clamp_min(0.0),
@@ -1647,7 +1636,7 @@ class Interpolant:
         else:
             drift_logits = logits_1
 
-        # in masking, forbid MASK as drift target
+        # in masking, forbid mask as drift target
         if interpolant_type == InterpolantAATypesInterpolantTypeEnum.masking:
             assert S == 21
             drift_logits = drift_logits.clone()
@@ -1668,22 +1657,22 @@ class Interpolant:
         # masks for mask vs AA, depending on interpolant type
         aa_cols = torch.ones(S, dtype=torch.bool, device=dev)
         if interpolant_type == InterpolantAATypesInterpolantTypeEnum.masking:
-            is_mask = aatypes_t == MASK_TOKEN_INDEX
             aa_cols[MASK_TOKEN_INDEX] = False
-        elif interpolant_type == InterpolantAATypesInterpolantTypeEnum.uniform:
-            is_mask = torch.zeros(B, N, dtype=torch.bool, device=dev)
+        is_mask = aatypes_t == MASK_TOKEN_INDEX
         is_aa = ~is_mask
 
         # uncertainty gating: for AA rows use 1 - p(current), for MASK rows set to 1
+        # TODO consider scaling (1 - p(current)) ** 1/gamma (configurable) to sharpen
         if self.cfg.aatypes.uncertainty_gating:
             p_current = (
                 drift_probs.gather(-1, aatypes_t.long().unsqueeze(-1))
                 .squeeze(-1)
                 .clamp(0.0, 1.0)
             )  # (B, N)
-            uncert = (1.0 - p_current) * is_aa.float() + (
-                1.0 * is_mask.float()
-            )  # (B, N)
+            # (1 - p_current) ** gamma
+            uncert = (1.0 - p_current) ** self.cfg.aatypes.uncertainty_gating_gamma
+            # mask to AA rows
+            uncert = uncert * is_aa.float() + (1.0 * is_mask.float()) # (B, N)
         else:
             uncert = torch.ones_like(is_aa, dtype=torch.float, device=dev)  # (B, N)
 
@@ -1706,14 +1695,14 @@ class Interpolant:
 
         # for AA positions, mass is split between change and remask
         if is_aa.any():
-            change_probs = drift_probs.clone()
             # disallow -> self
+            change_probs = drift_probs.clone()
             change_probs.scatter_(-1, aatypes_t.long().unsqueeze(-1), 0.0)
-            # disallow -> MASK here (remasking handled separately below)
+            # disallow -> mask here (remasking handled separately below)
             if interpolant_type == InterpolantAATypesInterpolantTypeEnum.masking:
                 change_probs[..., MASK_TOKEN_INDEX] = 0.0
-            zc = change_probs.sum(-1, keepdim=True).clamp_min(1e-8)
-            change_probs = change_probs / zc
+            z = change_probs.sum(-1, keepdim=True).clamp_min(1e-8)
+            change_probs = change_probs / z
             rates_change = (
                 change_scale
                 * uncert.unsqueeze(-1)
@@ -1722,7 +1711,7 @@ class Interpolant:
             )  # (B, N, S)
             rates_off += rates_change
 
-            # remasking has single MASK target
+            # remasking has single mask target
             if interpolant_type == InterpolantAATypesInterpolantTypeEnum.masking:
                 rates_remask = (remask_scale * uncert.unsqueeze(-1)).squeeze(
                     -1
@@ -1734,6 +1723,75 @@ class Interpolant:
         rates_off.scatter_(-1, aatypes_t.long().unsqueeze(-1), 0.0)
 
         return rates_off, drift_probs
+
+    def _aatypes_base_rates_noise(
+        self,
+        aatypes_t: torch.Tensor,  # (B, N)
+    ) -> torch.Tensor:
+        """
+        Build logits-free corruption-matching noise rate vector (B, N, S).
+        If aatypes are provided, no hazard rate for current state.
+        """
+        B, N = aatypes_t.shape
+        device = aatypes_t.device
+
+        interpolant_type = self.cfg.aatypes.interpolant_type
+
+        if interpolant_type == InterpolantAATypesInterpolantTypeEnum.masking:
+            S = 21
+            aa_cols = torch.ones(S, dtype=torch.bool, device=device)
+            aa_cols[MASK_TOKEN_INDEX] = False
+            aa_count = int(aa_cols.sum().item())  # 20
+        elif interpolant_type == InterpolantAATypesInterpolantTypeEnum.uniform:
+            S = 20
+            assert aatypes_t.lt(S).all(), "unexpected mask token"
+        else:
+            raise ValueError(f"Unknown aatypes interpolant type {interpolant_type}")
+
+        # Initialize rates
+        rates_noise = torch.zeros(B, N, S, device=device)
+
+        if interpolant_type == InterpolantAATypesInterpolantTypeEnum.uniform:
+            # AA -> AA' uniformly over S-1 (excludes self)
+            rates_noise += 1.0 / (S - 1)  # (B, N, S)
+            rates_noise.scatter_(-1, aatypes_t.long().unsqueeze(-1), 0.0)
+
+        elif interpolant_type == InterpolantAATypesInterpolantTypeEnum.masking:
+            is_mask = aatypes_t == MASK_TOKEN_INDEX  # (B, N)
+            is_aa = ~is_mask
+
+            # mask rows: split uniformly across AA columns
+            if is_mask.any():
+                masked_view = rates_noise[is_mask]
+                masked_view[..., aa_cols] = 1.0 / aa_count
+                rates_noise[is_mask] = masked_view
+
+            # AA rows: split mass between AA->AA' and AA->mask
+            if is_aa.any():
+                prop_change = self.cfg.aatypes.noise_prop_change
+                prop_remask = 1.0 - prop_change
+
+                # AA -> mask (remask)
+                aa_view = rates_noise[is_aa]
+                aa_view[..., MASK_TOKEN_INDEX] = prop_remask
+                rates_noise[is_aa] = aa_view
+
+                # AA -> AA' uniformly (exclude self and mask)
+                change_probs = torch.zeros(B, N, S, device=device)  # (B, N, S)
+                change_probs[
+                    is_aa.unsqueeze(-1).expand(-1, -1, S) & aa_cols.view(1, 1, -1)
+                ] = 1.0
+                change_probs.scatter_(-1, aatypes_t.long().unsqueeze(-1), 0.0)
+                z = change_probs.sum(-1, keepdim=True).clamp_min(1e-8)
+                change_probs = change_probs / z
+                rates_noise += (prop_change * is_aa.float()).unsqueeze(
+                    -1
+                ) * change_probs
+
+        else:
+            raise ValueError(f"Unknown aatypes interpolant type {interpolant_type}")
+
+        return rates_noise
 
     def _aatypes_build_rates_noise(
         self,
@@ -1938,10 +1996,9 @@ class Interpolant:
             torch.clamp(0.1 + 0.6 * t_b, 0.05, 0.6).view(B, 1).expand(B, N)
         )  # (B, N)
         # AA: allow flips mostly when uncertain & mid-trajectory
-        sigma_t = self._compute_sigma_t(
-            t_b, scale=self.cfg.aatypes.stochastic_noise_intensity, min_sigma=0.0
-        )
-        pmax_aa = torch.clamp(0.4 * sigma_t.view(B, 1) * uncert, 0.0, 0.25)  # (B, N)
+        pmax_aa = torch.clamp(
+            0.4 * (t_b * (1 - t_b)).view(B, 1) * uncert, 0.0, 0.25
+        )  # (B, N)
 
         # pmax depends on whether currently masked or AA
         # avoid 1.0 (would give inf rate)
@@ -2027,19 +2084,6 @@ class Interpolant:
             aatypes_t=aatypes_t, logits_1=logits_1, t=t, potential=potential
         )
 
-        # optionally add logits-free noise
-        rates_noise = torch.zeros_like(rates_drift)
-        if (
-            self.cfg.aatypes.stochastic
-            and self.cfg.aatypes.stochastic_noise_intensity > 0.0
-            and stochasticity_scale > 0.0
-        ):
-            rates_noise = self._aatypes_build_rates_noise(
-                aatypes_t=aatypes_t, t=t, stochasticity_scale=stochasticity_scale
-            )
-
-        rates = rates_drift + rates_noise
-
         # If purity sampling is enabled, not only do we avoid AA -> AA' transitions,
         # but also limit rates to top-K masked sites by ranked confidence
         # TODO - match Multiflow behavior of guaranteeing jump?
@@ -2062,6 +2106,19 @@ class Interpolant:
         rates = self._aatypes_regularize_rates(
             rates=rates, drift_probs=drift_probs, aatypes_t=aatypes_t, t=t, d_t=d_t
         )
+
+        # optionally add logits-free noise
+        rates_noise = torch.zeros_like(rates_drift)
+        if (
+            self.cfg.aatypes.stochastic
+            and self.cfg.aatypes.stochastic_noise_intensity > 0.0
+            and stochasticity_scale > 0.0
+        ):
+            rates_noise = self._aatypes_build_rates_noise(
+                aatypes_t=aatypes_t, t=t, stochasticity_scale=stochasticity_scale
+            )
+
+        rates = rates_drift + rates_noise
 
         # single CTMC jump using combined rates
         aatypes_next = self._aatypes_ctmc_jump(
