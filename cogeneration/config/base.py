@@ -902,7 +902,7 @@ class InterpolantAATypesConfig(BaseClassConfig):
     # AA -> AA' (disabled by purity)
     change_rate: float = 1.0
     # AA -> MASK via drift
-    remask_rate: float = 1.0
+    remask_rate: float = 2.0
     # uncertainty gate exit rates (1 - p_current), so confident logits less likely to exit
     uncertainty_gating: bool = True
     # purity_selection is a selction policy enabling similar to Multiflow "purity" sampling,
@@ -914,6 +914,8 @@ class InterpolantAATypesConfig(BaseClassConfig):
     stochastic: bool = "${shared.stochastic}"
     # sigma_t * stochastic_noise_intensity, where sigma_t is a function of `t` and schedule
     stochastic_noise_intensity: float = 1.0
+    # prop of mass [0, 1] to AA->AA' (change) vs AA->mask (remask)
+    noise_prop_change: float = 0.5
 
 
 class InterpolantTrainTimeSamplingEnum(StrEnum):
@@ -1593,6 +1595,8 @@ class RedesignConfig(BaseClassConfig):
     rmsd_good: float = 2.0
     # Skip existing redesigned sequences
     skip_existing: bool = True
+    # Re-run targets whose work directory exists but are missing in redesigns CSV
+    rerun_missing: bool = False
     # Shuffle the metadata rows before redesigning
     shuffle: bool = True
     # Sort by length (shuffling takes precedence)
@@ -1777,6 +1781,10 @@ class Config(BaseClassConfig):
         # and smaller transformers
         raw_cfg.model.ipa.no_heads = 2
 
+        # limit datasets
+        raw_cfg.dataset.enable_cogeneration_afdb = False
+        raw_cfg.dataset.enable_cogeneration_redesigns = False
+        raw_cfg.dataset.enable_multiflow_synthetic = False
         # filter to small PDBs for faster model + sampling
         raw_cfg.dataset.debug_head_samples = 1000
         raw_cfg.dataset.filter.min_num_res = 20

@@ -1,6 +1,7 @@
 import csv
 import gc
 import os
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -226,6 +227,75 @@ class SequenceRedesigner:
         )
         return folded_feats[dpc.atom_positions][:, :3, :]
 
+    def _clean_workdir_or_skip(self, pdb_name: str, work_dir: Path) -> bool:
+        """
+        Determine whether to run redesign for `pdb_name`.
+
+        - If `work_dir` does not exist, return True.
+        - If `work_dir` exists and `cfg.rerun_missing` is True and the example is missing in
+          `redesigns.csv`, remove `work_dir` and return True.
+        - Otherwise, log skip messages and return False.
+        """
+        if not work_dir.exists():
+            return True
+
+        should_rerun = False
+        if self.cfg.rerun_missing:
+            try:
+                if (
+                    os.path.exists(self.redesigns_path)
+                    and os.path.getsize(self.redesigns_path) > 0
+                ):
+                    existing = pd.read_csv(self.redesigns_path)
+                    should_rerun = RedesignColumn.example in existing.columns and str(
+                        pdb_name
+                    ) not in set(existing[RedesignColumn.example].astype(str).unique())
+                else:
+                    # No existing CSV => treat as missing
+                    should_rerun = True
+            except Exception:
+                # If unable to read CSV, fall back to default skip behavior
+                should_rerun = False
+
+        if should_rerun:
+            self.log.info(
+                f"🔁 Re-running {pdb_name}: work directory exists but example is missing from redesigns CSV. Cleaning {work_dir} and starting over."
+            )
+            try:
+                shutil.rmtree(work_dir)
+                return True
+            except Exception as e:
+                self.log.warning(
+                    f"Failed to remove existing work directory {work_dir}: {e}. Skipping re-run."
+                )
+                return False
+
+        # Not re-running: emit existing skip warnings and skip
+        if self.validator.cfg.folding_model == FoldingModel.boltz2:
+            try:
+                predictions_dir = work_dir / "folding" / "predictions"
+                if (
+                    os.path.exists(predictions_dir)
+                    and len(os.listdir(predictions_dir)) > 0
+                ):
+                    self.log.warning(
+                        f"⏩ Skipping {pdb_name}: found {len(os.listdir(predictions_dir))} unprocessed Boltz2 predictions, which will be ignored! You may wish to delete {work_dir}"
+                    )
+                else:
+                    self.log.warning(
+                        f"⏩ Skipping {pdb_name}: processed but no predictions found. You should delete {work_dir}"
+                    )
+            except Exception:
+                self.log.warning(
+                    f"⏩ Skipping {pdb_name}: incomplete Boltz2 predictions (may have failed or been interrupted). You should delete {work_dir}"
+                )
+        else:
+            self.log.warning(
+                f"⏩ Skipping {pdb_name}: redesign work directory already exists. You may wish to delete {work_dir}"
+            )
+
+        return False
+
     def redesign_structure(
         self,
         metadata_row: MetadataCSVRow,
@@ -240,33 +310,7 @@ class SequenceRedesigner:
         work_dir = self.work_dir / pdb_name
 
         # may exist if already attempted to redesign, but failed or interrupted
-        if work_dir.exists():
-            # If using Boltz2, hacky try to parse the predictions for a more meaningful message
-            # We probably don't want to just delete the work dir if it exists.
-            # But we can't continue, because it needs to be empty.
-            if self.validator.cfg.folding_model == FoldingModel.boltz2:
-                try:
-                    predictions_dir = work_dir / "folding" / "predictions"
-                    if (
-                        os.path.exists(predictions_dir)
-                        and len(os.listdir(predictions_dir)) > 0
-                    ):
-                        self.log.warning(
-                            f"⏩ Skipping {pdb_name}: found {len(os.listdir(predictions_dir))} unprocessed Boltz2 predictions, which will be ignored! You may wish to delete {work_dir}"
-                        )
-                    else:
-                        self.log.warning(
-                            f"⏩ Skipping {pdb_name}: processed but no predictions found. You should delete {work_dir}"
-                        )
-                except Exception as e:
-                    self.log.warning(
-                        f"⏩ Skipping {pdb_name}: incomplete Boltz2 predictions (may have failed or been interrupted). You should delete {work_dir}"
-                    )
-            else:
-                self.log.warning(
-                    f"⏩ Skipping {pdb_name}: redesign work directory already exists. You may wish to delete {work_dir}"
-                )
-
+        if not self._clean_workdir_or_skip(pdb_name=str(pdb_name), work_dir=work_dir):
             return []
 
         work_dir.mkdir(parents=True, exist_ok=True)
