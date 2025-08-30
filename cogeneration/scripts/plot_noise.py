@@ -18,6 +18,8 @@ import torch
 from cogeneration.config.base import Config
 from cogeneration.data import so3_utils
 from cogeneration.data.const import MASK_TOKEN_INDEX, NM_TO_ANG_SCALE
+from cogeneration.data.fm.rotations import FlowMatcherRotations
+from cogeneration.data.fm.translations import FlowMatcherTrans
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import uniform_so3
 from cogeneration.data.rigid import batch_center_of_mass
@@ -168,9 +170,11 @@ def measure_training_noise(
     cal_trans = interpolant._trans_noise(chain_idx=chain_idx, is_intermediate=True)
     cal_trans_mean_norm = torch.linalg.norm(cal_trans, dim=-1).mean().item()
     # rotations: mean angle (rad) for IGSO3 sigma=1
-    sigma_one = torch.ones((num_batch,), device=interpolant.igso3.sigma_grid.device)
+    rots_fm = FlowMatcherRotations(cfg=interpolant.cfg.rots)
+    rots_fm.set_device(device)
+    sigma_one = torch.ones((num_batch,), device=rots_fm.igso3.sigma_grid.device)
     cal_rot_noise = (
-        interpolant.igso3.sample(sigma_one, num_res)
+        rots_fm.igso3.sample(sigma_one, num_res)
         .to(device)
         .reshape(num_batch, num_res, 3, 3)
     )
@@ -179,13 +183,17 @@ def measure_training_noise(
     # storage
     results = TrainingNoiseResult()
 
+    # translations flow matcher
+    trans_fm = FlowMatcherTrans(cfg=interpolant.cfg.trans)
+    trans_fm.set_device(device)
+
     for i in eval_indices:
         t = ts[i]
         t_b = t.view(1).repeat(num_batch).view(num_batch, 1)
 
         # translations
         seed_all(12340 + i)
-        trans_no = interpolant._corrupt_trans(
+        trans_no = trans_fm.corrupt(
             trans_1=trans_1,
             t=t_b,
             res_mask=res_mask,
@@ -194,7 +202,7 @@ def measure_training_noise(
             stochasticity_scale=0.0,
         )
         seed_all(12340 + i)
-        trans_st = interpolant._corrupt_trans(
+        trans_st = trans_fm.corrupt(
             trans_1=trans_1,
             t=t_b,
             res_mask=res_mask,
@@ -209,7 +217,7 @@ def measure_training_noise(
 
         # rotations: measure geodesic angle between with/without stochasticity
         seed_all(22340 + i)
-        rot_no = interpolant._corrupt_rotmats(
+        rot_no = rots_fm.corrupt(
             rotmats_1=rotmats_1,
             t=t_b,
             res_mask=res_mask,
@@ -217,7 +225,7 @@ def measure_training_noise(
             stochasticity_scale=0.0,
         )
         seed_all(22340 + i)
-        rot_st = interpolant._corrupt_rotmats(
+        rot_st = rots_fm.corrupt(
             rotmats_1=rotmats_1,
             t=t_b,
             res_mask=res_mask,
@@ -252,7 +260,7 @@ def measure_training_noise(
         results.aa_noise_std_frac.append(aa_changed.float().std().item())
 
         # theoretical sigma(t)
-        sigma_t_trans = interpolant._compute_sigma_t(
+        sigma_t_trans = interpolant.trans_fm._compute_sigma_t(
             t=t_b.squeeze(1),
             scale=interpolant.cfg.trans.stochastic_noise_intensity,
         )
@@ -264,11 +272,11 @@ def measure_training_noise(
             so3_t = (1 - torch.exp(-t_b.squeeze(1) * rate)) / (1 - math.exp(-rate))
         else:
             raise ValueError("Unknown rotations train schedule")
-        sigma_t_rots = interpolant._compute_sigma_t(
+        sigma_t_rots = interpolant.rots_fm._compute_sigma_t(
             t=so3_t,
             scale=interpolant.cfg.rots.stochastic_noise_intensity,
         )
-        sigma_t_aa = interpolant._compute_sigma_t(
+        sigma_t_aa = interpolant.aatypes_fm._compute_sigma_t(
             t=t_b.squeeze(1),
             scale=interpolant.cfg.aatypes.stochastic_noise_intensity,
         )
@@ -297,19 +305,23 @@ def measure_sampling_noise_and_drift(
     )
 
     # initialize states at t=0 priors
-    trans_t = interpolant._trans_noise(chain_idx=chain_idx, is_intermediate=False)
-    rotmats_t = interpolant._rotmats_noise(res_mask=res_mask)
-    aatypes_t = interpolant._aatypes_noise(res_mask=res_mask)
+    trans_fm = FlowMatcherTrans(cfg=interpolant.cfg.trans)
+    trans_fm.set_device(device)
+    trans_t = trans_fm.sample_base(chain_idx=chain_idx, is_intermediate=False)
+    rots_fm = FlowMatcherRotations(cfg=interpolant.cfg.rots)
+    rots_fm.set_device(device)
+    rotmats_t = rots_fm.sample_base(res_mask=res_mask)
+    aatypes_t = interpolant.aatypes_fm.sample_base(res_mask=res_mask)
 
     ts = torch.linspace(interpolant.cfg.min_t, 1.0, num_timesteps, device=device)
 
     # calibration constants: same as in training
-    cal_trans = interpolant._trans_noise(chain_idx=chain_idx, is_intermediate=True)
+    cal_trans = trans_fm.sample_base(chain_idx=chain_idx, is_intermediate=True)
     cal_trans_mean_norm = torch.linalg.norm(cal_trans, dim=-1).mean().item()
     cal_trans_mean_norm2 = torch.linalg.norm(cal_trans, dim=-1).square().mean().item()
-    sigma_one = torch.ones((num_batch,), device=interpolant.igso3.sigma_grid.device)
+    sigma_one = torch.ones((num_batch,), device=rots_fm.igso3.sigma_grid.device)
     cal_rot_noise = (
-        interpolant.igso3.sample(sigma_one, num_res)
+        rots_fm.igso3.sample(sigma_one, num_res)
         .to(device)
         .reshape(num_batch, num_res, 3, 3)
     )
@@ -332,26 +344,24 @@ def measure_sampling_noise_and_drift(
         dt_f = float(dt.item())
 
         # ----- translations -----
-        trans_next_drift = interpolant._trans_euler_step(
+        trans_next_drift = trans_fm.euler_step(
             d_t=dt,
-            t=t1,
+            t=torch.ones(num_batch, device=device) * t1,
             trans_1=trans_1,
             trans_t=trans_t,
             chain_idx=chain_idx,
             stochasticity_scale=0.0,
             potential=None,
         )
-        trans_vf = interpolant._trans_vector_field(
-            t=t1, trans_1=trans_1, trans_t=trans_t
-        )
+        trans_vf = trans_fm.vector_field(t=t1, trans_1=trans_1, trans_t=trans_t)
         trans_drift_step = torch.linalg.norm(trans_vf * dt_f, dim=-1)
         out.trans_drift_mean.append(trans_drift_step.mean().item())
         out.trans_drift_std.append(trans_drift_step.std().item())
 
         seed_all(41340 + i)
-        trans_next_noise = interpolant._trans_euler_step(
+        trans_next_noise = trans_fm.euler_step(
             d_t=dt,
-            t=t1,
+            t=torch.ones(num_batch, device=device) * t1,
             trans_1=trans_1,
             trans_t=trans_t,
             chain_idx=chain_idx,
@@ -378,7 +388,7 @@ def measure_sampling_noise_and_drift(
         trans_t = trans_next_drift
 
         # theory
-        sigma_t_trans = interpolant._compute_sigma_t(
+        sigma_t_trans = interpolant.trans_fm._compute_sigma_t(
             t=torch.ones(num_batch, device=device) * t1_f,
             scale=interpolant.cfg.trans.stochastic_noise_intensity,
         ) * math.sqrt(dt_f)
@@ -389,7 +399,7 @@ def measure_sampling_noise_and_drift(
         out.trans_theory_cum_rss.append(math.sqrt(cum_theory_trans_sigma2))
 
         # ----- rotations -----
-        rot_next_drift = interpolant._rots_euler_step(
+        rot_next_drift = rots_fm.euler_step(
             d_t=dt,
             t=t1,
             rotmats_1=rotmats_1,
@@ -404,7 +414,7 @@ def measure_sampling_noise_and_drift(
         out.rots_drift_std_rad.append(drift_angles.std().item())
 
         seed_all(51340 + i)
-        rot_next_noise = interpolant._rots_euler_step(
+        rot_next_noise = rots_fm.euler_step(
             d_t=dt,
             t=t1,
             rotmats_1=rotmats_1,
@@ -432,16 +442,16 @@ def measure_sampling_noise_and_drift(
         rotmats_t = rot_next_drift
 
         # theory
-        sigma_t_rots = interpolant._compute_sigma_t(
+        sigma_t_rots = interpolant.rots_fm._compute_sigma_t(
             t=torch.ones(num_batch, device=device) * t1_f,
             scale=interpolant.cfg.rots.stochastic_noise_intensity,
         ) * math.sqrt(dt_f)
         # Monte Carlo IGSO3 to estimate E[angle] and E[angle^2] for current sigma
         # vectorized per-batch sampling
         K = 32
-        sig_vec = sigma_t_rots.to(interpolant.igso3.sigma_grid.device)
+        sig_vec = sigma_t_rots.to(rots_fm.igso3.sigma_grid.device)
         # sample K noises per residue and batch
-        mc_noise = interpolant.igso3.sample(sig_vec, num_res * K).to(device)
+        mc_noise = rots_fm.igso3.sample(sig_vec, num_res * K).to(device)
         mc_noise = mc_noise.reshape(num_batch, K, num_res, 3, 3)
         mc_angles, _, _ = so3_utils.angle_from_rotmat(mc_noise)
         e_angle = mc_angles.mean().item()
@@ -517,14 +527,14 @@ def measure_sampling_noise_and_drift(
         # update state (drift-only)
         aatypes_t = aa_next_drift
 
-        sigma_t_aa = interpolant._compute_sigma_t(
+        sigma_t_aa = interpolant.aatypes_fm._compute_sigma_t(
             t=torch.ones(num_batch, device=device) * t1_f,
             scale=interpolant.cfg.aatypes.stochastic_noise_intensity,
         ) * math.sqrt(dt_f)
         # Use CTMC jump expectation to form theory: E[fraction changed] = mean p_jump
         # replicate _aatype_jump_step rate construction with uniform logits
         # IMPORTANT: sigma_t here is NOT scaled by sqrt(dt); dt enters in the exp
-        sigma_no_sqrt = interpolant._compute_sigma_t(
+        sigma_no_sqrt = interpolant.aatypes_fm._compute_sigma_t(
             t=torch.ones(num_batch, device=device) * t1_f,
             scale=interpolant.cfg.aatypes.stochastic_noise_intensity,
         )  # (B,)
@@ -544,7 +554,7 @@ def measure_sampling_noise_and_drift(
         out.aa_sigma_step.append(p_jump.mean().item())
 
         # empirical jump rate by calling jump-step directly
-        aa_after_jump = interpolant._aatype_jump_step(
+        aa_after_jump = interpolant.aatypes_fm._aatype_jump_step(
             d_t=dt,
             t=t1,
             logits_1=torch.zeros(

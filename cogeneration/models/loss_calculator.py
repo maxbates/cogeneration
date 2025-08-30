@@ -151,17 +151,15 @@ class BatchNormScales:
         train_cfg = cfg.experiment.training
 
         # Timestep used for normalization.
-        r3_t = batch[nbp.r3_t]  # (B, 1)
-        so3_t = batch[nbp.so3_t]  # (B, 1)
-        cat_t = batch[nbp.cat_t]  # (B, 1)
+        r3_t = batch[nbp.r3_t]  # (B,)
+        so3_t = batch[nbp.so3_t]  # (B,)
+        cat_t = batch[nbp.cat_t]  # (B,)
 
-        r3_norm_scale = 1 - torch.min(
-            r3_t[..., None], torch.tensor(train_cfg.t_normalize_clip)
-        )
+        r3_norm_scale = 1 - torch.min(r3_t, torch.tensor(train_cfg.t_normalize_clip))
+        r3_norm_scale = r3_norm_scale.view(-1, 1, 1)
 
-        so3_norm_scale = 1 - torch.min(
-            so3_t[..., None], torch.tensor(train_cfg.t_normalize_clip)
-        )
+        so3_norm_scale = 1 - torch.min(so3_t, torch.tensor(train_cfg.t_normalize_clip))
+        so3_norm_scale = so3_norm_scale.view(-1, 1, 1)
 
         if train_cfg.aatypes_loss_use_likelihood_weighting:
             cat_norm_scale = 1 - torch.min(
@@ -169,6 +167,7 @@ class BatchNormScales:
             )
         else:
             cat_norm_scale = torch.ones_like(cat_t)
+        cat_norm_scale = cat_norm_scale.view(-1, 1)
 
         return cls(
             r3=r3_norm_scale,
@@ -965,8 +964,8 @@ class BatchLossCalculator:
         loss_auxiliary *= self.train_cfg.aux_loss_weight
 
         # limit auxiliary loss to certain times
-        loss_auxiliary *= self.batch[nbp.r3_t][:, 0] > self.train_cfg.aux_loss_t_pass
-        loss_auxiliary *= self.batch[nbp.so3_t][:, 0] > self.train_cfg.aux_loss_t_pass
+        loss_auxiliary *= self.batch[nbp.r3_t] > self.train_cfg.aux_loss_t_pass
+        loss_auxiliary *= self.batch[nbp.so3_t] > self.train_cfg.aux_loss_t_pass
 
         # clamp certain losses
         loss_trans = torch.clamp(loss_trans, max=5)

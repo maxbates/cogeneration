@@ -407,15 +407,15 @@ class FlowModule(LightningModule):
             self._log_scalar(f"train/{k}", v, batch_size=num_batch)
 
         # log t
-        so3_t = torch.squeeze(noisy_batch[nbp.so3_t])
+        so3_t = noisy_batch[nbp.so3_t]
         self._log_scalar(
             "train/so3_t",
             np.mean(to_numpy(so3_t)),
             batch_size=num_batch,
         )
-        r3_t = torch.squeeze(noisy_batch[nbp.r3_t])
+        r3_t = noisy_batch[nbp.r3_t]
         self._log_scalar("train/r3_t", np.mean(to_numpy(r3_t)), batch_size=num_batch)
-        cat_t = torch.squeeze(noisy_batch[nbp.cat_t])
+        cat_t = noisy_batch[nbp.cat_t]
         self._log_scalar(
             "train/cat_t",
             np.mean(to_numpy(cat_t)),

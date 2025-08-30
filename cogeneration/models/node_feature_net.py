@@ -56,9 +56,13 @@ class NodeFeatureNet(nn.Module):
         else:
             self.linear = nn.Linear(embed_size, self.cfg.c_s)
 
-    def embed_t(self, timesteps, mask):
+    def embed_t(
+        self,
+        timesteps: torch.Tensor,  # (B,)
+        mask: torch.Tensor,  # (B, N)
+    ):
         timestep_emb = get_time_embedding(
-            timesteps=timesteps[:, 0],
+            timesteps=timesteps,  # (B,)
             embedding_dim=self.cfg.c_timestep_emb,
             max_positions=2056,
         )[:, None, :].repeat(1, mask.shape[1], 1)
@@ -66,9 +70,9 @@ class NodeFeatureNet(nn.Module):
 
     def forward(
         self,
-        so3_t: torch.Tensor,  # (B, 1)
-        r3_t: torch.Tensor,  # (B, 1)
-        cat_t: torch.Tensor,  # (B, 1)
+        so3_t: torch.Tensor,  # (B,)
+        r3_t: torch.Tensor,  # (B,)
+        cat_t: torch.Tensor,  # (B,)
         res_mask: torch.Tensor,  # (B, N)
         diffuse_mask: torch.Tensor,  # (B, N)
         chain_index: torch.Tensor,  # (B, N)

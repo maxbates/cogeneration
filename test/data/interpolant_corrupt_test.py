@@ -7,6 +7,9 @@ from cogeneration.config.base import (
 )
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.data_transforms import make_one_hot
+from cogeneration.data.fm.rotations import FlowMatcherRotations
+from cogeneration.data.fm.torsions import FlowMatcherTorsions
+from cogeneration.data.fm.translations import FlowMatcherTrans
 from cogeneration.data.interpolant import Interpolant
 from cogeneration.data.noise_mask import (
     centered_gaussian,
@@ -72,7 +75,9 @@ class TestInterpolant:
             atol=0.1,
         )
 
-        result = interpolant._batch_ot(trans_0, trans_1, res_mask=res_mask, center=True)
+        result = interpolant.trans_fm.batch_ot(
+            trans_0, trans_1, res_mask=res_mask, center=True
+        )
 
         # ensure centered
         assert result.shape == trans_1.shape
@@ -224,10 +229,10 @@ class TestInterpolant:
             assert key.value in noisy_batch, f"Missing noisy batch key {key}"
 
         # Check shapes of noisy tensors
-        # t values shape [B, 1]
-        assert noisy_batch[nbp.so3_t].shape == (B, 1)
-        assert noisy_batch[nbp.r3_t].shape == (B, 1)
-        assert noisy_batch[nbp.cat_t].shape == (B, 1)
+        # t values shape [B]
+        assert noisy_batch[nbp.so3_t].shape == (B,)
+        assert noisy_batch[nbp.r3_t].shape == (B,)
+        assert noisy_batch[nbp.cat_t].shape == (B,)
         # translations and self-cond
         assert noisy_batch[nbp.trans_t].shape == (B, N, 3)
         assert noisy_batch[nbp.trans_sc].shape == (B, N, 3)
@@ -274,7 +279,7 @@ class TestInterpolant:
         chain_idx = torch.ones(B, N).long()
         res_mask = torch.ones(B, N).float()
         diffuse_mask = torch.ones(B, N).float()
-        t = torch.rand(B, 1)
+        t = torch.rand(B)
 
         if noise_type == "gaussian":
             trans_1 = centered_gaussian(B, N, device=interpolant._device)
@@ -283,7 +288,9 @@ class TestInterpolant:
         else:
             raise ValueError(f"Unknown noise type {noise_type}")
 
-        trans_t = interpolant._corrupt_trans(
+        trans_fm = FlowMatcherTrans(cfg=interpolant.cfg.trans)
+        trans_fm.set_device(interpolant._device)
+        trans_t = trans_fm.corrupt(
             trans_1,
             t=t,
             res_mask=res_mask,
@@ -305,11 +312,13 @@ class TestInterpolant:
         chain_idx = torch.ones(B, N).long()
         res_mask = torch.ones(B, N).float()
         diffuse_mask = torch.ones(B, N).float()
-        t = torch.rand(B, 1)
+        t = torch.rand(B)
 
         rotmats_1 = uniform_so3(B, N, device=interpolant._device)
 
-        rotmats_t = interpolant._corrupt_rotmats(
+        rots_fm = FlowMatcherRotations(cfg=interpolant.cfg.rots)
+        rots_fm.set_device(interpolant._device)
+        rotmats_t = rots_fm.corrupt(
             rotmats_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
         )
 
@@ -334,7 +343,7 @@ class TestInterpolant:
         B, N = 4, 16
         res_mask = torch.ones(B, N).float()
         diffuse_mask = torch.ones(B, N).float()
-        t = torch.rand(B, 1)
+        t = torch.rand(B)
 
         torsions_1 = torsions_noise(
             sigma=torch.ones(B, device=interpolant._device),
@@ -342,7 +351,9 @@ class TestInterpolant:
             num_angles=7,
         )
 
-        torsions_t = interpolant._corrupt_torsions(
+        torsions_fm = FlowMatcherTorsions(cfg=interpolant.cfg.torsions)
+        torsions_fm.set_device(interpolant._device)
+        torsions_t = torsions_fm.corrupt(
             torsions_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
         )
 
@@ -382,12 +393,12 @@ class TestInterpolant:
         chain_idx = torch.ones(B, N).long()
         res_mask = torch.ones(B, N).float()
         diffuse_mask = torch.ones(B, N).float()
-        t = torch.rand(B, 1)
+        t = torch.rand(B)
 
         # ground-truth sequence (cyclic so every aa appears, but no mask)
         aatype_1 = torch.arange(N).repeat(B, 1) % 20  # (B,N)
 
-        out = interpolant._corrupt_aatypes(
+        out = interpolant.aatypes_fm.corrupt(
             aatype_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
         )
 
@@ -413,16 +424,15 @@ class TestInterpolant:
 
         B, N = 10, 50
         t = 0.5  # max sigma_t
-        d_t = 0.1  # take a large timestep, more likely to jump
+        d_t = 0.5  # larger timestep to increase jump probability
         aatypes_t = torch.randint(0, 20, (B, N)).long()
-        logits_1 = make_one_hot(aatypes_t, num_classes=20)
-        logits_1 *= 3  # confident for current aatypes
-        logits_1 += torch.randn_like(logits_1) * 0.5  # noisy logits
+        # use diffuse logits to encourage non-zero exit rates
+        logits_1 = torch.randn(B, N, 20)
 
         interpolant = Interpolant(cfg=cfg.interpolant)
         interpolant.set_device(torch.device("cpu"))
 
-        noisy_aatypes_t = interpolant._aatype_jump_step(
+        noisy_aatypes_t = interpolant.aatypes_fm._aatype_jump_step(
             d_t=torch.tensor(d_t),
             t=torch.tensor(t),
             logits_1=logits_1,
@@ -543,18 +553,18 @@ class TestInterpolant:
         chain_idx = torch.ones(B, N).long()
         res_mask = torch.ones(B, N).float()
         diffuse_mask = torch.ones(B, N).float()
-        t = torch.ones((B, 1)) * time
+        t = torch.ones((B,)) * time
 
         # at both t=0 and t=1, sigma_t should be 0
         assert torch.allclose(
-            interpolant._compute_sigma_t(t, scale=1, min_sigma=0.0),
-            torch.zeros((B, 1)).float(),
+            interpolant.trans_fm._compute_sigma_t(t, scale=1, min_sigma=0.0),
+            torch.zeros((B,)).float(),
         )
 
         # Inspect corruptions
 
         aatypes_1 = torch.randint(0, 20, (B, N)).long()
-        aatypes_t = interpolant._corrupt_aatypes(
+        aatypes_t = interpolant.aatypes_fm.corrupt(
             aatypes_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
         )
         if time == 1:
@@ -562,7 +572,9 @@ class TestInterpolant:
 
         trans_1 = centered_gaussian(B, N, device=interpolant._device)
         trans_1 -= batch_center_of_mass(trans_1, mask=res_mask)[:, None]
-        trans_t = interpolant._corrupt_trans(
+        trans_fm = FlowMatcherTrans(cfg=interpolant.cfg.trans)
+        trans_fm.set_device(interpolant._device)
+        trans_t = trans_fm.corrupt(
             trans_1,
             t=t,
             res_mask=res_mask,
@@ -573,7 +585,7 @@ class TestInterpolant:
             assert torch.allclose(trans_1, trans_t, atol=1e-3)
 
         rotmats_1 = uniform_so3(B, N, device=interpolant._device)
-        rotmats_t = interpolant._corrupt_rotmats(
+        rotmats_t = interpolant.rots_fm.corrupt(
             rotmats_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
         )
         if time == 1:

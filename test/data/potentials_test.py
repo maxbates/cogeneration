@@ -10,7 +10,7 @@ from cogeneration.config.base import (
     ProteinMPNNRunnerConfig,
 )
 from cogeneration.data.data_transforms import make_one_hot
-from cogeneration.data.logits import center_logits
+from cogeneration.data.logits import center_logits, clamp_logits
 from cogeneration.data.potentials import (
     ChainBreakPotential,
     ContactConditioningPotential,
@@ -534,10 +534,12 @@ class TestInverseFoldPotential:
         # Energy should be low but not ~0 with moderate confidence logits
         assert torch.all(E > 0.01)
         assert torch.all(E < 0.2)
-        # Guidance should be returned with correct shape and match provided logits (no temp/scale effects)
+        # Guidance should be returned with correct shape and be centered
         assert guidance is not None and guidance.logits is not None
         assert guidance.logits.shape == (B, N, 21)
-        assert torch.allclose(guidance.logits, logits)
+        expected = center_logits(logits)
+        expected = clamp_logits(expected, abs_cap=potential.inverse_fold_logits_cap)
+        assert torch.allclose(guidance.logits, expected)
 
     def test_masks_are_respected(self):
         B, N = 1, 12
@@ -598,23 +600,27 @@ class TestInverseFoldPotential:
         assert E.shape == (B,)
         # Wrong-high logits should yield very large normalized energy
         assert E.item() > 1.0
-        # Guidance should be capped to 4.0 uniformly per-position
+        # Guidance should be centered and capped as expected
         assert guidance is not None and guidance.logits is not None
         assert guidance.logits.shape == (B, N, 21)
+        expected = center_logits(logits)
+        expected = clamp_logits(expected, abs_cap=4.0)
+        assert torch.allclose(guidance.logits, expected)
+
+        # Additionally: ensure logits reflect strong "wrong" signal
+        cap = potential.inverse_fold_logits_cap
+        # Max absolute value per-position should hit the cap due to strong contrast
         max_abs = guidance.logits.abs().amax(dim=-1)
-        assert torch.allclose(max_abs, torch.full_like(max_abs, 4.0))
-        # Since only the wrong class had magnitude, it should be exactly 4.0 after capping; others 0
+        assert torch.allclose(max_abs, torch.full_like(max_abs, cap))
+        # The wrong class should be the argmax, and minimum should saturate at -cap
         for i in range(N):
             tgt = int(step.aatypes[0, i].item())
             wrong = (tgt + 1) % 20
-            assert torch.allclose(
-                guidance.logits[0, i, wrong],
-                torch.tensor(4.0, device=guidance.logits.device),
+            row = guidance.logits[0, i]
+            assert int(torch.argmax(row).item()) == wrong
+            assert torch.isclose(
+                row.min(), torch.tensor(-cap, device=row.device, dtype=row.dtype)
             )
-            # all other 20 classes (including mask class) should be 0
-            mask = torch.ones(21, dtype=torch.bool, device=guidance.logits.device)
-            mask[wrong] = False
-            assert torch.all(guidance.logits[0, i][mask] == 0)
 
     def test_guidance_logit_padding_and_shape(self):
         B, N = 1, 7
@@ -644,9 +650,10 @@ class TestInverseFoldPotential:
         assert guidance is not None
         assert guidance.logits is not None
         assert guidance.logits.shape == step.logits.shape == (B, N, 21)
-        # Expect padding in the last class and other classes unchanged
-        assert torch.allclose(guidance.logits[:, :, :20], logits20)
-        assert torch.all(guidance.logits[:, :, 20] == 0)
+        pad = torch.zeros(B, N, 1, device=step.aatypes.device, dtype=logits20.dtype)
+        logits21 = torch.cat([logits20, pad], dim=-1)
+        expected = center_logits(logits21)
+        assert torch.allclose(guidance.logits, expected, atol=1e-6, rtol=0)
 
     def test_guidance_logits_are_centered(self):
         B, N = 1, 9

@@ -48,7 +48,7 @@ class DoubleAttentionPairBlock(nn.Module):
         self,
         edge_embed: torch.Tensor,  # (B, N, N, edge_dim)
         edge_mask: torch.Tensor,  # (B, N, N)
-        r3_t: torch.Tensor,  # (B, 1)
+        r3_t: torch.Tensor,  # (B,)
     ) -> torch.Tensor:
         B, N, _, edge_dim = edge_embed.shape
 
@@ -79,7 +79,7 @@ class DoubleAttentionPairBlock(nn.Module):
 
         # Feature-wise Linear Modulation (FiLM) using timestep embedding
         if self.cfg.use_film:
-            t_emb = self.time_mlp(r3_t.view(B, 1))  # (B, 2*C)
+            t_emb = self.time_mlp(r3_t[:, None])  # (B, 2*C)
             scale, shift = t_emb.chunk(2, dim=-1)
             O = O * (1 + scale.unsqueeze(1).unsqueeze(1)) + shift.unsqueeze(
                 1
@@ -130,7 +130,7 @@ class DoubleAttentionPairTrunk(nn.Module):
         self,
         edge_embed: torch.Tensor,  # (B, N, N, edge_dim)
         edge_mask: torch.Tensor,  # (B, N, N)
-        r3_t: Optional[torch.Tensor],  # (B, 1)
+        r3_t: Optional[torch.Tensor],  # (B,)
     ) -> torch.Tensor:
         """
         Pass edge features through all blocks, then layer-norm.

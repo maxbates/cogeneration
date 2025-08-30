@@ -83,7 +83,7 @@ def mock_noisy_feats(
     feats: NoisyFeatures = mock_feats(N=N, idx=idx, task=task, multimer=multimer)
 
     # generate corrupted noisy values for input_feats
-    t = torch.rand(1)  # use same value as with unconditional + not separate_t
+    t = torch.rand(())  # scalar so batches collate to shape (B,)
     feats[nbp.so3_t] = t
     feats[nbp.r3_t] = t
     feats[nbp.cat_t] = t

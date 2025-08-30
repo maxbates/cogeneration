@@ -67,9 +67,9 @@ class NoisyBatchProp(StrEnum):
     "_sc" properties are self-conditioned predictions, i.e. predictions at `t`
     """
 
-    cat_t = "cat_t"  # (B, 1) tensor, t for amino acids (categoricals)
-    so3_t = "so3_t"  # (B, 1) tensor, t for SO3 (rotations)
-    r3_t = "r3_t"  # (B, 1) tensor, t for R3 (translations)
+    cat_t = "cat_t"  # (B,) tensor, t for amino acids (categoricals)
+    so3_t = "so3_t"  # (B,) tensor, t for SO3 (rotations)
+    r3_t = "r3_t"  # (B,) tensor, t for R3 (translations)
     trans_t = "trans_t"  # (B, N, 3) tensor, translations @ t
     rotmats_t = "rotmats_t"  # (B, N, 3, 3) tensor, rotations @ t
     torsions_t = "torsions_t"  # (B, N, 7, 2) tensor, torsions @ t

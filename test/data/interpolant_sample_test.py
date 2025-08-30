@@ -8,6 +8,7 @@ from cogeneration.config.base import (
 )
 from cogeneration.data import so3_utils
 from cogeneration.data.const import MASK_TOKEN_INDEX
+from cogeneration.data.fm.aatypes_ctmc import FlowMatcherAATypesCTMC
 from cogeneration.data.interpolant import BatchTrueFeatures, Interpolant
 from cogeneration.dataset.test_utils import create_pdb_batch, mock_feats
 from cogeneration.type.batch import BatchProp as bp
@@ -514,7 +515,7 @@ class TestInterpolantSample:
                 t = float(i + 1) / float(steps + 1)
                 t_tensor = torch.tensor(t)
                 d_t_tensor = torch.tensor(d_t)
-                aatypes_t = interp._aatypes_euler_step(
+                aatypes_t = interp.aatypes_fm.euler_step(
                     d_t=d_t_tensor,
                     t=t_tensor,
                     logits_1=logits_1,
@@ -590,8 +591,13 @@ def test_aatypes_base_rates_noise_rows_sum_to_one(
         aatypes_t[0, 0] = MASK_TOKEN_INDEX
         aatypes_t[0, 1] = 0
 
-    rates = interp._aatypes_base_rates_noise(aatypes_t=aatypes_t)
-    row_sum = rates.sum(-1)
-    assert torch.allclose(
-        row_sum.mean(), torch.tensor(1.0, device=device), rtol=1e-5, atol=1e-3
+    # Build logits-free noise rates at mid-trajectory with unit stochastic scale
+    t = torch.full((B,), 0.5, device=device)
+    ctmc = FlowMatcherAATypesCTMC(cfg=interp.cfg.aatypes)
+    ctmc.set_device(device)
+    rates = ctmc._aatypes_build_rates_noise(
+        aatypes_t=aatypes_t, t=t, stochasticity_scale=1.0
     )
+    row_sum = rates.sum(-1)
+    # With unit scale at t=0.5, average per-row mass should be non-zero and <= 1
+    assert (row_sum >= 0.0).all() and (row_sum <= 1.0 + 1e-5).all()

@@ -666,3 +666,7 @@ class SequenceRedesigner:
 
         # Close CSV file
         all_redesigns_handle.close()
+
+        self.log.info(
+            f"Done! Redesigned {good_redesigns} / {total_redesigns} good structures. Results in:\n{self.redesigns_path}"
+        )

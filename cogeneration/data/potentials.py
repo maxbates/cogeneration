@@ -658,10 +658,11 @@ class InverseFoldPotential(Potential):
 
         # Apply temperature + scale
         T = max(self.inverse_fold_logits_temperature, 1e-4)
-        logits = logits / T
-        logits = logits * float(self.guidance_scale)
+        if T != 1.0:
+            logits = logits / T
+        logits = logits * float(self.inverse_fold_guidance_scale)
 
-        # clamp very strong logits
+        # Clamp strong logits
         logits = clamp_logits(logits, abs_cap=self.inverse_fold_logits_cap)
 
         guidance = PotentialField(

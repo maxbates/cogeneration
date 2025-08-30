@@ -77,7 +77,9 @@ def get_index_embedding(
         raise ValueError(f"Unknown positional embedding method: {pos_embed_method}")
 
 
-def get_time_embedding(timesteps, embedding_dim, max_positions=2000):
+def get_time_embedding(
+    timesteps: torch.Tensor, embedding_dim: int, max_positions: int = 2000
+):
     """
     Adapted from https://github.com/hojonathanho/diffusion/blob/master/diffusion_tf/nn.py
     From Fairseq.
