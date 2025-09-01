@@ -54,7 +54,7 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
     @abstractmethod
     def euler_step(
         self,
-        d_t: torch.Tensor,  # (B,)
+        d_t: torch.Tensor,  # scalar
         t: torch.Tensor,  # (B,)
         logits_1: torch.Tensor,  # (B, N, S)
         aatypes_t: torch.Tensor,  # (B, N)
@@ -133,7 +133,7 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
 
     def _aatypes_jump_step(
         self,
-        d_t: torch.Tensor,  # (B,)
+        d_t: torch.Tensor,  # scalar
         t: torch.Tensor,  # (B,)
         logits_1: Optional[torch.Tensor],  # (B, N, S)
         aatypes_t: torch.Tensor,  # (B, N)
@@ -277,7 +277,7 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
 
     def _euler_step_uniform(
         self,
-        d_t: torch.Tensor,  # (B,)
+        d_t: torch.Tensor,  # scalar
         t: torch.Tensor,  # (B,)
         logits_1: torch.Tensor,  # (B, N, S=20)
         aatypes_t: torch.Tensor,  # (B, N)
@@ -301,13 +301,12 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
         )  # (B, N, 1)
         assert pt_x1_eq_xt_prob.shape == (num_batch, num_res, 1)
 
-        # broadcast `d_t` and `t`
-        d_t_b = d_t.to(self._device).view(-1, 1, 1)
+        # broadcast `t` to per-site
         t_b = t.to(self._device).view(-1, 1, 1)
 
         # compute step probabilities (scaled by d_t), with noise and time factoring.
         # encourages transitions with a uncertainty-scaling 'noise' term for the current residue.
-        step_probs = d_t_b * (
+        step_probs = d_t * (
             pt_x1_probs * ((1.0 + noise + noise * (num_states - 1) * t_b) / (1.0 - t_b))
             + noise * pt_x1_eq_xt_prob
         )
@@ -321,12 +320,12 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
 
     def euler_step(
         self,
-        d_t: torch.Tensor,
-        t: torch.Tensor,
-        logits_1: torch.Tensor,
-        aatypes_t: torch.Tensor,
+        d_t: torch.Tensor,  # scalar
+        t: torch.Tensor,  # (B,)
+        logits_1: torch.Tensor,  # (B, N, S=20)
+        aatypes_t: torch.Tensor,  # (B, N)
         stochasticity_scale: float = 1.0,
-        potential: Optional[torch.Tensor] = None,
+        potential: Optional[torch.Tensor] = None,  # (B, N, S=20)
     ) -> torch.Tensor:
         """
         Perform a single Euler update step for the uniform interpolant (S=20).
@@ -377,10 +376,10 @@ class FlowMatcherAATypesMasking(FlowMatcherAATypes):
 
     def corrupt(
         self,
-        aatypes_1: torch.Tensor,
-        t: torch.Tensor,
-        res_mask: torch.Tensor,
-        diffuse_mask: torch.Tensor,
+        aatypes_1: torch.Tensor,  # (B, N)
+        t: torch.Tensor,  # (B,)
+        res_mask: torch.Tensor,  # (B, N)
+        diffuse_mask: torch.Tensor,  # (B, N)
         stochasticity_scale: float = 1.0,
     ) -> torch.Tensor:
         """
@@ -418,7 +417,7 @@ class FlowMatcherAATypesMasking(FlowMatcherAATypes):
 
     def _euler_step_masking(
         self,
-        d_t: torch.Tensor,  # (B,)
+        d_t: torch.Tensor,  # scalar
         t: torch.Tensor,  # (B,)
         logits_1: torch.Tensor,  # (B, N, S=21)
         aatypes_t: torch.Tensor,  # (B, N)
@@ -447,16 +446,14 @@ class FlowMatcherAATypesMasking(FlowMatcherAATypes):
         )
 
         # broadcast t and d_t to (B, 1, 1) for (B, N, S) tensors
-        t_b = t.to(self._device).view(-1, 1, 1)
-        d_t_b = d_t.to(self._device).view(-1, 1, 1)
+        t = t.to(self._device).view(-1, 1, 1)
+        d_t = d_t.to(self._device)
 
         # compute step probabilities (scaled by d_t), with noise and time factoring
-        step_probs = (
-            d_t_b * pt_x1_probs * ((1.0 + noise * t_b) / (1.0 - t_b))
-        )  # (B, N, S)
+        step_probs = d_t * pt_x1_probs * ((1.0 + noise * t) / (1.0 - t))  # (B, N, S)
         # add transitions from non-mask to mask as noise
         step_probs += (
-            d_t_b * (1.0 - aatypes_t_is_mask) * mask_one_hot.view(1, 1, -1) * noise
+            d_t * (1.0 - aatypes_t_is_mask) * mask_one_hot.view(1, 1, -1) * noise
         )
 
         # force valid rate matrix
@@ -468,7 +465,7 @@ class FlowMatcherAATypesMasking(FlowMatcherAATypes):
 
     def _euler_step_purity(
         self,
-        d_t: torch.Tensor,  # (B,)
+        d_t: torch.Tensor,  # scalar
         t: torch.Tensor,  # (B,)
         logits_1: torch.Tensor,  # (B, N, S=21)
         aatypes_t: torch.Tensor,  # (B, N)
@@ -567,12 +564,12 @@ class FlowMatcherAATypesMasking(FlowMatcherAATypes):
 
     def euler_step(
         self,
-        d_t: torch.Tensor,  # (B,)
+        d_t: torch.Tensor,  # scalar
         t: torch.Tensor,  # (B,)
-        logits_1: torch.Tensor,  # (B, N, S) unscaled probabilities, S={20, 21}
-        aatypes_t: torch.Tensor,  # (B, N) current amino acid types
+        logits_1: torch.Tensor,  # (B, N, S=21)
+        aatypes_t: torch.Tensor,  # (B, N)
         stochasticity_scale: float = 1.0,
-        potential: Optional[torch.Tensor] = None,  # (B, N, S)
+        potential: Optional[torch.Tensor] = None,  # (B, N, S=21)
     ) -> torch.Tensor:
         """
         Perform a single Euler update step for the masking interpolant (S=21).

@@ -600,7 +600,7 @@ class Interpolant:
         resampler: FKSteeringResampler,
         step_idx: int,
         t_1: torch.Tensor,  # (B,)
-        t_2: Optional[torch.Tensor],  # (B,) or None if final step
+        d_t: Optional[torch.Tensor],  # scalar or None if final step
         stochasticity_scale: float = 1.0,
     ) -> Tuple[NoisyFeatures, SamplingStep, SamplingStep, Optional[FKStepMetric]]:
         """
@@ -618,7 +618,7 @@ class Interpolant:
         If any torsions are predicted, `fill_torsions` fills them (B, N, K, 2) to (B, N, 7, 2).
         """
 
-        is_final_step = t_2 is None
+        is_final_step = d_t is None
 
         # Pull out masks + idx
         res_mask = noisy_batch[bp.res_mask]
@@ -739,10 +739,7 @@ class Interpolant:
                     pred_logits_1, true_feats.logits, scaffold_mask
                 )
 
-            # Take next step, size `d_t` from `t_1` (current value) to `t_2` (toward predicted value)
-            # We are at `t_1` with state `{domain}_t_1`. The model predicted `pred_{domain}_1`.
-            # We use a shared `d_t` across domains, even though each may have its own `t` in the batch.
-            d_t = t_2 - t_1  # (B,)
+            # Take next step of size `d_t` from `t_1` toward the next time `t_2` for each domain
             trans_t_2 = self.trans_fm.euler_step(
                 d_t=d_t,
                 t=t_1,
@@ -1062,9 +1059,9 @@ class Interpolant:
         )
         step_idx = 0
 
-        # We will integrate in a loop over ts, handling the last step after the loop.
         # t_1 (scalar) is the current time (handle updating ourselves at end of loop).
         # t_2 (scalar) is the next time.
+        # d_t (scalar) = t_2 - t_1  is the delta.
         t_1 = ts[0]
         for t_2 in tqdm(
             ts[1:], desc="Sampling timestep", disable=not show_progress, leave=False
@@ -1112,7 +1109,7 @@ class Interpolant:
                 resampler=resampler,
                 step_idx=step_idx,
                 t_1=t_1_b,
-                t_2=torch.ones((num_batch,), device=self._device) * t_2,
+                d_t=(t_2 - t_1),
                 stochasticity_scale=stochasticity_scale,
             )
 
@@ -1141,7 +1138,7 @@ class Interpolant:
             resampler=resampler,
             step_idx=self.cfg.sampling.num_timesteps,  # final step
             t_1=t_1_b,
-            t_2=None,  # final step
+            d_t=None,  # final step
             stochasticity_scale=stochasticity_scale,
         )
 

@@ -151,7 +151,7 @@ class FlowMatcherRotations(FlowMatcher):
 
     def euler_step(
         self,
-        d_t: torch.Tensor,  # (B,)
+        d_t: torch.Tensor,  # scalar
         t: torch.Tensor,  # (B,)
         rotmats_1: torch.Tensor,  # (B, N, 3, 3)
         rotmats_t: torch.Tensor,  # (B, N, 3, 3)
@@ -169,7 +169,7 @@ class FlowMatcherRotations(FlowMatcher):
             rot_vf += potential
 
         rotmats_next = so3_utils.geodesic_t(
-            t=(scaling * d_t).view(-1, 1, 1),  # scaled time along geodesic
+            t=scaling * d_t, # scaled time along geodesic
             mat=rotmats_1,
             base_mat=rotmats_t,
             rot_vf=rot_vf,

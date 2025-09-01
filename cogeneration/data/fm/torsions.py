@@ -81,7 +81,7 @@ class FlowMatcherTorsions(FlowMatcher):
 
     def euler_step(
         self,
-        d_t: torch.Tensor,  # (B,)
+        d_t: torch.Tensor,  # scalar
         t: torch.Tensor,  # (B,)
         torsions_1: torch.Tensor,  # (B, N, 7, 2)
         torsions_t: torch.Tensor,  # (B, N, K, 2)
@@ -107,9 +107,9 @@ class FlowMatcherTorsions(FlowMatcher):
 
         t = t.to(self._device)
         d_t = d_t.to(self._device)
-        # Broadcast per-batch t and d_t to (B, 1, 1) for (B, N, K) angles tensors
+        # Broadcast per-batch t to (B, 1, 1) for (B, N, K) angles tensors; d_t is scalar
         angles_vf = (angles_1 - angles_t) / (1.0 - t.view(-1, 1, 1))
-        angles_next = angles_t + angles_vf * d_t.view(-1, 1, 1)
+        angles_next = angles_t + angles_vf * d_t
 
         if (
             self.cfg.stochastic

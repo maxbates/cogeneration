@@ -479,7 +479,7 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
         rates: torch.Tensor,  # (B, N, S) drift rates
         drift_probs: torch.Tensor,  # (B, N, S) drift softmax, used for scoring
         t: torch.Tensor,  # (B,)
-        d_t: torch.Tensor,  # (B,)
+        d_t: torch.Tensor,  # scalar
     ) -> torch.Tensor:
         """
         Build a purity gate (B, N, S) for the masking interpolant that prevents unmasking on
@@ -516,10 +516,7 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
         # per-row confidence = max over AA columns of predicted probabilities
         # p_row: (B, N) with p_bi = 1 - exp(-lambda_bi * d_t)
         lam = rates.sum(dim=-1)  # (B, N)
-        if d_t.dim() == 0:
-            p_row = 1.0 - torch.exp(-lam * d_t.to(device))  # (B, N)
-        else:
-            p_row = 1.0 - torch.exp(-lam * d_t.to(device).view(-1, 1))  # (B, N)
+        p_row = 1.0 - torch.exp(-lam * d_t)  # (B, N)
         p_row = p_row.clamp(0.0, 1.0)
         # sample independent Bernoulli for masked rows, then sum -> K_b (Poisson–binomial)
         u = torch.rand_like(p_row)
@@ -552,8 +549,8 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
         rates: torch.Tensor,  # (B, N, S)
         drift_probs: torch.Tensor,  # (B, N, S)
         aatypes_t: torch.Tensor,  # (B, N)
-        t: torch.Tensor,  # scalar or (B,)
-        d_t: torch.Tensor,  # scalar or (B,)
+        t: torch.Tensor,  # (B,)
+        d_t: torch.Tensor,  # scalar
     ) -> torch.Tensor:
         """
         Regularize rates by capping them.
@@ -563,8 +560,7 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
         """
         B, N, S = rates.shape
         device = rates.device
-        t_b = t.to(device) if t.dim() > 0 else t.to(device).expand(B)  # (B,)
-        dt_b = d_t.to(device) if d_t.dim() > 0 else d_t.to(device).expand(B)  # (B,)
+        t = t.to(device)
 
         # uncertainty only for AA rows
         is_mask = aatypes_t == MASK_TOKEN_INDEX  # (B, N)
@@ -578,11 +574,11 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
         # simple per-step probability caps
         # mask: allow aggressive late unmasking (ramps to 0.6)
         pmax_mask = (
-            torch.clamp(0.1 + 0.6 * t_b, 0.05, 0.6).view(B, 1).expand(B, N)
+            torch.clamp(0.1 + 0.6 * t, 0.05, 0.6).view(B, 1).expand(B, N)
         )  # (B, N)
         # AA: allow flips mostly when uncertain & mid-trajectory
         pmax_aa = torch.clamp(
-            0.4 * (t_b * (1 - t_b)).view(B, 1) * uncert, 0.0, 0.25
+            0.4 * (t * (1 - t)).view(B, 1) * uncert, 0.0, 0.25
         )  # (B, N)
 
         # pmax depends on whether currently masked or AA
@@ -591,7 +587,7 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
 
         # convert probability to rate cap
         # CTMC relation: p = 1 - exp(-lambda * d_t) -> lambda = -log(1-p) / d_t
-        lambda_cap = -torch.log1p(-pmax) / dt_b.view(B, 1)
+        lambda_cap = -torch.log1p(-pmax) / d_t
 
         # soft-cap λ_eff = λ_cap * (1 - exp(-λ_raw / λ_cap))
         # monotone, identity for small rows, bounded for large rows
@@ -609,7 +605,7 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
         self,
         aatypes_t: torch.Tensor,  # (B, N)
         rates: torch.Tensor,  # (B, N, S)
-        d_t: torch.Tensor,  # (B,)
+        d_t: torch.Tensor,  # scalar
     ) -> torch.Tensor:
         """
         Single CTMC jump step using rate matrix (i.e. rates from current state), scaled by d_t.
@@ -624,18 +620,9 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
         S = rates.shape[-1]
         device = rates.device
 
-        # ensure d_t is on the right device/shape
-        d_t_b = d_t.to(device)
-        if d_t_b.dim() == 0:
-            d_t_b = d_t_b.expand(B)  # (B,)
-        elif d_t_b.dim() == 1:
-            assert d_t_b.shape[0] == B, "d_t shape must match batch"
-        else:
-            raise ValueError("d_t must be scalar or (B,)")
-
         # decide whether each residue jumps during d_t
         lambda_step = rates.sum(dim=-1)  # exit rate per site (B, N)
-        p_jump = 1.0 - torch.exp(-lambda_step * d_t_b.view(-1, 1))  # (B, N)
+        p_jump = 1.0 - torch.exp(-lambda_step * d_t)  # (B, N)
         jump_mask = torch.rand_like(p_jump) < p_jump  # (B, N)
         if not jump_mask.any():
             return aatypes_t
@@ -657,7 +644,7 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
 
     def euler_step(
         self,
-        d_t: torch.Tensor,  # (B,)
+        d_t: torch.Tensor,  # scalar
         t: torch.Tensor,  # (B,)
         logits_1: torch.Tensor,  # (B, N, S)
         aatypes_t: torch.Tensor,  # (B, N)

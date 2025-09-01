@@ -166,7 +166,7 @@ class FlowMatcherTrans(FlowMatcher):
 
     def euler_step(
         self,
-        d_t: torch.Tensor,  # (B,)
+        d_t: torch.Tensor,  # scalar
         t: torch.Tensor,  # (B,)
         trans_1: torch.Tensor,  # (B, N, 3)
         trans_t: torch.Tensor,  # (B, N, 3)
@@ -191,7 +191,7 @@ class FlowMatcherTrans(FlowMatcher):
             )
             sigma_t = sigma_t.to(trans_t.device)
             # Per-batch Brownian increment scales with sqrt(dt)
-            sqrt_dt = torch.sqrt(d_t).to(trans_t.device).view(-1, 1, 1)
+            sqrt_dt = torch.sqrt(d_t).to(trans_t.device)
             intermediate_noise = intermediate_noise * sqrt_dt * sigma_t[..., None, None]
         else:
             intermediate_noise = torch.zeros_like(trans_t)
@@ -202,5 +202,5 @@ class FlowMatcherTrans(FlowMatcher):
             ), f"potential {potential.shape} != trans_vf {trans_vf.shape}"
             trans_vf += potential
 
-        trans_next = trans_t + trans_vf * d_t.view(-1, 1, 1) + intermediate_noise
+        trans_next = trans_t + trans_vf * d_t + intermediate_noise
         return trans_next
