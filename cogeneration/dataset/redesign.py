@@ -415,8 +415,19 @@ class SequenceRedesigner:
             metadata = pd.read_csv(Path(self.cfg.metadata_csv).expanduser())
         else:
             self.log.info(f"Loading structures from datasets...")
+
+            # Optionally restrict datasets to PDB only
+            dataset_cfg = self.dataset_cfg
+            if getattr(self.cfg, "pdb_only", False):
+                dataset_cfg = self.dataset_cfg.clone()
+                dataset_cfg.enable_cogeneration_pdb = True
+                dataset_cfg.enable_cogeneration_afdb = False
+                dataset_cfg.enable_cogeneration_redesigns = False
+                dataset_cfg.enable_multiflow_redesigned = False
+                dataset_cfg.enable_multiflow_synthetic = False
+
             dataset = BaseDataset(
-                cfg=self.dataset_cfg,
+                cfg=dataset_cfg,
                 task=DataTask.hallucination,
                 eval=False,
                 use_test=False,

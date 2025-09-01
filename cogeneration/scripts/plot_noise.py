@@ -18,6 +18,7 @@ import torch
 from cogeneration.config.base import Config
 from cogeneration.data import so3_utils
 from cogeneration.data.const import MASK_TOKEN_INDEX, NM_TO_ANG_SCALE
+from cogeneration.data.fm.aatypes_ctmc import FlowMatcherAATypesCTMC
 from cogeneration.data.fm.rotations import FlowMatcherRotations
 from cogeneration.data.fm.translations import FlowMatcherTrans
 from cogeneration.data.interpolant import Interpolant
@@ -167,7 +168,9 @@ def measure_training_noise(
 
     # calibration constants so theory matches units and aggregation used for empirical curves
     # translations: mean ||noise|| for one unit sigma
-    cal_trans = interpolant._trans_noise(chain_idx=chain_idx, is_intermediate=True)
+    cal_trans = interpolant.trans_fm.sample_base(
+        chain_idx=chain_idx, is_intermediate=True
+    )
     cal_trans_mean_norm = torch.linalg.norm(cal_trans, dim=-1).mean().item()
     # rotations: mean angle (rad) for IGSO3 sigma=1
     rots_fm = FlowMatcherRotations(cfg=interpolant.cfg.rots)
@@ -240,7 +243,7 @@ def measure_training_noise(
 
         # aatypes: fraction of positions changed by stochastic jump
         seed_all(32340 + i)
-        aa_no = interpolant._corrupt_aatypes(
+        aa_no = interpolant.aatypes_fm.corrupt(
             aatypes_1=aatypes_1,
             t=t_b,
             res_mask=res_mask,
@@ -248,7 +251,7 @@ def measure_training_noise(
             stochasticity_scale=0.0,
         )
         seed_all(32340 + i)
-        aa_st = interpolant._corrupt_aatypes(
+        aa_st = interpolant.aatypes_fm.corrupt(
             aatypes_1=aatypes_1,
             t=t_b,
             res_mask=res_mask,
@@ -265,13 +268,9 @@ def measure_training_noise(
             scale=interpolant.cfg.trans.stochastic_noise_intensity,
         )
         # rotations use schedule-transformed time for sigma
-        if interpolant.cfg.rots.train_schedule.name == "linear":
-            so3_t = t_b.squeeze(1)
-        elif interpolant.cfg.rots.train_schedule.name == "exp":
-            rate = interpolant.cfg.rots.exp_rate
-            so3_t = (1 - torch.exp(-t_b.squeeze(1) * rate)) / (1 - math.exp(-rate))
-        else:
-            raise ValueError("Unknown rotations train schedule")
+        rots_fm = FlowMatcherRotations(cfg=interpolant.cfg.rots)
+        rots_fm.set_device(device)
+        so3_t = rots_fm._so3_train_time(t_b.squeeze(1))
         sigma_t_rots = interpolant.rots_fm._compute_sigma_t(
             t=so3_t,
             scale=interpolant.cfg.rots.stochastic_noise_intensity,
@@ -312,6 +311,10 @@ def measure_sampling_noise_and_drift(
     rots_fm.set_device(device)
     rotmats_t = rots_fm.sample_base(res_mask=res_mask)
     aatypes_t = interpolant.aatypes_fm.sample_base(res_mask=res_mask)
+
+    # helper for theoretical aatypes rates and scales
+    ctmc = FlowMatcherAATypesCTMC(cfg=interpolant.cfg.aatypes)
+    ctmc.set_device(device)
 
     ts = torch.linspace(interpolant.cfg.min_t, 1.0, num_timesteps, device=device)
 
@@ -462,7 +465,7 @@ def measure_sampling_noise_and_drift(
 
         # ----- aatypes -----
         seed_all(61340 + i)
-        aa_next_drift = interpolant._aatypes_euler_step(
+        aa_next_drift = interpolant.aatypes_fm.euler_step(
             d_t=dt,
             t=t1,
             logits_1=torch.zeros(
@@ -492,7 +495,7 @@ def measure_sampling_noise_and_drift(
         out.aa_drift_change_frac.append(drift_change.mean().item())
 
         seed_all(61340 + i)
-        aa_next_noise = interpolant._aatypes_euler_step(
+        aa_next_noise = interpolant.aatypes_fm.euler_step(
             d_t=dt,
             t=t1,
             logits_1=torch.zeros(
@@ -554,7 +557,7 @@ def measure_sampling_noise_and_drift(
         out.aa_sigma_step.append(p_jump.mean().item())
 
         # empirical jump rate by calling jump-step directly
-        aa_after_jump = interpolant.aatypes_fm._aatype_jump_step(
+        aa_after_jump = interpolant.aatypes_fm._aatypes_jump_step(
             d_t=dt,
             t=t1,
             logits_1=torch.zeros(
@@ -571,10 +574,10 @@ def measure_sampling_noise_and_drift(
         logits_zeros = torch.zeros(
             num_batch, num_res, interpolant.num_tokens, device=device
         )
-        rates_drift, _ = interpolant._aatypes_build_rates_drift(
+        rates_drift, _ = ctmc._aatypes_build_rates_drift(
             aatypes_t=aatypes_t, logits_1=logits_zeros, t=t1, potential=None
         )
-        rates_noise = interpolant._aatypes_build_rates_noise(
+        rates_noise = ctmc._aatypes_build_rates_noise(
             aatypes_t=aatypes_t, t=t1, stochasticity_scale=1.0
         )
         S = rates_drift.shape[-1]
@@ -634,9 +637,7 @@ def measure_sampling_noise_and_drift(
         out.aa_noise_rate_change.append(noise_change_rate)
 
         # Per-component scales as a function of time (dimensionless)
-        scale_change, scale_unmask, scale_remask = (
-            interpolant._aatypes_component_scales(t=t1)
-        )
+        scale_change, scale_unmask, scale_remask = ctmc._aatypes_component_scales(t=t1)
         out.aa_scale_change.append(scale_change.mean().item())
         out.aa_scale_unmask.append(scale_unmask.mean().item())
         out.aa_scale_remask.append(scale_remask.mean().item())

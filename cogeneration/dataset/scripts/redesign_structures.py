@@ -19,8 +19,8 @@ Specify a metadata CSV instead of using dataset
 Use AlphaFold2 only for monomers:
     python redesign_structures.py folding.folding_model=alphafold2 'dataset.filter.num_chains=[1]'
 
-Specify dataset and output:
-    python redesign_structures.py dataset.datasets=[dataset_spec] redesign.output_dir=/path/to/redesigns
+Limit to PDB (overwrites per-dataset enabling) and specify separate output directory:
+    python redesign_structures.py redesign.pdb_only=True redesign.output_dir=/path/to/redesigns
 
 Filter structures to pure proteins:
     python redesign_structures.py dataset.filter.max_non_residue_entities=0
@@ -51,7 +51,7 @@ def main(cfg: Config) -> None:
     register_memory_debugger()
 
     # disable the cache to limit memory usage - structures only used once
-    config.dataset.cache_num_res = 1e6
+    config.dataset.cache_num_res = int(1e6)
 
     # modify dataset cfg if providing redesigns
     if (

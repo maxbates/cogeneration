@@ -1610,6 +1610,8 @@ class RedesignConfig(BaseClassConfig):
     # When using `best_redesigns_csv`, override dataset filtering to be lenient so
     # we do not accidentally filter out target structures before matching.
     use_lenient_filter_with_best_redesigns: bool = True
+    # Limit datasets to PDB only when loading redesign targets from datasets
+    pdb_only: bool = True
 
 
 ##### Config #####

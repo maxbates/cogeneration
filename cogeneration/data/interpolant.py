@@ -20,7 +20,11 @@ from cogeneration.config.base import (
 )
 from cogeneration.data import so3_utils
 from cogeneration.data.const import MASK_TOKEN_INDEX
-from cogeneration.data.fm.aatypes import FlowMatcherAATypes
+from cogeneration.data.fm.aatypes import (
+    FlowMatcherAATypes,
+    FlowMatcherAATypesMasking,
+    FlowMatcherAATypesUniform,
+)
 from cogeneration.data.fm.rotations import FlowMatcherRotations
 from cogeneration.data.fm.torsions import FlowMatcherTorsions
 from cogeneration.data.fm.translations import FlowMatcherTrans
@@ -150,7 +154,22 @@ class Interpolant:
         self.trans_fm = FlowMatcherTrans(cfg=self.cfg.trans)
         self.torsions_fm = FlowMatcherTorsions(cfg=self.cfg.torsions)
         self.rots_fm = FlowMatcherRotations(cfg=self.cfg.rots)
-        self.aatypes_fm = FlowMatcherAATypes(cfg=self.cfg.aatypes)
+
+        # Instantiate AAtypes flow matcher according to interpolant type
+        if (
+            self.cfg.aatypes.interpolant_type
+            == InterpolantAATypesInterpolantTypeEnum.masking
+        ):
+            self.aatypes_fm = FlowMatcherAATypesMasking(cfg=self.cfg.aatypes)
+        elif (
+            self.cfg.aatypes.interpolant_type
+            == InterpolantAATypesInterpolantTypeEnum.uniform
+        ):
+            self.aatypes_fm = FlowMatcherAATypesUniform(cfg=self.cfg.aatypes)
+        else:
+            raise ValueError(
+                f"Unknown aatypes interpolant type {self.cfg.aatypes.interpolant_type}"
+            )
 
     def set_device(self, device: torch.device):
         self._device = device
