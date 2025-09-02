@@ -102,7 +102,7 @@ class PredBatchProp(StrEnum):
 
 
 """TensorFeat is a feature in primitive or pytorch"""
-TensorFeat = Union[torch.Tensor, str, int]
+TensorFeat = Union[torch.Tensor, str, int, None]
 
 """BatchFeatures is a batch, features after featurizing ProcessedFile"""
 BatchFeatures = Dict[BatchProp, TensorFeat]

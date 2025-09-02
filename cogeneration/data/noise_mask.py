@@ -107,17 +107,21 @@ def uniform_so3(num_batch: int, num_res: int, device) -> torch.Tensor:
     )
 
 
-def masked_categorical(num_batch, num_res, device) -> torch.Tensor:
+def masked_categorical(
+    num_batch: int, num_res: int, device: torch.device
+) -> torch.Tensor:
     """
-    Returns a mask tensor of shape (num_batch, num_res) with all values set to MASK_TOKEN_INDEX.
+    Returns a (B, N) tensor with all values set to MASK_TOKEN_INDEX.
     e.g. t=0 aa types, masking interpolation
     """
     return torch.ones(size=(num_batch, num_res), device=device) * MASK_TOKEN_INDEX
 
 
-def uniform_categorical(num_batch, num_res, num_tokens, device) -> torch.Tensor:
+def uniform_categorical(
+    num_batch: int, num_res: int, num_tokens: int, device: torch.device
+) -> torch.Tensor:
     """
-    Returns uniform random samples from the range [0, num_tokens) of shape (num_batch, num_res).
+    Returns (B, N) uniform random samples from the range [0, num_tokens).
     e.g. t=0 aa types, uniform interpolation
     """
     return torch.randint(

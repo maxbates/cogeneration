@@ -169,7 +169,7 @@ class FlowMatcherRotations(FlowMatcher):
             rot_vf += potential
 
         rotmats_next = so3_utils.geodesic_t(
-            t=scaling * d_t, # scaled time along geodesic
+            t=scaling * d_t,  # scaled time along geodesic
             mat=rotmats_1,
             base_mat=rotmats_t,
             rot_vf=rot_vf,

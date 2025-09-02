@@ -10,6 +10,7 @@ from cogeneration.config.base import (
     InterpolantAATypesScheduleEnum,
 )
 from cogeneration.data.const import MASK_TOKEN_INDEX
+from cogeneration.data.fm.aatypes import FlowMatcherAATypes
 from cogeneration.data.fm.flow_matcher import FlowMatcher
 from cogeneration.data.logits import combine_logits
 from cogeneration.data.noise_mask import (
@@ -19,7 +20,7 @@ from cogeneration.data.noise_mask import (
 )
 
 
-class FlowMatcherAATypesCTMC(FlowMatcher):
+class FlowMatcherAATypesCTMC(FlowMatcherAATypes):
     """
     AAtypes flow matching using CTMC drift rate matrix + optional noise
     """
@@ -53,7 +54,7 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
                 f"Unknown aatypes interpolant type {self.cfg.interpolant_type}"
             )
 
-    def _aatypes_schedule(
+    def aatypes_rate_schedule(
         self,
         t: torch.Tensor,  # (B,)
         kappa: float = 1.0,
@@ -68,23 +69,16 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
         eps smooths blowup at t=1
         kappa > 0 adds some mass early on
         """
-        if self.cfg.schedule == InterpolantAATypesScheduleEnum.linear:
-            y = t
-        elif self.cfg.schedule == InterpolantAATypesScheduleEnum.exp:
-            # map t -> y in [0,1): y = (1 - e^{-rt}) / (1 - e^{-r})
-            r = float(abs(self.cfg.schedule_exp_rate))
-            y = (1.0 - torch.exp(-r * t)) / (1.0 - math.e ** (-r))
-        else:
-            raise ValueError(f"Unknown aatypes schedule {self.cfg.schedule}")
+        tau = self.aatypes_rate_schedule(t=t)
 
-        sched = (1.0 + kappa * y + eps) / (1.0 - y + eps)
+        sched = (1.0 + kappa * tau + eps) / (1.0 - tau + eps)
         sched = sched.clamp_min(0.0)
 
-        return sched, y
+        return sched, tau
 
     def _aatypes_component_scales(
         self,
-        t: torch.Tensor,  # scalar or (B,)
+        t: torch.Tensor,  # (B,)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Time-dependent aatypes drift rate per-component scales
@@ -95,14 +89,10 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
         remask_scale (AA->MASK) : (B, 1, 1)  ~ cfg.remask_rate * 1/s_sched(t) - eps [->0 @ t=1]
         """
         t = t.to(self._device)
-        if t.dim() == 0:
-            t_b = t.expand(1)  # (B=1,)
-        else:
-            t_b = t.view(-1)  # (B,)
 
         # aggressively smooth out near t=1
         eps = 0.25
-        sched, _ = self._aatypes_schedule(t=t_b, eps=eps)
+        sched, _ = self.aatypes_rate_schedule(t=t, eps=eps)
         sched = sched.view(-1, 1, 1)
         inv_sched = (1.0 / sched).view(-1, 1, 1)
 
@@ -141,7 +131,7 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
         assert diffuse_mask.shape == (num_batch, num_res)
 
         # aatypes_t = aatypes_1 with masked fraction of residues based on t
-        _, tau = self._aatypes_schedule(t=t)
+        tau = self.aatypes_schedule(t=t)
         u = torch.rand(num_batch, num_res, device=self._device)
         corruption_mask = (u < (1.0 - tau)).int()
         aatypes_base = self.sample_base(res_mask=res_mask)
@@ -156,7 +146,7 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
             # we simply introduce changes, dependent on t and interpolant type.
 
             sigma_t = self._compute_sigma_t(
-                t,  # (B,)
+                tau,  # (B,)
                 scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
             )
 
@@ -182,8 +172,9 @@ class FlowMatcherAATypesCTMC(FlowMatcher):
                 # For masking interpolant, additional unmask / remask / change, weighted by component scales
                 elif interpolant_type == InterpolantAATypesInterpolantTypeEnum.masking:
                     # unmask unneeded - any mask that is jumping will unmask
+                    # pass t, not tau, will be scaled in function
                     change_scale, unmask_scale, remask_scale = (
-                        self._aatypes_component_scales(t=t.squeeze(1))
+                        self._aatypes_component_scales(t=t)
                     )
                     change_scale = change_scale.view(num_batch)
                     remask_scale = remask_scale.view(num_batch)

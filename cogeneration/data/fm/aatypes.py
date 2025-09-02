@@ -1,5 +1,5 @@
 import math
-from abc import ABC, abstractmethod
+from abc import ABC, abstractmethod, abstractproperty
 from typing import Optional, Tuple
 
 import torch
@@ -26,10 +26,16 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
 
     def __init__(self, cfg: InterpolantAATypesConfig):
         self.cfg = cfg
-        self._device: Optional[torch.device] = None
+        self._device: torch.device = torch.device("cpu")
 
     def set_device(self, device: torch.device):
         self._device = device
+
+    @property
+    @abstractmethod
+    def num_tokens(self) -> int:
+        """Number of amino acid tokens."""
+        raise NotImplementedError
 
     @abstractmethod
     def sample_base(
@@ -64,20 +70,14 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
         """Perform aatypes single Euler step update, returning new aatypes (B, N)"""
         raise NotImplementedError
 
-    def _aatypes_schedule(
+    def aatypes_schedule(
         self,
         t: torch.Tensor,  # (B,)
-        kappa: float = 1.0,
-        eps: float = 0.05,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Schedule for aatypes drift rate per-component scales
 
-        Returns `sched` and `tau` (mapped t -> y),
-        where `sched` is (1 + kappa * tau + eps) / (1 - tau + eps)
-
-        eps smooths blowup at t=1
-        kappa > 0 adds some mass early on
+        Returns `tau` (mapped time) (B,)
         """
         if self.cfg.schedule == InterpolantAATypesScheduleEnum.linear:
             y = t
@@ -88,10 +88,40 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
         else:
             raise ValueError(f"Unknown aatypes schedule {self.cfg.schedule}")
 
-        sched = (1.0 + kappa * y + eps) / (1.0 - y + eps)
-        sched = sched.clamp_min(0.0)
+        return y.clamp(min=0.0, max=1.0)
 
-        return sched, y
+    def _uncertainty_gate(
+        self,
+        aatypes_t: torch.Tensor,  # (B, N)
+        drift_probs: torch.Tensor,  # (B, N, S)
+    ) -> torch.Tensor:
+        """
+        Uncertainty gate (i.e. `1.0 - p_current`) multiplier (B, N)
+
+        May wish to .clamp_min(floor) e.g. for noise on very certain positions.
+        """
+        is_mask = aatypes_t == MASK_TOKEN_INDEX
+        is_aa = ~is_mask
+
+        # uncertainty gating: for AA rows use 1 - p(current), for MASK rows set to 1
+        if self.cfg.uncertainty_gating:
+            p_current = (
+                drift_probs.gather(-1, aatypes_t.long().unsqueeze(-1))
+                .squeeze(-1)
+                .clamp(0.0, 1.0)
+            )  # (B, N)
+            # (1 - p_current) ** gamma
+            uncertainty = (1.0 - p_current) ** self.cfg.uncertainty_gating_gamma
+            # mask to AA rows
+            uncertainty = uncertainty * is_aa.float() + (
+                1.0 * is_mask.float()
+            )  # (B, N)
+        else:
+            uncertainty = torch.ones_like(
+                is_aa, dtype=torch.float, device=self._device
+            )  # (B, N)
+
+        return uncertainty  # (B, N)
 
     def _regularize_step_probs(
         self,
@@ -108,22 +138,18 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
         but if it is high relative to other residues, it will likely stay
         """
         num_batch, num_res, S = probs.shape
-        device = probs.device
         assert aatypes_t.shape == (num_batch, num_res)
 
+        # clone to avoid in-place modification
         # clamp the probabilities in `step_probs` to the range [0.0, 1.0] to ensure valid probability values.
-        probs = torch.clamp(probs, min=0.0, max=1.0)
+        probs = probs.clone().clamp(min=0.0, max=1.0)
 
-        batch_idx = torch.arange(num_batch, device=device).repeat_interleave(num_res)
-        residue_idx = torch.arange(num_res, device=device).repeat(num_batch)
-        curr_states = aatypes_t.long().flatten()
+        # zero current state
+        probs.scatter_(-1, aatypes_t.long().unsqueeze(-1), 0.0)
 
-        # set the probabilities corresponding to the current amino acid types to 0.0
-        probs[batch_idx, residue_idx, curr_states] = 0.0
-
-        # adjust the probabilities at the current positions to be 1 - sum of all other values in the row
-        row_sums = torch.sum(probs, dim=-1).flatten()
-        probs[batch_idx, residue_idx, curr_states] = 1.0 - row_sums
+        # set diagonal (current state) to 1 - sum(off-diagonal)
+        row_sums = probs.sum(-1, keepdim=True)
+        probs.scatter_(-1, aatypes_t.long().unsqueeze(-1), 1.0 - row_sums)
 
         # clamp the probabilities in `step_probs` to the range [0.0, 1.0] to ensure valid probability values.
         # in case negative or out-of-bound values appear after the diagonal assignment.
@@ -160,7 +186,7 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
         if logits_1 is None:
             # uniform rates excluding self
             S = self.num_tokens
-            prob_rows = torch.ones(B, N, S, device=self._device)
+            prob_rows = torch.ones(B, N, self.num_tokens, device=self._device)
             current_idx = aatypes_t.unsqueeze(-1).long()
             prob_rows.scatter_(-1, current_idx, 0.0)
             prob_rows = prob_rows / prob_rows.sum(-1, keepdim=True).clamp_min(1e-8)
