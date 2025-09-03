@@ -667,9 +667,11 @@ class SequenceRedesigner:
                 # RMSD string, depending on number of redesigns
                 rmsds = list(sorted([r.rmsd for r in redesigns]))
                 if len(rmsds) > 1:
-                    last_rmsd = f"µ: {sum(rmsds) / (len(rmsds)):.2f} #1: {rmsds[0]:.2f} ({pdb_name})"
+                    last_rmsd = (
+                        f"{rmsds[0]:.2f} [µ={sum(rmsds) / (len(rmsds)):.2f}] {pdb_name}"
+                    )
                 else:
-                    last_rmsd = f"{rmsds[0]:.2f} ({pdb_name})"
+                    last_rmsd = f"{rmsds[0]:.2f} {pdb_name}"
 
                 # garbage collect between iterations
                 del redesigns, processed_file

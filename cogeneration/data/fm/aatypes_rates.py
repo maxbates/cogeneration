@@ -1,3 +1,7 @@
+"""
+WIP (i.e. not yet correct) rate-matrix formulation for CTMC jump aatypes flow matcher
+"""
+
 import math
 from typing import Optional, Tuple
 
@@ -54,7 +58,7 @@ class FlowMatcherAATypesCTMC(FlowMatcherAATypes):
                 f"Unknown aatypes interpolant type {self.cfg.interpolant_type}"
             )
 
-    def aatypes_rate_schedule(
+    def _aatypes_rate_schedule(
         self,
         t: torch.Tensor,  # (B,)
         kappa: float = 1.0,
@@ -69,7 +73,7 @@ class FlowMatcherAATypesCTMC(FlowMatcherAATypes):
         eps smooths blowup at t=1
         kappa > 0 adds some mass early on
         """
-        tau = self.aatypes_rate_schedule(t=t)
+        tau = self._aatypes_schedule(t=t)
 
         sched = (1.0 + kappa * tau + eps) / (1.0 - tau + eps)
         sched = sched.clamp_min(0.0)
@@ -92,7 +96,7 @@ class FlowMatcherAATypesCTMC(FlowMatcherAATypes):
 
         # aggressively smooth out near t=1
         eps = 0.25
-        sched, _ = self.aatypes_rate_schedule(t=t, eps=eps)
+        sched, _ = self._aatypes_rate_schedule(t=t, eps=eps)
         sched = sched.view(-1, 1, 1)
         inv_sched = (1.0 / sched).view(-1, 1, 1)
 
@@ -131,7 +135,7 @@ class FlowMatcherAATypesCTMC(FlowMatcherAATypes):
         assert diffuse_mask.shape == (num_batch, num_res)
 
         # aatypes_t = aatypes_1 with masked fraction of residues based on t
-        tau = self.aatypes_schedule(t=t)
+        tau = self._aatypes_schedule(t=t)
         u = torch.rand(num_batch, num_res, device=self._device)
         corruption_mask = (u < (1.0 - tau)).int()
         aatypes_base = self.sample_base(res_mask=res_mask)

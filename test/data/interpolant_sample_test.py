@@ -8,7 +8,7 @@ from cogeneration.config.base import (
 )
 from cogeneration.data import so3_utils
 from cogeneration.data.const import MASK_TOKEN_INDEX
-from cogeneration.data.fm.aatypes_ctmc import FlowMatcherAATypesCTMC
+from cogeneration.data.fm.aatypes_rates import FlowMatcherAATypesCTMC
 from cogeneration.data.interpolant import BatchTrueFeatures, Interpolant
 from cogeneration.dataset.test_utils import create_pdb_batch, mock_feats
 from cogeneration.type.batch import BatchProp as bp

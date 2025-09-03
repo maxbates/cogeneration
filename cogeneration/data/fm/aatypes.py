@@ -1,5 +1,5 @@
 import math
-from abc import ABC, abstractmethod, abstractproperty
+from abc import ABC, abstractmethod
 from typing import Optional, Tuple
 
 import torch
@@ -21,8 +21,26 @@ from cogeneration.data.noise_mask import (
 
 class FlowMatcherAATypes(FlowMatcher, ABC):
     """
-    Flow matcher for amino acid types (categorical domain).
+    Noisy aatypes interpolant
+
+    Uses Multiflow-style probability view and torch.multinomial() for jumps,
+    with explicit drift vs noise handling
     """
+
+    # TODO - configurable leave_mass_cap, or disable
+    # maximum leave mass during sampling
+    leave_mass_cap: Optional[float] = 0.25
+
+    # intensity multiplier for noise => E[#noise jumps] ~ 0.5 when scale=1
+    # Expected number of noise jumps per position over the full path:
+    #   E ≈ NOISE_GAIN * eta_base * ∫_0^1 t(1 - t) dt
+    #     = 3 * eta_base * (1/6)
+    #     = 0.5 * eta_base
+    # where:
+    #   - NOISE_GAIN = 3 (by design),
+    #   - eta_base = stochastic_noise_intensity * stochasticity_scale,
+    #   - assuming min_sigma = 0.
+    NOISE_GAIN: int = 3
 
     def __init__(self, cfg: InterpolantAATypesConfig):
         self.cfg = cfg
@@ -70,7 +88,7 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
         """Perform aatypes single Euler step update, returning new aatypes (B, N)"""
         raise NotImplementedError
 
-    def aatypes_schedule(
+    def _aatypes_schedule(
         self,
         t: torch.Tensor,  # (B,)
     ) -> torch.Tensor:
@@ -96,7 +114,7 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
         drift_probs: torch.Tensor,  # (B, N, S)
     ) -> torch.Tensor:
         """
-        Uncertainty gate (i.e. `1.0 - p_current`) multiplier (B, N)
+        Uncertainty gate (i.e. `1.0 - p_current`) multiplier (B, N). Ones if disabled.
 
         May wish to .clamp_min(floor) e.g. for noise on very certain positions.
         """
@@ -134,7 +152,8 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
         - rows sum to 1
         - current state is set to 1 - sum of all other values
 
-        So that if the probability of the current residue is low, it will likely jump,
+        Has the effect of injecting "stay" mass for the current state,
+        so that if the probability of the current residue is low, it will likely jump,
         but if it is high relative to other residues, it will likely stay
         """
         num_batch, num_res, S = probs.shape
@@ -157,93 +176,148 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
 
         return probs
 
-    def _aatypes_jump_step(
+    def _uniform_kernel(
         self,
-        d_t: torch.Tensor,  # scalar
+        aatypes: torch.Tensor,  # (B, N)
+        change_only: bool = True,
+        forbid_cols: Tuple[
+            int, ...
+        ] = (),  # e.g. (MASK_TOKEN_INDEX,) in masking for change kernel
+        eps: float = 1e-12,
+    ) -> torch.Tensor:
+        B, N = aatypes.shape
+        S = self.num_tokens
+        K = torch.ones(B, N, S, device=self._device)
+        for col in forbid_cols:
+            K[..., col] = 0.0
+        if change_only:
+            K.scatter_(-1, aatypes.long().unsqueeze(-1), 0.0)
+        K = K / K.sum(-1, keepdim=True).clamp_min(eps)
+        return K
+
+    def _cumulative_hazard_rho(
+        self,
         t: torch.Tensor,  # (B,)
-        logits_1: Optional[torch.Tensor],  # (B, N, S)
-        aatypes_t: torch.Tensor,  # (B, N)
-        stochasticity_scale: float = 1.0,
+        scale: float = 1.0,  # like _compute_sigma_t(), e.g. stochastic_scale
+        min_sigma: float = 0.0,  # like _compute_sigma_t()
+        kappa: float = 4.1589,  # hazard gain/steepness; larger -> quicker corruption
+        eps: float = 1e-4,
+        normalize: bool = False,  # => ρ(0)=1, ρ(1)=0 i.e. ignore scale
     ) -> torch.Tensor:
         """
-        CTMC jump for aatypes. pass no logits for stochastic jump.
+        Returns rho(t), cumulative hazard from uniform / noise to t (or tau)
+        cf. _compute_sigma_t() -> sigma_t which is instantaneous at `t`
+        sigma_t^2 = scale^2 * t(1-t) + min_sigma^2
 
-        Uses logits -> rate matrix to allow sequnce to explore neighboring states
-        in proportion to the rates the network thinks are possible.
-        So notice that unlike in training, where jumps are to a uniform-random sampled state,
-        here the jumps are to states the network thinks are plausible.
-        The thinking is that during training, the model must learn a broad "restoring drift" and uniform sampling is class balanced.
-        (We can't use logits during training without simulation, they are just a one-hot of the sequence.)
-        However, this training may slow convergence, or the model may only learn to fix very wrong residues.
+        rho(t) is built from sigma_t using a Poisson map.
+        we pull out `scale` from integral and multiply in linearly.
 
-        This is different than the `cfg.noise` term,
-        which adds noise to the rate matrix in determinsitic interpolation.
+        - When normalize=False
+            rho = 1 - exp(-kappa * scale * I_shape(t))
+        - When normalize=True
+            rho = [1 - exp(-kappa * I_shape(t))] / [1 - exp(-kappa * I_shape(0))]
+            (scale is ignored so endpoints are fixed for all 'scale')
+
+        where I_shape(t) = ∫ t^1 [1·u(1-u) + min_sigma^2] du
+                         = (1 - 3t^2 + 2t^3)/6 + min_sigma^2 * (1 - t).
+
+        Default kappa is ln(2)/(1/6) so rho(t=0, scale=1) = 0.5
         """
-        B, N = aatypes_t.shape
-        t = t.to(self._device)
-        d_t = d_t.to(self._device)
+        t = t.clamp(0.0, 1.0)
+        scale = max(scale, 0.0)  # >= 0
+        scale *= self.NOISE_GAIN
 
-        if logits_1 is None:
-            # uniform rates excluding self
-            S = self.num_tokens
-            prob_rows = torch.ones(B, N, self.num_tokens, device=self._device)
-            current_idx = aatypes_t.unsqueeze(-1).long()
-            prob_rows.scatter_(-1, current_idx, 0.0)
-            prob_rows = prob_rows / prob_rows.sum(-1, keepdim=True).clamp_min(1e-8)
-        else:
-            S = logits_1.shape[-1]
-            prob_rows = F.softmax(logits_1 / self.cfg.drift_temp, dim=-1)
-            prob_rows = prob_rows.clamp(min=1e-8)
+        # shape-only closed form integral of σ^2 at scale=1
+        I_shape = (1.0 - 3.0 * t**2 + 2.0 * t**3) / 6.0 + (min_sigma**2) * (
+            1.0 - t
+        )  # (B,)
 
-        # Build rate matrix (positive exits)
-        current_idx = aatypes_t.unsqueeze(-1).long()  # (B,N,1)
-        exit_rates = prob_rows.scatter_(-1, current_idx, 0.0)
-        exit_sums = exit_rates.sum(-1, keepdim=True)
-        step_rates = exit_rates.clone()
-        step_rates.scatter_(-1, current_idx, -exit_sums)  # current = neg sum of others
+        if not normalize:
+            # linear-in-scale hazard
+            rho = 1.0 - torch.exp(-kappa * scale * I_shape)
+            return rho.clamp(0.0, 1.0)
 
-        # Multiply by sigma_t so amount of noise mirrors other domains.
-        # Multiplying the whole rate matrix by the same value preserves valid rate matrix.
-        sigma_t = self._compute_sigma_t(
-            t,
-            scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
-        )
-        step_rates = step_rates * sigma_t[..., None, None]  # (B, N, S)
+        # normalize so endpoints are exact irrespective of scale
+        I0_shape = (1.0 / 6.0) + (min_sigma**2)  # I_shape at t=0
+        num = 1.0 - torch.exp(-kappa * I_shape)  # (B,)
+        den = 1.0 - math.exp(-kappa * I0_shape)  # scalar
+        rho = (num / (den + eps)).clamp(0.0, 1.0)
+        return rho
 
-        # decide whether each residue jumps during d_t
-        # total exit rate λ_i = − q_{i, current_state}
-        lambda_step = -step_rates.gather(-1, current_idx).squeeze(-1)  # (B, N), >0
-        p_jump = 1.0 - torch.exp(-lambda_step * d_t.view(-1, 1))  # (B, N)
-        jump_mask = torch.rand_like(p_jump) < p_jump  # bool (B, N)
+    def _sample_aatypes(
+        self,
+        probs: torch.Tensor,  # (B, N, S)
+        aatypes_1: torch.Tensor,  # (B, N)
+        res_mask: Optional[torch.Tensor],  # (B, N)
+        diffuse_mask: Optional[torch.Tensor],  # (B, N)
+    ) -> torch.Tensor:
+        """
+        Sample residues according to probs
+        """
+        B, N = aatypes_1.shape
+        assert probs.shape == (B, N, self.num_tokens)
 
-        if not jump_mask.any():
-            return aatypes_t
+        # sample residues according to probs
+        aatypes_t = torch.multinomial(probs.view(-1, self.num_tokens), num_samples=1)
+        aatypes_t = aatypes_t.view(B, N)
 
-        # set current state to 0, then normalize by exit rate
-        jump_aa_probs = step_rates.clone()
-        jump_aa_probs.scatter_(-1, current_idx, 0.0)
-        jump_aa_probs = jump_aa_probs / lambda_step.clamp_min(1e-8).unsqueeze(-1)
+        # residues outside `res_mask` are set to mask regardless; these should be excluded downstream
+        if res_mask is not None:
+            aatypes_t = aatypes_t * res_mask + MASK_TOKEN_INDEX * (1 - res_mask)
 
-        # sample new aa only for residues that jump
-        jumped_states = (
-            torch.multinomial(jump_aa_probs[jump_mask].reshape(-1, S), 1)
-            .squeeze(-1)
-            .to(aatypes_t.dtype)
-        )
+        # limit to diffuse_mask
+        if diffuse_mask is not None:
+            aatypes_t = mask_blend_1d(aatypes_t, aatypes_1, diffuse_mask)
 
-        # set new aa for jumped residues
-        jumped_aatypes_t = aatypes_t.clone()
-        jumped_aatypes_t[jump_mask] = jumped_states
-        return jumped_aatypes_t
+        return aatypes_t
+
+    def _poisson_noise_weight(
+        self,
+        t: torch.Tensor,  # (B,)
+        d_t: torch.Tensor,  # scalar
+        scale: float = 1.0,  # like _compute_sigma_t(), e.g. stochastic_scale
+        min_sigma: float = 0.0,  # like _compute_sigma_t()
+    ) -> torch.Tensor:
+        """
+        Compute Poisson mapped noise weight nu_t (B,) from sigma_t:
+        nu_t = 1 - exp(d_t * sigma_t^2 * (scale * NOISE_GAIN))
+
+        note that training's one-shot mix-in of noise is not exact (multiple jumps possible):
+        difference cf. sampling is on the order of sqrt(k * nu * integral(sigma_t^2))
+        but with scale OOM~1 and d_t ~0.01, the difference is quite small
+        """
+        # get sigma_t^2 shape (~ scale=1.0)
+        sigma_t_squared = t * (1.0 - t) + (min_sigma**2)  # (B,)
+        # scale linearly by `scale`, and include NOISE_GAIN
+        lambda_t = d_t * sigma_t_squared * (scale * self.NOISE_GAIN)
+        # Poisson map
+        nu_t = 1 - torch.exp(-lambda_t)
+        return nu_t
+
+    def _cap_leave_mass(
+        self,
+        step_probs: torch.Tensor,  # (B, N, S)
+        aatypes_t: torch.Tensor,  # (B, N)
+    ) -> torch.Tensor:
+        """
+        Scale step_probs to limit leave mass
+        """
+        if self.leave_mass_cap is None:
+            return step_probs
+
+        off = step_probs.clone()
+        off.scatter_(-1, aatypes_t.long().unsqueeze(-1), 0.0)
+        row_sum = off.sum(-1, keepdim=True).clamp_min(1e-12)
+        shrink = (self.leave_mass_cap / row_sum).clamp_max(1.0)
+        return off * shrink
 
 
 class FlowMatcherAATypesUniform(FlowMatcherAATypes):
     """
-    Uniform interpolant over 20 amino acid tokens (no MASK token).
+    Noisy interpolant over 20 amino acid tokens (no MASK token).
 
-    - t=0 base sampling: uniform over 20 tokens
-    - corruption: blends toward base according to t with optional stochastic jumps
-    - euler_step: discrete flow update without a MASK token
+    Uses Multiflow-style probability view and torch.multinomial() for jumps,
+    with explicit drift vs noise handling
     """
 
     @property
@@ -251,9 +325,12 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
         return 20
 
     def sample_base(self, res_mask: torch.Tensor) -> torch.Tensor:
-        num_batch, num_res = res_mask.shape
+        """
+        Returns uniform (random AA) t=0 base distribution (B, N)
+        """
+        B, N = res_mask.shape
         return uniform_categorical(
-            num_batch, num_res, num_tokens=self.num_tokens, device=self._device
+            B, N, num_tokens=self.num_tokens, device=self._device
         )
 
     def corrupt(
@@ -265,84 +342,55 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
         stochasticity_scale: float = 1.0,
     ) -> torch.Tensor:
         """
-        Corrupt AA residues from t=1 to t using uniform base sampling (no MASK token).
-        Optionally add stochastic CTMC-style jumps controlled by sigma_t.
+        Corrupt AA residues from t=1 to t using uniform base (no mask),
+        with optional additional stochasticity.
         """
-        num_batch, num_res = res_mask.shape
-        assert aatypes_1.shape == (num_batch, num_res)
-        assert t.shape == (num_batch,), f"t.shape: {t.shape} != (num_batch,)"
-        assert res_mask.shape == (num_batch, num_res)
-        assert diffuse_mask.shape == (num_batch, num_res)
+        B, N = res_mask.shape
+        assert aatypes_1.shape == (B, N)
 
-        u = torch.rand(num_batch, num_res, device=self._device)
-        corruption_mask = (u < (1 - t.view(-1, 1))).int()
-        aatypes_0 = self.sample_base(res_mask=res_mask)
-        aatypes_t = mask_blend_1d(aatypes_0, aatypes_1, corruption_mask)
+        # scale t -> tau according to schedule (linear, exp)
+        tau = self._aatypes_schedule(t=t)
 
+        # drift: simple interpolation between current and base
+        # t=1 aatypes as one-hot logits
+        current_aatypes = F.one_hot(
+            aatypes_1, num_classes=self.num_tokens
+        ).float()  # (B, N, S)
+        # t=0 base distribution is uniform across states
+        base = self._uniform_kernel(aatypes=aatypes_1, change_only=False)  # (B, N, S)
+        # combine linearly
+        tau_b11 = tau.view(B, 1, 1)
+        probs = tau_b11 * current_aatypes + (1.0 - tau_b11) * base  # (B, N, S)
+
+        # stochasticity: add-on "rate" rho via Poisson map over ∫σ^2 hazard
         if (
             self.cfg.stochastic
             and self.cfg.stochastic_noise_intensity > 0.0
             and stochasticity_scale > 0.0
         ):
-            sigma_t = self._compute_sigma_t(
-                t,
+            # `rho` represents cumulative hazard
+            rho = self._cumulative_hazard_rho(
+                t=tau,
                 scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
-            ).unsqueeze(
-                1
-            )  # (B, 1)
-            p_jump = sigma_t.clamp(max=1.0)
-            jump_mask = torch.rand(num_batch, num_res, device=self._device) < p_jump
-            if jump_mask.any():
-                jump_noise = self.sample_base(res_mask=res_mask)
-                aatypes_t = mask_blend_1d(jump_noise, aatypes_t, jump_mask.int())
+            )
+            rho = rho.view(B, 1, 1)
 
-        # residues outside `res_mask` are set to mask regardless; these should be excluded downstream
-        aatypes_t = aatypes_t * res_mask + MASK_TOKEN_INDEX * (1 - res_mask)
+            # change-only kernel
+            kernel_change = self._uniform_kernel(aatypes=aatypes_1, change_only=True)
 
-        return mask_blend_1d(aatypes_t, aatypes_1, diffuse_mask)
+            # combine with drift probs using cumulative hazard
+            probs = (1.0 - rho) * probs + rho * kernel_change
 
-    def _euler_step_uniform(
-        self,
-        d_t: torch.Tensor,  # scalar
-        t: torch.Tensor,  # (B,)
-        logits_1: torch.Tensor,  # (B, N, S=20)
-        aatypes_t: torch.Tensor,  # (B, N)
-    ) -> torch.Tensor:
-        num_batch, num_res, num_states = logits_1.shape
-        assert aatypes_t.shape == (num_batch, num_res)
-        assert num_states == 20
-        assert (
-            aatypes_t.max() < 20
-        ), "No UNK tokens allowed in the uniform sampling step!"
+        # regularize probabilities
+        probs = probs / probs.sum(-1, keepdim=True).clamp_min(1e-12)
 
-        temp = self.cfg.drift_temp
-        noise = self.cfg.stochastic_noise_intensity
-
-        # convert logits to probabilities
-        pt_x1_probs = F.softmax(logits_1 / temp, dim=-1)  # (B, N, S)
-
-        # probability of x1 matching xt exactly, used for uncertainty scaling (noise * prob_eq_xt)
-        pt_x1_eq_xt_prob = torch.gather(
-            pt_x1_probs, dim=-1, index=aatypes_t.long().unsqueeze(-1)
-        )  # (B, N, 1)
-        assert pt_x1_eq_xt_prob.shape == (num_batch, num_res, 1)
-
-        # broadcast `t` to per-site
-        t_b = t.to(self._device).view(-1, 1, 1)
-
-        # compute step probabilities (scaled by d_t), with noise and time factoring.
-        # encourages transitions with a uncertainty-scaling 'noise' term for the current residue.
-        step_probs = d_t * (
-            pt_x1_probs * ((1.0 + noise + noise * (num_states - 1) * t_b) / (1.0 - t_b))
-            + noise * pt_x1_eq_xt_prob
+        # sample from probs, limiting to res_mask and diffuse_mask
+        return self._sample_aatypes(
+            probs=probs,
+            aatypes_1=aatypes_1,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
         )
-
-        # force valid rate matrix
-        step_probs = self._regularize_step_probs(step_probs, aatypes_t)
-
-        # sample new residues from step_probs
-        new_aatypes = torch.multinomial(step_probs.view(-1, num_states), num_samples=1)
-        return new_aatypes.view(num_batch, num_res)
 
     def euler_step(
         self,
@@ -353,43 +401,72 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
         stochasticity_scale: float = 1.0,
         potential: Optional[torch.Tensor] = None,  # (B, N, S=20)
     ) -> torch.Tensor:
-        """
-        Perform a single Euler update step for the uniform interpolant (S=20).
-        Adds optional jump step if stochastic is enabled.
-        """
+        B, N = aatypes_t.shape
+        assert logits_1.shape == (B, N, self.num_tokens)
+
+        # combine potential with predicted logits
         if potential is not None:
             assert (
                 potential.shape == logits_1.shape
-            ), f"Guidance logits shape {potential.shape} does not match logits_1 shape {logits_1.shape}"
+            ), f"guidance {potential.shape} != logits_1 {logits_1.shape}"
             logits_1 = combine_logits([logits_1, potential])
 
-        aatypes_t = self._euler_step_uniform(
-            d_t=d_t, t=t, logits_1=logits_1, aatypes_t=aatypes_t
-        )
+        # compute probabilities from softmaxed logits
+        probs = F.softmax(logits_1 / self.cfg.drift_temp, dim=-1)  # (B, N, S)
+
+        # uncertainty gate ~ 1 - p(current)
+        uncertainty = self._uncertainty_gate(aatypes_t, probs).unsqueeze(
+            -1
+        )  # (B, N, 1)
+
+        # compute drift step probs (off-diagonal mass)
+        step_probs = d_t * probs * uncertainty
 
         if (
             self.cfg.stochastic
             and self.cfg.stochastic_noise_intensity > 0.0
             and stochasticity_scale > 0.0
         ):
-            aatypes_t = self._aatypes_jump_step(
-                d_t,
-                t=t,
-                logits_1=logits_1,
-                aatypes_t=aatypes_t,
-                stochasticity_scale=stochasticity_scale,
+            # t -> tau according to schedule
+            tau = self._aatypes_schedule(t=t)
+
+            # compute noise leave mass scale
+            nu_t = self._poisson_noise_weight(
+                t=tau,
+                d_t=d_t,
+                scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
             )
-        return aatypes_t
+            nu_t = nu_t.clamp_min(0.0).view(B, 1, 1)
+
+            # change-only kernel
+            kernel_change = self._uniform_kernel(aatypes_t, change_only=True)
+
+            # combine scaled noise kernel with drift probs
+            step_probs += nu_t * kernel_change
+
+        # cap leave mass
+        step_probs = self._cap_leave_mass(step_probs, aatypes_t)
+
+        # regularize step probs
+        step_probs = self._regularize_step_probs(
+            probs=step_probs,
+            aatypes_t=aatypes_t,
+        )
+
+        return self._sample_aatypes(
+            probs=step_probs,
+            aatypes_1=aatypes_t,
+            res_mask=None,
+            diffuse_mask=None,
+        )
 
 
 class FlowMatcherAATypesMasking(FlowMatcherAATypes):
     """
-    Masking interpolant with optional purity-based unmasking (21 tokens including MASK).
+    Noisy aatypes interpolant over 21 amino acid tokens (including MASK token).
 
-    - t=0 base sampling: all MASK
-    - corruption: blends toward base according to t with optional stochastic jumps
-    - euler_step: discrete flow update that excludes MASK in softmax; optionally
-      uses purity-based unmasking schedule
+    Uses Multiflow-style probability view and torch.multinomial() for jumps,
+    with explicit drift vs noise handling
     """
 
     @property
@@ -397,8 +474,44 @@ class FlowMatcherAATypesMasking(FlowMatcherAATypes):
         return 21
 
     def sample_base(self, res_mask: torch.Tensor) -> torch.Tensor:
-        num_batch, num_res = res_mask.shape
-        return masked_categorical(num_batch, num_res, device=self._device)
+        """
+        Returns all-mask t=0 base distribution (B, N)
+        """
+        B, N = res_mask.shape
+        return masked_categorical(B, N, device=self._device)
+
+    def _masking_kernels(
+        self,
+        aatypes: torch.Tensor,  # (B, N)
+        eps: float = 1e-12,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Masking kernel for noisy aatypes interpolant
+        """
+        is_mask = (aatypes == MASK_TOKEN_INDEX).unsqueeze(-1)  # (B, N, 1)
+        is_aa = ~is_mask  # (B, N, 1)
+
+        # unmask kernel: uniform over AA columns only (exclude MASK)
+        kernel_unmask = (
+            self._uniform_kernel(
+                aatypes=aatypes,
+                change_only=False,
+                forbid_cols=(MASK_TOKEN_INDEX,),
+            )
+            * is_mask.float()
+        )
+
+        # change kernel: exclude self and MASK column
+        kernel_change = (
+            self._uniform_kernel(
+                aatypes=aatypes,
+                change_only=True,
+                forbid_cols=(MASK_TOKEN_INDEX,),
+            )
+            * is_aa.float()
+        )
+
+        return kernel_unmask, kernel_change
 
     def corrupt(
         self,
@@ -409,184 +522,65 @@ class FlowMatcherAATypesMasking(FlowMatcherAATypes):
         stochasticity_scale: float = 1.0,
     ) -> torch.Tensor:
         """
-        Corrupt AA residues from t=1 to t using masking base (all MASK at t=0).
-        Optionally add stochastic CTMC-style jumps controlled by sigma_t.
+        Linear drift to mask base distribution, one-shot Poisson noise mixed between unmask and change
         """
-        num_batch, num_res = res_mask.shape
-        assert aatypes_1.shape == (num_batch, num_res)
-        assert t.shape == (num_batch,), f"t.shape: {t.shape} != (num_batch,)"
-        assert res_mask.shape == (num_batch, num_res)
-        assert diffuse_mask.shape == (num_batch, num_res)
+        B, N = res_mask.shape
+        assert aatypes_1.shape == (B, N)
 
-        u = torch.rand(num_batch, num_res, device=self._device)
-        corruption_mask = (u < (1 - t.view(-1, 1))).int()
-        aatypes_0 = self.sample_base(res_mask=res_mask)
-        aatypes_t = mask_blend_1d(aatypes_0, aatypes_1, corruption_mask)
+        # scale t -> tau according to schedule (linear, exp)
+        tau = self._aatypes_schedule(t=t)
 
+        # drift: simple interpolation between current and base
+        # t=1 aatypes as one-hot logits
+        current_aatypes = F.one_hot(
+            aatypes_1, num_classes=self.num_tokens
+        ).float()  # (B, N, S)
+        # t=0 base distribution is all mask
+        mask_onehot = torch.zeros(
+            B, N, self.num_tokens, device=self._device
+        )  # (B, N, S)
+        mask_onehot[..., MASK_TOKEN_INDEX] = 1.0
+        # combine linearly
+        tau_b11 = tau.view(B, 1, 1)
+        probs = tau_b11 * current_aatypes + (1.0 - tau_b11) * mask_onehot  # (B, N, S)
+
+        # stochasticity
         if (
             self.cfg.stochastic
             and self.cfg.stochastic_noise_intensity > 0.0
             and stochasticity_scale > 0.0
         ):
-            sigma_t = self._compute_sigma_t(
-                t,
+            # `rho` represents cumulative hazard
+            rho = self._cumulative_hazard_rho(
+                t=tau,
                 scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
-            ).unsqueeze(1)
-            p_jump = sigma_t.clamp(max=1.0)
-            jump_mask = torch.rand(num_batch, num_res, device=self._device) < p_jump
-            if jump_mask.any():
-                jump_noise = self.sample_base(res_mask=res_mask)
-                aatypes_t = mask_blend_1d(jump_noise, aatypes_t, jump_mask.int())
+            )
+            rho = rho.view(B, 1, 1)
 
-        aatypes_t = aatypes_t * res_mask + MASK_TOKEN_INDEX * (1 - res_mask)
-        return mask_blend_1d(aatypes_t, aatypes_1, diffuse_mask)
+            # get unmask and change kernels
+            kernel_unmask, kernel_change = self._masking_kernels(
+                aatypes=aatypes_1
+            )  # (B, N, S)
 
-    def _euler_step_masking(
-        self,
-        d_t: torch.Tensor,  # scalar
-        t: torch.Tensor,  # (B,)
-        logits_1: torch.Tensor,  # (B, N, S=21)
-        aatypes_t: torch.Tensor,  # (B, N)
-    ) -> torch.Tensor:
-        num_batch, num_res, num_states = logits_1.shape
-        assert num_states == 21
-        assert aatypes_t.shape == (num_batch, num_res)
+            # split the noise mass by current mask probability under drift
+            p_mask = probs[..., MASK_TOKEN_INDEX].unsqueeze(-1)  # (B, N, 1)
+            kernel_noise = (
+                p_mask * kernel_unmask + (1.0 - p_mask) * kernel_change
+            )  # (B, N, S)
 
-        device = logits_1.device
-        temp = self.cfg.drift_temp
-        noise = self.cfg.stochastic_noise_intensity  # used to be its own value, ~20.0
+            # combine with drift probs using cumulative hazard
+            probs = (1.0 - rho) * probs + rho * kernel_noise
 
-        # set mask to small negative so won't be picked in softmax
-        logits_1[:, :, MASK_TOKEN_INDEX] = -1e9
+        # regularize probabilities
+        probs = probs / probs.sum(-1, keepdim=True).clamp_min(1e-12)
 
-        # convert logits to probabilities
-        pt_x1_probs = F.softmax(logits_1 / temp, dim=-1)  # (B, N, S)
-
-        # prepare a (0,0,...1) mask vector to help add masking transitions.
-        mask_one_hot = torch.zeros((num_states,), device=device)
-        mask_one_hot[MASK_TOKEN_INDEX] = 1.0
-
-        # identify which positions are currently mask
-        aatypes_t_is_mask = (
-            (aatypes_t == MASK_TOKEN_INDEX).view(num_batch, num_res, 1).float()
+        # sample from probs, limiting to res_mask and diffuse_mask
+        return self._sample_aatypes(
+            probs=probs,
+            aatypes_1=aatypes_1,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
         )
-
-        # broadcast t and d_t to (B, 1, 1) for (B, N, S) tensors
-        t = t.to(self._device).view(-1, 1, 1)
-        d_t = d_t.to(self._device)
-
-        # compute step probabilities (scaled by d_t), with noise and time factoring
-        step_probs = d_t * pt_x1_probs * ((1.0 + noise * t) / (1.0 - t))  # (B, N, S)
-        # add transitions from non-mask to mask as noise
-        step_probs += (
-            d_t * (1.0 - aatypes_t_is_mask) * mask_one_hot.view(1, 1, -1) * noise
-        )
-
-        # force valid rate matrix
-        step_probs = self._regularize_step_probs(step_probs, aatypes_t)
-
-        # sample new residues from step_probs
-        new_aatypes = torch.multinomial(step_probs.view(-1, num_states), num_samples=1)
-        return new_aatypes.view(num_batch, num_res)
-
-    def _euler_step_purity(
-        self,
-        d_t: torch.Tensor,  # scalar
-        t: torch.Tensor,  # (B,)
-        logits_1: torch.Tensor,  # (B, N, S=21)
-        aatypes_t: torch.Tensor,  # (B, N)
-    ):
-        """
-        Perform an Euler step with purity sampling scheme, which decides which tokens to unmask
-        based on their log-probabilities.
-
-        This function identifies masked residues, ranks them by max log prob,
-        picks some number to unmask, and re-masks some positions proportional to (d_t, noise, t).
-
-        On average more dimensions are unmasked at each step, with the probability of ultimately
-        selecting the correct token increasing as noise increases.
-
-        This function is designed specifically for the "masking" interpolant type, where S = 21.
-        """
-        num_batch, num_res, num_states = logits_1.shape
-
-        assert aatypes_t.shape == (num_batch, num_res)
-        assert (
-            num_states == 21
-        ), "Purity-based unmasking only works with masking interpolant type"
-
-        temp = self.cfg.drift_temp
-        noise = self.cfg.stochastic_noise_intensity
-        t = t.to(self._device)
-        d_t = d_t.to(self._device)
-
-        # remove mask dimension to handle only the 20 valid aa states. mask is 21.
-        logits_1_wo_mask = logits_1[:, :, : (num_states - 1)]  # (B, N, S-1)
-        # convert logits to probabilities for the non-mask states
-        pt_x1_probs = F.softmax(logits_1_wo_mask / temp, dim=-1)  # (B, N, S-1)
-        # find maximum log prob among valid states
-        max_logprob = torch.log(pt_x1_probs).max(dim=-1)[0]  # (B, N)
-        # bias so only currently masked are favored for unmasking
-        max_logprob -= (aatypes_t != MASK_TOKEN_INDEX).float() * 1e9
-        # sort positions by descending maximum log-prob (highest to lowest)
-        sorted_max_logprob_indices = torch.argsort(
-            max_logprob, dim=-1, descending=True
-        )  # (B, N)
-
-        # determine how many masked residues to unmask
-        # probability of unmasking is scaled by d_t, noise, and time
-        unmask_probs = (
-            (d_t * ((1.0 + noise * t) / (1.0 - t))).clamp(max=1.0).to(self._device)
-        )  # scalar
-        masked_counts = (aatypes_t == MASK_TOKEN_INDEX).sum(dim=-1).float()  # (B,)
-        number_to_unmask = torch.binomial(
-            count=masked_counts, prob=unmask_probs
-        )  # (B,)
-
-        # sample new residues for unmasked positions from pt_x1_probs
-        # we'll assign these new residues to top 'number_to_unmask' positions
-        unmasked_samples = torch.multinomial(
-            pt_x1_probs.view(-1, num_states - 1), num_samples=1
-        )
-        unmasked_samples = unmasked_samples.view(num_batch, num_res)
-
-        # Next lines are vectorized version of per-batch top-k replacement
-
-        D_grid = (
-            torch.arange(num_res, device=self._device)
-            .unsqueeze(0)
-            .expand(num_batch, -1)
-        )  # (B, N)
-        # 'mask1' is 1 where d < number_to_unmask[b], 0 otherwise
-        mask1 = (D_grid < number_to_unmask.view(-1, 1)).float()
-        # if 0 to unmask, we set sorted_max_logprob_indices[:, 0] for all positions
-        fallback = sorted_max_logprob_indices[:, 0].view(-1, 1).repeat(1, num_res)
-        selected_indices = (mask1 * sorted_max_logprob_indices) + (
-            (1.0 - mask1) * fallback
-        )
-        selected_indices = selected_indices.long()
-
-        # 'mask2' indicates precisely which positions in aatypes_t we replace
-        mask2 = torch.zeros((num_batch, num_res), device=self._device)
-        mask2.scatter_(
-            dim=1,
-            index=selected_indices,
-            src=torch.ones((num_batch, num_res), device=self._device),
-        )
-        # if zero are unmasked, we skip altogether
-        none_unmasked_mask = (number_to_unmask == 0).unsqueeze(-1).float()
-        mask2 *= 1.0 - none_unmasked_mask
-
-        # 'mask2' is 1 where we replace with unmasked_samples, 0 otherwise
-        aatypes_t = aatypes_t * (1.0 - mask2) + unmasked_samples * mask2
-
-        # re-mask some positions as noise with probability (d_t * noise)
-        re_mask_prob = d_t.view(-1, 1) * noise
-        rand_vals = torch.rand(num_batch, num_res, device=self._device)
-        re_mask_mask = (rand_vals < re_mask_prob).float()
-        aatypes_t = aatypes_t * (1.0 - re_mask_mask) + (MASK_TOKEN_INDEX * re_mask_mask)
-
-        return aatypes_t
 
     def euler_step(
         self,
@@ -597,36 +591,69 @@ class FlowMatcherAATypesMasking(FlowMatcherAATypes):
         stochasticity_scale: float = 1.0,
         potential: Optional[torch.Tensor] = None,  # (B, N, S=21)
     ) -> torch.Tensor:
-        """
-        Perform a single Euler update step for the masking interpolant (S=21).
-        If `purity_selection` is enabled, use purity-based unmasking; otherwise
-        use masking-based rate update. Adds optional jump step if stochastic is enabled.
-        """
+        B, N = aatypes_t.shape
+        assert logits_1.shape == (B, N, self.num_tokens)
+
+        # combine potential with predicted logits
         if potential is not None:
             assert (
                 potential.shape == logits_1.shape
-            ), f"Guidance logits shape {potential.shape} does not match logits_1 shape {logits_1.shape}"
+            ), f"guidance {potential.shape} != logits_1 {logits_1.shape}"
             logits_1 = combine_logits([logits_1, potential])
 
-        if self.cfg.purity_selection:
-            aatypes_t = self._euler_step_purity(
-                d_t=d_t, t=t, logits_1=logits_1, aatypes_t=aatypes_t
-            )
-        else:
-            aatypes_t = self._euler_step_masking(
-                d_t=d_t, t=t, logits_1=logits_1, aatypes_t=aatypes_t
-            )
+        # compute probabilities from softmaxed logits
+        probs = F.softmax(logits_1 / self.cfg.drift_temp, dim=-1)  # (B, N, S)
 
+        # uncertainty gate ~ 1 - p(current)
+        uncertainty = self._uncertainty_gate(aatypes_t, probs).unsqueeze(
+            -1
+        )  # (B, N, 1)
+
+        # compute drift step probs (off-diagonal mass)
+        step_probs = d_t * probs * uncertainty
+
+        # Poisson noise per step (using unmask/change kernels dependent on current state)
         if (
             self.cfg.stochastic
             and self.cfg.stochastic_noise_intensity > 0.0
             and stochasticity_scale > 0.0
         ):
-            aatypes_t = self._aatypes_jump_step(
-                d_t,
-                t=t,
-                logits_1=logits_1,
-                aatypes_t=aatypes_t,
-                stochasticity_scale=stochasticity_scale,
+            # t -> tau according to schedule
+            tau = self._aatypes_schedule(t=t)
+
+            # compute noise leave mass scale
+            nu_t = self._poisson_noise_weight(
+                t=tau,
+                d_t=d_t,
+                scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
             )
-        return aatypes_t
+            nu_t = nu_t.clamp_min(0.0).view(B, 1, 1)
+
+            kernel_unmask, kernel_change = self._masking_kernels(
+                aatypes=aatypes_t
+            )  # (B, N, S)
+
+            # split the noise mass by whether position is mask or AA
+            is_mask = (aatypes_t == MASK_TOKEN_INDEX).unsqueeze(-1).float()  # (B, N, 1)
+            kernel_noise = (
+                is_mask * kernel_unmask + (1.0 - is_mask) * kernel_change
+            )  # (B, N, S)
+
+            # combine scaled noise kernel with drift probs
+            step_probs += nu_t * kernel_noise
+
+        # cap leave mass
+        step_probs = self._cap_leave_mass(step_probs, aatypes_t)
+
+        # regularize step probs
+        step_probs = self._regularize_step_probs(
+            probs=step_probs,
+            aatypes_t=aatypes_t,
+        )
+
+        return self._sample_aatypes(
+            probs=step_probs,
+            aatypes_1=aatypes_t,
+            res_mask=None,
+            diffuse_mask=None,
+        )

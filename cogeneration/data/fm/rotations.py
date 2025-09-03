@@ -112,7 +112,7 @@ class FlowMatcherRotations(FlowMatcher):
         so3_t = self._so3_train_time(t)
 
         # interpolate on geodesic between rotmats_0 and rotmats_1
-        rotmats_t = so3_utils.geodesic_t(so3_t[..., None, None], rotmats_1, rotmats_0)
+        rotmats_t = so3_utils.geodesic_t(so3_t[:, None, None], rotmats_1, rotmats_0)
 
         # stochastic intermediate noise
         if (
@@ -169,7 +169,9 @@ class FlowMatcherRotations(FlowMatcher):
             rot_vf += potential
 
         rotmats_next = so3_utils.geodesic_t(
-            t=scaling * d_t,  # scaled time along geodesic
+            t=(scaling * d_t)[
+                :, None, None
+            ],  # scaled time along geodesic, broadcast over (N,3)
             mat=rotmats_1,
             base_mat=rotmats_t,
             rot_vf=rot_vf,

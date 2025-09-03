@@ -18,7 +18,7 @@ import torch
 from cogeneration.config.base import Config
 from cogeneration.data import so3_utils
 from cogeneration.data.const import MASK_TOKEN_INDEX, NM_TO_ANG_SCALE
-from cogeneration.data.fm.aatypes_ctmc import FlowMatcherAATypesCTMC
+from cogeneration.data.fm.aatypes_rates import FlowMatcherAATypesCTMC
 from cogeneration.data.fm.rotations import FlowMatcherRotations
 from cogeneration.data.fm.translations import FlowMatcherTrans
 from cogeneration.data.interpolant import Interpolant
