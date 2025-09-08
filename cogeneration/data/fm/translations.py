@@ -122,6 +122,7 @@ class FlowMatcherTrans(FlowMatcher):
         chain_idx: torch.Tensor,  # (B, N)
         stochasticity_scale: float = 1.0,
     ) -> torch.Tensor:
+        tau = self.time_training(t)
         trans_0 = self.sample_base(chain_idx=chain_idx, is_intermediate=False)
 
         if self.cfg.batch_ot:
@@ -140,7 +141,7 @@ class FlowMatcherTrans(FlowMatcher):
             )
 
         if self.cfg.train_schedule == InterpolantTranslationsScheduleEnum.linear:
-            trans_t = (1 - t.view(-1, 1, 1)) * trans_0 + t.view(-1, 1, 1) * trans_1
+            trans_t = (1 - tau.view(-1, 1, 1)) * trans_0 + tau.view(-1, 1, 1) * trans_1
         else:
             raise ValueError(f"Unknown trans schedule {self.cfg.train_schedule}")
 
@@ -150,7 +151,7 @@ class FlowMatcherTrans(FlowMatcher):
             and stochasticity_scale > 0.0
         ):
             sigma_t = self._compute_sigma_t(
-                t,
+                tau,
                 scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
             )
             intermediate_noise = self.sample_base(
@@ -174,7 +175,8 @@ class FlowMatcherTrans(FlowMatcher):
         stochasticity_scale: float = 1.0,
         potential: Optional[torch.Tensor] = None,  # (B, N, 3) VF
     ) -> torch.Tensor:
-        trans_vf = self.vector_field(t=t, trans_1=trans_1, trans_t=trans_t)
+        tau = self.time_sampling(t)
+        trans_vf = self.vector_field(t=tau, trans_1=trans_1, trans_t=trans_t)
 
         if (
             self.cfg.stochastic
@@ -186,7 +188,7 @@ class FlowMatcherTrans(FlowMatcher):
                 is_intermediate=True,
             )
             sigma_t = self._compute_sigma_t(
-                t,
+                tau,
                 scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
             )
             sigma_t = sigma_t.to(trans_t.device)

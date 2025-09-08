@@ -54,28 +54,25 @@ class FlowMatcherRotations(FlowMatcher):
         num_batch, num_res = res_mask.shape
         return uniform_so3(num_batch, num_res, device=self._device)
 
-    def _so3_train_time(self, t: torch.Tensor) -> torch.Tensor:
-        """Map t to SO(3) schedule time for corruption, according to cfg."""
-        if self.cfg.train_schedule == InterpolantRotationsScheduleEnum.linear:
+    def _so3_time(
+        self, t: torch.Tensor, schedule: InterpolantRotationsScheduleEnum
+    ) -> torch.Tensor:
+        """Map t to SO(3) schedule time, using cfg's schedule"""
+        if schedule == InterpolantRotationsScheduleEnum.linear:
             return t
-        elif self.cfg.train_schedule == InterpolantRotationsScheduleEnum.exp:
+        elif schedule == InterpolantRotationsScheduleEnum.exp:
             rate = self.cfg.exp_rate
             return (1 - torch.exp(-t * rate)) / (1 - math.exp(-rate))
         else:
-            raise ValueError(f"Invalid schedule: {self.cfg.train_schedule}")
+            raise ValueError(f"Invalid schedule: {schedule}")
 
     def _vf_scaling(self, t: torch.Tensor) -> torch.Tensor:
+        schedule = self.cfg.sample_schedule
         """Euler step scaling for vector field under sample schedule."""
-        if self.cfg.sample_schedule == InterpolantRotationsScheduleEnum.linear:
+        if schedule == InterpolantRotationsScheduleEnum.linear:
             return (1 / (1 - t)).clamp(min=1e-4)
-        elif self.cfg.sample_schedule == InterpolantRotationsScheduleEnum.exp:
-            t = (
-                t.to(self._device)
-                if torch.is_tensor(t)
-                else torch.tensor(
-                    t, dtype=torch.get_default_dtype(), device=self._device
-                )
-            )
+        elif schedule == InterpolantRotationsScheduleEnum.exp:
+            t = t.to(self._device)
             r = torch.tensor(
                 self.cfg.exp_rate, dtype=torch.get_default_dtype(), device=t.device
             )
@@ -84,7 +81,13 @@ class FlowMatcherRotations(FlowMatcher):
             scale = r / denom
             return scale.clamp(min=1e-4)
         else:
-            raise ValueError(f"Unknown sample schedule {self.cfg.sample_schedule}")
+            raise ValueError(f"Unknown sample schedule {schedule}")
+
+    def time_training(self, t: torch.Tensor) -> torch.Tensor:
+        return self._so3_time(t, schedule=self.cfg.train_schedule)
+
+    def time_sampling(self, t: torch.Tensor) -> torch.Tensor:
+        return self._so3_time(t, schedule=self.cfg.sample_schedule)
 
     def corrupt(
         self,
@@ -96,6 +99,7 @@ class FlowMatcherRotations(FlowMatcher):
     ) -> torch.Tensor:
         """Corrupt rotations from t=1 to t using IGSO(3)."""
         num_batch, num_res = res_mask.shape
+        tau = self.time_training(t)
 
         # sample IGSO(3) for t=0
         sigma = torch.tensor(
@@ -108,11 +112,8 @@ class FlowMatcherRotations(FlowMatcher):
         # applying noise as composition ensures noise is relative to reference frame + stay on SO(3)
         rotmats_0 = torch.einsum("...ij,...jk->...ik", rotmats_1, noisy_rotmats)
 
-        # schedule time
-        so3_t = self._so3_train_time(t)
-
         # interpolate on geodesic between rotmats_0 and rotmats_1
-        rotmats_t = so3_utils.geodesic_t(so3_t[:, None, None], rotmats_1, rotmats_0)
+        rotmats_t = so3_utils.geodesic_t(tau[:, None, None], rotmats_1, rotmats_0)
 
         # stochastic intermediate noise
         if (
@@ -121,7 +122,7 @@ class FlowMatcherRotations(FlowMatcher):
             and stochasticity_scale > 0.0
         ):
             sigma_t = self._compute_sigma_t(
-                so3_t,
+                tau,
                 scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
             )
             # Only apply intermediate noise for samples with positive sigma
@@ -158,7 +159,10 @@ class FlowMatcherRotations(FlowMatcher):
         stochasticity_scale: float = 1.0,
         potential: Optional[torch.Tensor] = None,  # (B, N, 3)
     ) -> torch.Tensor:
+        # VF scaling applies schedule properly, dont give tau.
         scaling = self._vf_scaling(t)
+        # tau required for noise sigma_t
+        tau = self.time_sampling(t)
 
         rot_vf = so3_utils.calc_rot_vf(mat_t=rotmats_t, mat_1=rotmats_1)
 
@@ -168,10 +172,10 @@ class FlowMatcherRotations(FlowMatcher):
             ), f"potential {potential.shape} != rot_vf {rot_vf.shape}"
             rot_vf += potential
 
+        # scaled time along geodesic `t` -> `1`, broadcast over (N,3)
+        geodesic_time = (scaling * d_t)[:, None, None]
         rotmats_next = so3_utils.geodesic_t(
-            t=(scaling * d_t)[
-                :, None, None
-            ],  # scaled time along geodesic, broadcast over (N,3)
+            t=geodesic_time,
             mat=rotmats_1,
             base_mat=rotmats_t,
             rot_vf=rot_vf,
@@ -185,8 +189,9 @@ class FlowMatcherRotations(FlowMatcher):
             # Sample IGSO(3) noise with a time-independent sigma_t, scaled by sqrt(dt)
             # Add IGSO(3) noise to keep rotmats_next on SO(3).
             num_batch, num_res, _, _ = rotmats_t.shape
+
             sigma_t = self._compute_sigma_t(
-                t,
+                tau,
                 scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
             )
             # Per-batch Brownian increment: scale sigma_t by sqrt(dt)
@@ -195,8 +200,8 @@ class FlowMatcherRotations(FlowMatcher):
 
             # safety check sigma_t within IGSO3 grid spec
             if sigma_t.min() < self.igso3.sigma_grid.min():
-                print(
-                    f"WARNING: rots sigma_t < igso3 grid min, noise will be larger than desired. Lower igso3_sigma_min."
+                raise ValueError(
+                    f"rots sigma_t < igso3 grid min, noise will be larger than desired. Lower igso3_sigma_min."
                 )
 
             intermediate_noise = self.igso3.sample(sigma_t, num_res)

@@ -108,6 +108,12 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
 
         return y.clamp(min=0.0, max=1.0)
 
+    def time_training(self, t: torch.Tensor) -> torch.Tensor:
+        return self._aatypes_schedule(t)
+
+    def time_sampling(self, t: torch.Tensor) -> torch.Tensor:
+        return self._aatypes_schedule(t)
+
     def _uncertainty_gate(
         self,
         aatypes_t: torch.Tensor,  # (B, N)
@@ -197,7 +203,7 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
 
     def _cumulative_hazard_rho(
         self,
-        t: torch.Tensor,  # (B,)
+        t: torch.Tensor,  # (B,) tau
         scale: float = 1.0,  # like _compute_sigma_t(), e.g. stochastic_scale
         min_sigma: float = 0.0,  # like _compute_sigma_t()
         kappa: float = 4.1589,  # hazard gain/steepness; larger -> quicker corruption
@@ -273,7 +279,7 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
 
     def _poisson_noise_weight(
         self,
-        t: torch.Tensor,  # (B,)
+        t: torch.Tensor,  # (B,) tau
         d_t: torch.Tensor,  # scalar
         scale: float = 1.0,  # like _compute_sigma_t(), e.g. stochastic_scale
         min_sigma: float = 0.0,  # like _compute_sigma_t()
@@ -348,8 +354,7 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
         B, N = res_mask.shape
         assert aatypes_1.shape == (B, N)
 
-        # scale t -> tau according to schedule (linear, exp)
-        tau = self._aatypes_schedule(t=t)
+        tau = self.time_training(t)
 
         # drift: simple interpolation between current and base
         # t=1 aatypes as one-hot logits
@@ -403,6 +408,7 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
     ) -> torch.Tensor:
         B, N = aatypes_t.shape
         assert logits_1.shape == (B, N, self.num_tokens)
+        tau = self.time_sampling(t)
 
         # combine potential with predicted logits
         if potential is not None:
@@ -427,9 +433,6 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
             and self.cfg.stochastic_noise_intensity > 0.0
             and stochasticity_scale > 0.0
         ):
-            # t -> tau according to schedule
-            tau = self._aatypes_schedule(t=t)
-
             # compute noise leave mass scale
             nu_t = self._poisson_noise_weight(
                 t=tau,
@@ -445,7 +448,10 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
             step_probs += nu_t * kernel_change
 
         # cap leave mass
-        step_probs = self._cap_leave_mass(step_probs, aatypes_t)
+        step_probs = self._cap_leave_mass(
+            probs=step_probs,
+            aatypes_t=aatypes_t,
+        )
 
         # regularize step probs
         step_probs = self._regularize_step_probs(

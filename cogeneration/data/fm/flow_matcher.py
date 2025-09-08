@@ -32,6 +32,20 @@ class FlowMatcher(ABC):
         """
         return torch.sqrt(scale**2 * t * (1 - t) + min_sigma**2)
 
+    def time_training(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Map raw t in [0,1] to domain-specific training schedule time tau for corruption.
+        Base implementation is identity.
+        """
+        return t
+
+    def time_sampling(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Map raw t in [0,1] to domain-specific sampling schedule time tau for drift/noise usage.
+        Base implementation is identity.
+        """
+        return t
+
     @abstractmethod
     def sample_base(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         """Sample from the domain's base distribution (t=0)."""

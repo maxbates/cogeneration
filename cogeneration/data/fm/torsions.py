@@ -49,13 +49,14 @@ class FlowMatcherTorsions(FlowMatcher):
         Corrupt torsions from t=1 to t using noise.
         """
         num_batch, num_res = res_mask.shape
+        tau = self.time_training(t)
         torsions_0 = self.sample_base(res_mask=res_mask)
 
         # interpolate in angle space using linear schedule
         angles_1 = torch.atan2(torsions_1[..., 0], torsions_1[..., 1])  # (B, N, 7)
         angles_0 = torch.atan2(torsions_0[..., 0], torsions_0[..., 1])  # (B, N, 7)
-        t_broadcast = t.view(num_batch, 1, 1)  # (B, 1, 1)
-        angles_t = (1.0 - t_broadcast) * angles_0 + t_broadcast * angles_1
+        tau_broadcast = tau.view(num_batch, 1, 1)  # (B, 1, 1)
+        angles_t = (1.0 - tau_broadcast) * angles_0 + tau_broadcast * angles_1
 
         if (
             self.cfg.stochastic
@@ -63,7 +64,7 @@ class FlowMatcherTorsions(FlowMatcher):
             and stochasticity_scale > 0.0
         ):
             sigma_t = self._compute_sigma_t(
-                t,  # (B,)
+                tau,  # (B,)
                 scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
             )
             angles_t += angles_noise(sigma=sigma_t, num_samples=num_res, num_angles=7)
@@ -94,6 +95,7 @@ class FlowMatcherTorsions(FlowMatcher):
         However, torsions_1 is always 7, and torsions_t is filled to 7 if K < 7.
         """
         B, N, K = torsions_1.shape[:3]
+        tau = self.time_sampling(t)
 
         # (B, N, K, 2) -> (B, N, 7, 2)
         torsions_t = fill_torsions(
@@ -105,10 +107,10 @@ class FlowMatcherTorsions(FlowMatcher):
         angles_1 = torch.atan2(torsions_1[..., 0], torsions_1[..., 1])  # (B, N, 7)
         angles_t = torch.atan2(torsions_t[..., 0], torsions_t[..., 1])  # (B, N, 7)
 
-        t = t.to(self._device)
+        tau = tau.to(self._device)
         d_t = d_t.to(self._device)
         # Broadcast per-batch t to (B, 1, 1) for (B, N, K) angles tensors; d_t is scalar
-        angles_vf = (angles_1 - angles_t) / (1.0 - t.view(-1, 1, 1))
+        angles_vf = (angles_1 - angles_t) / (1.0 - tau.view(-1, 1, 1))
         angles_next = angles_t + angles_vf * d_t
 
         if (
@@ -118,7 +120,7 @@ class FlowMatcherTorsions(FlowMatcher):
         ):
             # Brownian increment: sigma_t * sqrt(dt)
             sigma_t = self._compute_sigma_t(
-                t,
+                tau,
                 scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
             )
             sqrt_dt = torch.sqrt(d_t.to(sigma_t.device))

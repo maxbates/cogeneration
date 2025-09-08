@@ -114,7 +114,9 @@ def masked_categorical(
     Returns a (B, N) tensor with all values set to MASK_TOKEN_INDEX.
     e.g. t=0 aa types, masking interpolation
     """
-    return torch.ones(size=(num_batch, num_res), device=device) * MASK_TOKEN_INDEX
+    return (
+        torch.ones(size=(num_batch, num_res), device=device).long() * MASK_TOKEN_INDEX
+    )
 
 
 def uniform_categorical(
@@ -126,7 +128,7 @@ def uniform_categorical(
     """
     return torch.randint(
         size=(num_batch, num_res), low=0, high=num_tokens, device=device
-    )
+    ).long()
 
 
 def torsions_empty(

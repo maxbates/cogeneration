@@ -778,16 +778,14 @@ class InterpolantRotationsConfig(BaseClassConfig):
     train_schedule: InterpolantRotationsScheduleEnum = (
         InterpolantRotationsScheduleEnum.linear
     )
+    # exp sampling schedule encourages rotations to settle more quickly, by scaling VF
     sample_schedule: InterpolantRotationsScheduleEnum = (
         InterpolantRotationsScheduleEnum.exp
     )
-    exp_rate: float = 3  # 10 in public multiflow code
+    exp_rate: float = 1.5  # 10 in public multiflow code
     # stochastic paths
-    # TODO(stochastic) consider min_t for stochastic rotations, so field can settle before injecting noise.
     stochastic: bool = "${shared.stochastic}"
-    # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
-    # Roughly, 0.5 => 11°, 1.0 => 23°, 2.0 => 34° over 500 timesteps
-    stochastic_noise_intensity: float = 2.0
+    stochastic_noise_intensity: float = 1.5
 
 
 class InterpolantTranslationsNoiseTypeEnum(StrEnum):
@@ -839,8 +837,6 @@ class InterpolantTranslationsConfig(BaseClassConfig):
     #   cutoff: 5.0
     # stochastic paths
     stochastic: bool = "${shared.stochastic}"
-    # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
-    # Roughly, 0.5 => 0.2Å, 1.0 => 0.4Å, 2.0 => 0.6Å over 500 timesteps
     stochastic_noise_intensity: float = 1.5
 
 
@@ -856,8 +852,7 @@ class InterpolantTorsionsConfig(BaseClassConfig):
     )
     # stochastic paths
     stochastic: bool = "${shared.stochastic}"
-    # sigma scaled by sqrt(t * (1-t)) * stochastic_noise_intensity
-    stochastic_noise_intensity: float = 1.5
+    stochastic_noise_intensity: float = 1.0
 
 
 class InterpolantAATypesScheduleEnum(StrEnum):
@@ -1578,6 +1573,19 @@ class InferenceConfig(BaseClassConfig):
 
 
 @dataclass
+class NoisePlotConfig(BaseClassConfig):
+    """
+    Configuration for plots comparing theory vs empirical noise/drift over domains.
+    """
+
+    num_batch: int = 8
+    num_res: int = 256
+    step_stride: int = 5
+    seed: int = "${shared.seed}"
+    output_path: Optional[str] = None
+
+
+@dataclass
 class RedesignConfig(BaseClassConfig):
     """Configuration for sequence redesign using ProteinMPNN."""
 
@@ -1632,7 +1640,10 @@ class Config(BaseClassConfig):
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     interpolant: InterpolantConfig = field(default_factory=InterpolantConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+
+    # scripts
     redesign: RedesignConfig = field(default_factory=RedesignConfig)
+    noise_plot: NoisePlotConfig = field(default_factory=NoisePlotConfig)
 
     @classmethod
     def load_dict_from_file(
