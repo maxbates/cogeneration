@@ -1307,7 +1307,8 @@ class DatasetConfig(BaseClassConfig):
     add_plddt_mask: bool = False
     min_plddt_threshold: float = 60.0  # [0-100]
     # add gaussian noise to atom positions prior to rigid frame calculation
-    noise_atom_positions_angstroms: float = 0.1
+    # mostly redundant with stochastic paths, but may provide minor regularization
+    noise_atom_positions_angstroms: float = 0.02
     # Inpainting / scaffolding parameters
     inpainting: DatasetInpaintingConfig = field(default_factory=DatasetInpaintingConfig)
     # Conditioning
