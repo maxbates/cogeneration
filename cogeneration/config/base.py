@@ -1308,6 +1308,10 @@ class DatasetConfig(BaseClassConfig):
     # stochastics
     # proportion of batches to disable stochasticity (i.e., revert to flow matching)
     stochastic_dropout_prop: float = 0.2
+    # frequency that we scale stochasticity (after dropout check); 0.0 disables scaling
+    stochastic_scale_frequency: float = 0.25
+    # stochasticity_scale multiplier, e.g. if 0.5, we sample from [0.5, 2.0]
+    stochastic_scale_multiplier: float = 0.5
     # add gaussian noise to atom positions prior to rigid frame calculation
     # mostly redundant with stochastic paths, but may provide minor regularization
     noise_atom_positions_angstroms: float = 0.02
@@ -1839,8 +1843,9 @@ class Config(BaseClassConfig):
         raw_cfg.interpolant.codesign_forward_fold_prop = 0.0
         raw_cfg.interpolant.codesign_inverse_fold_prop = 0.0
 
-        # always stochastic, if enabled
+        # always stochastic, if enabled, keep scale at 1.0
         raw_cfg.dataset.stochastic_dropout_prop = 0.0
+        raw_cfg.dataset.stochastic_scale_frequency = 0.0
         # always centered
         raw_cfg.dataset.backbone_center_noise = 0.0
 

@@ -562,7 +562,9 @@ class BatchFeaturizer:
             processed_file_path=csv_row[mc.processed_path],
         )
 
-        # Set per-sample stochastic scale and sometimes dropout to 0.0
+        # Set per-sample stochastic scale.
+        # Sometimes dropout to 0.0
+        # Sometimes scale the scale by multiplier
         if (
             self.is_training
             and self.cfg.stochastic_dropout_prop > 0.0
@@ -570,7 +572,18 @@ class BatchFeaturizer:
         ):
             feats[bp.stochastic_scale] = torch.tensor([0.0]).float()
         else:
-            feats[bp.stochastic_scale] = torch.tensor([1.0]).float()
+            scale = 1.0
+            if (
+                self.is_training
+                and self.cfg.stochastic_scale_frequency > 0.0
+                and random.random() < self.cfg.stochastic_scale_frequency
+            ):
+                lower = max(1e-6, float(self.cfg.stochastic_scale_multiplier))
+                upper = 1.0 / lower
+                low = min(lower, upper)
+                high = max(lower, upper)
+                scale = random.triangular(low, high, 1.0)
+            feats[bp.stochastic_scale] = torch.tensor([float(scale)]).float()
 
         # Update `diffuse_mask` and `motif_mask` depending on task
         if self.task == DataTask.hallucination:
