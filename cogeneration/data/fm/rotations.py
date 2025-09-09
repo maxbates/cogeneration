@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
@@ -12,6 +13,7 @@ from cogeneration.data.fm.flow_matcher import FlowMatcher
 from cogeneration.data.noise_mask import mask_blend_3d, uniform_so3
 
 
+@dataclass
 class FlowMatcherRotations(FlowMatcher):
     """
     Flow matcher for rotations (SO(3)).
@@ -20,13 +22,12 @@ class FlowMatcherRotations(FlowMatcher):
     using geodesics on SO(3). Base sampling returns uniform SO(3) rotations.
     """
 
-    def __init__(self, cfg: InterpolantRotationsConfig):
-        self.cfg = cfg
-        self._device: Optional[torch.device] = None
-        self._igso3 = None
+    cfg: InterpolantRotationsConfig
+
+    _igso3: Optional[so3_utils.SampleIGSO3] = None
 
     def set_device(self, device: torch.device):
-        self._device = device
+        super().set_device(device)
 
         # on CUDA, move to GPU, so can be broadcasted.
         # on MPS, leave on CPU, issues with VonMises.

@@ -1,9 +1,11 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import Any, Union
 
 import torch
 
 
+@dataclass
 class FlowMatcher(ABC):
     """
     Abstract base class for domain-specific flow matchers.
@@ -15,10 +17,12 @@ class FlowMatcher(ABC):
     - performing an Euler step toward t=1 using a vector field/logits (euler_step)
     """
 
-    @abstractmethod
+    def __post_init__(self):
+        # define in post_init to allow required fields in subclasses
+        self._device = torch.device("cpu")
+
     def set_device(self, device: torch.device):
-        """Set the device for the flow matcher."""
-        raise NotImplementedError
+        self._device = device
 
     @staticmethod
     def _compute_sigma_t(

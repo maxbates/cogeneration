@@ -1,5 +1,6 @@
 import math
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
@@ -19,6 +20,7 @@ from cogeneration.data.noise_mask import (
 )
 
 
+@dataclass
 class FlowMatcherAATypes(FlowMatcher, ABC):
     """
     Noisy aatypes interpolant
@@ -26,6 +28,8 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
     Uses Multiflow-style probability view and torch.multinomial() for jumps,
     with explicit drift vs noise handling
     """
+
+    cfg: InterpolantAATypesConfig
 
     # TODO - configurable leave_mass_cap, or disable
     # maximum leave mass during sampling
@@ -41,13 +45,6 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
     #   - eta_base = stochastic_noise_intensity * stochasticity_scale,
     #   - assuming min_sigma = 0.
     NOISE_GAIN: int = 3
-
-    def __init__(self, cfg: InterpolantAATypesConfig):
-        self.cfg = cfg
-        self._device: torch.device = torch.device("cpu")
-
-    def set_device(self, device: torch.device):
-        self._device = device
 
     @property
     @abstractmethod

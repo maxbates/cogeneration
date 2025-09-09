@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
@@ -19,6 +20,7 @@ from cogeneration.data.noise_mask import (
 from cogeneration.data.rigid import batch_align_structures, batch_center_of_mass
 
 
+@dataclass
 class FlowMatcherTrans(FlowMatcher):
     """
     Flow matcher for translations domain (R^3).
@@ -30,12 +32,7 @@ class FlowMatcherTrans(FlowMatcher):
     Handles base noise sampling, corruption, and Euler updates with optional stochasticity and potentials.
     """
 
-    def __init__(self, cfg: InterpolantTranslationsConfig):
-        self.cfg = cfg
-        self._device: Optional[torch.device] = None
-
-    def set_device(self, device: torch.device):
-        self._device = device
+    cfg: InterpolantTranslationsConfig
 
     def sample_base(
         self, chain_idx: torch.Tensor, is_intermediate: bool

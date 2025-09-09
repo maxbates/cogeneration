@@ -3,6 +3,7 @@ WIP (i.e. not yet correct) rate-matrix formulation for CTMC jump aatypes flow ma
 """
 
 import math
+from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
@@ -24,17 +25,13 @@ from cogeneration.data.noise_mask import (
 )
 
 
+@dataclass
 class FlowMatcherAATypesCTMC(FlowMatcherAATypes):
     """
     AAtypes flow matching using CTMC drift rate matrix + optional noise
     """
 
-    def __init__(self, cfg: InterpolantAATypesConfig):
-        self.cfg = cfg
-        self._device: Optional[torch.device] = None
-
-    def set_device(self, device: torch.device):
-        self._device = device
+    cfg: InterpolantAATypesConfig
 
     @property
     def num_tokens(self) -> int:

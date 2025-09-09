@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
@@ -13,6 +14,7 @@ from cogeneration.data.noise_mask import (
 )
 
 
+@dataclass
 class FlowMatcherTorsions(FlowMatcher):
     """
     Flow matcher for torsion angles.
@@ -21,12 +23,7 @@ class FlowMatcherTorsions(FlowMatcher):
     Euler updates are performed on angles, then converted back to (sin, cos).
     """
 
-    def __init__(self, cfg: InterpolantTorsionsConfig):
-        self.cfg = cfg
-        self._device: Optional[torch.device] = None
-
-    def set_device(self, device: torch.device):
-        self._device = device
+    cfg: InterpolantTorsionsConfig
 
     def sample_base(self, res_mask: torch.Tensor) -> torch.Tensor:
         """Generate t=0 torsion angles noise (B, N, 7, 2)."""

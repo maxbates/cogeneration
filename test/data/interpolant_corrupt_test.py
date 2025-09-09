@@ -1,4 +1,5 @@
 import copy as _copy
+import math
 
 import numpy as np
 import pytest
@@ -733,3 +734,137 @@ class TestInterpolant:
 
         for d in ["trans", "rots", "torsions", "aatypes"]:
             compare_domain(d)
+
+    def test_stochasticity_scale_monotonic_noise(self, mock_cfg_uninterpolated):
+        """Noise magnitude should be nondecreasing as stochasticity_scale increases across domains
+
+        Metrics:
+        - translations: mean L2 delta vs scale=0 output
+        - rotations: mean geodesic angle vs scale=0 output
+        - torsions: mean wrapped angle delta vs scale=0 output
+        - aatypes: mean noise rates row sum from CTMC builder
+        """
+        cfg = mock_cfg_uninterpolated
+        cfg.shared.stochastic = True
+        cfg = cfg.interpolate()
+
+        interpolant = Interpolant(cfg.interpolant)
+        device = interpolant._device
+
+        B, N = 6, 48
+        chain_idx = torch.ones(B, N, device=device).long()
+        res_mask = torch.ones(B, N, device=device).float()
+        diffuse_mask = torch.ones(B, N, device=device).float()
+        t = torch.full((B,), 0.5, device=device)
+
+        # base truths
+        trans_1 = centered_gaussian(B, N, device=device)
+        rotmats_1 = uniform_so3(B, N, device=device)
+        torsions_1 = torsions_noise(
+            sigma=torch.ones(B, device=device), num_samples=N, num_angles=7
+        )
+
+        # aatypes current state
+        if interpolant.num_tokens == 21:
+            aatypes_t = torch.randint(low=0, high=21, size=(B, N), device=device)
+        else:
+            aatypes_t = torch.randint(low=0, high=20, size=(B, N), device=device)
+
+        # Save RNG to reproduce same base/intermediate draws across scales
+        torch.manual_seed(0)
+        np.random.seed(0)
+        torch_state = torch.random.get_rng_state()
+        np_state = np.random.get_state()
+
+        # translations
+        trans_fm = FlowMatcherTrans(cfg=interpolant.cfg.trans)
+        torch.random.set_rng_state(torch_state)
+        np.random.set_state(np_state)
+        trans_base = trans_fm.corrupt(
+            trans_1,
+            t=t,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
+            chain_idx=chain_idx,
+            stochasticity_scale=0.0,
+        )
+        trans_deltas = []
+        for s in np.linspace(0.0, 2.0, 21)[1:]:
+            torch.random.set_rng_state(torch_state)
+            np.random.set_state(np_state)
+            trans_s = trans_fm.corrupt(
+                trans_1,
+                t=t,
+                res_mask=res_mask,
+                diffuse_mask=diffuse_mask,
+                chain_idx=chain_idx,
+                stochasticity_scale=float(s),
+            )
+            d = (trans_s - trans_base).norm(dim=-1).mean().item()
+            trans_deltas.append(d)
+        assert np.all(np.diff(trans_deltas) >= -1e-6)
+
+        # rotations
+        rots_fm = FlowMatcherRotations(cfg=interpolant.cfg.rots)
+        torch.random.set_rng_state(torch_state)
+        np.random.set_state(np_state)
+        rot_base = rots_fm.corrupt(
+            rotmats_1,
+            t=t,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
+            stochasticity_scale=0.0,
+        )
+        rot_deltas = []
+        for s in np.linspace(0.0, 2.0, 21)[1:]:
+            torch.random.set_rng_state(torch_state)
+            np.random.set_state(np_state)
+            rot_s = rots_fm.corrupt(
+                rotmats_1,
+                t=t,
+                res_mask=res_mask,
+                diffuse_mask=diffuse_mask,
+                stochasticity_scale=float(s),
+            )
+            delta = torch.matmul(rot_s, rot_base.transpose(-1, -2))
+            ang, _, _ = angle_from_rotmat(delta)
+            rot_deltas.append(float(ang.mean().item()))
+        assert np.all(np.diff(rot_deltas) >= -1e-6)
+
+        # torsions
+        tors_fm = FlowMatcherTorsions(cfg=interpolant.cfg.torsions)
+        torch.random.set_rng_state(torch_state)
+        np.random.set_state(np_state)
+        tors_base = tors_fm.corrupt(
+            torsions_1,
+            t=t,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
+            stochasticity_scale=0.0,
+        )
+        angles_base = torch.atan2(tors_base[..., 0], tors_base[..., 1])
+        tors_deltas = []
+        for s in np.linspace(0.0, 2.0, 21)[1:]:
+            torch.random.set_rng_state(torch_state)
+            np.random.set_state(np_state)
+            tors_s = tors_fm.corrupt(
+                torsions_1,
+                t=t,
+                res_mask=res_mask,
+                diffuse_mask=diffuse_mask,
+                stochasticity_scale=float(s),
+            )
+            angles_s = torch.atan2(tors_s[..., 0], tors_s[..., 1])
+            d_ang = (angles_s - angles_base + math.pi) % (2.0 * math.pi) - math.pi
+            tors_deltas.append(float(d_ang.abs().mean().item()))
+        assert np.all(np.diff(tors_deltas) >= -1e-6)
+
+        # aatypes (use CTMC noise rates row-sum as noise mass proxy)
+        ctmc = FlowMatcherAATypesCTMC(cfg=interpolant.cfg.aatypes)
+        rates_means = []
+        for s in np.linspace(0.0, 2.0, 21):
+            rates = ctmc._aatypes_build_rates_noise(
+                aatypes_t=aatypes_t, t=t, stochasticity_scale=float(s)
+            )
+            rates_means.append(float(rates.sum(-1).mean().item()))
+        assert np.all(np.diff(rates_means) >= -1e-6)
