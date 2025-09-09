@@ -40,6 +40,7 @@ def mock_feats(
     feats[bp.res_plddt] = ((torch.rand(N) + 0.3) * 100.0).clamp(0, 100).float()
     feats[bp.plddt_mask] = feats[bp.res_bfactor] > 60.0
     feats[bp.hot_spots] = torch.zeros(N).int()
+    feats[bp.stochastic_scale] = torch.tensor([1.0]).float()
 
     # index
     feats[bp.chain_idx] = torch.ones(N)  # 1-indexed

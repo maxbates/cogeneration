@@ -148,7 +148,7 @@ class Interpolant:
     def __init__(self, cfg: InterpolantConfig):
         self.cfg = cfg
 
-        self._device = None
+        self._device = torch.device("cpu")
 
         # Flow matchers per domain
         self.trans_fm = FlowMatcherTrans(cfg=self.cfg.trans)
@@ -387,6 +387,9 @@ class Interpolant:
         r3_t = noisy_batch[nbp.r3_t]  # (B,)
         so3_t = noisy_batch[nbp.so3_t]  # (B,)
         cat_t = noisy_batch[nbp.cat_t]  # (B,)
+        stochasticity_scale = batch.get(
+            bp.stochastic_scale, torch.ones(res_mask.shape[0], device=trans_1.device)
+        )  # (B,)
 
         # Determine sequence and structure corruption masks.
         # Inpainting:
@@ -396,17 +399,6 @@ class Interpolant:
         # For other tasks, everything is corrupted i.e. `(diffuse_mask == 1.0).all()`
         #   Though values at t=1 effectively won't be corrupted.
         scaffold_mask = (1 - motif_mask) if motif_mask is not None else diffuse_mask
-
-        # Stochastic dropout, if enabled, disables stochasticity for some proportion of batches.
-        # It is at the batch level, rather than sample level, largely out of expedience
-        # (sigma_t == 0 does not imply no noise is added), but could be changed to sample level.
-        if (
-            self.cfg.stochastic_dropout_prop > 0.0
-            and torch.rand(1).item() < self.cfg.stochastic_dropout_prop
-        ):
-            stochasticity_scale = 0.0
-        else:
-            stochasticity_scale = 1.0
 
         # Apply corruptions
 
@@ -601,7 +593,7 @@ class Interpolant:
         step_idx: int,
         t_1: torch.Tensor,  # (B,)
         d_t: Optional[torch.Tensor],  # scalar or None if final step
-        stochasticity_scale: float = 1.0,
+        stochasticity_scale: torch.Tensor,  # (B,)
     ) -> Tuple[NoisyFeatures, SamplingStep, SamplingStep, Optional[FKStepMetric]]:
         """
         Perform a single step of sampling, integrating from `t_1` toward `t_2`.
@@ -949,6 +941,18 @@ class Interpolant:
             num_batch, num_res, self.num_tokens, device=self._device
         )
 
+        # Build per-sample stochasticity tensor (B,)
+        if isinstance(stochasticity_scale, torch.Tensor):
+            stochastic_scale_tensor = stochasticity_scale.to(self._device).view(-1)
+            if stochastic_scale_tensor.shape[0] != num_batch:
+                stochastic_scale_tensor = stochastic_scale_tensor.expand(num_batch)
+        else:
+            stochastic_scale_tensor = (
+                torch.tensor([float(stochasticity_scale)], device=self._device)
+                .expand(num_batch)
+                .float()
+            )
+
         # set up additional default values
         structure_method_tensor = (
             StructureExperimentalMethod.to_tensor(structure_method)
@@ -971,6 +975,7 @@ class Interpolant:
             bp.structure_method: structure_method_tensor,
             bp.hot_spots: hot_spots,
             bp.contact_conditioning: contact_conditioning,
+            bp.stochastic_scale: stochastic_scale_tensor,
             nbp.trans_sc: trans_sc,
             nbp.aatypes_sc: aatypes_sc,
         }
@@ -1110,7 +1115,7 @@ class Interpolant:
                 step_idx=step_idx,
                 t_1=t_1_b,
                 d_t=(t_2 - t_1),
-                stochasticity_scale=stochasticity_scale,
+                stochasticity_scale=stochastic_scale_tensor,
             )
 
             model_trajectory.append(model_step)
@@ -1139,7 +1144,7 @@ class Interpolant:
             step_idx=self.cfg.sampling.num_timesteps,  # final step
             t_1=t_1_b,
             d_t=None,  # final step
-            stochasticity_scale=stochasticity_scale,
+            stochasticity_scale=stochastic_scale_tensor,
         )
 
         model_trajectory.append(model_step)

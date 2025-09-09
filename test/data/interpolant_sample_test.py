@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 import torch
 
@@ -219,6 +220,81 @@ class TestInterpolantSample:
         ), "Contact conditioning should be non-zero"
 
         self._run_sample(cfg=cfg, batch=batch, task=InferenceTask.inpainting)
+
+    def test_single_step_consistency_stochastic_off_vs_scale_zero(
+        self, mock_cfg_uninterpolated, mock_pred_unconditional_dataloader
+    ):
+        """
+        One sampling step should be identical when disabling stochasticity via
+        cfg.shared.stochastic=False vs setting stochasticity_scale=0.0.
+        """
+        # Build two configs: one with stochastic disabled, one enabled
+        cfg_off = mock_cfg_uninterpolated
+        cfg_off.shared.stochastic = False
+        cfg_off.inference.task = InferenceTask.unconditional
+        cfg_off.inference.interpolant.sampling.num_timesteps = 2
+        cfg_off = cfg_off.interpolate()
+
+        cfg_on = mock_cfg_uninterpolated
+        cfg_on.shared.stochastic = True
+        cfg_on.inference.task = InferenceTask.unconditional
+        cfg_on.inference.interpolant.sampling.num_timesteps = 2
+        cfg_on = cfg_on.interpolate()
+
+        interp_off = Interpolant(cfg_off.inference.interpolant)
+        interp_on = Interpolant(cfg_on.inference.interpolant)
+
+        # same input batch
+        batch = next(iter(mock_pred_unconditional_dataloader))
+
+        # model shim that just returns the noisy batch
+        def model_pred_batch(b: NoisyFeatures):
+            return {
+                pbp.pred_trans: b[nbp.trans_t],
+                pbp.pred_rotmats: b[nbp.rotmats_t],
+                pbp.pred_torsions: b[nbp.torsions_t],
+                pbp.pred_aatypes: b[nbp.aatypes_t].long(),
+                pbp.pred_logits: torch.nn.functional.one_hot(
+                    b[nbp.aatypes_t].long(), num_classes=interp_on.num_tokens
+                ).float(),
+            }
+
+        # save RNG state to duplicate random base draws
+        torch_state = torch.random.get_rng_state()
+        np_state = np.random.get_state()
+        # run with scale=0 using stochastic on
+        sample_traj_scale0, model_traj_scale0, _ = interp_on.sample(
+            num_batch=batch[bp.res_mask].shape[0],
+            num_res=batch[bp.res_mask].shape[1],
+            model=model_pred_batch,
+            task=InferenceTask.unconditional,
+            diffuse_mask=batch[bp.diffuse_mask],
+            motif_mask=batch.get(bp.motif_mask, None),
+            chain_idx=batch[bp.chain_idx],
+            res_idx=batch[bp.res_idx],
+            stochasticity_scale=0.0,
+        )
+        # restore RNG and run with stochastic disabled
+        torch.random.set_rng_state(torch_state)
+        np.random.set_state(np_state)
+        sample_traj_off, model_traj_off, _ = interp_off.sample(
+            num_batch=batch[bp.res_mask].shape[0],
+            num_res=batch[bp.res_mask].shape[1],
+            model=model_pred_batch,
+            task=InferenceTask.unconditional,
+            diffuse_mask=batch[bp.diffuse_mask],
+            motif_mask=batch.get(bp.motif_mask, None),
+            chain_idx=batch[bp.chain_idx],
+            res_idx=batch[bp.res_idx],
+        )
+
+        # compare after one step (index 1). step 0 is initial state.
+        s0 = sample_traj_scale0[1]
+        s1 = sample_traj_off[1]
+        assert torch.allclose(s0.trans, s1.trans, atol=1e-6)
+        assert torch.allclose(s0.rotmats, s1.rotmats, atol=1e-6)
+        assert torch.allclose(s0.torsions, s1.torsions, atol=1e-6)
+        assert torch.equal(s0.aatypes, s1.aatypes)
 
     @pytest.mark.parametrize("corruption", [0.0, 0.025])
     def test_inpainting_preserves_motif_in_sampling(
@@ -513,7 +589,7 @@ class TestInterpolantSample:
 
             for i in range(steps):
                 t = float(i + 1) / float(steps + 1)
-                t_tensor = torch.tensor(t)
+                t_tensor = torch.tensor([t]).expand(B)
                 d_t_tensor = torch.tensor(d_t)
                 aatypes_t = interp.aatypes_fm.euler_step(
                     d_t=d_t_tensor,

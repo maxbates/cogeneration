@@ -1,3 +1,6 @@
+import copy as _copy
+
+import numpy as np
 import pytest
 import torch
 
@@ -570,3 +573,163 @@ class TestInterpolant:
             delta = torch.matmul(rotmats_t, rotmats_1.transpose(-1, -2))  # (...,3,3)
             ang, _, _ = angle_from_rotmat(delta)  # (...,)
             assert torch.quantile(ang, 0.99) <= 1e-2  # 99 % within 0.01 rad ~ 0.57°
+
+    @pytest.mark.parametrize(
+        "interpolant_type",
+        [
+            InterpolantAATypesInterpolantTypeEnum.masking,
+            InterpolantAATypesInterpolantTypeEnum.uniform,
+        ],
+    )
+    def test_corrupt_consistency_stochastic_off_vs_scale_zero(
+        self, interpolant_type, mock_cfg_uninterpolated
+    ):
+        """
+        When noise is disabled across batch, corruptions should be identical whether
+        disabling via cfg.shared.stochastic=False or by passing stochasticity_scale=0.0.
+
+        Compare translations, rotations, torsions, and aatypes given the same
+        base distributions, masks, and time `t`.
+        """
+        device = torch.device("cpu")
+        B, N = 4, 16
+
+        # Build two configs: one with stochastic disabled, one enabled (and set scale to 0)
+        cfg_off = mock_cfg_uninterpolated
+        cfg_off.shared.stochastic = False
+        cfg_off.interpolant.aatypes.interpolant_type = interpolant_type
+        cfg_off = cfg_off.interpolate()
+
+        cfg_on = mock_cfg_uninterpolated
+        cfg_on.shared.stochastic = True
+        cfg_on.interpolant.aatypes.interpolant_type = interpolant_type
+        cfg_on = cfg_on.interpolate()
+
+        # Instantiate interpolants
+        interp_off = Interpolant(cfg_off.interpolant)
+        interp_on = Interpolant(cfg_on.interpolant)
+
+        # Build common inputs
+        torch.manual_seed(0)
+        chain_idx = torch.ones(B, N, device=device).long()
+        res_mask = torch.ones(B, N, device=device).float()
+        diffuse_mask = torch.ones(B, N, device=device).float()
+        t = torch.rand(B, device=device)
+
+        # Build a base batch once (use cfg_off); reuse it for both calls
+        torch.manual_seed(1)
+        batch = create_pdb_batch(cfg_off, training=True)
+        # Ensure masks are fully diffused to avoid task-dependent fixing
+        batch[bp.diffuse_mask] = torch.ones_like(batch[bp.diffuse_mask])
+        # second copy for the scale-zero path
+        batch_scale0 = _copy.deepcopy(batch)
+        # provide stochastic scale zeros (B,)
+        B = batch[bp.res_mask].shape[0]
+        batch_scale0[bp.stochastic_scale] = torch.zeros(B, device=device)
+
+        # Call interpolant.corrupt_batch directly and compare outputs
+        torch_state = torch.random.get_rng_state()
+        np_state = np.random.get_state()
+        noisy_scale0 = interp_on.corrupt_batch(batch_scale0, task=cfg_on.data.task)
+        torch.random.set_rng_state(torch_state)
+        np.random.set_state(np_state)
+        noisy_off = interp_off.corrupt_batch(batch, task=cfg_off.data.task)
+
+        assert torch.allclose(
+            noisy_scale0[nbp.trans_t], noisy_off[nbp.trans_t], atol=1e-6
+        )
+        assert torch.allclose(
+            noisy_scale0[nbp.rotmats_t], noisy_off[nbp.rotmats_t], atol=1e-6
+        )
+        assert torch.allclose(
+            noisy_scale0[nbp.torsions_t], noisy_off[nbp.torsions_t], atol=1e-6
+        )
+        assert torch.equal(noisy_scale0[nbp.aatypes_t], noisy_off[nbp.aatypes_t])
+
+    def test_corrupt_per_sample_stochastic_scale(self, mock_cfg_uninterpolated):
+        """
+        With per-sample stochasticity scales (B,), only samples with scale>0
+        should receive stochastic noise.
+        """
+        device = torch.device("cpu")
+
+        # Enable stochastic globally and per-domain with positive intensity
+        cfg = mock_cfg_uninterpolated
+        cfg.shared.stochastic = True
+        cfg = cfg.interpolate()
+
+        interpolant = Interpolant(cfg.interpolant)
+
+        # Build a small batch (B>=2) and ensure fully diffused
+        batch = create_pdb_batch(cfg, training=True)
+        B, N = batch[bp.res_mask].shape
+        assert B >= 2, "Test expects batch size >= 2"
+        batch[bp.diffuse_mask] = torch.ones_like(batch[bp.diffuse_mask])
+
+        # Two runs: (1) all zero scales; (2) mixed scales [0, 1]
+        base_allzero = _copy.deepcopy(batch)
+        base_mixed = _copy.deepcopy(batch)
+        base_allzero[bp.stochastic_scale] = torch.zeros(B, device=device)
+        mixed_scale = torch.zeros(B, device=device)
+        mixed_scale[1] = 1.0
+        base_mixed[bp.stochastic_scale] = mixed_scale
+
+        # Compare per-domain with other domains disabled to avoid RNG stream differences
+        def compare_domain(domain: str):
+            cfg_d = _copy.deepcopy(cfg)
+            cfg_d.interpolant.trans.corrupt = domain == "trans"
+            cfg_d.interpolant.rots.corrupt = domain == "rots"
+            cfg_d.interpolant.torsions.corrupt = domain == "torsions"
+            cfg_d.interpolant.aatypes.corrupt = domain == "aatypes"
+            interp_d = Interpolant(cfg_d.interpolant)
+
+            torch_state = torch.random.get_rng_state()
+            np_state = np.random.get_state()
+            noisy_zero = interp_d.corrupt_batch(
+                _copy.deepcopy(base_allzero), task=cfg_d.data.task
+            )
+            torch.random.set_rng_state(torch_state)
+            np.random.set_state(np_state)
+            noisy_mix = interp_d.corrupt_batch(
+                _copy.deepcopy(base_mixed), task=cfg_d.data.task
+            )
+
+            idx0, idx1 = 0, 1
+            if domain == "trans":
+                # sample 0 equal, sample 1 likely different
+                assert torch.allclose(
+                    noisy_zero[nbp.trans_t][idx0],
+                    noisy_mix[nbp.trans_t][idx0],
+                    atol=1e-6,
+                )
+                assert not torch.allclose(
+                    noisy_zero[nbp.trans_t][idx1], noisy_mix[nbp.trans_t][idx1]
+                )
+            elif domain == "rots":
+                assert torch.allclose(
+                    noisy_zero[nbp.rotmats_t][idx0],
+                    noisy_mix[nbp.rotmats_t][idx0],
+                    atol=1e-6,
+                )
+                assert not torch.allclose(
+                    noisy_zero[nbp.rotmats_t][idx1], noisy_mix[nbp.rotmats_t][idx1]
+                )
+            elif domain == "torsions":
+                assert torch.allclose(
+                    noisy_zero[nbp.torsions_t][idx0],
+                    noisy_mix[nbp.torsions_t][idx0],
+                    atol=1e-6,
+                )
+                assert not torch.allclose(
+                    noisy_zero[nbp.torsions_t][idx1], noisy_mix[nbp.torsions_t][idx1]
+                )
+            elif domain == "aatypes":
+                assert torch.equal(
+                    noisy_zero[nbp.aatypes_t][idx0], noisy_mix[nbp.aatypes_t][idx0]
+                )
+                assert not torch.equal(
+                    noisy_zero[nbp.aatypes_t][idx1], noisy_mix[nbp.aatypes_t][idx1]
+                )
+
+        for d in ["trans", "rots", "torsions", "aatypes"]:
+            compare_domain(d)

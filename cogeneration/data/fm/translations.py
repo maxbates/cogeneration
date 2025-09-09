@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from scipy.optimize import linear_sum_assignment  # noqa
@@ -120,7 +120,7 @@ class FlowMatcherTrans(FlowMatcher):
         res_mask: torch.Tensor,  # (B, N)
         diffuse_mask: torch.Tensor,  # (B, N)
         chain_idx: torch.Tensor,  # (B, N)
-        stochasticity_scale: float = 1.0,
+        stochasticity_scale: Union[torch.Tensor, float] = 1.0,  # (B,)
     ) -> torch.Tensor:
         tau = self.time_training(t)
         trans_0 = self.sample_base(chain_idx=chain_idx, is_intermediate=False)
@@ -145,10 +145,14 @@ class FlowMatcherTrans(FlowMatcher):
         else:
             raise ValueError(f"Unknown trans schedule {self.cfg.train_schedule}")
 
+        stochasticity_scale = self._stochasticity_scale_tensor(
+            scale=stochasticity_scale, t=t
+        )  # (B,)
+
         if (
             self.cfg.stochastic
             and self.cfg.stochastic_noise_intensity > 0.0
-            and stochasticity_scale > 0.0
+            and (stochasticity_scale > 0).any()
         ):
             sigma_t = self._compute_sigma_t(
                 tau,
@@ -172,16 +176,21 @@ class FlowMatcherTrans(FlowMatcher):
         trans_1: torch.Tensor,  # (B, N, 3)
         trans_t: torch.Tensor,  # (B, N, 3)
         chain_idx: torch.Tensor,  # (B, N)
-        stochasticity_scale: float = 1.0,
+        stochasticity_scale: Union[torch.Tensor, float] = 1.0,  # (B,)
         potential: Optional[torch.Tensor] = None,  # (B, N, 3) VF
     ) -> torch.Tensor:
         tau = self.time_sampling(t)
         trans_vf = self.vector_field(t=tau, trans_1=trans_1, trans_t=trans_t)
 
+        # normalize stochasticity scale to (B,) tensor
+        stochasticity_scale = self._stochasticity_scale_tensor(
+            scale=stochasticity_scale, t=t
+        )
+
         if (
             self.cfg.stochastic
             and self.cfg.stochastic_noise_intensity > 0.0
-            and stochasticity_scale > 0.0
+            and (stochasticity_scale > 0).any()
         ):
             intermediate_noise = self.sample_base(
                 chain_idx=chain_idx,

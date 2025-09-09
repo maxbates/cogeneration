@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Union
 
 import torch
 
@@ -22,7 +22,7 @@ class FlowMatcher(ABC):
 
     @staticmethod
     def _compute_sigma_t(
-        t: torch.Tensor, scale: float = 1.0, min_sigma: float = 0.0
+        t: torch.Tensor, scale: torch.Tensor, min_sigma: float = 0.0  # (B,)  # (B,)
     ) -> torch.Tensor:
         """
         Compute the instantaneous standard deviation of the noise at time t.
@@ -32,16 +32,41 @@ class FlowMatcher(ABC):
         """
         return torch.sqrt(scale**2 * t * (1 - t) + min_sigma**2)
 
+    @staticmethod
+    def _stochasticity_scale_tensor(
+        scale: Union[torch.Tensor, float, int],
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Normalize a possibly-scalar `scale` into a (B,) tensor broadcasted to `t`.
+
+        Inputs:
+        - scale: float/int or (B,) tensor
+        - t: (B,) time tensor (provides batch size and device)
+
+        Returns:
+        - (B,) tensor on same device as `t`
+        """
+        if isinstance(scale, torch.Tensor):
+            s = scale.to(t.device).view(-1)
+            if s.numel() == 1:
+                return s.expand_as(t)
+            if s.shape[0] != t.shape[0]:
+                return s.expand(t.shape[0])
+            return s
+        else:
+            return torch.ones(t.shape[0], device=t.device) * float(scale)
+
     def time_training(self, t: torch.Tensor) -> torch.Tensor:
         """
-        Map raw t in [0,1] to domain-specific training schedule time tau for corruption.
+        Map raw t (B,) in [0,1] to domain-specific training schedule time tau for corruption.
         Base implementation is identity.
         """
         return t
 
     def time_sampling(self, t: torch.Tensor) -> torch.Tensor:
         """
-        Map raw t in [0,1] to domain-specific sampling schedule time tau for drift/noise usage.
+        Map raw t (B,) in [0,1] to domain-specific sampling schedule time tau for drift/noise usage.
         Base implementation is identity.
         """
         return t

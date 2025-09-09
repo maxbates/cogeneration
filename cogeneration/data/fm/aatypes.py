@@ -1,6 +1,6 @@
 import math
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -70,7 +70,7 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
         t: torch.Tensor,  # (B,)
         res_mask: torch.Tensor,  # (B, N)
         diffuse_mask: torch.Tensor,  # (B, N)
-        stochasticity_scale: float = 1.0,
+        stochasticity_scale: Union[torch.Tensor, float] = 1.0,  # (B,)
     ) -> torch.Tensor:
         """Corrupt aatypes (B, N) from t=1 to t"""
         raise NotImplementedError
@@ -82,7 +82,7 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
         t: torch.Tensor,  # (B,)
         logits_1: torch.Tensor,  # (B, N, S)
         aatypes_t: torch.Tensor,  # (B, N)
-        stochasticity_scale: float = 1.0,
+        stochasticity_scale: Union[torch.Tensor, float] = 1.0,  # (B,)
         potential: Optional[torch.Tensor] = None,  # (B, N, S)
     ) -> torch.Tensor:
         """Perform aatypes single Euler step update, returning new aatypes (B, N)"""
@@ -204,7 +204,7 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
     def _cumulative_hazard_rho(
         self,
         t: torch.Tensor,  # (B,) tau
-        scale: float = 1.0,  # like _compute_sigma_t(), e.g. stochastic_scale
+        scale: torch.Tensor,  # (B,) like _compute_sigma_t(), e.g. stochastic_scale
         min_sigma: float = 0.0,  # like _compute_sigma_t()
         kappa: float = 4.1589,  # hazard gain/steepness; larger -> quicker corruption
         eps: float = 1e-4,
@@ -230,8 +230,9 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
         Default kappa is ln(2)/(1/6) so rho(t=0, scale=1) = 0.5
         """
         t = t.clamp(0.0, 1.0)
-        scale = max(scale, 0.0)  # >= 0
-        scale *= self.NOISE_GAIN
+        # ensure non-negative tensor scale (B,)
+        scale = scale.to(t.device).clamp_min(0.0)
+        scale = scale * self.NOISE_GAIN
 
         # shape-only closed form integral of σ^2 at scale=1
         I_shape = (1.0 - 3.0 * t**2 + 2.0 * t**3) / 6.0 + (min_sigma**2) * (
@@ -281,7 +282,7 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
         self,
         t: torch.Tensor,  # (B,) tau
         d_t: torch.Tensor,  # scalar
-        scale: float = 1.0,  # like _compute_sigma_t(), e.g. stochastic_scale
+        scale: torch.Tensor,  # (B,) like _compute_sigma_t(), e.g. stochastic_scale
         min_sigma: float = 0.0,  # like _compute_sigma_t()
     ) -> torch.Tensor:
         """
@@ -295,6 +296,7 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
         # get sigma_t^2 shape (~ scale=1.0)
         sigma_t_squared = t * (1.0 - t) + (min_sigma**2)  # (B,)
         # scale linearly by `scale`, and include NOISE_GAIN
+        scale = scale.to(t.device)
         lambda_t = d_t * sigma_t_squared * (scale * self.NOISE_GAIN)
         # Poisson map
         nu_t = 1 - torch.exp(-lambda_t)
@@ -367,11 +369,15 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
         tau_b11 = tau.view(B, 1, 1)
         probs = tau_b11 * current_aatypes + (1.0 - tau_b11) * base  # (B, N, S)
 
+        stochasticity_scale = self._stochasticity_scale_tensor(
+            scale=stochasticity_scale, t=t
+        )  # (B,)
+
         # stochasticity: add-on "rate" rho via Poisson map over ∫σ^2 hazard
         if (
             self.cfg.stochastic
             and self.cfg.stochastic_noise_intensity > 0.0
-            and stochasticity_scale > 0.0
+            and (stochasticity_scale > 0).any()
         ):
             # `rho` represents cumulative hazard
             rho = self._cumulative_hazard_rho(
@@ -403,7 +409,7 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
         t: torch.Tensor,  # (B,)
         logits_1: torch.Tensor,  # (B, N, S=20)
         aatypes_t: torch.Tensor,  # (B, N)
-        stochasticity_scale: float = 1.0,
+        stochasticity_scale: Union[torch.Tensor, float] = 1.0,  # (B,)
         potential: Optional[torch.Tensor] = None,  # (B, N, S=20)
     ) -> torch.Tensor:
         B, N = aatypes_t.shape
@@ -428,10 +434,14 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
         # compute drift step probs (off-diagonal mass)
         step_probs = d_t * probs * uncertainty
 
+        stochasticity_scale = self._stochasticity_scale_tensor(
+            scale=stochasticity_scale, t=t
+        )  # (B,)
+
         if (
             self.cfg.stochastic
             and self.cfg.stochastic_noise_intensity > 0.0
-            and stochasticity_scale > 0.0
+            and (stochasticity_scale > 0).any()
         ):
             # compute noise leave mass scale
             nu_t = self._poisson_noise_weight(
@@ -449,7 +459,7 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
 
         # cap leave mass
         step_probs = self._cap_leave_mass(
-            probs=step_probs,
+            step_probs=step_probs,
             aatypes_t=aatypes_t,
         )
 
@@ -525,7 +535,7 @@ class FlowMatcherAATypesMasking(FlowMatcherAATypes):
         t: torch.Tensor,  # (B,)
         res_mask: torch.Tensor,  # (B, N)
         diffuse_mask: torch.Tensor,  # (B, N)
-        stochasticity_scale: float = 1.0,
+        stochasticity_scale: Union[torch.Tensor, float] = 1.0,  # (B,)
     ) -> torch.Tensor:
         """
         Linear drift to mask base distribution, one-shot Poisson noise mixed between unmask and change
@@ -550,11 +560,14 @@ class FlowMatcherAATypesMasking(FlowMatcherAATypes):
         tau_b11 = tau.view(B, 1, 1)
         probs = tau_b11 * current_aatypes + (1.0 - tau_b11) * mask_onehot  # (B, N, S)
 
-        # stochasticity
+        stochasticity_scale = self._stochasticity_scale_tensor(
+            scale=stochasticity_scale, t=t
+        )  # (B,)
+
         if (
             self.cfg.stochastic
             and self.cfg.stochastic_noise_intensity > 0.0
-            and stochasticity_scale > 0.0
+            and (stochasticity_scale > 0).any()
         ):
             # `rho` represents cumulative hazard
             rho = self._cumulative_hazard_rho(
@@ -594,7 +607,7 @@ class FlowMatcherAATypesMasking(FlowMatcherAATypes):
         t: torch.Tensor,  # (B,)
         logits_1: torch.Tensor,  # (B, N, S=21)
         aatypes_t: torch.Tensor,  # (B, N)
-        stochasticity_scale: float = 1.0,
+        stochasticity_scale: Union[torch.Tensor, float] = 1.0,  # (B,)
         potential: Optional[torch.Tensor] = None,  # (B, N, S=21)
     ) -> torch.Tensor:
         B, N = aatypes_t.shape
@@ -618,11 +631,15 @@ class FlowMatcherAATypesMasking(FlowMatcherAATypes):
         # compute drift step probs (off-diagonal mass)
         step_probs = d_t * probs * uncertainty
 
+        stochasticity_scale = self._stochasticity_scale_tensor(
+            scale=stochasticity_scale, t=t
+        )  # (B,)
+
         # Poisson noise per step (using unmask/change kernels dependent on current state)
         if (
             self.cfg.stochastic
             and self.cfg.stochastic_noise_intensity > 0.0
-            and stochasticity_scale > 0.0
+            and (stochasticity_scale > 0).any()
         ):
             # t -> tau according to schedule
             tau = self._aatypes_schedule(t=t)

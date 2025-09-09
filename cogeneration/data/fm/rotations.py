@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
@@ -95,7 +95,7 @@ class FlowMatcherRotations(FlowMatcher):
         t: torch.Tensor,  # (B,)
         res_mask: torch.Tensor,  # (B, N)
         diffuse_mask: torch.Tensor,  # (B, N)
-        stochasticity_scale: float = 1.0,
+        stochasticity_scale: Union[torch.Tensor, float] = 1.0,  # (B,)
     ) -> torch.Tensor:
         """Corrupt rotations from t=1 to t using IGSO(3)."""
         num_batch, num_res = res_mask.shape
@@ -115,11 +115,15 @@ class FlowMatcherRotations(FlowMatcher):
         # interpolate on geodesic between rotmats_0 and rotmats_1
         rotmats_t = so3_utils.geodesic_t(tau[:, None, None], rotmats_1, rotmats_0)
 
+        stochasticity_scale = self._stochasticity_scale_tensor(
+            scale=stochasticity_scale, t=t
+        )  # (B,)
+
         # stochastic intermediate noise
         if (
             self.cfg.stochastic
             and self.cfg.stochastic_noise_intensity > 0.0
-            and stochasticity_scale > 0.0
+            and (stochasticity_scale > 0).any()
         ):
             sigma_t = self._compute_sigma_t(
                 tau,
@@ -156,7 +160,7 @@ class FlowMatcherRotations(FlowMatcher):
         t: torch.Tensor,  # (B,)
         rotmats_1: torch.Tensor,  # (B, N, 3, 3)
         rotmats_t: torch.Tensor,  # (B, N, 3, 3)
-        stochasticity_scale: float = 1.0,
+        stochasticity_scale: Union[torch.Tensor, float] = 1.0,  # (B,)
         potential: Optional[torch.Tensor] = None,  # (B, N, 3)
     ) -> torch.Tensor:
         # VF scaling applies schedule properly, dont give tau.
@@ -181,10 +185,14 @@ class FlowMatcherRotations(FlowMatcher):
             rot_vf=rot_vf,
         )
 
+        stochasticity_scale = self._stochasticity_scale_tensor(
+            scale=stochasticity_scale, t=t
+        )  # (B,)
+
         if (
             self.cfg.stochastic
             and self.cfg.stochastic_noise_intensity > 0.0
-            and stochasticity_scale > 0.0
+            and (stochasticity_scale > 0).any()
         ):
             # Sample IGSO(3) noise with a time-independent sigma_t, scaled by sqrt(dt)
             # Add IGSO(3) noise to keep rotmats_next on SO(3).
@@ -198,17 +206,25 @@ class FlowMatcherRotations(FlowMatcher):
             sqrt_dt = torch.sqrt(d_t).to(sigma_t.device)
             sigma_t = (sigma_t * sqrt_dt).to(self.igso3.sigma_grid.device)
 
-            # safety check sigma_t within IGSO3 grid spec
-            if sigma_t.min() < self.igso3.sigma_grid.min():
-                raise ValueError(
-                    f"rots sigma_t < igso3 grid min, noise will be larger than desired. Lower igso3_sigma_min."
-                )
+            # Only apply noise where sigma_t > 0
+            apply_mask = sigma_t > 0
+            if apply_mask.any():
+                sigma_sel = sigma_t[apply_mask].to(self.igso3.sigma_grid.device)
+                # safety check sigma range for selected only
+                if sigma_sel.min() < self.igso3.sigma_grid.min():
+                    raise ValueError(
+                        f"rots sigma_t < igso3 grid min, noise will be larger than desired. Lower igso3_sigma_min."
+                    )
 
-            intermediate_noise = self.igso3.sample(sigma_t, num_res)
-            intermediate_noise = intermediate_noise.to(rotmats_t.device)
-            intermediate_noise = intermediate_noise.reshape(num_batch, num_res, 3, 3)
-            rotmats_next = torch.einsum(
-                "...ij,...jk->...ik", rotmats_next, intermediate_noise
-            )
+                identity_noise = torch.eye(3, device=self._device)[None, None].repeat(
+                    num_batch, num_res, 1, 1
+                )
+                noise_sel = self.igso3.sample(sigma_sel, num_res).to(self._device)
+                noise_sel = noise_sel.reshape(apply_mask.sum(), num_res, 3, 3)
+                intermediate_noise = identity_noise
+                intermediate_noise[apply_mask] = noise_sel
+                rotmats_next = torch.einsum(
+                    "...ij,...jk->...ik", rotmats_next, intermediate_noise
+                )
 
         return rotmats_next

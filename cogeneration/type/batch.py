@@ -49,6 +49,10 @@ class BatchProp(StrEnum):
 
     # inference only
     sample_id = "sample_id"  # (B) [inference only] sample id
+    # stochastic control
+    stochastic_scale = (
+        "stochastic_scale"  # (B) stochasticity scale, 0 disables, 1 pass-through
+    )
 
 
 # datum level metadata, i.e. `(B)` rather than `(B, N)`, and non-tensors
@@ -57,6 +61,7 @@ METADATA_BATCH_PROPS = [
     BatchProp.structure_method,
     BatchProp.csv_idx,
     BatchProp.sample_id,
+    BatchProp.stochastic_scale,
 ]
 
 

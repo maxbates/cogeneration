@@ -502,6 +502,9 @@ class BatchFeaturizer:
         hot_spots_mask = torch.zeros_like(res_mask).int()
         contact_conditioning = torch.zeros(res_mask.shape[0], res_mask.shape[0])
 
+        # default stochasticity enabled, may drop out when featurizing
+        stochastic_scale = torch.tensor([1.0]).float()
+
         feats: BatchFeatures = {
             bp.res_mask: res_mask,
             bp.aatypes_1: aatypes_1,
@@ -515,6 +518,7 @@ class BatchFeaturizer:
             bp.structure_method: method_feature,
             bp.diffuse_mask: diffuse_mask,
             bp.plddt_mask: plddt_mask,
+            bp.stochastic_scale: stochastic_scale,
             bp.hot_spots: hot_spots_mask,
             bp.contact_conditioning: contact_conditioning,
             # bp.motif_mask: None, # inpainting only, defined when featurizing
@@ -557,6 +561,16 @@ class BatchFeaturizer:
             cfg=self.cfg,
             processed_file_path=csv_row[mc.processed_path],
         )
+
+        # Set per-sample stochastic scale and sometimes dropout to 0.0
+        if (
+            self.is_training
+            and self.cfg.stochastic_dropout_prop > 0.0
+            and random.random() < self.cfg.stochastic_dropout_prop
+        ):
+            feats[bp.stochastic_scale] = torch.tensor([0.0]).float()
+        else:
+            feats[bp.stochastic_scale] = torch.tensor([1.0]).float()
 
         # Update `diffuse_mask` and `motif_mask` depending on task
         if self.task == DataTask.hallucination:

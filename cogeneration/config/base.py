@@ -1030,8 +1030,6 @@ class InterpolantConfig(BaseClassConfig):
     self_condition_prob: float = 0.5  # 0.5 in public MultiFlow
     # kappa allows scaling rotation t exponentially during sampling
     provide_kappa: bool = True
-    # non-stochastic proportion in training, i.e. reverting to flow matching. batch level.
-    stochastic_dropout_prop: float = 0.2
 
     # sub-modules
     rots: InterpolantRotationsConfig = field(default_factory=InterpolantRotationsConfig)
@@ -1306,11 +1304,16 @@ class DatasetConfig(BaseClassConfig):
     # (Does not apply to PDB b-factors, which we try to predict by default).
     add_plddt_mask: bool = False
     min_plddt_threshold: float = 60.0  # [0-100]
+
+    # stochastics
+    # proportion of batches to disable stochasticity (i.e., revert to flow matching)
+    stochastic_dropout_prop: float = 0.2
     # add gaussian noise to atom positions prior to rigid frame calculation
     # mostly redundant with stochastic paths, but may provide minor regularization
     noise_atom_positions_angstroms: float = 0.02
     # global backbone center jitter (translation) Å std dev; 0.0 to disable
     backbone_center_noise: float = 0.3
+
     # Inpainting / scaffolding parameters
     inpainting: DatasetInpaintingConfig = field(default_factory=DatasetInpaintingConfig)
     # Conditioning
@@ -1837,7 +1840,9 @@ class Config(BaseClassConfig):
         raw_cfg.interpolant.codesign_inverse_fold_prop = 0.0
 
         # always stochastic, if enabled
-        raw_cfg.interpolant.stochastic_dropout_prop = 0.0
+        raw_cfg.dataset.stochastic_dropout_prop = 0.0
+        # always centered
+        raw_cfg.dataset.backbone_center_noise = 0.0
 
         # skip animations, they are slow to generate
         raw_cfg.inference.write_animations = False
