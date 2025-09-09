@@ -633,6 +633,17 @@ class BatchFeaturizer:
             # Center the whole structure
             BatchFeaturizer.recenter_structure(feats)
 
+        # Apply global translation center jitter, if training and enabled
+        if self.is_training and self.cfg.backbone_center_noise > 0.0:
+            sigma = float(self.cfg.backbone_center_noise)
+            jitter = (
+                torch.randn(
+                    3, device=feats[bp.trans_1].device, dtype=feats[bp.trans_1].dtype
+                )
+                * sigma
+            )
+            feats[bp.trans_1] = feats[bp.trans_1] + jitter[None, :]
+
         # Randomize chains and reset residue positions
         BatchFeaturizer.randomize_chains(feats)
         BatchFeaturizer.reset_residue_index(feats)

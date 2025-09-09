@@ -1309,6 +1309,8 @@ class DatasetConfig(BaseClassConfig):
     # add gaussian noise to atom positions prior to rigid frame calculation
     # mostly redundant with stochastic paths, but may provide minor regularization
     noise_atom_positions_angstroms: float = 0.02
+    # global backbone center jitter (translation) Å std dev; 0.0 to disable
+    backbone_center_noise: float = 0.3
     # Inpainting / scaffolding parameters
     inpainting: DatasetInpaintingConfig = field(default_factory=DatasetInpaintingConfig)
     # Conditioning
