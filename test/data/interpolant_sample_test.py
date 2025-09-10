@@ -596,7 +596,7 @@ class TestInterpolantSample:
                     t=t_tensor,
                     logits_1=logits_1,
                     aatypes_t=aatypes_t,
-                    stochasticity_scale=0.0,
+                    stochasticity_scale=torch.zeros_like(t_tensor),
                     potential=potential,
                 )
 
@@ -672,7 +672,7 @@ def test_aatypes_base_rates_noise_rows_sum_to_one(
     ctmc = FlowMatcherAATypesCTMC(cfg=interp.cfg.aatypes)
     ctmc.set_device(device)
     rates = ctmc._aatypes_build_rates_noise(
-        aatypes_t=aatypes_t, t=t, stochasticity_scale=1.0
+        aatypes_t=aatypes_t, t=t, stochasticity_scale=torch.ones_like(t)
     )
     row_sum = rates.sum(-1)
     # With unit scale at t=0.5, average per-row mass should be non-zero and <= 1

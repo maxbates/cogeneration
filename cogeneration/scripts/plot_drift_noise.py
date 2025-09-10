@@ -426,7 +426,7 @@ class TrainingMeasurer:
             res_mask=res_mask,
             diffuse_mask=diffuse_mask,
             chain_idx=chain_idx,
-            stochasticity_scale=0.0,
+            stochasticity_scale=torch.zeros_like(t),
         )
         seed_all(12000 + i)
         trans_st = self.interpolant.trans_fm.corrupt(
@@ -435,7 +435,7 @@ class TrainingMeasurer:
             res_mask=res_mask,
             diffuse_mask=diffuse_mask,
             chain_idx=chain_idx,
-            stochasticity_scale=1.0,
+            stochasticity_scale=torch.ones_like(t),
         )
         d = (trans_st - trans_no) * res_mask[..., None]
         dnorm = torch.linalg.norm(d, dim=-1)
@@ -477,7 +477,7 @@ class TrainingMeasurer:
             t=t,
             res_mask=res_mask,
             diffuse_mask=diffuse_mask,
-            stochasticity_scale=0.0,
+            stochasticity_scale=torch.zeros_like(t),
         )
         seed_all(22000 + i)
         rot_st = self.interpolant.rots_fm.corrupt(
@@ -485,7 +485,7 @@ class TrainingMeasurer:
             t=t,
             res_mask=res_mask,
             diffuse_mask=diffuse_mask,
-            stochasticity_scale=1.0,
+            stochasticity_scale=torch.ones_like(t),
         )
         delta = torch.matmul(rot_st, rot_no.transpose(-1, -2))
         ang = _angles_from_rotmats(delta)
@@ -517,7 +517,7 @@ class TrainingMeasurer:
             t=t,
             res_mask=res_mask,
             diffuse_mask=diffuse_mask,
-            stochasticity_scale=0.0,
+            stochasticity_scale=torch.zeros_like(t),
         )
         seed_all(32000 + i)
         aa_st = self.interpolant.aatypes_fm.corrupt(
@@ -525,7 +525,7 @@ class TrainingMeasurer:
             t=t,
             res_mask=res_mask,
             diffuse_mask=diffuse_mask,
-            stochasticity_scale=1.0,
+            stochasticity_scale=torch.ones_like(t),
         )
         frac = (aa_st != aa_no).float().mean().item()
         out.aatypes.corr_noise_mean.append(frac)
@@ -533,7 +533,10 @@ class TrainingMeasurer:
         tau = self.interpolant.aatypes_fm.time_training(t)
         rho = (
             self.interpolant.aatypes_fm._cumulative_hazard_rho(
-                t=tau, scale=self.interpolant.cfg.aatypes.stochastic_noise_intensity
+                t=tau,
+                scale=torch.full_like(
+                    tau, float(self.interpolant.cfg.aatypes.stochastic_noise_intensity)
+                ),
             )
             .mean()
             .item()
@@ -556,7 +559,7 @@ class TrainingMeasurer:
             t=t,
             res_mask=res_mask,
             diffuse_mask=diffuse_mask,
-            stochasticity_scale=0.0,
+            stochasticity_scale=torch.zeros_like(t),
         )
         seed_all(42000 + i)
         tor_st = self.interpolant.torsions_fm.corrupt(
@@ -564,7 +567,7 @@ class TrainingMeasurer:
             t=t,
             res_mask=res_mask,
             diffuse_mask=diffuse_mask,
-            stochasticity_scale=1.0,
+            stochasticity_scale=torch.ones_like(t),
         )
         ang_no = torch.atan2(tor_no[..., 0], tor_no[..., 1])
         ang_st = torch.atan2(tor_st[..., 0], tor_st[..., 1])
@@ -734,7 +737,7 @@ class SamplingMeasurer:
             trans_1=trans_1,
             trans_t=trans_t,
             chain_idx=chain_idx,
-            stochasticity_scale=0.0,
+            stochasticity_scale=torch.zeros_like(t),
             potential=None,
         )
         trans_vf = trans_fm.vector_field(t=t, trans_1=trans_1, trans_t=trans_t)
@@ -750,7 +753,9 @@ class SamplingMeasurer:
             trans_1=trans_1,
             trans_t=trans_t,
             chain_idx=chain_idx,
-            stochasticity_scale=1.0,
+            stochasticity_scale=trans_fm.effective_stochastic_scale(
+                t=t, stochastic_scale=torch.ones_like(t)
+            ),
             potential=None,
         )
         trans_noise_comp = trans_next_noise - (trans_t + trans_vf * dt_f)
@@ -810,7 +815,7 @@ class SamplingMeasurer:
             t=t,
             rotmats_1=rotmats_1,
             rotmats_t=rotmats_t,
-            stochasticity_scale=0.0,
+            stochasticity_scale=torch.zeros_like(t),
             potential=None,
         )
         delta_drift = torch.matmul(rot_next_drift, rotmats_t.transpose(-1, -2))
@@ -823,7 +828,9 @@ class SamplingMeasurer:
             t=t,
             rotmats_1=rotmats_1,
             rotmats_t=rotmats_t,
-            stochasticity_scale=1.0,
+            stochasticity_scale=rots_fm.effective_stochastic_scale(
+                t=t, stochastic_scale=torch.ones_like(t)
+            ),
             potential=None,
         )
         delta_noise = torch.matmul(rot_next_noise, rot_next_drift.transpose(-1, -2))
@@ -869,7 +876,7 @@ class SamplingMeasurer:
             t=t,
             torsions_1=torch.zeros_like(torsions_t),
             torsions_t=torsions_t,
-            stochasticity_scale=0.0,
+            stochasticity_scale=torch.zeros_like(t),
         )
         ang_t = torch.atan2(torsions_t[..., 0], torsions_t[..., 1])
         ang_next = torch.atan2(tors_next_drift[..., 0], tors_next_drift[..., 1])
@@ -884,7 +891,9 @@ class SamplingMeasurer:
             t=t,
             torsions_1=torch.zeros_like(torsions_t),
             torsions_t=torsions_t,
-            stochasticity_scale=1.0,
+            stochasticity_scale=torsions_fm.effective_stochastic_scale(
+                t=t, stochastic_scale=torch.ones_like(t)
+            ),
         )
         ang_next_noise = torch.atan2(tors_next_noise[..., 0], tors_next_noise[..., 1])
         noise_da = torch.atan2(
@@ -931,7 +940,7 @@ class SamplingMeasurer:
                 num_batch, num_res, self.interpolant.num_tokens, device=device
             ),
             aatypes_t=aatypes_t,
-            stochasticity_scale=0.0,
+            stochasticity_scale=torch.zeros_like(t),
             potential=None,
         )
         drift_frac = (aa_next_drift != aatypes_t).float().mean().item()
@@ -944,7 +953,9 @@ class SamplingMeasurer:
                 num_batch, num_res, self.interpolant.num_tokens, device=device
             ),
             aatypes_t=aatypes_t,
-            stochasticity_scale=1.0,
+            stochasticity_scale=aatypes_fm.effective_stochastic_scale(
+                t=t, stochastic_scale=torch.ones_like(t)
+            ),
             potential=None,
         )
         noise_frac = (aa_next_noise != aa_next_drift).float().mean().item()
@@ -954,7 +965,9 @@ class SamplingMeasurer:
             aatypes_fm._poisson_noise_weight(
                 t=tau,
                 d_t=dt,
-                scale=self.interpolant.cfg.aatypes.stochastic_noise_intensity,
+                scale=torch.full_like(
+                    t, float(self.interpolant.cfg.aatypes.stochastic_noise_intensity)
+                ),
             )
             .mean()
             .item()

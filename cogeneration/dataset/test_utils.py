@@ -95,6 +95,12 @@ def mock_noisy_feats(
     feats[nbp.trans_sc] = torch.rand(N, 3)
     feats[nbp.aatypes_sc] = torch.rand(N, 21)  # include mask token
 
+    # per-domain stochasticity (B,) -> here as scalars so collate to (B,)
+    feats[nbp.trans_stochasticity] = torch.tensor(1.0)
+    feats[nbp.rotmats_stochasticity] = torch.tensor(1.0)
+    feats[nbp.torsions_stochasticity] = torch.tensor(1.0)
+    feats[nbp.aatypes_stochasticity] = torch.tensor(1.0)
+
     return feats
 
 

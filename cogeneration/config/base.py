@@ -286,6 +286,8 @@ class ModelNodeFeaturesConfig(BaseClassConfig):
     embed_torsions: bool = True
     # embed_structural_method: whether to embed structure experimental method
     embed_structural_method: bool = True
+    # whether to embed per-domain stochasticity scales at t
+    embed_stochasticity_scales: bool = True
     # embed_hotspots: whether to embed hot spot indicators
     embed_hotspots: bool = True
     # use_mlp: whether to use MLP for embedding, otherwise linear layer
@@ -754,6 +756,16 @@ class FoldingConfig(BaseClassConfig):
 ##### Interpolant #####
 
 
+@dataclass
+class InterpolantDomainConfig(BaseClassConfig):
+    """Base config for each domain's flow matcher"""
+
+    corrupt: bool = False
+    # stochastic paths
+    stochastic: bool = "${shared.stochastic}"
+    stochastic_noise_intensity: float = 1.0
+
+
 class InterpolantRotationsScheduleEnum(StrEnum):
     linear = "linear"
     # Note that structures seem to generate better when rotations settle first.
@@ -763,7 +775,7 @@ class InterpolantRotationsScheduleEnum(StrEnum):
 
 
 @dataclass
-class InterpolantRotationsConfig(BaseClassConfig):
+class InterpolantRotationsConfig(InterpolantDomainConfig):
     # corrupt rotations (unless inverse folding)
     corrupt: bool = (
         "${ternary:${equals: ${inference.task}, 'inverse_folding'}, False, True}"
@@ -783,9 +795,7 @@ class InterpolantRotationsConfig(BaseClassConfig):
         InterpolantRotationsScheduleEnum.exp
     )
     exp_rate: float = 1.5  # 10 in public multiflow code
-    # stochastic paths
-    stochastic: bool = "${shared.stochastic}"
-    stochastic_noise_intensity: float = 1.5
+    stochastic_noise_intensity: float = 1.5  # minor boost
 
 
 class InterpolantTranslationsNoiseTypeEnum(StrEnum):
@@ -802,7 +812,7 @@ class InterpolantTranslationsScheduleEnum(StrEnum):
 
 
 @dataclass
-class InterpolantTranslationsConfig(BaseClassConfig):
+class InterpolantTranslationsConfig(InterpolantDomainConfig):
     # corrupt translations (unless inverse folding)
     corrupt: bool = (
         "${ternary:${equals: ${inference.task}, 'inverse_folding'}, False, True}"
@@ -829,19 +839,11 @@ class InterpolantTranslationsConfig(BaseClassConfig):
     vpsde_bmin: float = 0.1
     # vpsde_bmax: variance-preserving SDE maximum
     vpsde_bmax: float = 20.0
-    # potentials and radius of gyration (rog) not used in public multiflow code (but in config)
-    # potential: str = 'null'
-    # potential_t_scaling: bool = False
-    # rog:
-    #   weight: 10.0
-    #   cutoff: 5.0
-    # stochastic paths
-    stochastic: bool = "${shared.stochastic}"
-    stochastic_noise_intensity: float = 1.5
+    stochastic_noise_intensity: float = 1.5  # minor boost
 
 
 @dataclass
-class InterpolantTorsionsConfig(BaseClassConfig):
+class InterpolantTorsionsConfig(InterpolantDomainConfig):
     """
     Interpolant for torsion angles.
     """
@@ -850,8 +852,6 @@ class InterpolantTorsionsConfig(BaseClassConfig):
     corrupt: bool = (
         "${ternary:${equals: ${inference.task}, 'forward_folding'}, False, True}"
     )
-    # stochastic paths
-    stochastic: bool = "${shared.stochastic}"
     stochastic_noise_intensity: float = 1.0
 
 
@@ -866,7 +866,7 @@ class InterpolantAATypesInterpolantTypeEnum(StrEnum):
 
 
 @dataclass
-class InterpolantAATypesConfig(BaseClassConfig):
+class InterpolantAATypesConfig(InterpolantDomainConfig):
     """
     Interpolant for amino acids.
 
@@ -906,9 +906,8 @@ class InterpolantAATypesConfig(BaseClassConfig):
     # which only unmasks masked positions, and ranks top-logit AAs for targets.
     # unlike MultiFlow it is not a separate sampling strategy.
     purity_selection: bool = False
-    # enable stochastic CTMC rates
+    # stochastic CTMC rates
     # Note that change and re-masking + stochastic rates are additive but noise is logits-free
-    stochastic: bool = "${shared.stochastic}"
     # sigma_t * stochastic_noise_intensity, where sigma_t is a function of `t` and schedule
     stochastic_noise_intensity: float = 1.0
     # prop of mass [0, 1] to AA->AA' (change) vs AA->mask (remask)
@@ -1901,6 +1900,7 @@ class Config(BaseClassConfig):
         raw_cfg.model.predict_all_torsions = False
         # restrict embeddings, which positional embeddings
         raw_cfg.model.node_features.embed_structural_method = False
+        raw_cfg.model.node_features.embed_stochasticity_scales = False
         raw_cfg.model.node_features.embed_hotspots = False
         raw_cfg.model.node_features.embed_chain = False
         raw_cfg.model.node_features.embed_torsions = False

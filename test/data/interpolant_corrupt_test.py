@@ -11,7 +11,10 @@ from cogeneration.config.base import (
 )
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.data_transforms import make_one_hot
-from cogeneration.data.fm.aatypes_rates import FlowMatcherAATypesCTMC
+from cogeneration.data.fm.aatypes import (
+    FlowMatcherAATypesMasking,
+    FlowMatcherAATypesUniform,
+)
 from cogeneration.data.fm.rotations import FlowMatcherRotations
 from cogeneration.data.fm.torsions import FlowMatcherTorsions
 from cogeneration.data.fm.translations import FlowMatcherTrans
@@ -293,6 +296,8 @@ class TestInterpolant:
         else:
             raise ValueError(f"Unknown noise type {noise_type}")
 
+        stochasticity_scale = torch.ones_like(t) if stochastic else torch.zeros_like(t)
+
         trans_fm = FlowMatcherTrans(cfg=interpolant.cfg.trans)
         trans_fm.set_device(interpolant._device)
         trans_t = trans_fm.corrupt(
@@ -301,6 +306,7 @@ class TestInterpolant:
             res_mask=res_mask,
             diffuse_mask=diffuse_mask,
             chain_idx=chain_idx,
+            stochasticity_scale=stochasticity_scale,
         )
 
         assert not torch.allclose(trans_t, trans_1)
@@ -321,10 +327,16 @@ class TestInterpolant:
 
         rotmats_1 = uniform_so3(B, N, device=interpolant._device)
 
+        stochasticity_scale = torch.ones_like(t) if stochastic else torch.zeros_like(t)
+
         rots_fm = FlowMatcherRotations(cfg=interpolant.cfg.rots)
         rots_fm.set_device(interpolant._device)
         rotmats_t = rots_fm.corrupt(
-            rotmats_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
+            rotmats_1,
+            t=t,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
+            stochasticity_scale=stochasticity_scale,
         )
 
         assert not torch.allclose(rotmats_t, rotmats_1)
@@ -356,10 +368,16 @@ class TestInterpolant:
             num_angles=7,
         )
 
+        stochasticity_scale = torch.ones_like(t) if stochastic else torch.zeros_like(t)
+
         torsions_fm = FlowMatcherTorsions(cfg=interpolant.cfg.torsions)
         torsions_fm.set_device(interpolant._device)
         torsions_t = torsions_fm.corrupt(
-            torsions_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
+            torsions_1,
+            t=t,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
+            stochasticity_scale=stochasticity_scale,
         )
 
         assert torsions_t.shape == (B, N, 7, 2)
@@ -401,10 +419,16 @@ class TestInterpolant:
         t = torch.rand(B)
 
         # ground-truth sequence (cyclic so every aa appears, but no mask)
-        aatype_1 = torch.arange(N).repeat(B, 1) % 20  # (B,N)
+        aatype_1 = torch.arange(N).repeat(B, 1) % 20  # (B, N)
+
+        stochasticity_scale = torch.ones_like(t) if stochastic else torch.zeros_like(t)
 
         out = interpolant.aatypes_fm.corrupt(
-            aatype_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
+            aatype_1,
+            t=t,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
+            stochasticity_scale=stochasticity_scale,
         )
 
         assert not torch.equal(out, aatype_1)  # something corrupted
@@ -541,11 +565,18 @@ class TestInterpolant:
             torch.zeros((B,)).float(),
         )
 
+        # pass scale 1 in all cases - sigma_t should still be 0
+        stochasticity_scale = torch.ones_like(t)
+
         # Inspect corruptions
 
         aatypes_1 = torch.randint(0, 20, (B, N)).long()
         aatypes_t = interpolant.aatypes_fm.corrupt(
-            aatypes_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
+            aatypes_1,
+            t=t,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
+            stochasticity_scale=stochasticity_scale,
         )
         if time == 1:
             assert torch.equal(aatypes_1, aatypes_t)
@@ -560,13 +591,18 @@ class TestInterpolant:
             res_mask=res_mask,
             diffuse_mask=diffuse_mask,
             chain_idx=chain_idx,
+            stochasticity_scale=stochasticity_scale,
         )
         if time == 1:
             assert torch.allclose(trans_1, trans_t, atol=1e-3)
 
         rotmats_1 = uniform_so3(B, N, device=interpolant._device)
         rotmats_t = interpolant.rots_fm.corrupt(
-            rotmats_1, t=t, res_mask=res_mask, diffuse_mask=diffuse_mask
+            rotmats_1,
+            t=t,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
+            stochasticity_scale=stochasticity_scale,
         )
         if time == 1:
             # geodesic may introduce some numerical gaps in log-exp map for geodesic,
@@ -766,9 +802,9 @@ class TestInterpolant:
 
         # aatypes current state
         if interpolant.num_tokens == 21:
-            aatypes_t = torch.randint(low=0, high=21, size=(B, N), device=device)
+            aatypes_1 = torch.randint(low=0, high=21, size=(B, N), device=device)
         else:
-            aatypes_t = torch.randint(low=0, high=20, size=(B, N), device=device)
+            aatypes_1 = torch.randint(low=0, high=20, size=(B, N), device=device)
 
         # Save RNG to reproduce same base/intermediate draws across scales
         torch.manual_seed(0)
@@ -786,19 +822,23 @@ class TestInterpolant:
             res_mask=res_mask,
             diffuse_mask=diffuse_mask,
             chain_idx=chain_idx,
-            stochasticity_scale=0.0,
+            stochasticity_scale=torch.zeros_like(t),
         )
         trans_deltas = []
         for s in np.linspace(0.0, 2.0, 21)[1:]:
             torch.random.set_rng_state(torch_state)
             np.random.set_state(np_state)
+            stochasticity_scale = trans_fm.effective_stochastic_scale(
+                t=t,
+                stochastic_scale=torch.full_like(t, float(s)),
+            )
             trans_s = trans_fm.corrupt(
                 trans_1,
                 t=t,
                 res_mask=res_mask,
                 diffuse_mask=diffuse_mask,
                 chain_idx=chain_idx,
-                stochasticity_scale=float(s),
+                stochasticity_scale=stochasticity_scale,
             )
             d = (trans_s - trans_base).norm(dim=-1).mean().item()
             trans_deltas.append(d)
@@ -813,18 +853,22 @@ class TestInterpolant:
             t=t,
             res_mask=res_mask,
             diffuse_mask=diffuse_mask,
-            stochasticity_scale=0.0,
+            stochasticity_scale=torch.zeros_like(t),
         )
         rot_deltas = []
         for s in np.linspace(0.0, 2.0, 21)[1:]:
             torch.random.set_rng_state(torch_state)
             np.random.set_state(np_state)
+            stochasticity_scale = rots_fm.effective_stochastic_scale(
+                t=t,
+                stochastic_scale=torch.full_like(t, float(s)),
+            )
             rot_s = rots_fm.corrupt(
                 rotmats_1,
                 t=t,
                 res_mask=res_mask,
                 diffuse_mask=diffuse_mask,
-                stochasticity_scale=float(s),
+                stochasticity_scale=stochasticity_scale,
             )
             delta = torch.matmul(rot_s, rot_base.transpose(-1, -2))
             ang, _, _ = angle_from_rotmat(delta)
@@ -840,31 +884,69 @@ class TestInterpolant:
             t=t,
             res_mask=res_mask,
             diffuse_mask=diffuse_mask,
-            stochasticity_scale=0.0,
+            stochasticity_scale=torch.zeros_like(t),
         )
         angles_base = torch.atan2(tors_base[..., 0], tors_base[..., 1])
         tors_deltas = []
         for s in np.linspace(0.0, 2.0, 21)[1:]:
             torch.random.set_rng_state(torch_state)
             np.random.set_state(np_state)
+            stochasticity_scale = tors_fm.effective_stochastic_scale(
+                t=t,
+                stochastic_scale=torch.full_like(t, float(s)),
+            )
             tors_s = tors_fm.corrupt(
                 torsions_1,
                 t=t,
                 res_mask=res_mask,
                 diffuse_mask=diffuse_mask,
-                stochasticity_scale=float(s),
+                stochasticity_scale=stochasticity_scale,
             )
             angles_s = torch.atan2(tors_s[..., 0], tors_s[..., 1])
             d_ang = (angles_s - angles_base + math.pi) % (2.0 * math.pi) - math.pi
             tors_deltas.append(float(d_ang.abs().mean().item()))
         assert np.all(np.diff(tors_deltas) >= -1e-6)
 
-        # aatypes (use CTMC noise rates row-sum as noise mass proxy)
-        ctmc = FlowMatcherAATypesCTMC(cfg=interpolant.cfg.aatypes)
-        rates_means = []
-        for s in np.linspace(0.0, 2.0, 21):
-            rates = ctmc._aatypes_build_rates_noise(
-                aatypes_t=aatypes_t, t=t, stochasticity_scale=float(s)
+        # aatypes
+        if interpolant.num_tokens == 21:
+            aatypes_fm = FlowMatcherAATypesMasking(cfg=interpolant.cfg.aatypes)
+        else:
+            aatypes_fm = FlowMatcherAATypesUniform(cfg=interpolant.cfg.aatypes)
+        aatypes_fm.set_device(device)
+        torch.random.set_rng_state(torch_state)
+        np.random.set_state(np_state)
+        aatypes_base = aatypes_fm.corrupt(
+            aatypes_1=aatypes_1,
+            t=t,
+            res_mask=res_mask,
+            diffuse_mask=diffuse_mask,
+            stochasticity_scale=torch.zeros_like(t),
+        )
+        change_scales = np.linspace(0.0, 2.0, 21)
+        change_means = []
+        for s in change_scales:
+            stochasticity_scale = aatypes_fm.effective_stochastic_scale(
+                t=t,
+                stochastic_scale=torch.full_like(t, float(s)),
             )
-            rates_means.append(float(rates.sum(-1).mean().item()))
-        assert np.all(np.diff(rates_means) >= -1e-6)
+            aatypes_s = aatypes_fm.corrupt(
+                aatypes_1=aatypes_1,
+                t=t,
+                res_mask=res_mask,
+                diffuse_mask=diffuse_mask,
+                stochasticity_scale=stochasticity_scale,
+            )
+            change_means.append(float(aatypes_s.ne(aatypes_base).sum().item()))
+
+        # For aatypes (categorical jumps), single-sample paths can show small non-monotone fluctuations
+        # as probabilities shift with scale. We therefore check a positive linear trend with sufficient R^2
+        # instead of strict stepwise monotonicity.
+        x = np.asarray(change_scales, dtype=float)
+        y = np.asarray(change_means, dtype=float)
+        A = np.vstack([x, np.ones_like(x)]).T
+        slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
+        y_hat = slope * x + intercept
+        ss_res = np.sum((y - y_hat) ** 2)
+        ss_tot = np.sum((y - y.mean()) ** 2) + 1e-12
+        r2 = 1.0 - ss_res / ss_tot
+        assert slope > 0.0 and r2 >= 0.8

@@ -90,7 +90,7 @@ class FlowModel(nn.Module):
         edge_mask = res_mask[:, None] * res_mask[:, :, None]
 
         diffuse_mask = batch[bp.diffuse_mask]
-        motif_mask = batch.get(bp.motif_mask, None)
+        motif_mask = batch.get(bp.motif_mask, None)  # optional
         # embed `1-motif_mask` instead of `diffuse_mask` if defined
         # for inpainting with guidance: `diffuse_mask == 1` for backbone update so `motif_mask` more meaningful
         embed_diffuse_mask = (
@@ -112,7 +112,7 @@ class FlowModel(nn.Module):
         aatypes_sc = batch[nbp.aatypes_sc]
         structure_method = batch[bp.structure_method]
         hot_spots_mask = batch[bp.hot_spots]
-        contact_conditioning = batch.get(bp.contact_conditioning, None)
+        contact_conditioning = batch.get(bp.contact_conditioning, None)  # optional
 
         init_rigids_ang = create_rigid(rots=rotmats_t, trans=trans_t)
         init_rigids_nm = rigids_ang_to_nm(init_rigids_ang)
@@ -131,6 +131,10 @@ class FlowModel(nn.Module):
             torsions_t=torsions_t,
             structure_method=structure_method,
             hot_spots_mask=hot_spots_mask,
+            trans_stoch_scale=batch[nbp.trans_stochasticity],
+            rotmats_stoch_scale=batch[nbp.rotmats_stochasticity],
+            torsions_stoch_scale=batch[nbp.torsions_stochasticity],
+            aatypes_stoch_scale=batch[nbp.aatypes_stochasticity],
         )
         init_edge_embed = self.edge_feature_net(
             node_embed=init_node_embed,

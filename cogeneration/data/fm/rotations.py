@@ -96,7 +96,7 @@ class FlowMatcherRotations(FlowMatcher):
         t: torch.Tensor,  # (B,)
         res_mask: torch.Tensor,  # (B, N)
         diffuse_mask: torch.Tensor,  # (B, N)
-        stochasticity_scale: Union[torch.Tensor, float] = 1.0,  # (B,)
+        stochasticity_scale: torch.Tensor,  # (B,)
     ) -> torch.Tensor:
         """Corrupt rotations from t=1 to t using IGSO(3)."""
         num_batch, num_res = res_mask.shape
@@ -116,19 +116,13 @@ class FlowMatcherRotations(FlowMatcher):
         # interpolate on geodesic between rotmats_0 and rotmats_1
         rotmats_t = so3_utils.geodesic_t(tau[:, None, None], rotmats_1, rotmats_0)
 
-        stochasticity_scale = self._stochasticity_scale_tensor(
-            scale=stochasticity_scale, t=t
-        )  # (B,)
+        stochasticity_scale = stochasticity_scale.to(t.device).view(-1)  # (B,)
 
         # stochastic intermediate noise
-        if (
-            self.cfg.stochastic
-            and self.cfg.stochastic_noise_intensity > 0.0
-            and (stochasticity_scale > 0).any()
-        ):
+        if (stochasticity_scale > 0).any():
             sigma_t = self._compute_sigma_t(
                 tau,
-                scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
+                scale=stochasticity_scale,
             )
             # Only apply intermediate noise for samples with positive sigma
             # ensure exact t in {0,1} receive no noise, e.g. if domain's t is fixed
@@ -161,7 +155,7 @@ class FlowMatcherRotations(FlowMatcher):
         t: torch.Tensor,  # (B,)
         rotmats_1: torch.Tensor,  # (B, N, 3, 3)
         rotmats_t: torch.Tensor,  # (B, N, 3, 3)
-        stochasticity_scale: Union[torch.Tensor, float] = 1.0,  # (B,)
+        stochasticity_scale: torch.Tensor,  # (B,)
         potential: Optional[torch.Tensor] = None,  # (B, N, 3)
     ) -> torch.Tensor:
         # VF scaling applies schedule properly, dont give tau.
@@ -186,22 +180,16 @@ class FlowMatcherRotations(FlowMatcher):
             rot_vf=rot_vf,
         )
 
-        stochasticity_scale = self._stochasticity_scale_tensor(
-            scale=stochasticity_scale, t=t
-        )  # (B,)
-
-        if (
-            self.cfg.stochastic
-            and self.cfg.stochastic_noise_intensity > 0.0
-            and (stochasticity_scale > 0).any()
-        ):
+        # optionally add intermediate noise
+        stochasticity_scale = stochasticity_scale.to(t.device).view(-1)  # (B,)
+        if (stochasticity_scale > 0).any():
             # Sample IGSO(3) noise with a time-independent sigma_t, scaled by sqrt(dt)
             # Add IGSO(3) noise to keep rotmats_next on SO(3).
             num_batch, num_res, _, _ = rotmats_t.shape
 
             sigma_t = self._compute_sigma_t(
                 tau,
-                scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
+                scale=stochasticity_scale,
             )
             # Per-batch Brownian increment: scale sigma_t by sqrt(dt)
             sqrt_dt = torch.sqrt(d_t).to(sigma_t.device)

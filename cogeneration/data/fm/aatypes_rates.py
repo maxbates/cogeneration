@@ -114,7 +114,7 @@ class FlowMatcherAATypesCTMC(FlowMatcherAATypes):
         t: torch.Tensor,  # (B,)
         res_mask: torch.Tensor,  # (B, N)
         diffuse_mask: torch.Tensor,  # (B, N)
-        stochasticity_scale: Union[torch.Tensor, float] = 1.0,  # (B,)
+        stochasticity_scale: torch.Tensor,  # (B,)
     ):
         """
         Corrupt AA residues from t=1 to t, using masking or uniform sampling.
@@ -138,17 +138,13 @@ class FlowMatcherAATypesCTMC(FlowMatcherAATypes):
         aatypes_base = self.sample_base(res_mask=res_mask)
         aatypes_t = mask_blend_1d(aatypes_base, aatypes_1, corruption_mask)
 
-        if (
-            self.cfg.stochastic
-            and self.cfg.stochastic_noise_intensity > 0.0
-            and (stochasticity_scale > 0).any()
-        ):
+        if (stochasticity_scale > 0).any():
             # For stochasticity, instead of specifying rates and using CTMC jump,
             # we simply introduce changes, dependent on t and interpolant type.
 
             sigma_t = self._compute_sigma_t(
                 tau,  # (B,)
-                scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
+                scale=stochasticity_scale,
             )
 
             # probability a residue jumps
@@ -409,18 +405,14 @@ class FlowMatcherAATypesCTMC(FlowMatcherAATypes):
         # Initialize rates
         rates_noise = torch.zeros(B, N, S, device=device)
 
-        stochasticity_scale = self._stochasticity_scale_tensor(
-            scale=stochasticity_scale, t=t
-        )  # (B,)
-
         # if all entries are zero, skip
         if not (stochasticity_scale > 0).any():
             return rates_noise
 
-        # sigma_t per batch (B,) scaled by config + stochasticity_scale
+        # sigma_t per batch (B,) using provided per-domain stochasticity scale
         sigma = self._compute_sigma_t(
             t=t,
-            scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
+            scale=stochasticity_scale,
         )
         sigma = sigma.clamp_min(0.0)  # (B,)
 
@@ -680,17 +672,10 @@ class FlowMatcherAATypesCTMC(FlowMatcherAATypes):
             d_t=d_t,
         )
 
-        stochasticity_scale = self._stochasticity_scale_tensor(
-            scale=stochasticity_scale, t=t
-        )  # (B,)
-
         # optionally add logits-free noise
         rates_noise = torch.zeros_like(rates_drift)
-        if (
-            self.cfg.stochastic
-            and self.cfg.stochastic_noise_intensity > 0.0
-            and (stochasticity_scale > 0).any()
-        ):
+        stochasticity_scale = stochasticity_scale.to(t.device).view(-1)  # (B,)
+        if (stochasticity_scale > 0).any():
             rates_noise = self._aatypes_build_rates_noise(
                 aatypes_t=aatypes_t, t=t, stochasticity_scale=stochasticity_scale
             )

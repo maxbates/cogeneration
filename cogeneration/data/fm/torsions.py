@@ -40,7 +40,7 @@ class FlowMatcherTorsions(FlowMatcher):
         t: torch.Tensor,  # (B,)
         res_mask: torch.Tensor,  # (B, N)
         diffuse_mask: torch.Tensor,  # (B, N)
-        stochasticity_scale: Union[torch.Tensor, float] = 1.0,  # (B,)
+        stochasticity_scale: torch.Tensor,  # (B,)
     ) -> torch.Tensor:
         """
         Corrupt torsions from t=1 to t using noise.
@@ -55,18 +55,12 @@ class FlowMatcherTorsions(FlowMatcher):
         tau_broadcast = tau.view(num_batch, 1, 1)  # (B, 1, 1)
         angles_t = (1.0 - tau_broadcast) * angles_0 + tau_broadcast * angles_1
 
-        stochasticity_scale = self._stochasticity_scale_tensor(
-            scale=stochasticity_scale, t=t
-        )  # (B,)
+        stochasticity_scale = stochasticity_scale.to(t.device).view(-1)  # (B,)
 
-        if (
-            self.cfg.stochastic
-            and self.cfg.stochastic_noise_intensity > 0.0
-            and (stochasticity_scale > 0).any()
-        ):
+        if (stochasticity_scale > 0).any():
             sigma_t = self._compute_sigma_t(
                 tau,  # (B,)
-                scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
+                scale=stochasticity_scale,
             )
             noise = angles_noise(sigma=sigma_t, num_samples=num_res, num_angles=7)
             apply_mask = (sigma_t > 0).view(-1, 1, 1).float()
@@ -89,7 +83,7 @@ class FlowMatcherTorsions(FlowMatcher):
         t: torch.Tensor,  # (B,)
         torsions_1: torch.Tensor,  # (B, N, 7, 2)
         torsions_t: torch.Tensor,  # (B, N, K, 2)
-        stochasticity_scale: torch.Tensor | float = 1.0,  # (B,)
+        stochasticity_scale: torch.Tensor,  # (B,)
     ) -> torch.Tensor:  # (B, N, 7, 2)
         """
         Perform an Euler step in angle space to update torsion angles.
@@ -116,19 +110,13 @@ class FlowMatcherTorsions(FlowMatcher):
         angles_vf = (angles_1 - angles_t) / (1.0 - tau.view(-1, 1, 1))
         angles_next = angles_t + angles_vf * d_t
 
-        stochasticity_scale = self._stochasticity_scale_tensor(
-            scale=stochasticity_scale, t=t
-        )  # (B,)
-
-        if (
-            self.cfg.stochastic
-            and self.cfg.stochastic_noise_intensity > 0.0
-            and (stochasticity_scale > 0).any()
-        ):
+        # optionally add intermediate noise
+        stochasticity_scale = stochasticity_scale.to(t.device).view(-1)  # (B,)
+        if (stochasticity_scale > 0).any():
             # Brownian increment: sigma_t * sqrt(dt)
             sigma_t = self._compute_sigma_t(
                 tau,
-                scale=self.cfg.stochastic_noise_intensity * stochasticity_scale,
+                scale=stochasticity_scale,
             )
             sqrt_dt = torch.sqrt(d_t.to(sigma_t.device))
             sigma_t = sigma_t * sqrt_dt

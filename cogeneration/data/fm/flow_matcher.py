@@ -4,6 +4,8 @@ from typing import Any, Union
 
 import torch
 
+from cogeneration.config.base import InterpolantDomainConfig
+
 
 @dataclass
 class FlowMatcher(ABC):
@@ -17,6 +19,8 @@ class FlowMatcher(ABC):
     - performing an Euler step toward t=1 using a vector field/logits (euler_step)
     """
 
+    cfg: InterpolantDomainConfig
+
     def __post_init__(self):
         # define in post_init to allow required fields in subclasses
         self._device = torch.device("cpu")
@@ -24,9 +28,30 @@ class FlowMatcher(ABC):
     def set_device(self, device: torch.device):
         self._device = device
 
+    def effective_stochastic_scale(
+        self,
+        t: torch.Tensor,  # (B,)
+        stochastic_scale: torch.Tensor,  # (B,)  batch[bp.stochastic_scale]
+    ) -> torch.Tensor:
+        """
+        Compute the effective per-batch stochasticity scale at time t (B,).
+
+        Default: if stochastic disabled or intensity==0, returns zeros; else returns
+        cfg.stochastic_noise_intensity * batch[bp.stochastic_scale].
+        """
+        if not self.cfg.stochastic or self.cfg.stochastic_noise_intensity == 0.0:
+            return torch.zeros_like(t)
+
+        tau = self.time_sampling(t)
+        return self.cfg.stochastic_noise_intensity * stochastic_scale.to(
+            tau.device
+        ).view(-1)
+
     @staticmethod
     def _compute_sigma_t(
-        t: torch.Tensor, scale: torch.Tensor, min_sigma: float = 0.0  # (B,)  # (B,)
+        t: torch.Tensor,  # (B,)
+        scale: torch.Tensor,  # (B,) per-domain scale * per-batch-item stochasticity scale
+        min_sigma: float = 0.0,
     ) -> torch.Tensor:
         """
         Compute the instantaneous standard deviation of the noise at time t.
@@ -35,31 +60,6 @@ class FlowMatcher(ABC):
             sigma(t) = sqrt(scale^2 * t * (1 - t) + min_sigma^2)
         """
         return torch.sqrt(scale**2 * t * (1 - t) + min_sigma**2)
-
-    @staticmethod
-    def _stochasticity_scale_tensor(
-        scale: Union[torch.Tensor, float, int],
-        t: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Normalize a possibly-scalar `scale` into a (B,) tensor broadcasted to `t`.
-
-        Inputs:
-        - scale: float/int or (B,) tensor
-        - t: (B,) time tensor (provides batch size and device)
-
-        Returns:
-        - (B,) tensor on same device as `t`
-        """
-        if isinstance(scale, torch.Tensor):
-            s = scale.to(t.device).view(-1)
-            if s.numel() == 1:
-                return s.expand_as(t)
-            if s.shape[0] != t.shape[0]:
-                return s.expand(t.shape[0])
-            return s
-        else:
-            return torch.ones(t.shape[0], device=t.device) * float(scale)
 
     def time_training(self, t: torch.Tensor) -> torch.Tensor:
         """

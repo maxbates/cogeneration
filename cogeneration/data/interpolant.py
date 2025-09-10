@@ -352,6 +352,45 @@ class Interpolant:
         noisy_batch[nbp.r3_t] = r3_t  # (B,)
         noisy_batch[nbp.cat_t] = cat_t  # (B,)
 
+    def _set_stochastic_scales(
+        self,
+        noisy_batch: NoisyFeatures,
+        override_t: torch.Tensor = None,  # (B,)
+    ):
+        """
+        Set the stochastic scales for each domain at the current time,
+        optionally overriding the time (e.g. at final time step)
+        """
+        if override_t is not None:
+            r3_t = override_t
+            so3_t = override_t
+            cat_t = override_t
+        else:
+            r3_t = noisy_batch[nbp.r3_t]
+            so3_t = noisy_batch[nbp.so3_t]
+            cat_t = noisy_batch[nbp.cat_t]
+
+        stochastic_scale_tensor = noisy_batch[bp.stochastic_scale]
+
+        noisy_batch[nbp.trans_stochasticity] = self.trans_fm.effective_stochastic_scale(
+            t=r3_t, stochastic_scale=stochastic_scale_tensor
+        )
+        noisy_batch[nbp.rotmats_stochasticity] = (
+            self.rots_fm.effective_stochastic_scale(
+                t=so3_t, stochastic_scale=stochastic_scale_tensor
+            )
+        )
+        noisy_batch[nbp.torsions_stochasticity] = (
+            self.torsions_fm.effective_stochastic_scale(
+                t=r3_t, stochastic_scale=stochastic_scale_tensor
+            )
+        )
+        noisy_batch[nbp.aatypes_stochasticity] = (
+            self.aatypes_fm.effective_stochastic_scale(
+                t=cat_t, stochastic_scale=stochastic_scale_tensor
+            )
+        )
+
     def corrupt_batch(
         self,
         batch: BatchFeatures,
@@ -383,13 +422,17 @@ class Interpolant:
         res_mask = batch[bp.res_mask]  # (B, N)
         diffuse_mask = batch[bp.diffuse_mask]  # (B, N)
         motif_mask = batch.get(bp.motif_mask, None)  # (B, N)
-        chain_idx = noisy_batch[bp.chain_idx]  # (B, N)
+        chain_idx = batch[bp.chain_idx]  # (B, N)
+        stochasticity_scale = batch[bp.stochastic_scale]  # (B,)
+
         r3_t = noisy_batch[nbp.r3_t]  # (B,)
         so3_t = noisy_batch[nbp.so3_t]  # (B,)
         cat_t = noisy_batch[nbp.cat_t]  # (B,)
-        stochasticity_scale = batch.get(
-            bp.stochastic_scale, torch.ones(res_mask.shape[0], device=trans_1.device)
-        )  # (B,)
+
+        # Compute effective per-domain stochasticity scales (B,) using r3_t, so3_t, cat_t
+        self._set_stochastic_scales(
+            noisy_batch=noisy_batch,
+        )
 
         # Determine sequence and structure corruption masks.
         # Inpainting:
@@ -409,7 +452,7 @@ class Interpolant:
                 res_mask=res_mask,
                 diffuse_mask=diffuse_mask,
                 chain_idx=chain_idx,
-                stochasticity_scale=stochasticity_scale,
+                stochasticity_scale=noisy_batch[nbp.trans_stochasticity],
             )
         else:
             trans_t = trans_1
@@ -423,7 +466,7 @@ class Interpolant:
                 t=so3_t,
                 res_mask=res_mask,
                 diffuse_mask=diffuse_mask,
-                stochasticity_scale=stochasticity_scale,
+                stochasticity_scale=noisy_batch[nbp.rotmats_stochasticity],
             )
         else:
             rotmats_t = rotmats_1
@@ -437,7 +480,7 @@ class Interpolant:
                 t=r3_t,
                 res_mask=res_mask,
                 diffuse_mask=diffuse_mask,
-                stochasticity_scale=stochasticity_scale,
+                stochasticity_scale=noisy_batch[nbp.torsions_stochasticity],
             )
         else:
             torsions_t = torsions_1
@@ -451,7 +494,7 @@ class Interpolant:
                 t=cat_t,
                 res_mask=res_mask,
                 diffuse_mask=scaffold_mask,
-                stochasticity_scale=stochasticity_scale,
+                stochasticity_scale=noisy_batch[nbp.aatypes_stochasticity],
             )
         else:
             aatypes_t = aatypes_1
@@ -738,7 +781,7 @@ class Interpolant:
                 trans_1=pred_trans_1,
                 trans_t=trans_t_1,
                 chain_idx=chain_idx,
-                stochasticity_scale=stochasticity_scale,
+                stochasticity_scale=noisy_batch[nbp.trans_stochasticity],
                 potential=guidance.trans,
             )
             rotmats_t_2 = self.rots_fm.euler_step(
@@ -746,7 +789,7 @@ class Interpolant:
                 t=t_1,
                 rotmats_1=pred_rotmats_1,
                 rotmats_t=rotmats_t_1,
-                stochasticity_scale=stochasticity_scale,
+                stochasticity_scale=noisy_batch[nbp.rotmats_stochasticity],
                 potential=guidance.rotmats,
             )
             aatypes_t_2 = self.aatypes_fm.euler_step(
@@ -754,7 +797,7 @@ class Interpolant:
                 t=t_1,
                 logits_1=pred_logits_1,
                 aatypes_t=aatypes_t_1,
-                stochasticity_scale=stochasticity_scale,
+                stochasticity_scale=noisy_batch[nbp.aatypes_stochasticity],
                 potential=guidance.logits,
             )
             torsions_t_2 = (
@@ -763,7 +806,7 @@ class Interpolant:
                     t=t_1,
                     torsions_1=pred_torsions_1,
                     torsions_t=torsions_t_1,
-                    stochasticity_scale=stochasticity_scale,
+                    stochasticity_scale=noisy_batch[nbp.torsions_stochasticity],
                 )
                 if pred_torsions_1 is not None
                 else None
@@ -1105,6 +1148,11 @@ class Interpolant:
                 else:
                     raise ValueError(f"Unknown task {task}")
 
+            # Update per-domain stochastic scales for this t
+            self._set_stochastic_scales(
+                noisy_batch=batch,
+            )
+
             # Take a single step, updating the batch in place
             batch, model_step, sample_step, step_metrics = self.sample_single_step(
                 noisy_batch=batch,
@@ -1134,6 +1182,11 @@ class Interpolant:
         batch[nbp.so3_t] = t_1_b
         batch[nbp.r3_t] = t_1_b
         batch[nbp.cat_t] = t_1_b
+        # update stochastic scales to final `t`
+        self._set_stochastic_scales(
+            noisy_batch=batch,
+            override_t=t_1_b,
+        )
 
         batch, model_step, sample_step, step_metrics = self.sample_single_step(
             noisy_batch=batch,

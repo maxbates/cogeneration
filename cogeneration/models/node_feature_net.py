@@ -16,6 +16,7 @@ class NodeFeatureNet(nn.Module):
         self.cfg = cfg
 
         # input embedding size is function of what we optionally embed
+        # we always embed the pos_emb, diffuse_mask, 2x time embeddings
         embed_size = self.cfg.c_pos_emb + 1 + self.cfg.c_timestep_emb * 2
 
         if self.cfg.embed_aatype:
@@ -38,6 +39,11 @@ class NodeFeatureNet(nn.Module):
             self.structural_method_embedding = nn.Embedding(
                 num_methods, self.cfg.c_pos_emb
             )
+            embed_size += self.cfg.c_pos_emb
+
+        if self.cfg.embed_stochasticity_scales:
+            # single projection for [trans, rotmats, torsions, aatypes] -> c_pos_emb
+            self.stoch_embed = nn.Linear(4, self.cfg.c_pos_emb)
             embed_size += self.cfg.c_pos_emb
 
         # TODO consider modulating node embed with hotspots (like 2d constraints) rather than concat + embedding
@@ -82,6 +88,10 @@ class NodeFeatureNet(nn.Module):
         torsions_t: torch.Tensor,  # (B, N, 7, 2)
         structure_method: torch.Tensor,  # (B, 1)
         hot_spots_mask: torch.Tensor,  # (B, N)
+        trans_stoch_scale: torch.Tensor,  # (B,)
+        rotmats_stoch_scale: torch.Tensor,  # (B,)
+        torsions_stoch_scale: torch.Tensor,  # (B,)
+        aatypes_stoch_scale: torch.Tensor,  # (B,)
     ):
         pos_emb = get_index_embedding(
             res_index,
@@ -126,6 +136,20 @@ class NodeFeatureNet(nn.Module):
             input_feats.append(
                 self.structural_method_embedding(method_feature)
             )  # (B, N, c_pos_emb)
+
+        if self.cfg.embed_stochasticity_scales:
+            B, N = res_mask.shape
+            scales = torch.stack(
+                [
+                    trans_stoch_scale,
+                    rotmats_stoch_scale,
+                    torsions_stoch_scale,
+                    aatypes_stoch_scale,
+                ],
+                dim=-1,
+            ).float()  # (B, 4)
+            scales = scales[:, None, :].expand(B, N, 4)  # (B, N, 4)
+            input_feats.append(self.stoch_embed(scales))  # (B, N, c_pos_emb)
 
         if self.cfg.embed_hotspots:
             input_feats.append(hot_spots_mask.float().unsqueeze(-1))  # (B, N, 1)

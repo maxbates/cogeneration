@@ -50,9 +50,7 @@ class BatchProp(StrEnum):
     # inference only
     sample_id = "sample_id"  # (B) [inference only] sample id
     # stochastic control
-    stochastic_scale = (
-        "stochastic_scale"  # (B) stochasticity scale, 0 disables, 1 pass-through
-    )
+    stochastic_scale = "stochastic_scale"  # (B) stochasticity scale, 0.0 disables, 1.0 pass-through domain scale
 
 
 # datum level metadata, i.e. `(B)` rather than `(B, N)`, and non-tensors
@@ -81,6 +79,10 @@ class NoisyBatchProp(StrEnum):
     aatypes_t = "aatypes_t"  # (B, N) tensor, predicted amino acids @ t as ints (0-20)
     trans_sc = "trans_sc"  # (B, N, 3) tensor, self-conditioned pred translations @ t
     aatypes_sc = "aatypes_sc"  # (B, N, 21) tensor, self-conditioned pred logits @ t, including mask token
+    trans_stochasticity = "trans_stochasticity"  # (B,) trans scale @ t
+    rotmats_stochasticity = "rotmats_stochasticity"  # (B,) rotmats scale @ t
+    torsions_stochasticity = "torsions_stochasticity"  # (B,) torsions scale @ t
+    aatypes_stochasticity = "aatypes_stochasticity"  # (B,) aatypes scale @ t
 
 
 class PredBatchProp(StrEnum):
