@@ -148,10 +148,28 @@ def _get_letters_res_colors() -> Tuple[List[str], npt.NDArray]:
     return letters, res_colors
 
 
-def _rgba_from_logits(logits: npt.NDArray) -> npt.NDArray:
+def _softmax(x: npt.NDArray, axis: int = -1) -> npt.NDArray:
+    """
+    Numerically stable softmax for numpy arrays.
+
+    Args:
+        x: input array
+        axis: axis over which to apply softmax (typically the class dimension)
+    Returns:
+        probabilities with the same shape as x, summing to 1 along `axis`.
+    """
+    x_max = np.max(x, axis=axis, keepdims=True)
+    e_x = np.exp(x - x_max)
+    return e_x / np.sum(e_x, axis=axis, keepdims=True)
+
+
+def _rgba_from_logits(logits: npt.NDArray, softmax_logits: bool = True) -> npt.NDArray:
     """
     logits: (N_res, S) where S = 20 or 21
     returns a (S, N_res, 4) RGBA image with row-wise fixed hue + value-based alpha
+
+    If `softmax_logits` is True, applies softmax over the last dimension before
+    mapping to alpha; otherwise uses the raw values clipped to [0, 1].
     """
     letters, res_colors = _get_letters_res_colors()
 
@@ -160,8 +178,12 @@ def _rgba_from_logits(logits: npt.NDArray) -> npt.NDArray:
     ), "Logits must be of shape (N_res, 20) or (N_res, 21)"
     # base RGB for each aa (21, 1, 3) → broadcast across columns
     rgb = np.repeat(res_colors[:, None, :], logits.T.shape[1], axis=1)
-    # clip / scale to [0,1]
-    alpha = np.clip(logits.T, 0.0, 1.0)[..., None]  # (S, L, 1)
+    # convert to alpha in [0,1]
+    if softmax_logits:
+        probs = _softmax(logits, axis=-1)  # (N, S)
+        alpha = probs.T[..., None]
+    else:
+        alpha = np.clip(logits.T, 0.0, 1.0)[..., None]  # (S, L, 1)
     return np.concatenate([rgb, alpha], axis=-1)  # (S, L, 4)
 
 
@@ -238,6 +260,7 @@ def _save_logits_traj(
     file_path: str,
     writer: matplotlib.animation.AbstractMovieWriter,
     animation_interval_ms: float = 100,
+    softmax_logits: bool = True,
 ) -> str:
     """
     Writes logits trajectory as a heatmap animation, one frame per step in the trajectory, up to 50 frames.
@@ -254,7 +277,9 @@ def _save_logits_traj(
     )
 
     def update(frame):
-        im.set_data(_rgba_from_logits(logits_traj[frame]))
+        im.set_data(
+            _rgba_from_logits(logits_traj[frame], softmax_logits=softmax_logits)
+        )
 
         # move rectangles to new AA row
         for i, r in enumerate(rects):
@@ -282,6 +307,7 @@ def save_logits_traj(
     motif_mask: Optional[npt.NDArray],  # (N,)
     output_dir: str,
     animation_interval_ms: float = 100,
+    softmax_logits: bool = True,
 ) -> str:
     """Write sampled logits trajectory"""
     ext, writer = _get_anim_writer()
@@ -302,6 +328,7 @@ def save_logits_traj(
         file_path=anim_path,
         writer=writer,
         animation_interval_ms=animation_interval_ms,
+        softmax_logits=softmax_logits,
     )
 
 
@@ -311,6 +338,7 @@ def save_potential_logits_traj(
     motif_mask: Optional[npt.NDArray],  # (N,)
     output_dir: str,
     animation_interval_ms: float = 100,
+    softmax_logits: bool = True,
 ) -> Optional[str]:
     """Write FK steering potential logits trajectory if logits guidance present.
 
@@ -365,6 +393,7 @@ def save_potential_logits_traj(
         file_path=anim_path,
         writer=writer,
         animation_interval_ms=animation_interval_ms,
+        softmax_logits=softmax_logits,
     )
 
 
@@ -569,6 +598,7 @@ def animate_trajectories(
     output_dir: str,
     animation_max_frames: int,
     animation_take_last_frames: int,
+    softmax_logits: bool = True,
 ):
     """
     Animates the protein and model trajectories side by side.
@@ -682,7 +712,11 @@ def animate_trajectories(
                 texts=seq_texts_r,
             )
             _update_structure_artists(model_structure_traj[timestep - 1], scats=scat_r)
-            logits_im.set_data(_rgba_from_logits(model_logits_traj[timestep - 1]))
+            logits_im.set_data(
+                _rgba_from_logits(
+                    model_logits_traj[timestep - 1], softmax_logits=softmax_logits
+                )
+            )
             for i, r in enumerate(logits_rects):
                 r.set_y(model_aa_traj[timestep - 1, i] - 0.5)
         else:
@@ -846,6 +880,7 @@ def save_trajectory(
     write_animations: bool = True,
     animation_max_frames: int = 50,
     animation_take_last_frames: int = 1,
+    softmax_logits: bool = True,
 ) -> SavedTrajectory:
     """
     Writes final sample and reverse diffusion trajectory.
@@ -997,6 +1032,7 @@ def save_trajectory(
                 sample_aa_traj=sample_aa_traj,
                 motif_mask=motif_mask,
                 output_dir=output_dir,
+                softmax_logits=softmax_logits,
             )
 
     # Trajectory panel animation
@@ -1017,6 +1053,7 @@ def save_trajectory(
             output_dir=output_dir,
             animation_max_frames=animation_max_frames,
             animation_take_last_frames=animation_take_last_frames,
+            softmax_logits=softmax_logits,
         )
         log_time("trajectory animation")
 
