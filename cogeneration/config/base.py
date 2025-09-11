@@ -889,19 +889,12 @@ class InterpolantAATypesConfig(InterpolantDomainConfig):
     # lower temp sharpens logits
     # lower temp reduces uncertainty -> lowers uncertainty-gated exit rates
     drift_temp: float = 0.25
-    # drift rate scales (note each component follows a different schedule)
-    # rate magnitudes determine probability of transition per step
-    # relative rates determine relative probability of transition type
-    # mask -> AA (masking only)
-    unmask_rate: float = 1.0
-    # AA -> AA' (disabled by purity)
-    change_rate: float = 1.0
-    # AA -> MASK via drift
-    remask_rate: float = 2.0
+    # drift gain scaling for categorical drift near t->1. 1.0 disables scaling.
+    drift_gain_max: float = 10.0
     # uncertainty gate exit rates (1 - p_current), so confident logits less likely to exit
     uncertainty_gating: bool = True
-    # uncertain gating gamma, > 1 sharpens: (1 - p_current) ** gamma
-    uncertainty_gating_gamma: float = 1.0
+    # uncertain gating gamma, > 1 sharpens: (1 - p_current) ** sharpness
+    uncertainty_gating_sharpness: float = 1.0
     # purity_selection is a selction policy enabling similar to Multiflow "purity" sampling,
     # which only unmasks masked positions, and ranks top-logit AAs for targets.
     # unlike MultiFlow it is not a separate sampling strategy.
@@ -912,6 +905,17 @@ class InterpolantAATypesConfig(InterpolantDomainConfig):
     stochastic_noise_intensity: float = 1.0
     # prop of mass [0, 1] to AA->AA' (change) vs AA->mask (remask)
     noise_prop_change: float = 0.5
+
+    # rates formulation
+    # drift rate scales (note each component follows a different schedule)
+    # rate magnitudes determine probability of transition per step
+    # relative rates determine relative probability of transition type
+    # mask -> AA (masking only)
+    unmask_rate: float = 1.0
+    # AA -> AA' (disabled by purity)
+    change_rate: float = 1.0
+    # AA -> MASK via drift
+    remask_rate: float = 2.0
 
 
 class InterpolantTrainTimeSamplingEnum(StrEnum):

@@ -95,6 +95,7 @@ class FoldingValidator:
         pred_pdb_path: str,  # PDB file for predicted / generated structure, atom37.
         pred_bb_positions: npt.NDArray,  # (N, n_bb_atoms, 3) where n_bb_atoms in {3, 5}
         pred_aa: npt.NDArray,  # (N)
+        sample_aa_traj: npt.NDArray,  # (T, N) full AA trajectory
         diffuse_mask: npt.NDArray,  # (N)
         motif_mask: Optional[npt.NDArray],  # (N) [inpainting only]
         chain_idx: npt.NDArray,  # (N)
@@ -411,6 +412,24 @@ class FoldingValidator:
                 residue_index=res_idx,
             )
         )
+
+        # sequence trajectory metrics
+        # percent of positions that changed on the final snap
+        try:
+            flips_frac = None
+            if sample_aa_traj.shape[0] >= 2:
+                prev_step_aa = sample_aa_traj[-2]
+                final_step_aa = sample_aa_traj[-1]
+                if task == InferenceTask.inpainting and motif_mask is not None:
+                    scaffold_mask = (1 - motif_mask).astype(bool)
+                else:
+                    scaffold_mask = np.ones_like(prev_step_aa, dtype=bool)
+                flips = (prev_step_aa != final_step_aa) & scaffold_mask
+                flips_frac = float(np.mean(flips)) if flips.size > 0 else 0.0
+            if flips_frac is not None:
+                top_sample[MetricName.aatypes_final_flip_percent] = 100.0 * flips_frac
+        except Exception:
+            pass
 
         # TODO(inpainting) - calculate scaffold-specific metrics for secondary structure, clashes
 

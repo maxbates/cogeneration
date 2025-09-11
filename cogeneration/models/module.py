@@ -926,13 +926,14 @@ class FlowModule(LightningModule):
                 pred_pdb_path=saved_trajectory_files.sample_pdb_path,
                 pred_bb_positions=sample_structure_traj[-1],
                 pred_aa=sample_aa_traj[-1],
+                sample_aa_traj=sample_aa_traj,
                 diffuse_mask=diffuse_mask,
                 motif_mask=motif_mask,
                 chain_idx=chain_idx,
                 res_idx=res_idx,
-                also_fold_pmpnn_seq=also_fold_pmpnn_seq,
                 true_bb_positions=true_bb_pos,
                 true_aa=true_aa,
+                also_fold_pmpnn_seq=also_fold_pmpnn_seq,
                 n_inverse_folds=n_inverse_folds,
             )
         )

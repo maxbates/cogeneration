@@ -975,8 +975,11 @@ class SamplingMeasurer:
         block.aatypes.add_sigma(nu_t)
         block.aatypes.add_step_ratio(noise_frac / (drift_frac + 1e-8))
         dt_f = float(dt.item())
+        # aatypes drift gain scaling
+        drift_gain = aatypes_fm._compute_drift_gain(t)
+        drift_scale = float(drift_gain.mean().item())
         block.aatypes.add_theory_drift_scales(
-            step_scale=1.0 * dt_f, vel_scale=1.0, dt_value=dt_f
+            step_scale=drift_scale * dt_f, vel_scale=drift_scale, dt_value=dt_f
         )
         return aa_next_drift
 

@@ -131,8 +131,8 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
                 .squeeze(-1)
                 .clamp(0.0, 1.0)
             )  # (B, N)
-            # (1 - p_current) ** gamma
-            uncertainty = (1.0 - p_current) ** self.cfg.uncertainty_gating_gamma
+            # (1 - p_current) ** sharpness
+            uncertainty = (1.0 - p_current) ** self.cfg.uncertainty_gating_sharpness
             # mask to AA rows
             uncertainty = uncertainty * is_aa.float() + (
                 1.0 * is_mask.float()
@@ -275,6 +275,22 @@ class FlowMatcherAATypes(FlowMatcher, ABC):
 
         return aatypes_t
 
+    def _compute_drift_gain(
+        self,
+        t: torch.Tensor,  # (B,) tau
+    ) -> torch.Tensor:
+        """
+        Drift gain that grows like 1/(1 - τ + 1e-2) and is hard-clipped at drift_gain_max.
+        τ = time_sampling(t). If drift_gain_max <= 1, returns ones.
+        """
+        tau = self.time_sampling(t).clamp(0.0, 1.0)
+        G = float(self.cfg.drift_gain_max)
+        if G <= 1.0:
+            return torch.ones_like(tau, device=self._device)
+        eps = 1e-2
+        g = 1.0 / (1.0 - tau + eps)
+        return torch.clamp(g, min=1.0, max=G)
+
     def _poisson_noise_weight(
         self,
         t: torch.Tensor,  # (B,) tau
@@ -405,6 +421,9 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
         B, N = aatypes_t.shape
         assert logits_1.shape == (B, N, self.num_tokens)
 
+        # t -> tau according to schedule
+        tau = self.time_sampling(t)
+
         # combine potential with predicted logits
         if potential is not None:
             assert (
@@ -420,13 +439,13 @@ class FlowMatcherAATypesUniform(FlowMatcherAATypes):
             -1
         )  # (B, N, 1)
 
+        # compute drift gain (analagous to 1/(1-t) scaling)
+        drift_gain = self._compute_drift_gain(t=tau)
+
         # compute drift step probs (off-diagonal mass)
-        step_probs = d_t * probs * uncertainty
+        step_probs = d_t * drift_gain.view(B, 1, 1) * probs * uncertainty
 
         if self.cfg.stochastic and (stochasticity_scale > 0).any():
-            # t -> tau according to schedule
-            tau = self.time_sampling(t)
-
             # compute noise leave mass scale
             nu_t = self._poisson_noise_weight(
                 t=tau,
@@ -604,8 +623,11 @@ class FlowMatcherAATypesMasking(FlowMatcherAATypes):
             -1
         )  # (B, N, 1)
 
+        # compute drift gain (analagous to 1/(1-t) scaling)
+        drift_gain = self._compute_drift_gain(t)
+
         # compute drift step probs (off-diagonal mass)
-        step_probs = d_t * probs * uncertainty
+        step_probs = d_t * drift_gain.view(B, 1, 1) * probs * uncertainty
 
         stochasticity_scale = stochasticity_scale.to(t.device).view(-1)  # (B,)
 

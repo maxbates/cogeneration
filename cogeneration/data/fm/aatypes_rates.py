@@ -317,7 +317,7 @@ class FlowMatcherAATypesCTMC(FlowMatcherAATypes):
                 .clamp(0.0, 1.0)
             )  # (B, N)
             # (1 - p_current) ** gamma
-            uncert = (1.0 - p_current) ** self.cfg.uncertainty_gating_gamma
+            uncert = (1.0 - p_current) ** self.cfg.uncertainty_gating_sharpness
             # mask to AA rows
             uncert = uncert * is_aa.float() + (1.0 * is_mask.float())  # (B, N)
         else:

@@ -64,6 +64,10 @@ class MetricName(StrEnum):
     # TM-score of generated sample -> folded structure
     tm_score_folded = "tm_score"
 
+    # sequence trajectory
+    # percent of flips on final step (from sampled t-1 state to t=1 prediction)
+    aatypes_final_flip_percent = "aatypes_final_flip_percent"
+
     # sequence recovery
     # gt => ground truth true_aa provided
     # inverse folded sequence -> predicted sequence recovery (only for designability df)
