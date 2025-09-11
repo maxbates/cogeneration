@@ -14,7 +14,12 @@ from cogeneration.config.base import FoldingConfig, FoldingModel
 from cogeneration.data import residue_constants
 from cogeneration.data.const import CA_IDX, aatype_to_seq, seq_to_aatype
 from cogeneration.data.io import write_numpy_json
-from cogeneration.data.metrics import calc_ca_ca_metrics, calc_mdtraj_metrics
+from cogeneration.data.metrics import (
+    calc_ca_ca_metrics,
+    calc_mdtraj_metrics,
+    calc_scaffold_mdtraj_metrics,
+    calc_scaffold_plddt_mean,
+)
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import restype_order_with_x, restypes_with_x
 from cogeneration.data.superimposition import calc_tm_score, superimpose
@@ -431,8 +436,23 @@ class FoldingValidator:
         except Exception:
             pass
 
-        # TODO(inpainting) - calculate scaffold-specific metrics for secondary structure, clashes
-
+        # inpainting metrics
+        if task == InferenceTask.inpainting and motif_mask is not None:
+            scaffold_mask = (1 - motif_mask).astype(bool)
+            # scaffold-specific secondary structure metrics
+            top_sample.update(
+                calc_scaffold_mdtraj_metrics(
+                    pdb_path=top_sample[MetricName.sample_pdb_path],
+                    scaffold_mask=scaffold_mask,
+                )
+            )
+            # folded scaffold pLDDT
+            top_sample.update(
+                calc_scaffold_plddt_mean(
+                    pdb_path=top_sample[MetricName.folded_pdb_path],
+                    scaffold_mask=scaffold_mask,
+                )
+            )
         # TODO(fksteering) - calculate FK steering metrics?
 
         # write top sample JSON

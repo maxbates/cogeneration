@@ -759,6 +759,9 @@ class Interpolant:
             # Note we deviate from the convention in FrameFlow which does not mask with true values,
             # as we do above. Forcing them, like `forward_folding` or `inverse_folding`
             # seems to make sense if they are used for guidance and were fixed throughout.
+            # For inpainting, do not fix the structure's motifs.
+            # Instead, trust they have been pushed by motif guidance,
+            # so we allow for flexibility and don't introduce breaks.
             trans_t_2 = pred_trans_1
             rotmats_t_2 = pred_rotmats_1
             aatypes_t_2 = pred_aatypes_1

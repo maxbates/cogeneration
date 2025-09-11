@@ -26,6 +26,12 @@ class MetricName(StrEnum):
     strand_percent = "strand_percent"
     radius_of_gyration = "radius_of_gyration"
 
+    # scaffold-only variants (masking out motifs for inpainting)
+    scaffold_coil_percent = "scaffold_coil_percent"
+    scaffold_helix_percent = "scaffold_helix_percent"
+    scaffold_strand_percent = "scaffold_strand_percent"
+    scaffold_plddt_mean = "scaffold_plddt_mean"
+
     # Assessment pipeline
 
     # `parse_pdb_feats()` and `parse_chain_feats()` are called when parsing structures

@@ -6,6 +6,9 @@ import numpy.typing as npt
 import torch
 
 from cogeneration.data import residue_constants
+from cogeneration.data.const import CA_IDX
+from cogeneration.dataset.process_pdb import process_pdb_file
+from cogeneration.type.dataset import DatasetProteinColumn as dpc
 from cogeneration.type.metrics import MetricName
 
 
@@ -149,3 +152,61 @@ def calc_mdtraj_metrics(pdb_path: str) -> Dict[MetricName, float]:
         MetricName.strand_percent: pdb_strand_percent,
         MetricName.radius_of_gyration: pdb_rg,
     }
+
+
+def calc_scaffold_mdtraj_metrics(
+    pdb_path: str,
+    scaffold_mask: Optional[npt.NDArray],  # (N,) bool, True for scaffold residues
+) -> Dict[MetricName, float]:
+    """
+    Compute scaffold-only DSSP composition on the PDB corresponding to the top sample.
+
+    Notes:
+    - The mask should align with sequence order written in the PDB (same residue ordering used to write it).
+    - When mask is None or empty, returns zeros.
+    """
+    metrics: Dict[MetricName, float] = {}
+
+    if scaffold_mask is None or scaffold_mask.size == 0 or not scaffold_mask.any():
+        return metrics
+
+    try:
+        traj = md.load(pdb_path)
+        dssp = md.compute_dssp(traj, simplified=True)  # (1, N)
+        dssp = dssp[0]
+        if scaffold_mask.shape[0] != dssp.shape[0]:
+            return metrics
+        sel = scaffold_mask.astype(bool)
+        metrics[MetricName.scaffold_coil_percent] = float(np.mean(dssp[sel] == "C"))
+        metrics[MetricName.scaffold_helix_percent] = float(np.mean(dssp[sel] == "H"))
+        metrics[MetricName.scaffold_strand_percent] = float(np.mean(dssp[sel] == "E"))
+    except Exception:
+        pass
+
+    return metrics
+
+
+def calc_scaffold_plddt_mean(
+    pdb_path: str,
+    scaffold_mask: npt.NDArray,  # (N,) True for scaffold residues
+) -> Dict[MetricName, float]:
+    """
+    Compute mean pLDDT over scaffold residues only.
+    """
+    metrics: Dict[MetricName, float] = {}
+
+    try:
+        folded_feats = process_pdb_file(
+            pdb_file_path=pdb_path,
+            pdb_name="",
+        )
+        plddt_ca = folded_feats[dpc.b_factors][:, CA_IDX]
+
+        assert plddt_ca.shape[0] == scaffold_mask.shape[0]
+        sel = scaffold_mask.astype(bool)
+        metrics[MetricName.scaffold_plddt_mean] = plddt_ca[sel].mean()
+
+    except Exception:
+        pass
+
+    return metrics
