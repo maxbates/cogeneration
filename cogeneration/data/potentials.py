@@ -1,9 +1,11 @@
 import logging
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from textwrap import dedent
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import torch
 from sympy import Float
 
@@ -15,7 +17,7 @@ from cogeneration.config.base import (
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.logits import center_logits, clamp_logits, combine_logits
 from cogeneration.data.tools.protein_mpnn_runner import ProteinMPNNRunner
-from cogeneration.data.trajectory import SamplingStep
+from cogeneration.data.trajectory import SamplingStep, SamplingTrajectory
 from cogeneration.dataset.interaction import DIST_INTERACTION_BACKBONE
 from cogeneration.models.esm_frozen import get_frozen_esm
 from cogeneration.type.batch import BatchProp as bp
@@ -85,6 +87,14 @@ class PotentialField:
             trans=self.trans * scale if self.trans is not None else None,
             rotmats=self.rotmats * scale if self.rotmats is not None else None,
             logits=self.logits * scale if self.logits is not None else None,
+        )
+
+    def select_batch_idx(self, idx: torch.Tensor) -> "PotentialField":
+        """Select the potential field for a subset of the batch."""
+        return PotentialField(
+            trans=self.trans[idx] if self.trans is not None else None,
+            rotmats=self.rotmats[idx] if self.rotmats is not None else None,
+            logits=self.logits[idx] if self.logits is not None else None,
         )
 
     def mask(self, mask: torch.Tensor):
@@ -169,6 +179,10 @@ class Potential(ABC):
 class FKStepMetric:
     """
     Metrics for each resampling step using FK steering. lists are len `num_batch` * `num_particles`
+
+    `keep` is the mapping of post-resample to pre-resample particle indices,
+    i.e. the result of torch.multinomial draw from resampling weights,
+    e.g. keep[i] == j means at this step, particle i was taken from particle j.
     """
 
     step: int
@@ -191,6 +205,23 @@ class FKStepMetric:
         """
         )
 
+    def best_particle_index(self, num_particles: int, batch_idx: int = 0) -> int:
+        """
+        Return the local index (0..K-1) of the best particle for the given batch item at this step.
+
+        Notes:
+        - This assumes the metric stores `log_G` flattened across (B*K,) and
+          `weights` as shape (B, K) list-of-lists (as produced by the resampler).
+        - In many usages we'll already slice to a single batch (B=1) with K particles:
+          in this case, do not pass batch_idx (defaults to 0)
+        """
+        assert self.log_G is not None
+
+        start = batch_idx * num_particles
+        end = start + num_particles
+        vals = np.asarray(self.log_G[start:end])
+        return int(np.argmax(vals))
+
 
 @dataclass
 class FKSteeringTrajectory:
@@ -205,6 +236,9 @@ class FKSteeringTrajectory:
     num_particles: int
     metrics: List[FKStepMetric] = field(default_factory=list)
 
+    def __repr__(self):
+        return f"FKSteeringTrajectory(num_batch={self.num_batch}, num_particles={self.num_particles}, num_steps={self.num_steps}, metrics=...)"
+
     def append(self, metric: Optional[FKStepMetric]):
         """
         Append an FK step metric. If metric is None (steering disabled), skip.
@@ -218,7 +252,7 @@ class FKSteeringTrajectory:
 
     def batch_sample_slice(self, batch_idx: int) -> "FKSteeringTrajectory":
         """
-        Extract FK steering trajectory for a specific batch member.
+        Extract FK steering trajectory for a specific **batch** (not particle) member.
 
         Args:
             batch_idx: Index of the batch member (0-based, in original batch before particle expansion)
@@ -255,6 +289,47 @@ class FKSteeringTrajectory:
             num_particles=self.num_particles,
             metrics=sliced_metrics,
         )
+
+    def best_particle_lineage(self, batch_idx: int) -> List[int]:
+        """
+        Compute the best particle lineage for `batch_idx` across FK steps.
+
+        Returns:
+            List[int]: list of particle indices (0..K-1) for each FK metric step, in chronological order.
+
+        Notes:
+            - Uses per-step `keep` mapping (new -> previous absolute index) to backtrack.
+        """
+        assert 0 <= batch_idx < self.num_batch
+
+        if len(self.metrics) == 0:
+            return []
+
+        # Note that step metrics are not re-indexed like the batch or model/sample trajectories.
+        # So `metric.keep` tracks the un-reindexed indices.
+        # Resampling runs on the final step. So we first look at the final metrics
+        # to get the best particle, then backtrack using the keep mapping.
+
+        # Start from the last step's best index (previous abs index)
+        K = self.num_particles
+        last_metric = self.metrics[-1]
+        best_k = last_metric.best_particle_index(batch_idx=batch_idx, num_particles=K)
+        abs_idx = batch_idx * K + best_k
+
+        # Backtrack across metric steps using keep mapping (new -> previous absolute index)
+        per_step_k_rev: List[int] = []
+        for m in reversed(self.metrics):
+            if abs_idx < 0 or abs_idx >= len(m.keep):
+                raise ValueError(f"abs_idx {abs_idx} out of bounds for metric {m.step}")
+            # convert to particle index relative to this batch member
+            k_idx = int(abs_idx % K)
+            per_step_k_rev.append(k_idx)
+            # map to previous absolute index using keep mapping, should always be valid
+            # keep[i] = j  ==> particle i at step s came from j at step s-1.
+            abs_idx = int(m.keep[abs_idx])
+
+        # reverse to chronological order
+        return list(reversed(per_step_k_rev))
 
 
 @dataclass
@@ -858,10 +933,24 @@ class FKSteeringCalculator:
 @dataclass
 class FKSteeringResampler:
     """
-    Stateful Feynman-Kac Steering Sequential Monte Carlo driver.
+    Stateful Feynman-Kac Steering Sequential Monte Carlo driver. Hooks into sampling e.g. in Interpolant.
 
     If enabled, creates K particles per sample in the batch,
     and manages energy calculation and resampling during interpolant sampling.
+
+    Reindexing behavior:
+    - On resampling steps, the resampler reindexes its internal state (_energy_trajectory, _log_G, _log_G_delta, _cached_guidance) and the input batch to match the selected particles.
+    - Returns resample_idx tensor for the caller to reindex model and sample trajectories.
+    - FK step metrics are NOT reindexed; they preserve the historical record of all particles at each step.
+
+    Caller responsibilities:
+    - on_step(): use the returned resample_idx to reindex model predictions and sample states in the interpolant, to keep them in sync with batch and resampler internal state.
+    - on completion, use best_particle_in_batch() to select final winners from the last resampled population.
+
+    Particle selection:
+    - Particles form a tree over time: each resampling step selects K survivors per batch member from the previous K particles.
+    - The keep array maps each post-resample particle index to its pre-resample ancestor index.
+    - Best particle selection uses the final step's log G scores to pick winners from the current population.
     """
 
     cfg: InterpolantSteeringConfig
@@ -874,6 +963,9 @@ class FKSteeringResampler:
 
         if self.num_particles is None:
             self.num_particles = self.cfg.num_particles
+
+        # track FK trajectory (un-resampled step metrics)
+        self._fk_trajectory: Optional[FKSteeringTrajectory] = None
 
         # track energy trajectory for each particle
         self._energy_trajectory: Optional[torch.Tensor] = None  # (B * K, 0->T)
@@ -888,6 +980,10 @@ class FKSteeringResampler:
     @property
     def enabled(self) -> bool:
         return self.num_particles > 1
+
+    @property
+    def trajectory(self) -> Optional[FKSteeringTrajectory]:
+        return self._fk_trajectory
 
     def log_G_score(self) -> torch.Tensor:
         """
@@ -915,47 +1011,22 @@ class FKSteeringResampler:
 
         batch = {k: _batch_repeat_feat(v, self.num_particles) for k, v in batch.items()}
 
+        # initialize FK trajectory storage (un-resampled)
+        self._fk_trajectory = FKSteeringTrajectory(
+            num_batch=num_batch,
+            num_particles=self.num_particles,
+        )
+
         return batch
 
-    def on_step(
+    def _calculate_metrics(
         self,
         step_idx: int,
         batch: NoisyFeatures,
         protein_state: SamplingStep,
         model_pred: SamplingStep,
         protein_pred: SamplingStep,
-    ) -> Tuple[
-        NoisyFeatures,  # batch with selected particles, if enabled
-        Optional[torch.Tensor],  # reindexing, if enabled
-        FKStepMetric,  # metrics for this step
-        PotentialField,  # guidance for this step
-    ]:
-        """
-        If enabled, resample particles in a batch according to their energy.
-        Updates the batch's particles and returns the resampled indices.
-
-        Batch is updated to new particles, but caller must update out of scope
-        predictions / state with the resampled indices.
-
-        We output sample indices and metrics if this is a resampling step.
-
-        However, guidance potential field may be output on all steps, if enabled.
-        Guidance is cached and reused (with optional decay) on non-resampling steps.
-        """
-        # escape if disabled
-        if not self.enabled:
-            return batch, None, None, PotentialField()
-
-        # If not resampling at this step, return decayed guidance
-        if (step_idx % self.cfg.resampling_interval) != 0:
-            if self._cached_guidance is None:
-                return batch, None, None, PotentialField()
-
-            steps_since_resampling = step_idx % self.cfg.resampling_interval
-            decay = self.cfg.guidance_cache_decay**steps_since_resampling
-            decayed_guidance = self._cached_guidance.decayed(decay)
-            return batch, None, None, decayed_guidance
-
+    ) -> FKStepMetric:
         assert self._energy_trajectory is not None, "FK Steering not initialized."
 
         batch_size, num_res = batch[bp.res_mask].shape  # (B * K, N)
@@ -972,9 +1043,6 @@ class FKSteeringResampler:
         self._energy_trajectory = torch.cat(
             [self._energy_trajectory, energy.unsqueeze(1)], dim=1
         )
-
-        # cache guidance for use on non-resampling steps
-        self._cached_guidance = guidance
 
         # Compute log G values, weighing particles by improvement
         # Calculate both the running total, and difference from previous step.
@@ -1011,6 +1079,8 @@ class FKSteeringResampler:
         effective_sample_size = 1.0 / (resampling_weights**2).sum(dim=1)
 
         # draw surviving particle indices
+        # re-indexing is handled in `on_step()` - do not reindex here.
+        # step metrics capture pre-resample indices.
         row_idx = [
             torch.multinomial(w_i, self.num_particles, replacement=True)
             for w_i in resampling_weights
@@ -1030,7 +1100,66 @@ class FKSteeringResampler:
             keep=idx.tolist(),
             guidance=guidance,
         )
+
+        # cache guidance for use on non-resampling steps
+        self._cached_guidance = guidance
+
+        return step_metric
+
+    def on_step(
+        self,
+        step_idx: int,
+        batch: NoisyFeatures,
+        protein_state: SamplingStep,  # batch as SamplingStep
+        model_pred: SamplingStep,  # direct model prediction
+        protein_pred: SamplingStep,  # masked prediction
+    ) -> Tuple[
+        NoisyFeatures,  # batch with selected particles, if enabled
+        Optional[torch.Tensor],  # reindexing, if enabled
+        FKStepMetric,  # metrics for this step
+        PotentialField,  # guidance for this step
+    ]:
+        """
+        If enabled, resample particles in a batch according to their energy.
+        Updates the batch's particles and returns the resampled indices.
+
+        Batch is updated to new particles, but caller must update out of scope
+        predictions / state with the resampled indices.
+
+        We output sample indices and metrics if this is a resampling step.
+
+        However, guidance potential field may be output on all steps, if enabled.
+        Guidance is cached and reused (with optional decay) on non-resampling steps.
+        """
+        # escape if disabled
+        if not self.enabled:
+            return batch, None, None, PotentialField()
+
+        # If not resampling at this step, return decayed guidance
+        if (step_idx % self.cfg.resampling_interval) != 0:
+            if self._cached_guidance is None:
+                return batch, None, None, PotentialField()
+
+            steps_since_resampling = step_idx % self.cfg.resampling_interval
+            decay = self.cfg.guidance_cache_decay**steps_since_resampling
+            decayed_guidance = self._cached_guidance.decayed(decay)
+            return batch, None, None, decayed_guidance
+
+        step_metric = self._calculate_metrics(
+            step_idx=step_idx,
+            batch=batch,
+            protein_state=protein_state,
+            model_pred=model_pred,
+            protein_pred=protein_pred,
+        )
         self._log.debug(step_metric.log())
+
+        # record FK step metric on the trajectory
+        self._fk_trajectory.append(step_metric)
+
+        # pull out the sampled indices
+        device = batch[bp.res_mask].device
+        idx = torch.tensor(step_metric.keep, device=device)
 
         # reindex batch + internal state using the sampled indices
         batch = {k: _batch_select_feat(v, idx) for k, v in batch.items()}
@@ -1038,26 +1167,136 @@ class FKSteeringResampler:
         self._log_G = self._log_G.index_select(0, idx)
         self._log_G_delta = self._log_G_delta.index_select(0, idx)
 
-        return batch, idx, step_metric, guidance
+        # (Do not re-index fk-trajectory; keep step metrics as is.)
+
+        # Reindex cached guidance to keep it aligned with the resampled particles for forthcoming steps.
+        if self._cached_guidance is not None:
+            self._cached_guidance = self._cached_guidance.select_batch_idx(idx)
+
+        return batch, idx, step_metric, step_metric.guidance
 
     def best_particle_in_batch(
-        self, batch: NoisyFeatures
-    ) -> Tuple[NoisyFeatures, Optional[torch.Tensor]]:
+        self,
+        batch: NoisyFeatures,
+        sample_trajectory: Optional[SamplingTrajectory] = None,
+        model_trajectory: Optional[SamplingTrajectory] = None,
+    ) -> Tuple[
+        NoisyFeatures, Optional[SamplingTrajectory], Optional[SamplingTrajectory]
+    ]:
         """
-        Pick the best particle per sample in the batch by log G score.
-        Converts batch from (B * K, ...) to (B, ...), and returns indices of the best particles.
+        Pick the best particle per sample in the batch.
+        Converts batch from (B * K, ...) to (B, ...), and returns indices (in B*K) of the best particles.
+
+        If sample_trajectory and model_trajectory are provided, downselects trajectories to same best particles.
         """
         if not self.enabled:
-            return batch, None
+            return batch, sample_trajectory, model_trajectory
+
+        assert (
+            self._fk_trajectory is not None and self._fk_trajectory.num_steps > 0
+        ), "FKSteeringTrajectory must be enabled and have steps"
 
         batch_size, num_res = batch[bp.res_mask].shape  # (B * K, N)
         num_batch = batch_size // self.num_particles  # B (original batch size)
         device = batch[bp.res_mask].device
 
-        log_G_score = self.log_G_score()
-        logG_mat = log_G_score.view(num_batch, self.num_particles)  # (B, K)
-        idx_best = logG_mat.argmax(dim=1)  # (B,)
-        idx_best += torch.arange(num_batch, device=device) * self.num_particles  # (B,)
-        batch_best = {k: _batch_select_feat(v, idx_best) for k, v in batch.items()}
+        # Use the last recorded FKStepMetric to select winners in the current (post-resample) population
+        last_metric = self._fk_trajectory.metrics[-1]
+        # list of indices of particle K, per batch item (i.e. each in 0..K-1)
+        best_local = [
+            last_metric.best_particle_index(
+                num_particles=self.num_particles, batch_idx=b
+            )
+            for b in range(num_batch)
+        ]
+        idx_best = torch.tensor(best_local, device=device)
 
-        return batch_best, idx_best
+        # convert to absolute indices in (B*K)
+        abs_idx_best = (
+            idx_best + torch.arange(num_batch, device=device) * self.num_particles
+        )  # (B,)
+        batch_best = {k: _batch_select_feat(v, abs_idx_best) for k, v in batch.items()}
+
+        # if trajectories are provided, downselect them to same best particles
+        # note that sample_trajectory expected to have 1 additional frame (initial noise) at beginning
+        if sample_trajectory is not None and model_trajectory is not None:
+            fk_traj = self._fk_trajectory
+            B = fk_traj.num_batch
+            K = self.num_particles
+            resampling_steps = fk_traj.num_steps
+
+            assert (
+                sample_trajectory.num_steps == model_trajectory.num_steps + 1
+            ), f"sample traj S={sample_trajectory.num_steps} != model traj={model_trajectory.num_steps} + 1"
+            assert (
+                sample_trajectory.num_batch == model_trajectory.num_batch
+            ), f"sample traj B={sample_trajectory.num_batch} != model traj={model_trajectory.num_batch}"
+            assert (
+                sample_trajectory.num_batch == B * K
+            ), f"sample traj B={sample_trajectory.num_batch} != B*K={B*K} (B={B}, K={K})"
+
+            # Confirm we have the expected number of resampling steps metrics,
+            # i.e. one at 0, one at final step, and each resampling interval
+            assert (
+                resampling_steps
+                == math.ceil(model_trajectory.num_steps / self.cfg.resampling_interval)
+                + 1
+            ), f"unexpected number of resampling steps {resampling_steps} != model traj steps {model_trajectory.num_steps} // resampling interval {self.cfg.resampling_interval} + 1"
+            assert (
+                fk_traj.metrics[0].step == 0
+            ), f"first FK step metric step {fk_traj.metrics[0].step} != 0"
+            assert (
+                fk_traj.metrics[-1].step == model_trajectory.num_steps
+            ), f"last FK step metric step {fk_traj.metrics[-1].step} != model traj steps {model_trajectory.num_steps}"
+
+            # Array of per-step indices in [0, B*K] for the selected particle lineage
+            particle_lineage_idx: List[torch.Tensor] = []
+
+            # Collect per-batch item per-step local particle indices in [0, K]
+            particle_lineages: List[List[int]] = [
+                fk_traj.best_particle_lineage(batch_idx=b) for b in range(B)
+            ]
+            assert all(
+                len(k_list) == resampling_steps for k_list in particle_lineages
+            ), "FK best_particle_indices length mismatch"
+            for b in range(B):
+                assert (
+                    particle_lineages[b][-1] == idx_best[b]
+                ), f"Batch {b} final particle {particle_lineages[b][-1]} != idx_best {idx_best[b]}"
+
+            # Convert local particle indices to absolute indices in [0, B*K], and
+            # in-fill model steps without resampling to the last FK metric index.
+            for model_step in range(model_trajectory.num_steps):
+                # Map model step index to the most recent FK metric step index.
+                # Resampling is recorded at step indices that are exact multiples of the interval (including 0),
+                # and additionally at the final step. For regular steps, use floor(model_step / interval);
+                # for the final model step, map to the final FK metric.
+                if model_step == (model_trajectory.num_steps - 1):
+                    resample_step_num = resampling_steps - 1
+                else:
+                    resample_step_num = model_step // self.cfg.resampling_interval
+
+                # abs indices in [0, B*K]
+                step_particle_idx = torch.tensor(
+                    [b * K + particle_lineages[b][resample_step_num] for b in range(B)]
+                )
+                particle_lineage_idx.append(step_particle_idx)
+
+            # Determine particle index at step 0 (not re-indexed) for sample trajectory
+            # (i.e. the initial noise)
+            # We need the PRE-resample ancestor index for step 0 along the chosen lineage.
+            abs_new_0 = torch.tensor(
+                [b * K + particle_lineages[b][0] for b in range(B)]
+            )
+            keep0 = torch.tensor(fk_traj.metrics[0].keep, device=abs_new_0.device)
+            first_step_particle_idx = keep0.index_select(0, abs_new_0)
+
+            # Apply per-step selection
+            model_trajectory = model_trajectory.select_batch_idx_per_step(
+                particle_lineage_idx
+            )
+            sample_trajectory = sample_trajectory.select_batch_idx_per_step(
+                [first_step_particle_idx] + particle_lineage_idx
+            )
+
+        return batch_best, sample_trajectory, model_trajectory

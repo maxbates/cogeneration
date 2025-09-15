@@ -3,6 +3,7 @@ import os.path
 
 import pytest
 import torch
+from numpy import False_
 
 from cogeneration.config.base import Config, InferenceSamplesConfig
 from cogeneration.dataset.datasets import EvalDatasetConstructor
@@ -43,8 +44,8 @@ class TestEvalRunner:
         )
 
     # This is a slow test, because it actually samples with real model, many timesteps, and animates.
-    # Can run manually.
-    @pytest.mark.skip
+    @pytest.mark.slow
+    @pytest.mark.skip  # Can run manually by uncommenting
     def test_public_weights_sampling(self, public_weights_path, tmp_path):
         cfg = Config.public_multiflow()
 
@@ -56,9 +57,9 @@ class TestEvalRunner:
         cfg.shared.stochastic = True
         cfg.inference.interpolant.trans.stochastic_noise_intensity *= 0.25
         cfg.inference.interpolant.rots.stochastic_noise_intensity *= 0.25
-        cfg.inference.interpolant.aatypes.stochastic_noise_intensity *= 1.0
+        cfg.inference.interpolant.aatypes.stochastic_noise_intensity *= 0.75
         # FK Steering
-        cfg.inference.interpolant.steering.num_particles = 4
+        cfg.inference.interpolant.steering.num_particles = 4  # 0 to disable
         # set up predict_dir to tmp_path
         cfg.inference.predict_dir = str(tmp_path / "inference")
         # control number of timesteps. e.g. use 1 to debug folding validation / plotting
@@ -68,12 +69,12 @@ class TestEvalRunner:
         cfg.inference.samples.num_batch = 1
         cfg.inference.samples.multimer_fraction = 0.0
         cfg.inference.samples.length_subset = [156]
-        # Consider disabling ESM and ProteinMPNN guidance, which is slow
+        # Control ESM and ProteinMPNN guidance, which is slow
         # (since ESM not used in the model, nothing cached, have to compute each resampling step)
         cfg.inference.interpolant.steering.inverse_fold_energy_scale = 0.0
         cfg.inference.interpolant.steering.inverse_fold_guidance_scale = 0.0
-        cfg.inference.interpolant.steering.esm_logits_energy_scale = 0.0
-        cfg.inference.interpolant.steering.esm_logits_guidance_scale = 0.0
+        cfg.inference.interpolant.steering.esm_logits_energy_scale = 1.0
+        cfg.inference.interpolant.steering.esm_logits_guidance_scale = 5.0
         # skip designability? requires folding each ProteinMPNN sequence
         cfg.inference.also_fold_pmpnn_seq = False
         # write trajectories to inspect

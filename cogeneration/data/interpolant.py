@@ -512,7 +512,7 @@ class Interpolant:
         self,
         t: torch.Tensor,  # (B,)
         noisy_batch: NoisyFeatures,
-        pred: ModelPrediction,
+        model_pred: SamplingStep,
         true_feats: BatchTrueFeatures,
         motif_mask: Optional[torch.Tensor],  # (B, N) bool
     ) -> PotentialField:
@@ -541,8 +541,8 @@ class Interpolant:
 
         trans_t = noisy_batch[nbp.trans_t]
         rotmats_t = noisy_batch[nbp.rotmats_t]
-        pred_trans_1 = pred[pbp.pred_trans]
-        pred_rotmats_1 = pred[pbp.pred_rotmats]
+        pred_trans_1 = model_pred.trans
+        pred_rotmats_1 = model_pred.rotmats
         motif_sel = motif_mask.bool()
 
         eps = 1e-3
@@ -636,8 +636,7 @@ class Interpolant:
         step_idx: int,
         t_1: torch.Tensor,  # (B,)
         d_t: Optional[torch.Tensor],  # scalar or None if final step
-        stochasticity_scale: torch.Tensor,  # (B,)
-    ) -> Tuple[NoisyFeatures, SamplingStep, SamplingStep, Optional[FKStepMetric]]:
+    ) -> Tuple[NoisyFeatures, SamplingStep, SamplingStep]:
         """
         Perform a single step of sampling, integrating from `t_1` toward `t_2`.
         Batch `_t` properties should be at `t_1`.
@@ -655,7 +654,7 @@ class Interpolant:
 
         is_final_step = d_t is None
 
-        # Pull out masks + idx
+        # Pull out masks + idx (shared across particles)
         res_mask = noisy_batch[bp.res_mask]
         diffuse_mask = noisy_batch[bp.diffuse_mask]
         chain_idx = noisy_batch[bp.chain_idx]
@@ -664,12 +663,6 @@ class Interpolant:
         # we use `scaffold_mask` for sequence interpolation, and `diffuse_mask` for structure.
         # if `motif_mask` is missing or empty, effectively uses `diffuse_mask`.
         scaffold_mask = (1 - motif_mask) if motif_mask is not None else diffuse_mask
-
-        # Pull out t_1 values
-        trans_t_1 = noisy_batch[nbp.trans_t]
-        rotmats_t_1 = noisy_batch[nbp.rotmats_t]
-        aatypes_t_1 = noisy_batch[nbp.aatypes_t]
-        torsions_t_1 = noisy_batch[nbp.torsions_t]
 
         # Gather protein state before interpolating (we already saved after previous step)
         prev_protein_state = SamplingStep.from_batch(
@@ -730,24 +723,45 @@ class Interpolant:
             logits=None,
         )
 
-        # For inpainting, compute a potential (scaled by `t=t_1`) to pull the motifs
-        # (trans + rotmats) towards their known positions.
-        # If not inpainting, motif_mask is None, and no guidance.
-        motif_guidance = self.motif_potentials(
-            t=t_1,
-            noisy_batch=noisy_batch,
-            pred=model_out,
-            true_feats=true_feats,
-            motif_mask=motif_mask,
-        )
-
         # Feynman-Kac steering, if enabled.
+        # Note FK steering requires thoughtful state management, to keep resampled indices in sync.
         noisy_batch, resample_idx, step_metrics, potential_guidance = resampler.on_step(
             step_idx=step_idx,
             batch=noisy_batch,
             protein_state=prev_protein_state,
             protein_pred=protein_pred,
             model_pred=model_pred,
+        )
+
+        # If FK steering enabled and resampled at this step, update to new particles.
+        # All particle-specific values calculated before resampling should be reindexed to the resampled batch.
+        # Values shared across particles (masks, true values) don't need to be reindexed.
+        # Things calculated following resampling just use the resampled batch.
+        if resample_idx is not None:
+            # keep trajectories aligned with the resampled batch
+            model_pred = model_pred.select_batch_idx(resample_idx)
+            protein_pred = protein_pred.select_batch_idx(resample_idx)
+
+            # reindex pre-resample model predictions that will drive euler steps
+            pred_trans_1 = pred_trans_1.index_select(0, resample_idx)
+            pred_rotmats_1 = pred_rotmats_1.index_select(0, resample_idx)
+            pred_logits_1 = pred_logits_1.index_select(0, resample_idx)
+            pred_aatypes_1 = pred_aatypes_1.index_select(0, resample_idx)
+            if pred_torsions_1 is not None:
+                pred_torsions_1 = pred_torsions_1.index_select(0, resample_idx)
+
+            # masks should be unchanged, since they are shared across particles
+            # i.e. res_mask, diffuse_mask, motif_mask, scaffold_mask, chain_idx, etc.
+
+        # For inpainting, compute a potential (scaled by `t=t_1`) to pull the motifs
+        # (trans + rotmats) towards their known positions.
+        # If not inpainting, motif_mask is None, and no guidance.
+        motif_guidance = self.motif_potentials(
+            t=t_1,
+            noisy_batch=noisy_batch,
+            model_pred=model_pred,
+            true_feats=true_feats,
+            motif_mask=motif_mask,
         )
 
         # add motif and potential guidance vector fields
@@ -767,6 +781,12 @@ class Interpolant:
             aatypes_t_2 = pred_aatypes_1
             torsions_t_2 = pred_torsions_1
         else:
+            # Pull out current t_1 values
+            trans_t_1 = noisy_batch[nbp.trans_t]
+            rotmats_t_1 = noisy_batch[nbp.rotmats_t]
+            aatypes_t_1 = noisy_batch[nbp.aatypes_t]
+            torsions_t_1 = noisy_batch[nbp.torsions_t]
+
             # Update self-conditioning values using model outputs.
             # Fixed domains depending on task have already been updated above.
             if self.cfg.self_condition:
@@ -845,12 +865,7 @@ class Interpolant:
             batch=noisy_batch,
         )
 
-        # FK Steering particle selection, if enabled
-        if resample_idx is not None:
-            model_pred = model_pred.select_batch_idx(resample_idx)
-            protein_state = protein_state.select_batch_idx(resample_idx)
-
-        return noisy_batch, model_pred, protein_state, step_metrics
+        return noisy_batch, model_pred, protein_state
 
     def sample(
         self,
@@ -870,19 +885,19 @@ class Interpolant:
         rotmats_1: Optional[torch.Tensor] = None,
         torsions_1: Optional[torch.Tensor] = None,
         aatypes_1: Optional[torch.Tensor] = None,
-        # t_nn is model/function that generates explicit time steps (r3, so3, cat) given t
-        t_nn: Union[Callable[[torch.Tensor], torch.Tensor], Any] = None,
-        # scale euler step stochasticity, 0 to disable for this `sample()`.
-        # stochasticity for each domain must be enabled in cfg; this scales it those values
-        stochasticity_scale: float = 1.0,
+        # optionally override stochasticity_scale, 0.0 to disable for this `sample()`.
+        # stochasticity for each domain must be enabled in cfg; this scales those values
+        stochastic_scale: Optional[Union[float, torch.Tensor]] = None,
         structure_method: StructureExperimentalMethod = StructureExperimentalMethod.XRAY_DIFFRACTION,
         hot_spots: Optional[torch.Tensor] = None,
         contact_conditioning: Optional[torch.Tensor] = None,
+        # t_nn is model/function that generates explicit time steps (r3, so3, cat) given t
+        t_nn: Union[Callable[[torch.Tensor], torch.Tensor], Any] = None,
         # Optional override for FK steering particles; set to 1 to disable
         num_particles: Optional[int] = None,
         # progress bar
         show_progress: bool = False,
-    ) -> Tuple[SamplingTrajectory, SamplingTrajectory, FKSteeringTrajectory]:
+    ) -> Tuple[SamplingTrajectory, SamplingTrajectory, Optional[FKSteeringTrajectory]]:
         """
         Generate samples by interpolating towards model predictions.
 
@@ -949,31 +964,13 @@ class Interpolant:
 
         # Set up Feynman-Kac steering + resampling for this sampling run
         resampler = FKSteeringResampler(
-            cfg=self.cfg.steering, num_particles=num_particles
+            cfg=self.cfg.steering,
+            num_particles=num_particles,
         )
         if resampler.enabled:
             assert (
                 self.cfg.sampling.num_timesteps % resampler.cfg.resampling_interval == 0
             ), f"Number of sampling timesteps ({self.cfg.sampling.num_timesteps}) must be divisible by the steering resampling interval ({resampler.cfg.resampling_interval})"
-
-        # fk_trajectory tracks FK steering metrics over time
-        fk_trajectory = FKSteeringTrajectory(
-            num_batch=num_batch,
-            num_particles=resampler.num_particles,
-        )
-
-        # model_trajectory tracks model outputs
-        model_trajectory = SamplingTrajectory(
-            num_batch=num_batch,
-            num_res=num_res,
-            num_tokens=self.num_tokens,
-        )
-        # sample_trajectory tracks predicted intermediate states integrating from t=0 to t=1
-        sample_trajectory = SamplingTrajectory(
-            num_batch=num_batch,
-            num_res=num_res,
-            num_tokens=self.num_tokens,
-        )
 
         # for inference, all residues under consideration
         res_mask = torch.ones(num_batch, num_res, device=self._device)
@@ -988,15 +985,21 @@ class Interpolant:
         )
 
         # Build per-sample stochasticity tensor (B,)
-        if isinstance(stochasticity_scale, torch.Tensor):
-            stochastic_scale_tensor = stochasticity_scale.to(self._device).view(-1)
+        if stochastic_scale is None:
+            stochastic_scale_tensor = torch.ones(num_batch, device=self._device)
+        elif isinstance(stochastic_scale, float):
+            stochastic_scale_tensor = (
+                torch.tensor([float(stochastic_scale)], device=self._device)
+                .expand(num_batch)
+                .float()
+            )
+        elif isinstance(stochastic_scale, torch.Tensor):
+            stochastic_scale_tensor = stochastic_scale.to(self._device).view(-1)
             if stochastic_scale_tensor.shape[0] != num_batch:
                 stochastic_scale_tensor = stochastic_scale_tensor.expand(num_batch)
         else:
-            stochastic_scale_tensor = (
-                torch.tensor([float(stochasticity_scale)], device=self._device)
-                .expand(num_batch)
-                .float()
+            raise ValueError(
+                f"Unknown stochasticity_scale type: {type(stochastic_scale)}"
             )
 
         # set up additional default values
@@ -1097,11 +1100,26 @@ class Interpolant:
         batch[nbp.aatypes_t] = aatypes_0
 
         # Set up Feynman-Kac resampling, which expands each batch member to K particles.
-        # Idempotent if not enabled or number of particles is 1.
+        # Idempotent if not enabled.
         batch = resampler.init_particles(batch=batch)  # (B, ...) -> (B * K, ...)
-        num_batch = batch[bp.res_mask].shape[0]  # may have changed
+        if resampler.enabled and resampler.num_particles > 1:
+            num_batch = batch[bp.res_mask].shape[0]  # expanded to B*K
+            # TODO - expand true_feats; implicitly assumes B=1 for broadcasting across particles
 
-        # save t=0 state
+        # model_trajectory tracks model outputs
+        model_trajectory = SamplingTrajectory(
+            num_batch=num_batch,
+            num_res=num_res,
+            num_tokens=self.num_tokens,
+        )
+        # sample_trajectory tracks predicted intermediate states integrating from t=0 to t=1
+        sample_trajectory = SamplingTrajectory(
+            num_batch=num_batch,
+            num_res=num_res,
+            num_tokens=self.num_tokens,
+        )
+
+        # save sample t=0 state
         sample_trajectory.append(SamplingStep.from_batch(batch=batch))
 
         # Set-up time steps
@@ -1157,7 +1175,7 @@ class Interpolant:
             )
 
             # Take a single step, updating the batch in place
-            batch, model_step, sample_step, step_metrics = self.sample_single_step(
+            batch, model_step, sample_step = self.sample_single_step(
                 noisy_batch=batch,
                 true_feats=true_feats,
                 model=model,
@@ -1166,12 +1184,10 @@ class Interpolant:
                 step_idx=step_idx,
                 t_1=t_1_b,
                 d_t=(t_2 - t_1),
-                stochasticity_scale=stochastic_scale_tensor,
             )
 
             model_trajectory.append(model_step)
             sample_trajectory.append(sample_step)
-            fk_trajectory.append(step_metrics)
 
             # Update t_1 to t_2 for the next step
             t_1 = t_2
@@ -1191,7 +1207,7 @@ class Interpolant:
             override_t=t_1_b,
         )
 
-        batch, model_step, sample_step, step_metrics = self.sample_single_step(
+        batch, model_step, sample_step = self.sample_single_step(
             noisy_batch=batch,
             true_feats=true_feats,
             model=model,
@@ -1200,21 +1216,21 @@ class Interpolant:
             step_idx=self.cfg.sampling.num_timesteps,  # final step
             t_1=t_1_b,
             d_t=None,  # final step
-            stochasticity_scale=stochastic_scale_tensor,
         )
 
         model_trajectory.append(model_step)
         sample_trajectory.append(sample_step)
-        fk_trajectory.append(step_metrics)
 
-        # If FK steering is enabled, pick the best particle per sample
-        # TODO(fksteering) - allow passing through all the particles.
-        #   Ensure each is handled properly.
-        #   Right now we make some assumptions and build directory structure before calling sample().
-        _, best_idx = resampler.best_particle_in_batch(batch=batch)
-        if best_idx is not None:
-            # Select the best particle for each sample
-            model_trajectory = model_trajectory.select_batch_idx(best_idx)
-            sample_trajectory = sample_trajectory.select_batch_idx(best_idx)
+        # If FK steering is enabled, extract the particle lineage for the model and sample trajectories
+        # TODO(fksteering) - support outputting all particles.
+        #   We assume a single particle prior to calling sample() in directory construction etc.
+        if resampler.enabled:
+            batch, sample_trajectory, model_trajectory = (
+                resampler.best_particle_in_batch(
+                    batch=batch,
+                    sample_trajectory=sample_trajectory,
+                    model_trajectory=model_trajectory,
+                )
+            )
 
-        return sample_trajectory, model_trajectory, fk_trajectory
+        return sample_trajectory, model_trajectory, resampler.trajectory

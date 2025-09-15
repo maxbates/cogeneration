@@ -44,6 +44,9 @@ class SamplingStep:
     torsions: Optional[torch.Tensor]  # (B, N, 7, 2)
     logits: Optional[torch.Tensor]  # model output only; (B, N, S) S={20,21}
 
+    def __repr__(self):
+        return f"SamplingStep(res_mask={self.res_mask.shape}, trans={self.trans.shape}, rotmats={self.rotmats.shape}, aatypes={self.aatypes.shape}, torsions={self.torsions.shape if self.torsions is not None else None}, logits={self.logits.shape if self.logits is not None else None})"
+
     def to_cpu(self):
         """
         Move all tensors to CPU and detach.
@@ -160,17 +163,36 @@ class SamplingTrajectory:
     def __getitem__(self, index: int) -> SamplingStep:
         return self.steps[index]
 
+    def __repr__(self):
+        return f"SamplingTrajectory(num_batch={self.num_batch}, num_res={self.num_res}, num_tokens={self.num_tokens}, num_steps={self.num_steps}, steps=...)"
+
     def append(self, step: SamplingStep):
         step.to_cpu()
         self.steps.append(step)
 
-    def select_batch_idx(self, idx: torch.Tensor):
+    def select_batch_idx_per_step(self, idx_per_step: List[torch.Tensor]):
         """
-        Select batch members by index `idx`.
-        Returns a new SamplingTrajectory with the selected steps.
+        Select batch members using a potentially different index tensor per step.
+
+        Args:
+            idx_per_step: list of 1D index tensors, one per step, each of shape (new_B,)
+
+        Returns:
+            New SamplingTrajectory with per-step-selected batch members.
         """
-        new_num_batch = idx.shape[0]
-        new_steps = [step.select_batch_idx(idx) for step in self.steps]
+        # Use the first step's idx to define the new batch size
+        new_num_batch = idx_per_step[0].shape[0]
+
+        assert len(idx_per_step) == len(
+            self.steps
+        ), f"idx_per_step length {len(idx_per_step)} must match number of steps {len(self.steps)}"
+        assert all(
+            i.shape[0] == new_num_batch for i in idx_per_step
+        ), f"idx_per_step must have shape (new_B,)"
+
+        new_steps = [
+            step.select_batch_idx(i) for step, i in zip(self.steps, idx_per_step)
+        ]
         return SamplingTrajectory(
             num_batch=new_num_batch,
             num_res=self.num_res,

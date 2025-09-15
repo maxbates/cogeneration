@@ -579,7 +579,9 @@ class FlowModule(LightningModule):
 
             # Extract FK steering trajectory for this batch member
             sample_fk_traj = (
-                fk_traj.batch_sample_slice(i) if fk_traj.num_steps > 0 else None
+                fk_traj.batch_sample_slice(i)
+                if fk_traj is not None and fk_traj.num_steps > 0
+                else None
             )
 
             # Compute metrics, and inverse fold + fold the designed structure
@@ -795,7 +797,9 @@ class FlowModule(LightningModule):
 
             # Extract FK steering trajectory for this batch member
             sample_fk_traj = (
-                fk_traj.batch_sample_slice(i) if fk_traj.num_steps > 0 else None
+                fk_traj.batch_sample_slice(i)
+                if fk_traj is not None and fk_traj.num_steps > 0
+                else None
             )
 
             top_sample_metrics, _, _ = self.compute_sample_metrics(

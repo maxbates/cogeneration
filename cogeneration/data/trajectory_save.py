@@ -85,12 +85,14 @@ def _subsample_timesteps(
         timesteps = np.concatenate(
             [timesteps, np.arange(num_timesteps - take_last, num_timesteps)]
         )
-        timesteps = np.unique(timesteps)
-        timesteps = np.sort(timesteps)
 
-    # regardless of take_last,ensure we include the final timestep
+    # regardless of take_last, ensure we include the final timestep
     if timesteps[-1] != num_timesteps - 1:
         timesteps = np.append(timesteps, num_timesteps - 1)
+
+    # Ensure unique and sorted
+    timesteps = np.unique(timesteps)
+    timesteps = np.sort(timesteps)
 
     return list(timesteps.astype(int))
 
@@ -191,12 +193,14 @@ def _init_logits_heatmap(
     ax: plt.Axes,
     logits: npt.NDArray,  # (N, S) where S = 20 or 21
     title: Optional[str] = "",
+    softmax_logits: bool = True,
 ) -> matplotlib.image.AxesImage:
-    rgba = _rgba_from_logits(logits)  # (21, L, 4)
+    rgba = _rgba_from_logits(logits, softmax_logits=softmax_logits)  # (S, L, 4)
     im = ax.imshow(rgba, origin="lower", interpolation="none")  # 1-time image
 
     if title is not None:
-        ax.set_title(title)
+        suffix = " (softmax)" if softmax_logits else ""
+        ax.set_title(f"{title}{suffix}")
 
     ax.set_xlabel("Residue")
     ax.set_ylabel("Amino-acid")
@@ -271,7 +275,12 @@ def _save_logits_traj(
     fig, ax = plt.subplots(figsize=(int(num_res * 0.15), 5), dpi=100)
 
     # create image to update, draw frame 1
-    im = _init_logits_heatmap(ax, logits=logits_traj[0], title="Logits trajectory")
+    im = _init_logits_heatmap(
+        ax,
+        logits=logits_traj[0],
+        title="Logits trajectory",
+        softmax_logits=softmax_logits,
+    )
     rects = _init_logits_borders(
         ax, logits_traj=logits_traj, aa_traj=aa_traj, motif_mask=motif_mask
     )
@@ -333,7 +342,7 @@ def save_logits_traj(
 
 
 def save_potential_logits_traj(
-    metrics: List[FKStepMetric],
+    fk_traj: FKSteeringTrajectory,
     sample_aa_traj: Optional[npt.NDArray],  # (T, N)
     motif_mask: Optional[npt.NDArray],  # (N,)
     output_dir: str,
@@ -345,21 +354,29 @@ def save_potential_logits_traj(
     Returns path to saved animation, or None if logits guidance not present.
     """
     # Check if any metric has logits guidance
-    if metrics is None or len(metrics) == 0 or sample_aa_traj is None:
+    if (
+        fk_traj is None
+        or fk_traj.metrics is None
+        or len(fk_traj.metrics) == 0
+        or sample_aa_traj is None
+    ):
         return None
 
-    first_guidance = metrics[0].guidance
+    first_guidance = fk_traj.metrics[0].guidance
     if first_guidance is None or first_guidance.logits is None:
         return None
 
-    # Build logits trajectory across FK resampling steps
+    # Determine per-step best particle lineage for this sample (assumes batch is already sliced to 1)
+    k_indices = fk_traj.best_particle_lineage(batch_idx=0)
+
+    # Build logits trajectory across FK resampling steps for that lineage
     fk_logits_guidance: List[npt.NDArray] = []
-    for m in metrics:
+    for m, k_idx in zip(fk_traj.metrics, k_indices):
         if m.guidance is None or m.guidance.logits is None:
             continue
         logits_t = m.guidance.logits  # (K, N, S) or (N, S)
         if logits_t.dim() == 3:
-            logits_t = logits_t.mean(dim=0)
+            logits_t = logits_t[int(k_idx)]
         logits_np = logits_t.detach().cpu().to(torch.float32).numpy()  # (N, S)
         fk_logits_guidance.append(logits_np)
 
@@ -369,7 +386,9 @@ def save_potential_logits_traj(
     logits_traj = np.stack(fk_logits_guidance, axis=0)  # (T, N, S)
 
     # Build AA trajectory across FK resampling steps
-    aa_traj = np.stack([sample_aa_traj[m.step] for m in metrics], axis=0)  # (T, N)
+    aa_traj = np.stack(
+        [sample_aa_traj[m.step] for m in fk_traj.metrics], axis=0
+    )  # (T, N)
 
     # Determine output path and writer
     ext, writer = _get_anim_writer()
@@ -599,6 +618,7 @@ def animate_trajectories(
     animation_max_frames: int,
     animation_take_last_frames: int,
     softmax_logits: bool = True,
+    fk_steering_traj: Optional[FKSteeringTrajectory] = None,
 ):
     """
     Animates the protein and model trajectories side by side.
@@ -641,7 +661,7 @@ def animate_trajectories(
         wspace=0.02,
         hspace=0.01,
     )
-    # ax_logits_prot = fig.add_subplot(gs[0, 0]) # (not used)
+    ax_logits_guidance = fig.add_subplot(gs[0, 0])
     ax_logits_model = fig.add_subplot(gs[0, 1])
     ax_sequence_prot = fig.add_subplot(gs[1, 0])
     ax_sequence_model = fig.add_subplot(gs[1, 1])
@@ -652,8 +672,55 @@ def animate_trajectories(
     fig.subplots_adjust(left=0.01, right=0.99, top=0.98, bottom=0.06)
     title_text = fig.text(0.5, 0.02, "", ha="center", va="bottom", fontsize=20)
 
+    # Prepare FK guidance logits (if provided) for the lineage of the best particle across steps
+    guidance_map = {}
+    if fk_steering_traj is not None and len(fk_steering_traj.metrics) > 0:
+        k_indices = fk_steering_traj.best_particle_lineage(batch_idx=0)
+        for m, k_idx in zip(fk_steering_traj.metrics, k_indices):
+            if m.guidance is None or m.guidance.logits is None:
+                continue
+            logits_t = m.guidance.logits  # (K, N, S) or (N, S)
+            if logits_t.dim() == 3:
+                logits_t = logits_t[int(k_idx)]
+            logits_np = logits_t.detach().cpu().to(torch.float32).numpy()  # (N, S)
+            guidance_map[int(m.step)] = logits_np
+    has_guidance = len(guidance_map) > 0
+    guidance_steps: List[int] = sorted(guidance_map.keys()) if has_guidance else []
+
     # initialise artists
-    logits_im = _init_logits_heatmap(ax_logits_model, model_logits_traj[0])
+    guidance_im = None
+    guidance_rects: List[Rectangle] = []
+    if has_guidance:
+        # pick an initial logits just to create artists; hide if not at timestep 0
+        initial_step = 0 if 0 in guidance_map else sorted(guidance_map.keys())[0]
+        initial_logits = guidance_map[initial_step]
+        guidance_im = _init_logits_heatmap(
+            ax_logits_guidance,
+            initial_logits,
+            title="Guidance logits",
+            softmax_logits=softmax_logits,
+        )
+        guidance_rects = _init_logits_borders(
+            ax_logits_guidance,
+            logits_traj=initial_logits[None, ...],
+            aa_traj=sample_aa_traj,
+            motif_mask=motif_mask,
+        )
+        if initial_step != 0:
+            guidance_im.set_visible(False)
+            for r in guidance_rects:
+                r.set_visible(False)
+            ax_logits_guidance.set_axis_off()
+    else:
+        # nothing to show on guidance panel
+        ax_logits_guidance.set_axis_off()
+
+    logits_im = _init_logits_heatmap(
+        ax_logits_model,
+        model_logits_traj[0],
+        title="Model logits",
+        softmax_logits=softmax_logits,
+    )
     logits_rects = _init_logits_borders(
         ax_logits_model,
         logits_traj=model_logits_traj,
@@ -688,6 +755,8 @@ def animate_trajectories(
         + tuple(seq_texts_r)
         + scat_l
         + scat_r
+        + ((guidance_im,) if guidance_im is not None else tuple())
+        + tuple(guidance_rects)
         + (logits_im,)
         + tuple(logits_rects)
         + (title_text,)
@@ -721,6 +790,32 @@ def animate_trajectories(
                 r.set_y(model_aa_traj[timestep - 1, i] - 0.5)
         else:
             pass  # blank on t=0 timestep
+
+        # Update FK guidance logits: show latest available guidance <= current timestep, else hide
+        if has_guidance and guidance_im is not None:
+            # find latest guidance step not exceeding current timestep
+            display_step = None
+            for s in guidance_steps:
+                if s <= timestep:
+                    display_step = s
+                else:
+                    break
+            if display_step is not None:
+                ax_logits_guidance.set_axis_on()
+                guidance_im.set_data(
+                    _rgba_from_logits(
+                        guidance_map[display_step], softmax_logits=softmax_logits
+                    )
+                )
+                guidance_im.set_visible(True)
+                for i, r in enumerate(guidance_rects):
+                    r.set_y(sample_aa_traj[timestep, i] - 0.5)
+                    r.set_visible(True)
+            else:
+                guidance_im.set_visible(False)
+                for r in guidance_rects:
+                    r.set_visible(False)
+                ax_logits_guidance.set_axis_off()
 
         return dynamic_artists
 
@@ -1028,7 +1123,7 @@ def save_trajectory(
         # Plot logits guidance
         if write_animations:
             fk_steering_potential_logits_path = save_potential_logits_traj(
-                metrics=fk_steering_traj.metrics,
+                fk_traj=fk_steering_traj,
                 sample_aa_traj=sample_aa_traj,
                 motif_mask=motif_mask,
                 output_dir=output_dir,
@@ -1054,6 +1149,7 @@ def save_trajectory(
             animation_max_frames=animation_max_frames,
             animation_take_last_frames=animation_take_last_frames,
             softmax_logits=softmax_logits,
+            fk_steering_traj=fk_steering_traj,
         )
         log_time("trajectory animation")
 

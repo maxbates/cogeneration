@@ -272,7 +272,7 @@ class TestInterpolantSample:
             motif_mask=batch.get(bp.motif_mask, None),
             chain_idx=batch[bp.chain_idx],
             res_idx=batch[bp.res_idx],
-            stochasticity_scale=0.0,
+            stochastic_scale=0.0,
         )
         # restore RNG and run with stochastic disabled
         torch.random.set_rng_state(torch_state)
@@ -451,7 +451,7 @@ class TestInterpolantSample:
         pf = interp_infer.motif_potentials(
             t=t_scalar,
             noisy_batch=noisy,
-            pred=pred,
+            model_pred=pred,
             true_feats=true_feats,
             motif_mask=motif_sel,
         )

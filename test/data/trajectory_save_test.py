@@ -79,7 +79,7 @@ class TestWriteFKSteeringTraj:
         # Write the logits trajectory animation
         aa_traj = torch.randint(low=0, high=21, size=(num_steps, num_res))
         logits_anim_path = save_potential_logits_traj(
-            metrics=fk_traj.metrics,
+            fk_traj=fk_traj,
             sample_aa_traj=aa_traj.numpy(),
             motif_mask=None,
             output_dir=str(tmp_path),

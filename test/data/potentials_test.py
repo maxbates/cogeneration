@@ -1,6 +1,9 @@
 # tests/test_fk_steering.py
+import types
 from typing import Tuple
+from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -17,8 +20,10 @@ from cogeneration.data.potentials import (
     ESMLogitsPotential,
     FKSteeringCalculator,
     FKSteeringResampler,
+    FKStepMetric,
     HotSpotPotential,
     InverseFoldPotential,
+    PotentialField,
 )
 from cogeneration.data.trajectory import SamplingStep
 from cogeneration.dataset.test_utils import MockDataloader
@@ -794,7 +799,210 @@ class TestFKSteeringResampler:
         assert batch[bp.res_mask].shape[0] == steer_batch_size
 
         # collapse particles
-        batch, best_idx = resampler.best_particle_in_batch(batch)
-        assert best_idx is not None
-        assert best_idx.shape[0] == orig_batch_size
+        batch, sample_trajectory, model_trajectory = resampler.best_particle_in_batch(
+            batch
+        )
+        assert sample_trajectory is None
+        assert model_trajectory is None
         assert batch[bp.res_mask].shape[0] == orig_batch_size
+
+    def test_lineage_matches_scripted_energy(self, mock_cfg):
+        """
+        Mock `_calculate_metrics` to output predetermined keep indices at resampling steps
+        so that lineage is fully controlled without touching sampling randomness.
+        Also verify collapse mapping per-model-step with resampling interval > 1 has no off-by-one.
+        """
+        torch.manual_seed(123)
+
+        B = 3  # batch
+        K = 8  # particles
+        interval = 3
+        # Number of model steps (final metric occurs at exactly this step)
+        M = 6
+
+        # Winners per FK metric step (local k indices)
+        metric_winners = [
+            np.random.randint(K, size=3).tolist() for _ in range(B)
+        ]  # steps: 0, 3, 6
+        final_winner = [seq[-1] for seq in metric_winners]
+
+        # Build per-metric keep arrays so that keep maps this step's winner -> previous metric's winner
+        # keep[i_abs] = j_abs  ==> particle i at step s came from j at previous resample step.
+        metric_steps = [0, 3, 6]
+        keep_by_metric = []
+        for m, s in enumerate(metric_steps):
+            keep = []
+            for b in range(B):
+                base = b * K
+                # identity by default
+                for j in range(K):
+                    keep.append(base + j)
+                # override mapping for the winner at this metric to point to previous metric's winner
+                prev_k = metric_winners[b][m - 1] if m > 0 else metric_winners[b][0]
+                win_k = metric_winners[b][m]
+                keep[base + win_k] = base + prev_k
+            keep_by_metric.append(torch.tensor(keep, dtype=torch.long))
+
+        # Helper: recover expected lineage by walking keeps backward from final winner.
+        def expected_lineage_for_batch(b: int):
+            seq_len = len(metric_steps)
+            seq = [None] * seq_len
+            abs_idx = b * K + final_winner[b]
+            for m in range(seq_len - 1, -1, -1):
+                seq[m] = abs_idx - b * K  # convert absolute to local
+                if m > 0:
+                    abs_idx = keep_by_metric[m][abs_idx].item()
+            return seq
+
+        expected_all = [expected_lineage_for_batch(b) for b in range(B)]
+
+        # --- set up resampler, batch, particles
+
+        batch, step = _make_batch_and_step(B=B, N=30, multimer=False)
+
+        steering_cfg = mock_cfg.inference.interpolant.steering
+        steering_cfg.num_particles = K
+        steering_cfg.resampling_interval = interval
+
+        resampler = FKSteeringResampler(cfg=steering_cfg)
+        assert resampler.enabled
+
+        # Initialize particles (B -> B*K)
+        batch = resampler.init_particles(batch)
+        assert batch[bp.res_mask].shape[0] == B * K
+
+        # Expand SamplingStep to B*K
+        expanded_idx = torch.cat([torch.full((K,), b) for b in range(B)])
+        step = step.select_batch_idx(idx=expanded_idx)
+
+        # Replace _calculate_metrics to emit deterministic FKStepMetric objects at s in [0,3,6]
+        call_idx = {"i": 0}
+
+        def fake_calc_metrics(
+            self, step_idx, batch, protein_state, model_pred, protein_pred
+        ):
+            # Called only on resampling steps: 0, 3, 6
+            i = call_idx["i"]
+            assert step_idx == metric_steps[i]
+            keep = keep_by_metric[i]
+            # energies/logs don't matter; populate with zeros of correct sizes
+            BK = batch[bp.res_mask].shape[0]
+            E = torch.zeros(BK)
+            # Set log_G to pick the scripted winner per batch for this metric step
+            LG = torch.zeros(BK)
+            for b in range(B):
+                LG[b * K + metric_winners[b][i]] = 1.0
+            LGd = torch.zeros(BK)
+            # weights are per-batch lists of length K
+            weights = [
+                [1.0 if k == metric_winners[b][i] else 0.0 for k in range(K)]
+                for b in range(B)
+            ]
+            metric = FKStepMetric(
+                step=step_idx,
+                energy=E.tolist(),
+                log_G=LG.tolist(),
+                log_G_delta=LGd.tolist(),
+                weights=weights,
+                effective_sample_size=1.0,
+                keep=keep.tolist(),
+                guidance=None,
+            )
+            call_idx["i"] = i + 1
+            return metric
+
+        # Drive steps 0..M-1 (non-final), then final step M.
+        with patch.object(
+            FKSteeringResampler, "_calculate_metrics", autospec=True
+        ) as mock_calc:
+            mock_calc.side_effect = fake_calc_metrics
+
+            for s in range(M):
+                batch, idx, metric, _ = resampler.on_step(
+                    step_idx=s,
+                    batch=batch,
+                    model_pred=step,
+                    protein_pred=step,
+                    protein_state=step,
+                )
+                # metric only on multiples of interval
+                if s % interval == 0:
+                    assert metric is not None
+                else:
+                    assert metric is None
+
+            # final step (must be multiple of interval per config assumption)
+            assert M % interval == 0
+            batch, idx, metric, _ = resampler.on_step(
+                step_idx=M,
+                batch=batch,
+                model_pred=step,
+                protein_pred=step,
+                protein_state=step,
+            )
+            assert metric is not None
+
+        fk_traj = resampler.trajectory
+        assert fk_traj is not None and fk_traj.num_steps == len(metric_steps)
+
+        # confirm best-particle lineage equals scripted winners per metric step
+        for b in range(B):
+            lineage = fk_traj.best_particle_lineage(batch_idx=b)
+            assert lineage == metric_winners[b]
+            assert lineage == expected_all[b]
+
+        # Build dummy trajectories to test collapse per-step mapping (no off-by-one)
+        from cogeneration.data.trajectory import SamplingStep, SamplingTrajectory
+
+        N = batch[bp.res_mask].shape[1]
+        BK = B * K
+
+        model_traj = SamplingTrajectory(num_batch=BK, num_res=N, num_tokens=21)
+        for s in range(M):
+            # aatypes value per particle equals its local index (0..K-1), repeated for each batch
+            row_vals = torch.arange(K).repeat(B)  # (B*K,)
+            aatypes = row_vals.view(B * K, 1).expand(B * K, N)
+            model_traj.append(
+                SamplingStep(
+                    res_mask=step.res_mask,
+                    trans=step.trans,
+                    rotmats=step.rotmats,
+                    aatypes=aatypes.long(),
+                    torsions=None,
+                    logits=None,
+                )
+            )
+
+        sample_traj = SamplingTrajectory(num_batch=BK, num_res=N, num_tokens=21)
+        for s in range(M + 1):
+            row_vals = torch.arange(K).repeat(B)
+            aatypes = row_vals.view(B * K, 1).expand(B * K, N)
+            sample_traj.append(
+                SamplingStep(
+                    res_mask=step.res_mask,
+                    trans=step.trans,
+                    rotmats=step.rotmats,
+                    aatypes=aatypes.long(),
+                    torsions=None,
+                    logits=None,
+                )
+            )
+
+        # Collapse and check mapping
+        _, sample_traj_c, model_traj_c = resampler.best_particle_in_batch(
+            batch, sample_traj, model_traj
+        )
+
+        assert model_traj_c is not None and model_traj_c.num_batch == B
+        # Expected: for step s in [0..M-2], use floor(s/interval); for s==M-1, use final metric (len(metric_steps)-1)
+        for s in range(M):
+            if s == M - 1:
+                midx = len(metric_steps) - 1
+            else:
+                midx = s // interval
+            for b in range(B):
+                expected_k = metric_winners[b][midx]
+                chosen_val = model_traj_c.amino_acids[b, s, 0].item()
+                assert (
+                    chosen_val == expected_k
+                ), f"batch {b} step {s}: got {chosen_val}, expected {expected_k} (metric idx {midx})"
