@@ -979,7 +979,10 @@ class FKSteeringResampler:
 
     @property
     def enabled(self) -> bool:
-        return self.num_particles > 1
+        # Enable FK steering when at least one particle is requested.
+        # Use K=0 to disable entirely. With K=1 we will compute potentials
+        # guidance and metrics, but skip resampling/reindexing.
+        return self.num_particles > 0
 
     @property
     def trajectory(self) -> Optional[FKSteeringTrajectory]:
@@ -1157,18 +1160,21 @@ class FKSteeringResampler:
         # record FK step metric on the trajectory
         self._fk_trajectory.append(step_metric)
 
+        # If only a single particle, do not resample or reindex; just return guidance.
+        if self.num_particles == 1:
+            return batch, None, step_metric, step_metric.guidance
+
+        # Update state to resampled indices.
+        # Do not re-index fk-trajectory; keep step metrics as is.
+
         # pull out the sampled indices
         device = batch[bp.res_mask].device
         idx = torch.tensor(step_metric.keep, device=device)
-
         # reindex batch + internal state using the sampled indices
         batch = {k: _batch_select_feat(v, idx) for k, v in batch.items()}
         self._energy_trajectory = self._energy_trajectory.index_select(0, idx)
         self._log_G = self._log_G.index_select(0, idx)
         self._log_G_delta = self._log_G_delta.index_select(0, idx)
-
-        # (Do not re-index fk-trajectory; keep step metrics as is.)
-
         # Reindex cached guidance to keep it aligned with the resampled particles for forthcoming steps.
         if self._cached_guidance is not None:
             self._cached_guidance = self._cached_guidance.select_batch_idx(idx)
@@ -1237,10 +1243,10 @@ class FKSteeringResampler:
 
             # Confirm we have the expected number of resampling steps metrics,
             # i.e. one at 0, one at final step, and each resampling interval
-            assert (
-                resampling_steps
-                == math.ceil(model_trajectory.num_steps / self.cfg.resampling_interval)
-                + 1
+            assert resampling_steps == min(
+                model_trajectory.num_steps,
+                math.ceil(model_trajectory.num_steps / self.cfg.resampling_interval)
+                + 1,
             ), f"unexpected number of resampling steps {resampling_steps} != model traj steps {model_trajectory.num_steps} // resampling interval {self.cfg.resampling_interval} + 1"
             assert (
                 fk_traj.metrics[0].step == 0

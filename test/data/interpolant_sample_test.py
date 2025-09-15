@@ -11,6 +11,7 @@ from cogeneration.data import so3_utils
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.fm.aatypes_rates import FlowMatcherAATypesCTMC
 from cogeneration.data.interpolant import BatchTrueFeatures, Interpolant
+from cogeneration.data.trajectory import SamplingStep
 from cogeneration.dataset.test_utils import create_pdb_batch, mock_feats
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyBatchProp as nbp
@@ -436,10 +437,14 @@ class TestInterpolantSample:
         )
 
         # use current noisy state as the "prediction", so the guidance direction = (true - current)
-        pred = {
-            pbp.pred_trans: noisy[nbp.trans_t],
-            pbp.pred_rotmats: noisy[nbp.rotmats_t],
-        }
+        pred = SamplingStep(
+            res_mask=batch[bp.res_mask],
+            trans=noisy[nbp.trans_t],
+            rotmats=noisy[nbp.rotmats_t],
+            aatypes=noisy[nbp.aatypes_t],
+            torsions=noisy.get(nbp.torsions_t, None),
+            logits=None,
+        )
 
         # compute motif potentials at the current scalar t (any scalar in (0,1) is fine)
         t_scalar = noisy[nbp.r3_t].mean()  # scalar tensor

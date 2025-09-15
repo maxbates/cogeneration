@@ -893,7 +893,7 @@ class Interpolant:
         contact_conditioning: Optional[torch.Tensor] = None,
         # t_nn is model/function that generates explicit time steps (r3, so3, cat) given t
         t_nn: Union[Callable[[torch.Tensor], torch.Tensor], Any] = None,
-        # Optional override for FK steering particles; set to 1 to disable
+        # Optional override for FK steering particles; set to 0 to disable
         num_particles: Optional[int] = None,
         # progress bar
         show_progress: bool = False,
@@ -1100,11 +1100,11 @@ class Interpolant:
         batch[nbp.aatypes_t] = aatypes_0
 
         # Set up Feynman-Kac resampling, which expands each batch member to K particles.
-        # Idempotent if not enabled.
+        # Idempotent if not enabled; when enabled with K=1, batch shape remains B.
         batch = resampler.init_particles(batch=batch)  # (B, ...) -> (B * K, ...)
-        if resampler.enabled and resampler.num_particles > 1:
-            num_batch = batch[bp.res_mask].shape[0]  # expanded to B*K
-            # TODO - expand true_feats; implicitly assumes B=1 for broadcasting across particles
+        # Update num_batch to reflect potential particle expansion (handles K=1 and disabled gracefully)
+        num_batch = batch[bp.res_mask].shape[0]
+        # TODO - expand true_feats; implicitly assumes B=1 for broadcasting across particles
 
         # model_trajectory tracks model outputs
         model_trajectory = SamplingTrajectory(

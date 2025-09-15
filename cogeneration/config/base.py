@@ -933,7 +933,7 @@ class InterpolantSamplingConfig(BaseClassConfig):
 class InterpolantSteeringConfig(BaseClassConfig):
     """Feynman-Kac Steering configuration."""
 
-    # number of particles per sample; 1 to disable
+    # number of particles per sample; 0 to disable
     # Note the batch will be scaled (B, ...) -> (B * K, ...),
     num_particles: int = 4
     # resample (i.e. run steering) every N steps
@@ -1826,8 +1826,8 @@ class Config(BaseClassConfig):
         raw_cfg.inference.predict_dir = str(tmp_path / "inference")
 
         # disable multiple particles / steering
-        raw_cfg.interpolant.steering.num_particles = 1
-        raw_cfg.inference.interpolant.steering.num_particles = 1
+        raw_cfg.interpolant.steering.num_particles = 0
+        raw_cfg.inference.interpolant.steering.num_particles = 0
         raw_cfg.inference.interpolant.steering.resampling_interval = 3
         # limit number of lengths + timesteps sampled for validation / inference
         raw_cfg.interpolant.sampling.num_timesteps = 3
