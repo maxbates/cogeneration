@@ -143,6 +143,7 @@ class MotifFactory:
         motif_mask: torch.Tensor,
         chain_idx: torch.Tensor,
         random_scale_range: Optional[Tuple[float, float]] = None,
+        max_total_length: Optional[int] = None,
     ):
         """
         Generate segments from a diffuse mask.
@@ -222,6 +223,68 @@ class MotifFactory:
             segments.append(
                 Scaffold(start=seg_start, end=seg_end_inclusive, new_length=new_length)
             )
+
+        # if no max length constraint, return segments as-is
+        if max_total_length is None:
+            return segments
+
+        # check total length
+        motif_total = sum(seg.length for seg in segments if isinstance(seg, Motif))
+        scaffold_idx = [i for i, s in enumerate(segments) if isinstance(s, Scaffold)]
+        scaffold_current_lens = np.array(
+            [segments[i].length for i in scaffold_idx], dtype=int
+        )
+        cur_total = int(motif_total + scaffold_current_lens.sum())
+        if cur_total <= max_total_length:
+            return segments
+        if motif_total > max_total_length:
+            raise ValueError(
+                f"Motif length {motif_total} exceeds max_total_length {max_total_length}"
+            )
+
+        # minimum allowed scaffold lengths from min scale
+        if random_scale_range is not None:
+            min_scale = float(min(random_scale_range))
+        else:
+            s = float(self.cfg.scaffold_length_scale)
+            min_scale = 1.0 / s if s > 0 else 0.0
+        scaffold_orig_lens = np.array(
+            [segments[i].end - segments[i].start + 1 for i in scaffold_idx], dtype=int
+        )
+        scaffold_min_lens = np.ceil(scaffold_orig_lens * min_scale).astype(int)
+        # motifs + min scaffolds must fit within max_total_length
+        if motif_total + int(scaffold_min_lens.sum()) > max_total_length:
+            raise ValueError(
+                f"Motifs + minimum scaffolds exceed max_total_length {max_total_length}"
+            )
+
+        # shrink delta proportional to size/min_allowed, respecting min lengths
+        delta = cur_total - max_total_length
+        weights = scaffold_current_lens / np.maximum(scaffold_min_lens, 1)
+        weights_sum = float(weights.sum()) if weights.sum() > 0 else float(len(weights))
+        if weights_sum == 0:
+            weights = np.ones_like(weights, dtype=float)
+            weights_sum = float(len(weights))
+        shrink = np.floor(delta * (weights / weights_sum)).astype(int)
+        shrink = np.minimum(shrink, scaffold_current_lens - scaffold_min_lens)
+        remaining = int(delta - shrink.sum())
+        if remaining > 0:
+            order = np.argsort(-weights)  # descending
+            for j in order:
+                if remaining == 0:
+                    break
+                cap = int((scaffold_current_lens - scaffold_min_lens)[j] - shrink[j])
+                if cap > 0:
+                    add = min(cap, remaining)
+                    shrink[j] += add
+                    remaining -= add
+
+        # shrink scaffolds
+        for k in range(len(scaffold_idx)):
+            idx = scaffold_idx[k]
+            dec = int(shrink[k])
+            min_len_k = int(scaffold_min_lens[k])
+            segments[idx].new_length = max(min_len_k, segments[idx].new_length - dec)
 
         return segments
 

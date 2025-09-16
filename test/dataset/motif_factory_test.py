@@ -163,6 +163,54 @@ class TestMotifFactory:
             diffuse_mask == 0.0
         ).any(), "At least one residue should be part of the motif"
 
+    def test_generate_segments_respects_max_length_with_minimum_scaffolds(self):
+        """
+        Define a simple motif/scaffold pattern and enforce a max length that is
+        only slightly above motifs + minimum scaffold lengths. Ensure segments are
+        shortened accordingly and never below the minimum allowed per-scaffold length.
+        """
+        # Motif (1) and scaffold (0) pattern: M M S S S M M S S
+        motif_mask = torch.tensor([1, 1, 0, 0, 0, 1, 1, 0, 0]).int()
+        chain_idx = torch.ones_like(motif_mask)
+
+        cfg = (
+            DatasetInpaintingConfig()
+        )  # default scaffold_length_scale=2.0 -> min_scale=0.5
+        rng = default_rng(0)
+        factory = MotifFactory(cfg=cfg, rng=rng)
+
+        # Compute motif and scaffold properties for expected bounds
+        # Motifs: [0-1] len 2, [5-6] len 2 -> total 4
+        motif_total = 4
+        scaffold_orig_lengths = [3, 2]  # [2-4], [7-8]
+        min_scale = 1.0 / float(cfg.scaffold_length_scale)  # 0.5 by default
+        min_scaffold_lengths = [
+            int(np.ceil(l * min_scale)) for l in scaffold_orig_lengths
+        ]
+        # Choose max length just 1 above the minimum feasible total
+        max_total_length = motif_total + sum(min_scaffold_lengths) + 1
+
+        segments = factory.generate_segments_from_motif_mask(
+            motif_mask=motif_mask,
+            chain_idx=chain_idx,
+            max_total_length=max_total_length,
+        )
+
+        total_len = sum(seg.length for seg in segments)
+        assert total_len == max_total_length
+
+        # Extract scaffold new lengths and validate against min lengths
+        sc_new_lengths = [
+            seg.new_length for seg in segments if isinstance(seg, Scaffold)
+        ]
+        assert len(sc_new_lengths) == 2
+        assert sc_new_lengths[0] >= min_scaffold_lengths[0]
+        assert sc_new_lengths[1] >= min_scaffold_lengths[1]
+
+        # With the chosen weights, the shorter scaffold should shrink by 1
+        # Original scaffolds: [3, 2]; min allowed: [2, 1]; delta=1 -> expect [3, 1]
+        assert sc_new_lengths == [3, 1]
+
     def test_generate_densest_neighbors_diffuse_mask(self):
         cfg = DatasetInpaintingConfig()
         rng = default_rng(seed=0)

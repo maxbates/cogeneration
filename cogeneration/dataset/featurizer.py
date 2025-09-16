@@ -638,6 +638,7 @@ class BatchFeaturizer:
             segments = self.motif_factory.generate_segments_from_motif_mask(
                 motif_mask=feats[bp.motif_mask],
                 chain_idx=feats[bp.chain_idx],
+                max_total_length=self.cfg.max_eval_length,
             )
             # apply segmenting (note, updates masks and generates new chain_idx)
             feats = BatchFeaturizer.segment_features(feats=feats, segments=segments)
