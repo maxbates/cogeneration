@@ -58,9 +58,17 @@ cogeneration/ - main directory containing all source code
 │   ├── all_atom.py - (~Openfold) frames/rigids to atom14 and atom37 representations
 │   ├── const.py - (~Openfold) sequence, structure and amino acid constants
 │   ├── data_transforms.py - (~Openfold)data pipeline for rigid features and angles
+│   ├── fm/
+│   │   ├── flow_matcher.py - base `FlowMatcher` ABC
+│   │   ├── translations.py - `FlowMatcherTrans` for translations (R^3)
+│   │   ├── rotations.py - `FlowMatcherRotations` on SO(3)
+│   │   ├── torsions.py - `FlowMatcherTorsions` for torsion angles
+│   │   ├── aatypes.py - `FlowMatcherAATypes`, `FlowMatcherAATypesMasking` (21-token)
+│   │   └── aatypes_rates.py - `FlowMatcherAATypesCTMC` (CTMC variant; WIP)
 │   ├── folding_validation.py - `FoldingValidator` for sample assessment and metrics, runs folding / inverse folding.
 │   ├── interpolant.py - Big file. `Interpolant` class with `corrupt_batch()` and `sample()` methods. core training and sampling. 
 │   ├── io.py - save/load utilities for pkl and json
+│   ├── logits.py - logits utilities (e.g., `combine_logits`)
 │   ├── metrics.py - sample metrics computation
 │   ├── noise_mask.py - masking and noise generation utilities
 │   ├── potentials.py - Feynman-Kac steering. `Potential`, `FKSTeeringCalculator`, `FKSteeringResampler` classes
@@ -89,7 +97,7 @@ cogeneration/ - main directory containing all source code
 │   ├── mmcif_parsing.py - mmCIF file parsing utilities
 │   ├── motif_factory.py - `MotifFactory` for motif and scaffold generation (inpainting)
 │   ├── process_pdb.py - PDB parsing to `ProcessedFile` and `MetadataCSVRow`
-│   ├── protein_downloader.py - dataloader with DDP and `LengthBatcher`
+│   ├── protein_dataloader.py - dataloader with DDP and `LengthBatcher`
 │   ├── spec.py - DatasetSpec, enumeration of datasets
 │   └── test_utils.py - test utilities for mock features and datasets
 ├── datasets/ - training and test data directory
