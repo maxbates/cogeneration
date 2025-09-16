@@ -782,10 +782,10 @@ class InterpolantRotationsConfig(InterpolantDomainConfig):
     )
     # IGSO3 grid std deviation range, in log space.
     # Need grid to support small sigma (5e-3) for stochastic paths intermediate noise
-    # and initial noise (~igso3_sigma).
+    # and initial noise (~igso3_sigma). If stochastic scale is small, lower.
     # If sigma_t > the minimum value in the grid,
     # it will map to the min std dev value, and be too large.
-    igso3_sigma_min: float = 1e-3
+    igso3_sigma_min: float = 1e-4
     igso3_sigma: float = 1.5
     train_schedule: InterpolantRotationsScheduleEnum = (
         InterpolantRotationsScheduleEnum.linear
@@ -1361,7 +1361,6 @@ class ExperimentTrainingConfig(BaseClassConfig):
     torsion_loss_weight: float = 0.2
     # aatypes
     aatypes_loss_weight: float = 1.0  # default 0.0 in multiflow
-    aatypes_loss_mean_or_sum: str = "mean"
     aatypes_loss_use_likelihood_weighting: bool = True
 
     # Auxiliary losses

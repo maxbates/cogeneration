@@ -202,7 +202,7 @@ class FlowMatcherRotations(FlowMatcher):
                 # safety check sigma range for selected only
                 if sigma_sel.min() < self.igso3.sigma_grid.min():
                     raise ValueError(
-                        f"rots sigma_t < igso3 grid min, noise will be larger than desired. Lower igso3_sigma_min."
+                        f"rots sigma_t {sigma_sel.min()} < igso3 grid min {self.igso3.sigma_grid.min()}, noise will be larger than desired. Lower `igso3_sigma_min`."
                     )
 
                 identity_noise = torch.eye(3, device=self._device)[None, None].repeat(

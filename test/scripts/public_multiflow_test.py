@@ -5,7 +5,11 @@ import pytest
 import torch
 from numpy import False_
 
-from cogeneration.config.base import Config, InferenceSamplesConfig
+from cogeneration.config.base import (
+    Config,
+    InferenceSamplesConfig,
+    InterpolantAATypesInterpolantTypeEnum,
+)
 from cogeneration.dataset.datasets import EvalDatasetConstructor
 from cogeneration.models.module import FlowModule
 from cogeneration.scripts.predict import EvalRunner
@@ -45,19 +49,22 @@ class TestEvalRunner:
 
     # This is a slow test, because it actually samples with real model, many timesteps, and animates.
     @pytest.mark.slow
-    @pytest.mark.skip  # Can run manually by uncommenting
+    # @pytest.mark.skip  # Can run manually by uncommenting
     def test_public_weights_sampling(self, public_weights_path, tmp_path):
         cfg = Config.public_multiflow()
 
         # specify task
         # Multiflow not trained to support inpainting but should support using motif guidance
-        # cfg.inference.task = InferenceTask.unconditional
-        cfg.inference.task = InferenceTask.inpainting
+        cfg.inference.task = InferenceTask.unconditional
+        # cfg.inference.task = InferenceTask.inpainting
         # stochastic paths (NOTE public multiflow not trained to support, but can force)
         cfg.shared.stochastic = True
-        cfg.inference.interpolant.trans.stochastic_noise_intensity *= 0.25
-        cfg.inference.interpolant.rots.stochastic_noise_intensity *= 0.25
-        cfg.inference.interpolant.aatypes.stochastic_noise_intensity *= 0.75
+        cfg.inference.interpolant.trans.stochastic_noise_intensity *= 0.0
+        cfg.inference.interpolant.rots.stochastic_noise_intensity *= 0.0
+        cfg.inference.interpolant.aatypes.interpolant_type = (
+            InterpolantAATypesInterpolantTypeEnum.masking
+        )
+        cfg.inference.interpolant.aatypes.stochastic_noise_intensity *= 0.5
         # FK Steering
         cfg.inference.interpolant.steering.num_particles = 4  # 0 to disable
         # set up predict_dir to tmp_path
@@ -68,13 +75,13 @@ class TestEvalRunner:
         cfg.inference.samples.samples_per_length = 1
         cfg.inference.samples.num_batch = 1
         cfg.inference.samples.multimer_fraction = 0.0
-        cfg.inference.samples.length_subset = [156]
+        cfg.inference.samples.length_subset = [162]
         # Control ESM and ProteinMPNN guidance, which is slow
         # (since ESM not used in the model, nothing cached, have to compute each resampling step)
         cfg.inference.interpolant.steering.inverse_fold_energy_scale = 0.0
         cfg.inference.interpolant.steering.inverse_fold_guidance_scale = 0.0
         cfg.inference.interpolant.steering.esm_logits_energy_scale = 1.0
-        cfg.inference.interpolant.steering.esm_logits_guidance_scale = 5.0
+        cfg.inference.interpolant.steering.esm_logits_guidance_scale = 2.0
         # skip designability? requires folding each ProteinMPNN sequence
         cfg.inference.also_fold_pmpnn_seq = False
         # write trajectories to inspect

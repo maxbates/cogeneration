@@ -124,7 +124,7 @@ class BatchGroundTruth:
         return self.batch[bp.aatypes_1]  # (B, N)
 
     @property
-    def torsions_1(self) -> torch.Tensor:
+    def torsions_1(self) -> Optional[torch.Tensor]:
         return self.batch[bp.torsions_1]  # (B, N, 7, 2)
 
     @property
@@ -427,7 +427,9 @@ class BatchLossCalculator:
         dist_mat_loss = torch.sum(
             (gt_pair_dists - pred_pair_dists) ** 2 * pair_dist_mask, dim=(1, 2)
         )
-        dist_mat_loss /= torch.sum(pair_dist_mask, dim=(1, 2)) + 1
+        # Normalize by number of valid pairs; clamp to avoid divide-by-zero
+        denom = pair_dist_mask.float().sum(dim=(1, 2)).clamp_min(1.0)
+        dist_mat_loss = dist_mat_loss / denom
 
         return dist_mat_loss
 
@@ -960,6 +962,7 @@ class BatchLossCalculator:
             + loss_pae
             + loss_hot_spots
             + loss_contact_conditioning
+            + loss_torsions
         )
         loss_auxiliary *= self.train_cfg.aux_loss_weight
 
@@ -969,6 +972,8 @@ class BatchLossCalculator:
 
         # clamp certain losses
         loss_trans = torch.clamp(loss_trans, max=5)
+        loss_rot_vf = torch.clamp(loss_rot_vf, max=5)
+        loss_aatypes_ce = torch.clamp(loss_aatypes_ce, max=5)
         loss_auxiliary = torch.clamp(loss_auxiliary, max=5)
 
         # aggregate losses
