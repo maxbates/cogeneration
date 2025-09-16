@@ -1,9 +1,11 @@
 # Cogeneration
 
-Cogeneration is a protein generative model that simultaneously generates protein sequences and structures.
+Cogeneration is a protein generative model that simultaneously generates protein sequences and structures based on MultiFlow. 
 
-It is based on MultiFlow, which uses the AlphaFold2 style frame representation, and  applies flow matching across several domains:
+It uses the AlphaFold2 style frame representation, and applies flow matching across several domains:
 Translations + torsions are interpolated in Euclidean space, rotations are interpolated in SO(3), and the sequence with discrete flow matching.
+
+This project is a work in progress; a new model enabling all these features has not yet been trained, though many features can be exercised while using the public Multiflow weights.
 
 This project collects several ideas from other work and includes several extensions over MultiFlow:
 - **Inpainting (conditional generation)** given partial sequences / structures using guidance
@@ -32,16 +34,17 @@ This project collects several ideas from other work and includes several extensi
 - **Harmonic prior** instead of only gaussian prior
 - Enables **recyling** through the trunk + IPA
 - **CUDA optimizations + kernels**, e.g. Flash Attention (and Flash IPA), cuEquivariant triangle attention
+  - **MPS** support, so all models can be run on a Mac
 - **Unified and Strutured Configs**, in code using dataclasses instead of YAML
 - many improvements to code base: typing, enums, documentation, tests, etc.
 - Many of these **new features and modules are optional**
   - everything is easily **reverse compatible with MultiFlow, i.e. can use public Multiflow weights** with a config preset
 
-See an [example trajectory](media/example_uncond_172_traj_panel.mp4) and [rough hand-drawn diagrams](media/cogeneration%20diagrams.pdf).
+See an [example trajectory](media/example_uncond_172_traj_panel.mp4).
 
 ## Future Work
 
-This project is a work in progress with several outstanding improvements and features:
+Some outstanding improvements and features:
 
 - discrete flow matching alternatives, e.g. simplex or gumbel-softmax, or latent flow matching like La-proteina
 - support another model for enriching single/pair encodings - ESM a poor fit for multimers
@@ -51,7 +54,6 @@ This project is a work in progress with several outstanding improvements and fea
 - improve sequence sampling diversity (e.g. train using MSAs)
 - improve torsion flow matching representation
 - enable fixed-motif style inpintaing, rather than guided motifs
-- train a model with all new features enabled
 - benchmark: forward folding, inverse folding, unconditional designability
 - benchmark: inpainting performance, e.g. on RFDiffusion scaffold set
 
@@ -60,6 +62,14 @@ This project is a work in progress with several outstanding improvements and fea
 See directions in [installation.md](installation.md) for installation, training, and sampling.
 
 ## Project Structure
+
+These [rough hand-drawn diagrams](media/cogeneration%20diagrams.pdf) may help outline the major components of the project. 
+
+- The `interpolant` coordinates `flow_matchers`, which corrupt samples to intermediate states at time `t`, and perform sampling using the `model`
+- The `model` (with several modules) predicts translations, rotations, torsions, logits, etc. given some corrupted sample at time `t`
+- The `dataset` package defines the protein dataset, featurization, and provides the processing pipeline
+- The `data` package generates noise, tracks trajectories, calculates metrics and folding validation (using `tools`), defines FK Steering potentials
+- A `config` defines configuration for modules across the project
 
 ```
 cogeneration/ - main directory containing all source code
