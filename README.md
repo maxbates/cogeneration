@@ -3,7 +3,7 @@
 Cogeneration is a protein generative model that simultaneously generates protein sequences and structures.
 
 It is based on MultiFlow, which uses the AlphaFold2 style frame representation, and  applies flow matching across several domains:
-Translations are interpolated in Euclidean space, rotations are interpolated in SO(3), and the sequence with discrete flow matching.
+Translations + torsions are interpolated in Euclidean space, rotations are interpolated in SO(3), and the sequence with discrete flow matching.
 
 This project collects several ideas from other work and includes several extensions over MultiFlow:
 - **Inpainting (conditional generation)** given partial sequences / structures using guidance
@@ -37,9 +37,27 @@ This project collects several ideas from other work and includes several extensi
 - Many of these **new features and modules are optional**
   - everything is easily **reverse compatible with MultiFlow, i.e. can use public Multiflow weights** with a config preset
 
+See an [example trajectory](media/example_uncond_172_traj_panel.mp4) and [rough hand-drawn diagrams](media/cogeneration%20diagrams.pdf).
+
+## Future Work
+
+This project is a work in progress with several outstanding improvements and features:
+
+- discrete flow matching alternatives, e.g. simplex or gumbel-softmax, or latent flow matching like La-proteina
+- support another model for enriching single/pair encodings - ESM a poor fit for multimers
+- sequence confidence metric, like pLDDT 
+- additional data augmentation strategies esp for multimers, e.g. dynamic cropping, chain-pair selection
+- improve conformation sampling (e.g. train on ensembles, conformation diversity potentials)
+- improve sequence sampling diversity (e.g. train using MSAs)
+- improve torsion flow matching representation
+- enable fixed-motif style inpintaing, rather than guided motifs
+- train a model with all new features enabled
+- benchmark: forward folding, inverse folding, unconditional designability
+- benchmark: inpainting performance, e.g. on RFDiffusion scaffold set
+
 ## Installation, Training, and Sampling
 
-See directions in [installation.md](docs/installation.md) for installation, training, and sampling.
+See directions in [installation.md](installation.md) for installation, training, and sampling.
 
 ## Project Structure
 

@@ -10,6 +10,11 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_PARENT="$(dirname "$REPO_DIR")"
 cd "$REPO_DIR"
 
+if [[ ! -d "$REPO_DIR/cogeneration" ]]; then
+    echo "Expected cogeneration directory at $REPO_DIR/cogeneration" >&2
+    exit 1
+fi
+
 usage() {
     echo "Usage: $0 [--cpu] [--dev]"
     echo "  --cpu  Install CPU-only dependencies"
