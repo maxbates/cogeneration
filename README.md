@@ -46,6 +46,7 @@ See an [example trajectory](media/example_uncond_172_traj_panel.mp4).
 
 Some outstanding improvements and features:
 
+- support non-residue atoms (small molecules, nucleic polymers, metals), and implicitly small molecule drug binding generation
 - discrete flow matching alternatives, e.g. simplex or gumbel-softmax, or latent flow matching like La-proteina
 - support another model for enriching single/pair encodings - ESM a poor fit for multimers
 - sequence confidence metric, like pLDDT 
@@ -174,36 +175,9 @@ doc/ - documentation and feature specs
 test/ - unit tests (run with `pytest`)
 ```
 
-### Ignored Directories
-
-There are several directories that should be ignored:
-```
-.cache
-ckpt
-/inference_outputs
-/lightning_logs
-/multiflow_weights
-/venv
-/wandb
-```
-
 ## Project Conventions
 
-### Code Style
-
-- Code is formatted using `black` and `isort`
-- Use `dataclasses` for structs and for classes. Prefer classes to several global functions.
-- Prefer single line comments. Short comments can proceed code on the same line followed by 2 spaces. 
-- Use multiline comments to explain complex logic. Avoid formatting comments with `#` blocks.
-- Use type annotations. Comment shape annotations for tensors.
-- Use kwargs generally, especially if there is more than one argument or the function is imported.
-
-### Tests
-
-- Tests are in `/test`
-- Test by running `pytest`
-- Test directory structure should ~ match the `/cogeneration` directory structure, with `_test.py` suffix.
-- Many long-running tests are marked as slow and can be skipped by running `pytest -m "not slow"`
+Refer to [AGENTS.md](AGENTS.md) for up-to-date information on code style, testing practices, and ignored directories.
 
 ## License
 
