@@ -24,6 +24,7 @@ from cogeneration.data.potentials import (
     HotSpotPotential,
     InverseFoldPotential,
     PotentialField,
+    StructureDiversityPotential,
 )
 from cogeneration.data.trajectory import SamplingStep
 from cogeneration.dataset.test_utils import MockDataloader
@@ -742,6 +743,59 @@ class TestESMLogitsPotential:
         assert guidance is not None and guidance.logits is not None
         expected = center_logits(logits)
         assert torch.allclose(guidance.logits, expected, atol=1e-6, rtol=0)
+
+
+class TestStructureDiversityPotential:
+    def test_diversity_penalizes_close_structures(self):
+        batch, step = _make_batch_and_step(B=1, N=20, multimer=False, with_break=False)
+        reference = step.trans[0].clone()
+
+        # add some jitter to reference to very similar but can define field
+        reference += torch.randn_like(reference) * 0.2
+
+        potential = StructureDiversityPotential(
+            energy_scale=1.0,
+            guidance_scale=1.0,
+            structures=[reference],
+            rmsd_margin=5.0,
+        )
+
+        energy_close, guidance_close = potential.compute(
+            batch=batch,
+            protein_state=step,
+            model_pred=step,
+            protein_pred=step,
+        )
+
+        # energy ~ 1.0 for same structure
+        assert energy_close.item() > 0.9
+        # should define field if equal
+        assert guidance_close.trans is not None
+        assert not torch.allclose(
+            guidance_close.trans, torch.zeros_like(guidance_close.trans)
+        )
+
+        far_trans = step.trans.clone() + torch.randn_like(step.trans) * 5
+        far_step = SamplingStep(
+            res_mask=step.res_mask,
+            trans=far_trans,
+            rotmats=step.rotmats,
+            aatypes=step.aatypes,
+            torsions=step.torsions,
+            logits=step.logits,
+        )
+
+        energy_far, guidance_far = potential.compute(
+            batch=batch,
+            protein_state=far_step,
+            model_pred=far_step,
+            protein_pred=far_step,
+        )
+
+        assert energy_far.item() < 0.1
+        assert guidance_far is None or torch.allclose(
+            guidance_far.trans, torch.zeros_like(guidance_far.trans)
+        )
 
 
 class TestFKSteeringCalculator:

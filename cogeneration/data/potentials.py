@@ -16,13 +16,16 @@ from cogeneration.config.base import (
 )
 from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.logits import center_logits, clamp_logits, combine_logits
+from cogeneration.data.superimposition import superimpose
 from cogeneration.data.tools.protein_mpnn_runner import ProteinMPNNRunner
 from cogeneration.data.trajectory import SamplingStep, SamplingTrajectory
 from cogeneration.dataset.interaction import DIST_INTERACTION_BACKBONE
+from cogeneration.dataset.process_pdb import _process_pdb
 from cogeneration.models.esm_frozen import get_frozen_esm
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
+from cogeneration.type.dataset import DatasetProteinColumn as dpc
 
 
 def _batch_repeat_feat(v: Any, K: int) -> Any:
@@ -825,6 +828,121 @@ class ESMLogitsPotential(Potential):
         logits = clamp_logits(logits, abs_cap=self.esm_logits_cap)
 
         guidance = PotentialField(logits=logits)
+
+        return energy, guidance
+
+
+@dataclass
+class StructureDiversityPotential(Potential):
+    """Penalize samples that closely resemble a set of reference structures.
+
+    The potential compares the predicted structure against a library of reference
+    coordinates and assigns higher energy to particles whose backbone frames are
+    close (low RMSD) to any reference. Potential guidance is repulsive vector field
+    that pushes particles away from the closest reference structure.
+
+    TODO - fully specify usage, adding incremental structures to the potential each iteration
+    TODO support masked structures (of otherwise different lengths)
+    """
+
+    # structures to avoid can be provided directly, or as PDB files to load
+    structures: Optional[Sequence[torch.Tensor]] = None  # (N, 37, 3)
+    pdb_files: Optional[Sequence[str]] = None
+    rmsd_margin: float = 5.0  # Å (>=0) at which energy decays to zero
+    potential_max_force_angstroms: float = 1.0
+
+    def __post_init__(self):
+        self._reference_structures: List[torch.Tensor] = []
+        if self.structures:
+            for structure in self.structures:
+                self.add_structure(structure)
+
+        if self.pdb_files:
+            for pdb_file in self.pdb_files:
+                # TODO - better account for res_mask / gaps in PDB structure, consistent trimming, etc.
+                processed_file = _process_pdb(pdb_file_path=pdb_file)
+                structure = torch.tensor(
+                    processed_file[dpc.bb_positions], dtype=torch.float32
+                )
+                self.add_structure(structure)
+
+    def add_structure(
+        self,
+        structure: torch.Tensor,  # (N, 3) Ca positions
+    ):
+        assert structure.ndim == 2 and structure.shape[1] == 3
+        self._reference_structures.append(structure)
+
+    def compute(
+        self,
+        batch: NoisyFeatures,
+        protein_state: SamplingStep,
+        model_pred: SamplingStep,
+        protein_pred: SamplingStep,
+    ) -> Tuple[PotentialEnergy, Optional[PotentialField]]:
+        device = protein_pred.trans.device
+        trans = protein_pred.trans  # (B, N, 3)
+        B, N, _ = trans.shape
+
+        # determine mask for residues to align; inpainting: limit to scaffolds
+        mask = batch[bp.res_mask].float().to(device)
+        mask = mask * batch[bp.diffuse_mask].float().to(device)
+        if bp.motif_mask in batch:
+            mask = mask * (1 - batch[bp.motif_mask].float().to(device))
+
+        num_refs = len(self._reference_structures)
+        rmsd_matrix = torch.full((B, num_refs), float("inf"), device=device)
+        diffs = torch.zeros((B, num_refs, N, 3), device=device)
+
+        # compute RMSDs
+        for ref_idx, ref_coords in enumerate(self._reference_structures):
+            ref_coords = ref_coords.to(device)
+            if ref_coords.shape[0] != N:
+                raise ValueError(
+                    "Reference structure length does not match batch residue count"
+                )
+
+            for b in range(B):
+                aligned_ref, rmsd = superimpose(
+                    reference=trans[b].unsqueeze(0),
+                    coords=ref_coords.unsqueeze(0),
+                    mask=mask.unsqueeze(0),
+                )
+                rmsd_matrix[b, ref_idx] = rmsd[0]
+                diffs[b, ref_idx] = (trans[b] - aligned_ref[0]) * mask.unsqueeze(-1)
+
+        min_rmsd, best_ref = rmsd_matrix.min(dim=1)
+        finite_mask = torch.isfinite(min_rmsd)
+
+        # calculate energy, 0 if RMSD >= rmsd_margin
+        energy = torch.zeros(B, device=device)
+        if finite_mask.any():
+            scaled = 1.0 - (min_rmsd[finite_mask] / self.rmsd_margin)
+            energy[finite_mask] = scaled.clamp(min=0.0, max=1.0)
+
+        # compute VF to push away from closest structures
+        # TODO - consider pushing away from all structures?
+        guidance: Optional[PotentialField] = None
+        if self.guidance_scale != 0.0 and finite_mask.any():
+            trans_vf = torch.zeros_like(trans)
+            eps = 1e-6
+            for b in range(B):
+                if not finite_mask[b]:
+                    continue
+                rmsd_val = min_rmsd[b]
+                if rmsd_val >= self.rmsd_margin:
+                    continue
+                ref_idx = best_ref[b].item()
+                diff = diffs[b, ref_idx]
+                grad = diff / max(rmsd_val, eps)
+                vf = (grad / self.rmsd_margin) * mask.unsqueeze(-1)
+                vf = vf * float(self.guidance_scale)
+                norm = vf.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                vf = vf * (self.potential_max_force_angstroms / norm).clamp(max=1.0)
+                trans_vf[b] = vf
+
+            if torch.any(trans_vf != 0):
+                guidance = PotentialField(trans=trans_vf)
 
         return energy, guidance
 

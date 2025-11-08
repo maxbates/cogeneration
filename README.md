@@ -17,6 +17,7 @@ This project collects several ideas from other work and includes several extensi
   - Specifying RFDiffusion style **hot spot** residues
 - **Feynman-Kac steering** for sequential monte-carlo sampling guided by potentials, defined only at inference time
   - **Logit guidance** from ESM and ProteinMPNN potentials, demonstrating how language models can guide sequence generation
+  - **Improved conformation diversity** using a potential that penalizes encountered structures
 - **existing protein language models (e.g. ESM)** to get frozen embeddings, enriching the node and edge representations
   - particularly for sequence-conditioned tasks like inpainting
 - **Improved sequence prediction** and inverse folding, using a deeper sequence prediction network
@@ -51,7 +52,7 @@ Some outstanding improvements and features:
 - support another model for enriching single/pair encodings - ESM a poor fit for multimers
 - sequence confidence metric, like pLDDT 
 - additional data augmentation strategies esp for multimers, e.g. dynamic cropping, chain-pair selection
-- improve conformation sampling (e.g. train on ensembles, conformation diversity potentials)
+- improve conformation sampling (e.g. train on ensembles)
 - improve sequence sampling diversity (e.g. train using MSAs)
 - improve torsion flow matching representation
 - enable fixed-motif style inpintaing, rather than guided motifs
