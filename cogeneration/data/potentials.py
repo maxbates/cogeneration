@@ -765,6 +765,7 @@ class ESMLogitsPotential(Potential):
     esm_model_key: ModelESMKey = ModelESMKey.esm2_t30_150M_UR50D
     esm_logits_temperature: float = 1.0
     esm_logits_cap: float = 4.0
+    precision: str = "32"
 
     def __post_init__(self):
         # model is loaded when needed
@@ -774,7 +775,9 @@ class ESMLogitsPotential(Potential):
     def esm(self):
         if self._esm is None:
             self._esm = get_frozen_esm(
-                model_key=self.esm_model_key, use_esm_attn_map=False
+                model_key=self.esm_model_key,
+                use_esm_attn_map=False,
+                precision=self.precision,
             )
         return self._esm
 
@@ -1008,6 +1011,7 @@ class FKSteeringCalculator:
                 esm_logits_temperature=cfg.esm_logits_temperature,
                 esm_logits_cap=cfg.esm_logits_cap,
                 esm_model_key=cfg.esm_model_key,
+                precision=cfg.precision,
             ),
         ]
 

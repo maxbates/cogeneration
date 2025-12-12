@@ -31,6 +31,9 @@ def torsion_angles_to_frames(
         All 8 frames corresponding to each torsion frame.
 
     """
+    # Clamp aatype to valid range [0, len(restypes) := 20]
+    aatype = aatype.clamp(0, len(residue_constants.restypes))
+
     # [*, N, 8, 4, 4]
     with torch.no_grad():
         default_4x4 = DEFAULT_FRAMES.to(aatype.device)[aatype, ...]
@@ -116,6 +119,9 @@ def frames_to_atom14_pos(
     Returns:
         Idealized all atom positions. [..., N, 14, 3]
     """
+    # Clamp aatype to valid range [0, len(restypes) := 20]
+    aatype = aatype.clamp(0, len(residue_constants.restypes))
+
     with torch.no_grad():
         group_mask = GROUP_IDX.to(aatype.device)[aatype, ...]
         group_mask = torch.nn.functional.one_hot(

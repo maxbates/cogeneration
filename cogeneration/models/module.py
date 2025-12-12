@@ -151,6 +151,36 @@ class FlowModule(LightningModule):
             **self.cfg.experiment.optimizer.asdict(),
         )
 
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        Load state dict, gracefully handling missing frozen ESM keys.
+
+        The frozen ESM model excludes itself from checkpoints to save space,
+        since it's loaded separately from pretrained weights. This allows
+        warm starting from checkpoints without ESM weights.
+        """
+        if strict:
+            # Check what keys are expected vs what we have
+            current_keys = set(self.state_dict().keys())
+            checkpoint_keys = set(state_dict.keys())
+
+            missing_keys = current_keys - checkpoint_keys
+
+            # Separate ESM keys from other missing keys
+            esm_missing = {k for k in missing_keys if ".esm_combiner.esm." in k}
+            other_missing = missing_keys - esm_missing
+
+            # If only ESM keys are missing, that's expected - load with strict=False
+            # If other keys are missing, let PyTorch raise the error
+            if esm_missing and not other_missing:
+                self._log.info(
+                    f"Warm start: skipping {len(esm_missing)} frozen ESM keys "
+                    "(will be loaded from pretrained)"
+                )
+                strict = False
+
+        return super().load_state_dict(state_dict, strict=strict)
+
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
         """
         MPS doesn't support float64, so convert to float64 tensors to float32.
@@ -345,7 +375,9 @@ class FlowModule(LightningModule):
 
         return true_aa, true_bb_pos
 
-    def model_step(self, batch: NoisyFeatures) -> TrainingLosses:
+    def model_step(
+        self, batch: NoisyFeatures
+    ) -> tuple[TrainingLosses, AuxiliaryMetrics]:
         model_output = self.model(batch)
 
         loss_calculator = BatchLossCalculator(
@@ -364,7 +396,7 @@ class FlowModule(LightningModule):
             }
         )
 
-        return losses
+        return losses, aux
 
     def training_step(self, batch: BatchFeatures):
         step_start_time = time.time()
@@ -397,14 +429,14 @@ class FlowModule(LightningModule):
                 )
 
         # Model pass, get losses
-        batch_losses = self.model_step(noisy_batch)
+        batch_losses, aux_metrics = self.model_step(noisy_batch)
 
         # Log the calculated losses and other metrics we want to track
 
         num_batch = batch_losses.trans_loss.shape[0]
         total_losses = {k: torch.mean(v) for k, v in batch_losses.items()}
         for k, v in total_losses.items():
-            self._log_scalar(f"train/{k}", v, batch_size=num_batch)
+            self._log_scalar(f"train/{k}", v.item(), batch_size=num_batch)
 
         # log t
         so3_t = noisy_batch[nbp.so3_t]
@@ -442,7 +474,11 @@ class FlowModule(LightningModule):
                 batch_t, loss_dict, loss_name=loss_name
             )
             for k, v in stratified_losses.items():
-                self._log_scalar(f"train/{k}", v, batch_size=num_batch)
+                self._log_scalar(
+                    f"train/{k}",
+                    v.item() if isinstance(v, torch.Tensor) else v,
+                    batch_size=num_batch,
+                )
 
         # log training throughput
         self._log_scalar(
@@ -458,13 +494,13 @@ class FlowModule(LightningModule):
 
         # conditioning metrics
         self._log_scalar(
-            "train/num_hotspots",
-            batch[bp.hot_spots].float().sum(dim=-1).mean(),
+            "aux/num_hotspots",
+            batch[bp.hot_spots].float().sum(dim=-1).mean().item(),
             batch_size=num_batch,
         )
         self._log_scalar(
-            "train/contact_conditioning_defined",
-            (batch[bp.contact_conditioning].sum(dim=-1) > 0).float().mean(),
+            "aux/contact_conditioning_defined",
+            (batch[bp.contact_conditioning].sum(dim=-1) > 0).float().mean().item(),
             batch_size=num_batch,
         )
 
@@ -476,20 +512,47 @@ class FlowModule(LightningModule):
 
             scaffold_percent = torch.mean(scaffold_mask).item()
             self._log_scalar(
-                "train/scaffolding_percent",
+                "aux/scaffolding_percent",
                 scaffold_percent,
                 batch_size=num_batch,
             )
             num_motif_res = torch.sum(motif_mask, dim=-1)
             self._log_scalar(
-                "train/motif_size",
+                "aux/motif_size",
                 torch.mean(num_motif_res).item(),
                 batch_size=num_batch,
             )
 
+        # log some auxiliary metrics
+        aux_metrics_to_log = {
+            "loss_mask_fraction": aux_metrics.loss_mask_fraction.item(),
+            "stochastic_scale": aux_metrics.stochastic_scale.item(),
+            "atom_loss": aux_metrics.atom_loss.item(),
+            "dist_mat_loss_local": aux_metrics.dist_mat_loss_local.item(),
+            "dist_mat_loss_global": aux_metrics.dist_mat_loss_global.item(),
+            "multimer_interface_loss": aux_metrics.multimer_interface_loss.item(),
+            "hot_spots_loss": aux_metrics.hot_spots_loss.item(),
+            "contact_conditioning_loss": aux_metrics.contact_conditioning_loss.item(),
+        }
+        for metric_key, metric_value in aux_metrics_to_log.items():
+            self._log_scalar(f"aux/{metric_key}", metric_value, batch_size=num_batch)
+
         # log final loss explicitly (though it's already logged as `train_loss`)
         train_loss = total_losses["train_loss"]
-        self._log_scalar("train/loss", train_loss, prog_bar=True, batch_size=num_batch)
+        self._log_scalar(
+            "train/loss", train_loss.item(), prog_bar=True, batch_size=num_batch
+        )
+
+        # Periodically clear cache to prevent memory fragmentation
+        if self.global_step > 0 and self.global_step % 1000 == 0:
+            import gc
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self._log.info(
+                f"Step {self.global_step}: Cleared cache and ran garbage collection"
+            )
 
         return train_loss
 

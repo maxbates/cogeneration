@@ -115,6 +115,9 @@ class BaseDataset(Dataset):
         metadata[DatasetColumn.index] = list(range(len(metadata)))
         self.csv = metadata
 
+        if self.cfg.cache_num_res is not None:
+            self._log.info(f"♻️ Caching enabled for lengths >= {self.cfg.cache_num_res}")
+
     @property
     def is_training(self) -> bool:
         """
@@ -430,7 +433,9 @@ class BaseDataset(Dataset):
         """
         processed_file_path = csv_row[mc.processed_path]
         seq_len = csv_row[self.modeled_length_col]
-        use_cache = seq_len > self.cfg.cache_num_res
+        use_cache = (
+            self.cfg.cache_num_res is not None and seq_len > self.cfg.cache_num_res
+        )
 
         if use_cache and processed_file_path in self._cache:
             return self._cache[processed_file_path]
@@ -444,6 +449,12 @@ class BaseDataset(Dataset):
         )
 
         if use_cache:
+            # Enforce max cache size (FIFO eviction)
+            if len(self._cache) >= self.cfg.max_cache_entries:
+                # Remove oldest entry (first key in dict)
+                oldest_key = next(iter(self._cache))
+                del self._cache[oldest_key]
+
             self._cache[processed_file_path] = processed_feats
 
         return processed_feats

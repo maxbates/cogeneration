@@ -14,6 +14,19 @@ from cogeneration.type.batch import ModelPrediction
 from cogeneration.type.batch import NoisyBatchProp as nbp
 from cogeneration.type.batch import NoisyFeatures
 from cogeneration.type.batch import PredBatchProp as pbp
+from cogeneration.util.log import rank_zero_logger
+
+# Module-level logger, to be shared across instances of BatchLossCalculator
+logger = rank_zero_logger(__name__)
+
+
+def log_clamp(x: torch.Tensor, threshold: float = 5.0) -> torch.Tensor:
+    """
+    Soft clamp using log compression above threshold.
+    Preserves gradients above threshold but at diminishing scale: threshold + log(1 + excess)
+    """
+    return torch.where(x > threshold, threshold + torch.log1p(x - threshold), x)
+
 
 """
 TODO(model) Additional losses to consider:
@@ -68,9 +81,12 @@ class AuxiliaryMetrics:
     iptm_loss: torch.Tensor
     hot_spots_loss: torch.Tensor
     contact_conditioning_loss: torch.Tensor
+    # metrics
     loss_denom_num_res: torch.Tensor
+    loss_mask_fraction: torch.Tensor
     examples_per_step: torch.Tensor
     res_length: torch.Tensor
+    stochastic_scale: torch.Tensor
 
 
 @dataclass
@@ -191,7 +207,7 @@ class BatchLossCalculator:
         return self.cfg.experiment.training
 
     @cached_property
-    def loss_mask(self) -> torch.Tensor:
+    def loss_mask(self) -> torch.Tensor:  # (B, N)
         """
         Mask for residues to consider for loss calculation.
         Note for inpainting, we ignore motifs in loss.
@@ -207,28 +223,33 @@ class BatchLossCalculator:
         if bp.motif_mask in self.batch and self.batch[bp.motif_mask] is not None:
             loss_mask *= 1 - self.batch[bp.motif_mask]
 
-        if torch.any(torch.sum(loss_mask, dim=-1) < 1):
-            raise ValueError("Empty batch encountered")
+        empty_samples = torch.sum(loss_mask, dim=-1) < 1
+        if torch.any(empty_samples):
+            num_empty = empty_samples.sum().item()
+            logger.warning(
+                f"Batch contains {num_empty} / {self.num_batch} samples with all residues masked out. "
+                "These samples will not contribute to the loss."
+            )
 
         return loss_mask.bool()
 
     @cached_property
-    def loss_denom_num_res(self) -> torch.Tensor:
-        return torch.sum(self.loss_mask, dim=-1).float()
+    def loss_denom_num_res(self) -> torch.Tensor:  # (B,)
+        return torch.sum(self.loss_mask, dim=-1).float() + 1e-10
 
     @cached_property
-    def batch_loss_mask(self) -> torch.Tensor:
+    def batch_loss_mask(self) -> torch.Tensor:  # (B,)
         return torch.any(self.batch[bp.res_mask], dim=-1)
 
-    def normalize_loss(self, x: torch.Tensor):
+    def normalize_loss(self, x: torch.Tensor) -> torch.Tensor:  # (B,)
         return x.sum() / (self.batch_loss_mask.sum() + 1e-10)
 
     @cached_property
-    def num_batch(self) -> int:
+    def num_batch(self) -> int:  # (B,)
         return self.batch[bp.res_mask].shape[0]
 
     @cached_property
-    def num_res(self) -> int:
+    def num_res(self) -> int:  # (B,)
         return self.batch[bp.res_mask].shape[1]
 
     @cached_property
@@ -278,7 +299,9 @@ class BatchLossCalculator:
         )
         trans_loss = torch.sum(
             trans_error**2 * self.loss_mask[..., None], dim=(-1, -2)
-        ) / (self.loss_denom_num_res * 3)
+        ) / (
+            self.loss_denom_num_res * 3
+        )  # * 3 for xyz coords
         return trans_loss
 
     def loss_rot_vf(self) -> torch.Tensor:
@@ -288,7 +311,9 @@ class BatchLossCalculator:
         rot_vf_error = (self.gt.rot_vf - self.pred_rot_vf) / so3_norm_scale
         rot_vf_loss = torch.sum(
             rot_vf_error**2 * self.loss_mask[..., None], dim=(-1, -2)
-        ) / (self.loss_denom_num_res * 3)
+        ) / (
+            self.loss_denom_num_res * 3
+        )  # * 3 for xyz coords
         return rot_vf_loss
 
     def loss_torsions(self) -> torch.Tensor:
@@ -344,9 +369,7 @@ class BatchLossCalculator:
             angle_cnt + 1e-10
         )  # (B, N)
 
-        loss = (loss_per_residue * self.loss_mask).sum(-1) / (
-            self.loss_denom_num_res + 1e-10
-        )
+        loss = (loss_per_residue * self.loss_mask).sum(-1) / self.loss_denom_num_res
         return loss
 
     def loss_aatypes_ce(self) -> torch.Tensor:
@@ -385,7 +408,9 @@ class BatchLossCalculator:
         bb_atom_loss = torch.sum(
             (gt_bb_atoms - pred_bb_atoms) ** 2 * bb_atom_loss_mask[..., None],
             dim=(-1, -2, -3),
-        ) / (bb_atom_loss_mask.sum(dim=(-1, -2)) + 1e-10)
+        ) / (
+            bb_atom_loss_mask.sum(dim=(-1, -2)) * 3 + 1e-10
+        )  # * 3 for xyz coords
 
         return bb_atom_loss
 
@@ -882,7 +907,7 @@ class BatchLossCalculator:
             - torch.cdist(self.gt.trans_1, self.gt.trans_1)
         ).abs()  # (B, N, N)
 
-        n_res = mask.sum(dim=-1, keepdim=False)  # (B,)
+        n_res = mask.sum(dim=-1, keepdim=False).clamp(min=1)  # (B,) ensuring >= 1
         tm_val = tm_function(pae, n_res)  # (B, N, N)
 
         pair_mask = mask.unsqueeze(2) * mask.unsqueeze(1)  # valid pairs
@@ -904,7 +929,9 @@ class BatchLossCalculator:
         loss_rot_vf = self.loss_rot_vf()
         loss_torsions = self.loss_torsions()
         loss_aatypes_ce = self.loss_aatypes_ce()
-        loss_atom_positions = self.loss_atom_positions(n_bb_atoms=self.n_atoms_modeled)
+        loss_atom_positions = log_clamp(
+            self.loss_atom_positions(n_bb_atoms=self.n_atoms_modeled), threshold=3.0
+        )  # scale down large errors, so focus on primary domains first
         loss_pairwise_dist_local = self.loss_bb_pairwise_dist(
             proximity_threshold_ang=7.0, ca_only=False
         )  # neighbors
@@ -950,7 +977,7 @@ class BatchLossCalculator:
             * self.train_cfg.aux_contact_conditioning_loss_weight
         )
 
-        # auxiliary loss
+        # auxiliary loss (only for timepoints > aux_loss_t_pass)
         loss_auxiliary = (
             loss_atom_positions
             + loss_pairwise_dist_local
@@ -970,16 +997,22 @@ class BatchLossCalculator:
         loss_auxiliary *= self.batch[nbp.r3_t] > self.train_cfg.aux_loss_t_pass
         loss_auxiliary *= self.batch[nbp.so3_t] > self.train_cfg.aux_loss_t_pass
 
-        # clamp certain losses
-        loss_trans = torch.clamp(loss_trans, max=5)
-        loss_rot_vf = torch.clamp(loss_rot_vf, max=5)
-        loss_aatypes_ce = torch.clamp(loss_aatypes_ce, max=5)
-        loss_auxiliary = torch.clamp(loss_auxiliary, max=5)
+        # soft clamp using log compression above threshold to preserve gradient signal
+        loss_trans = log_clamp(loss_trans, threshold=5.0)
+        loss_rot_vf = log_clamp(loss_rot_vf, threshold=5.0)
+        loss_aatypes_ce = log_clamp(loss_aatypes_ce, threshold=5.0)
+        loss_auxiliary = log_clamp(loss_auxiliary, threshold=5.0)
 
         # aggregate losses
         loss_total = loss_trans + loss_rot_vf + loss_aatypes_ce + loss_auxiliary
 
         assert loss_total.shape == (self.num_batch,)
+
+        # other metrics
+        loss_mask_fraction = torch.mean(
+            self.loss_mask.sum(dim=-1).float()
+            / (self.batch[bp.res_mask].sum(dim=-1).float() + 1e-10)
+        )
 
         aux = AuxiliaryMetrics(
             batch_train_loss=loss_total,
@@ -1014,9 +1047,12 @@ class BatchLossCalculator:
             iptm_loss=self.normalize_loss(loss_iptm),
             hot_spots_loss=self.normalize_loss(loss_hot_spots),
             contact_conditioning_loss=self.normalize_loss(loss_contact_conditioning),
+            # metrics
             loss_denom_num_res=self.loss_denom_num_res,
+            loss_mask_fraction=loss_mask_fraction,
             examples_per_step=torch.tensor(self.num_batch),
             res_length=torch.mean(torch.sum(self.batch[bp.res_mask], dim=-1).float()),
+            stochastic_scale=torch.mean(self.batch[bp.stochastic_scale]),
         )
 
         losses = TrainingLosses(

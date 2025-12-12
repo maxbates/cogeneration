@@ -144,7 +144,7 @@ class MotifFactory:
         chain_idx: torch.Tensor,
         random_scale_range: Optional[Tuple[float, float]] = None,
         max_total_length: Optional[int] = None,
-    ):
+    ) -> List[Segment]:
         """
         Generate segments from a diffuse mask.
         Motifs are defined by diffuse_mask == 0, scaffolds are defined by diffuse_mask == 1

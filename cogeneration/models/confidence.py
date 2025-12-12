@@ -40,7 +40,7 @@ def compute_ptms(
     num_bins = pae_logits.shape[-1]
     bin_width = 32.0 / num_bins
 
-    n_res = mask.sum(dim=-1, keepdim=False)  # (B,)
+    n_res = mask.sum(dim=-1, keepdim=False).clamp(min=1)  # (B,) ensuring >= 1
     pae_values = (
         torch.arange(0.5 * bin_width, 32.0, bin_width, device=pae_logits.device)
         .unsqueeze(0)  # (1, num_bins)

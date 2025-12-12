@@ -82,9 +82,10 @@ class MetadataUpdater:
         # Peek at first row and what will be updated
         first_row = self.df.iloc[0]
         first_row_updates = self._update_row(first_row, 0)
-        self.logger.info(
-            f"Updates first row:\n{'\n'.join([f'{k}: {v}' for k, v in first_row_updates.items()])}"
+        first_row_updates_str = "\n".join(
+            [f"{k}: {v}" for k, v in first_row_updates.items()]
         )
+        self.logger.info(f"Updates first row:\n{first_row_updates_str}")
 
         # Compute updates per row by loading processed file once
         updates = []

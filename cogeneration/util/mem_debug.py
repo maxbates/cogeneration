@@ -131,8 +131,8 @@ def register_memory_debugger(
         sig_name = sig.name if isinstance(sig, signal.Signals) else str(sig)
     except Exception:
         sig_name = str(sig)
-    _logger.debug(
-        "Registered memory debugger on %s for PID %s. Send: `kill -%s %s` to dump to %s",
+    _logger.info(
+        "📞 Memory debugger registered on %s (PID %s). Trigger: kill -%s %s → %s",
         sig_name,
         pid,
         sig_name.replace("SIG", ""),

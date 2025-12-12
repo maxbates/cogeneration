@@ -11,7 +11,7 @@ This is a slow process: ProteinMPNN is relatively quick but Boltz/AlphaFold is s
 Outputs are streamed into the output CSVs and directory.
 
 Example usage:
-    python redesign_structures.py 
+    python redesign_structures.py
 
 Specify a metadata CSV instead of using dataset
     python redesign_structures.py redesign.metadata_csv=$HOME/pdb/rcsb/processed/metadata.csv

@@ -330,6 +330,7 @@ class FrozenEsmModel(nn.Module):
         model_key: str,
         use_esm_attn_map: bool = True,  # return pair repr
         caching: bool = True,  # enable caching the last call
+        precision: str = "32",  # model precision (32, 16, bf16, bf16-mixed, etc.)
     ):
         """
         FrozenEsmModel wraps ESM, sets to eval, supports caching,
@@ -357,7 +358,12 @@ class FrozenEsmModel(nn.Module):
         # Set to eval mode
         self.esm.eval()
 
-        logger.info(f"✅ ESM {model_key} loaded")
+        # Set precision for inference (bf16/fp16 supported by flash attention)
+        self._set_precision(precision)
+
+        logger.info(
+            f"✅ ESM {model_key} loaded (precision: {precision}, use_esm_attn_map: {use_esm_attn_map})"
+        )
 
     def state_dict(self, *args, **kwargs):
         # contibute nothing to state_dict (save space in checkpoints)
@@ -380,6 +386,21 @@ class FrozenEsmModel(nn.Module):
         # ignore parent module `load_state_dict` nested calls
         return
 
+    def _set_precision(self, precision: str) -> None:
+        """Convert ESM model to specified precision for inference."""
+        if precision == "32":
+            self.esm = self.esm.float()
+        elif precision in ("16", "fp16"):
+            self.esm = self.esm.half()
+        elif precision in ("bf16", "bf16-mixed"):
+            self.esm = self.esm.to(dtype=torch.bfloat16)
+        elif precision == "64":
+            self.esm = self.esm.double()
+        else:
+            logger.warning(
+                f"Unknown precision '{precision}' for ESM, keeping default precision"
+            )
+
     @property
     def embed_dim(self):
         try:
@@ -400,6 +421,40 @@ class FrozenEsmModel(nn.Module):
             return self.esm.attention_heads  # FAIR ESM style
         except AttributeError:
             return self.esm.config.num_attention_heads  # FAPLM style
+
+    @staticmethod
+    def _unpack_flash_attention_output(
+        packed_output: torch.Tensor,  # (1, num_valid_tokens, C) or (1, B*L, C)
+        attention_mask: torch.Tensor,  # (B, L)
+        target_shape: Tuple[int, int, int],  # (B, L, C)
+    ) -> torch.Tensor:
+        """
+        Unpack flash attention outputs that drop padding tokens.
+
+        Args:
+            packed_output: (1, num_valid_tokens, C) or (1, B*L, C)
+            attention_mask: (B, L) boolean mask for valid tokens
+            target_shape: (B, L, C) desired output shape
+
+        Returns:
+            unpacked: (B, L, C) tensor with zeros at padding positions
+        """
+        B, L, C = target_shape
+        squeezed = packed_output.squeeze(0)  # (num_valid_tokens, C) or (B*L, C)
+
+        # Flatten attention mask for 1D indexing
+        attention_mask_flat = attention_mask.flatten()  # (B*L,)
+        num_valid_tokens = attention_mask_flat.sum().item()
+
+        # Check if output is packed (only valid tokens) or full
+        if squeezed.shape[0] == num_valid_tokens:
+            # Packed format - reconstruct with zeros at padding positions
+            full_flat = squeezed.new_zeros(B * L, C)
+            full_flat[attention_mask_flat] = squeezed
+            return full_flat.view(B, L, C)
+        else:
+            # Already full format - just reshape
+            return squeezed.view(B, L, C)
 
     @torch.no_grad()
     def forward(
@@ -440,6 +495,7 @@ class FrozenEsmModel(nn.Module):
 
         residue_mask = sequence_data.non_linker_mask  # (B, L)
         padding_mask = sequence_data.aa_sequence == self.esm_dict.padding_idx  # (B, L)
+        attention_mask = ~padding_mask  # (B, L) True for valid tokens
 
         # track sizes
         B, N = aatypes.shape
@@ -447,6 +503,7 @@ class FrozenEsmModel(nn.Module):
 
         res = self.esm(
             sequence_data.aa_sequence,
+            attention_mask=attention_mask,
             # FAPLM style arguments
             output_attentions=self.use_esm_attn_map,
             output_hidden_states=True,
@@ -468,13 +525,17 @@ class FrozenEsmModel(nn.Module):
         #     dim=2,
         # )  # (B, L, nLayers, C)
 
-        # FAPLM style
-        # Flash attention may introduce pseudo-batch and flattens actual batch,
-        # i.e. (1, B * L, C), and drops pad tokens (unknown are treated as pad).
+        # Flash attention may pack outputs (dropping padding tokens), so we unpack them.
+        # get embedding dimension from first hidden state
+        C = res["hidden_states"][0].shape[-1]
+        # unpack all hidden state layers: (B, L, nLayers, C)
         reps = torch.stack(
-            [h.squeeze(0).view(B, L, -1) for h in res["hidden_states"]],
+            [
+                self._unpack_flash_attention_output(h, attention_mask, (B, L, C))
+                for h in res["hidden_states"]
+            ],
             dim=2,
-        )  # (B, L, nLayers, C)
+        )
 
         # keep only the non-linker / non-special residues
         single_repns = reps[residue_mask].view(
@@ -486,6 +547,8 @@ class FrozenEsmModel(nn.Module):
             # attn = res["attentions"]
 
             # FAPLM style
+            # Note: When output_attentions=True, FAEsm falls back to standard attention
+            # (not flash attention), so outputs are in standard format, not packed.
             flat_attn = []
             for a in res["attentions"]:
                 # handle flash attention "layer batch".
@@ -511,10 +574,12 @@ class FrozenEsmModel(nn.Module):
         else:
             pair_repns = None
 
-        # Extract logits
+        # Extract and unpack logits: (B, L, vocab_size)
         logits = res["logits"]
-        if logits.dim() == 3 and logits.shape[0] == 1:
-            logits = logits.squeeze(0).view(B, L, -1)
+        vocab_size = logits.shape[-1]
+        logits = self._unpack_flash_attention_output(
+            logits, attention_mask, (B, L, vocab_size)
+        )
         # Convert to AF2 ordering, use 'X' token for AF2 'X' class
         lut_logits = torch.tensor(
             [self.esm_dict.get_idx(a) for a in restypes] + [self.esm_dict.get_idx("X")],
@@ -541,13 +606,14 @@ class FrozenEsmModel(nn.Module):
 
 
 # Singleton accessor so different callers share the same wrapper and underlying model
-_FROZEN_ESM_SINGLETONS: Dict[Tuple[str, bool], FrozenEsmModel] = {}
+_FROZEN_ESM_SINGLETONS: Dict[Tuple[str, bool, bool, str], FrozenEsmModel] = {}
 
 
 def get_frozen_esm(
     model_key: str,
     use_esm_attn_map: bool,
     caching: bool = True,
+    precision: str = "32",
 ) -> FrozenEsmModel:
     """
     Factory for singleton (of same model key + outputs) FrozenEsmModel instances.
@@ -558,11 +624,12 @@ def get_frozen_esm(
     and potential will just run on that device.
     FrozenEsmModel will move the inputs / cached outputs to the input device.)
     """
-    key = (str(model_key), bool(use_esm_attn_map), bool(caching))
+    key = (str(model_key), bool(use_esm_attn_map), bool(caching), str(precision))
     if key not in _FROZEN_ESM_SINGLETONS:
         _FROZEN_ESM_SINGLETONS[key] = FrozenEsmModel(
             model_key=model_key,
             use_esm_attn_map=use_esm_attn_map,
             caching=caching,
+            precision=precision,
         )
     return _FROZEN_ESM_SINGLETONS[key]

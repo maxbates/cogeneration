@@ -200,6 +200,73 @@ class TestFrozenEsmModel:
         # Expect a strong fraction of positions to have the true AA in top-5
         assert successes_top5 >= math.floor(k * 0.8)
 
+    @pytest.mark.parametrize("get_attn_map", [True, False])
+    @pytest.mark.parametrize(
+        "model_key", [ModelESMKey.esm2_t6_8M_UR50D, ModelESMKey.DUMMY]
+    )
+    def test_forward_pass_with_variable_length_batch(self, model_key, get_attn_map):
+        """Test that variable-length sequences in a batch (requiring padding) work correctly.
+
+        This is the scenario that triggered the flash attention packing bug where
+        hidden states would be (1, total_valid_tokens, C) instead of (1, B*L, C).
+        """
+        model = FrozenEsmModel(model_key, use_esm_attn_map=get_attn_map, caching=False)
+
+        B = 3
+        max_length = 15
+
+        # Create variable-length sequences: lengths [15, 10, 7]
+        aatypes = torch.randint(0, 21, (B, max_length))
+        chain_idx = torch.ones_like(aatypes)
+
+        # Create masks with different valid lengths per batch element
+        res_mask = torch.zeros_like(aatypes, dtype=torch.bool)
+        lengths = [15, 10, 7]
+        for b, length in enumerate(lengths):
+            res_mask[b, :length] = True
+
+        token_reps, pair_reps, logits = model(aatypes, chain_idx, res_mask)
+
+        # token-level reps: (B, L, nLayers+1, embed_dim)
+        # Note: L here is the actual valid length per batch element after packing/unpacking
+        assert token_reps.shape[0] == B
+        assert token_reps.shape[2] == model.num_layers + 1
+        assert token_reps.shape[3] == model.embed_dim
+
+        # Each batch element should have output for its valid length
+        for b, length in enumerate(lengths):
+            # Check that we get valid outputs for each sequence
+            batch_reps = token_reps[b, :length]
+            assert batch_reps.shape == (length, model.num_layers + 1, model.embed_dim)
+            # Check that representations are not all zeros (i.e., were actually computed)
+            assert torch.any(batch_reps != 0)
+
+        if get_attn_map:
+            assert pair_reps is not None
+            assert pair_reps.shape[0] == B
+            assert pair_reps.shape[3] == model.num_layers * model.num_heads
+
+            # Check each batch element's pair reps
+            for b, length in enumerate(lengths):
+                batch_pair = pair_reps[b, :length, :length]
+                assert batch_pair.shape == (
+                    length,
+                    length,
+                    model.num_layers * model.num_heads,
+                )
+                # Check that attention is not all zeros
+                assert torch.any(batch_pair != 0)
+        else:
+            assert pair_reps is None
+
+        # Check logits for each sequence
+        assert logits.shape[0] == B
+        assert logits.shape[2] == 21
+        for b, length in enumerate(lengths):
+            batch_logits = logits[b, :length]
+            assert batch_logits.shape == (length, 21)
+            assert torch.any(batch_logits != 0)
+
     def test_caching_across_instances(self, monkeypatch):
         """Cache should avoid calling underlying ESM forward twice for identical inputs, including across instances with same model key."""
         B, N = 1, 8

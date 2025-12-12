@@ -102,21 +102,25 @@ tools.setup(
             "torchmetrics==1.4.2",
             # CUDA-accelerated packages
             "torch-scatter==2.1.2",
-            "cuequivariance-torch==0.5.1",
-            "cuequivariance-ops-torch-cu12==0.5.1",
-            # pin nvidia cuda packages
-            # "nvidia-cublas-cu12==12.9.1.4",
-            # "nvidia-cuda-nvrtc-cu12==12.8.61",
-            # "nvidia-cuda-runtime-cu12==12.8.57",
-            # "nvidia-cudnn-cu12==9.11.0.98",
-            # "nvidia-cufft-cu12==11.4.1.4",
-            # "nvidia-curand-cu12==10.3.10.19",
-            # "nvidia-cusolver-cu12==11.7.5.82",
-            # "nvidia-cusparse-cu12==12.5.10.65",
-            # "nvidia-cusparselt-cu12==0.7.1",
-            # "nvidia-nccl-cu12==2.27.6",
-            # "nvidia-nvjitlink-cu12==12.9.86",
-            # "nvidia-nvtx-cu12==12.9.79",
+            "cuequivariance-torch==0.8.0",
+            "cuequivariance-ops-torch-cu12==0.8.0",
+            # pin nvidia cuda packages                 # debug, actual set used on lambda instance
+            # "nvidia-cublas-cu12==12.9.1.4",          # nvidia-cublas-cu12==12.8.3.14
+                                                       # nvidia-cuda-cupti-cu12==12.8.57
+            # "nvidia-cuda-nvrtc-cu12==12.8.61",       # nvidia-cuda-nvrtc-cu12==12.8.61
+            # "nvidia-cuda-runtime-cu12==12.8.57",     # nvidia-cuda-runtime-cu12==12.8.57
+            # "nvidia-cudnn-cu12==9.11.0.98",          # nvidia-cudnn-cu12==9.7.1.26
+                                                       # nvidia-cufile-cu12==1.13.0.11
+            # "nvidia-cufft-cu12==11.4.1.4",           # nvidia-cufft-cu12==11.3.3.41
+            # "nvidia-curand-cu12==10.3.10.19",        # nvidia-curand-cu12==10.3.9.55
+            # "nvidia-cusolver-cu12==11.7.5.82",       # nvidia-cusolver-cu12==11.7.2.55
+            # "nvidia-cusparse-cu12==12.5.10.65",      # nvidia-cusparse-cu12==12.5.7.53
+            # "nvidia-cusparselt-cu12==0.7.1",         # nvidia-cusparselt-cu12==0.6.3
+                                                       # nvidia-ml-py==12.555.43
+            # "nvidia-nccl-cu12==2.27.6",              # nvidia-nccl-cu12==2.26.2
+            # "nvidia-nvjitlink-cu12==12.9.86",        # nvidia-nvjitlink-cu12==12.8.61
+                                                       # nvidia-nvshmem-cu12==3.3.20
+            # "nvidia-nvtx-cu12==12.9.79",             # nvidia-nvtx-cu12==12.8.55
             # Flash attention (requires manual install with --no-build-isolation)
             "flash-attn==2.8.1",
             # Flash IPA - from git repo

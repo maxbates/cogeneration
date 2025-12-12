@@ -37,7 +37,7 @@ class TestFlowModule:
 
     def test_model_step(self, mock_cfg, pdb_noisy_batch):
         module = FlowModule(mock_cfg)
-        losses = module.model_step(pdb_noisy_batch)
+        losses, aux = module.model_step(pdb_noisy_batch)
         assert isinstance(losses, TrainingLosses)
 
     def test_training_step(self, mock_cfg, pdb_noisy_batch):
@@ -413,3 +413,53 @@ class TestFlowModule:
         assert not any(
             "esm." in k for k in ckpt["state_dict"].keys()
         ), "Found ESM keys in checkpoint"
+
+    def test_warm_start_with_esm_combiner(self, tmp_path, mock_checkpoint):
+        """
+        Test that warm starting from a checkpoint without ESM weights works correctly.
+
+        This simulates the real-world scenario where:
+        1. A checkpoint is saved without frozen ESM weights (to save space)
+        2. A new module is initialized with ESM combiner enabled
+        3. The checkpoint is loaded as a warm start
+        4. The module initializes correctly, loading ESM combiner params but not ESM weights
+        """
+        cfg = Config.test_uninterpolated(tmp_path=tmp_path / "test").interpolate()
+        assert (
+            cfg.model.esm_combiner.enabled
+        ), "ESM combiner must be enabled for this test"
+
+        cfg, ckpt_path = mock_checkpoint(cfg=cfg)
+
+        # Verify checkpoint excludes ESM weights but includes ESM combiner params
+        ckpt = torch.load(ckpt_path, weights_only=False)
+        esm_combiner_keys = [
+            k for k in ckpt["state_dict"].keys() if "esm_combiner" in k
+        ]
+        esm_frozen_keys = [
+            k for k in ckpt["state_dict"].keys() if ".esm_combiner.esm." in k
+        ]
+
+        assert len(esm_combiner_keys) > 0, "Expected ESM combiner params in checkpoint"
+        assert len(esm_frozen_keys) == 0, "Expected no frozen ESM keys in checkpoint"
+
+        # Create a new module and load the checkpoint (simulating warm start)
+        new_module = FlowModule(cfg)
+
+        # Load checkpoint - this should work without errors even though ESM keys are missing
+        new_module.load_state_dict(ckpt["state_dict"])
+
+        # Verify the module is functional with ESM combiner properly initialized
+        assert new_module.model is not None
+        assert hasattr(new_module.model, "esm_combiner")
+        assert new_module.model.esm_combiner is not None
+
+        # Verify ESM combiner params exist in the loaded module
+        loaded_combiner_keys = [
+            k
+            for k in new_module.state_dict().keys()
+            if "esm_combiner" in k and ".esm." not in k
+        ]
+        assert (
+            len(loaded_combiner_keys) > 0
+        ), "Expected ESM combiner params in loaded module"

@@ -237,7 +237,7 @@ class ModelHyperParamsConfig(BaseClassConfig):
             pos_embed_size=64,
             timestep_embed_size=64,
             num_recycles=0,
-            trunk_num_layers=2,
+            trunk_num_layers=4,
             ipa_num_layers=2,
             seq_trunk_num_layers=1,
         )
@@ -330,8 +330,8 @@ class ModelEdgeFeaturesConfig(BaseClassConfig):
         "${model.hyper_params.pos_embed_method}"
     )
     pos_embed_max_len: int = "${model.hyper_params.pos_embed_max_len}"
-    # self_condition: used by interpolant config.
-    self_condition: bool = True
+    # embed self_conditioning bins
+    embed_self_condition: bool = "${interpolant.self_condition}"
     # embed_chain: whether to embed chain index.
     embed_chain: bool = True
     # embed_diffuse_mask: whether to embed diffuse mask. important esp. for `scaffolding` task.
@@ -387,7 +387,7 @@ class ModelPairformerConfig(BaseClassConfig):
     post_layer_norm: bool = False
     chunk_size_tri_attn: int = 512  # chunking/tiling for large sequences
     use_kernels: bool = "${shared.kernels}"
-    # torch.utils.checkpoint on every layer. True trades speed for memory.
+    # torch.utils.checkpoint on every layer. True trades speed for less memory.
     checkpointing: bool = True
 
 
@@ -492,7 +492,9 @@ class ModelESMCombinerConfig(BaseClassConfig):
     # so only using single representation allows faster pass through model
     only_single: bool = True
     # which ESM model size to use
-    esm_model_key: ModelESMKey = ModelESMKey.esm2_t30_150M_UR50D
+    esm_model_key: ModelESMKey = ModelESMKey.esm2_t12_35M_UR50D
+    # Precision for ESM model (frozen inference)
+    precision: str = "${shared.precision}"
     # dims coming from simple node/edge networks
     node_embed_size: int = "${model.hyper_params.node_embed_size}"
     edge_embed_size: int = "${model.hyper_params.edge_embed_size}"
@@ -992,8 +994,9 @@ class InterpolantSteeringConfig(BaseClassConfig):
     esm_logits_temperature: float = 1.0
     # cap for logits guidance
     esm_logits_cap: float = 4.0
-    # use same ESM model as in combiner (sequence cached per pass)
+    # use same ESM model + precision as in combiner (sequence cached per pass)
     esm_model_key: ModelESMKey = "${model.esm_combiner.esm_model_key}"
+    precision: str = "${model.esm_combiner.precision}"
 
 
 @dataclass
@@ -1021,14 +1024,14 @@ class InterpolantConfig(BaseClassConfig):
     # `codesign_separate_t` allows separate `t` times for rots / trans / aatypes so fixed domains are at ~t=1.
     codesign_separate_t: bool = True
     # `forward_folding` proportion of codesign samples; requires `codesign_separate_t`
-    codesign_forward_fold_prop: float = 0.1  # default 0.1 in public MultiFlow
+    codesign_forward_fold_prop: float = 0.15  # default 0.1 in public MultiFlow
     # `inverse_folding` proportion of codesign samples; requires `codesign_separate_t`
-    codesign_inverse_fold_prop: float = 0.25  # default 0.1 in public MultiFlow
+    codesign_inverse_fold_prop: float = 0.2  # default 0.1 in public MultiFlow
     # `inpainting_unconditional_prop` in training removes motifs `inpainting` examples,
     # which makes them unconditional, or forward_folding/inverse_folding without motifs.
-    inpainting_unconditional_prop: float = 0.35
+    inpainting_unconditional_prop: float = 0.5
     # enable self-conditioning
-    self_condition: bool = "${model.edge_features.self_condition}"
+    self_condition: bool = True
     # during training, portion of time to use self-conditioning (on or off during sampling)
     self_condition_prob: float = 0.5  # 0.5 in public MultiFlow
     # kappa allows scaling rotation t exponentially during sampling
@@ -1066,8 +1069,9 @@ class DataLoaderConfig(BaseClassConfig):
 @dataclass
 class DataSamplerConfig(BaseClassConfig):
     # table lookups in format: ${table:${shared.gpu_memory_gb},key1,value1,...}
+    # appropriate ceilings depend on model architecture, esp number of triangle / IPA blocks.
     max_batch_size: int = "${table:${shared.gpu_memory_gb},40,64,80,128}"
-    max_num_res_squared: int = "${table:${shared.gpu_memory_gb},40,400000,80,1024000}"
+    max_num_res_squared: int = "${table:${shared.gpu_memory_gb},40,320000,80,640000}"
 
 
 @dataclass
@@ -1187,7 +1191,7 @@ class DatasetContactConditioningConfig(BaseClassConfig):
     """
 
     # Percent of time to not include contact conditioning matrix
-    conditioning_prob_disabled: float = 0.25
+    conditioning_prob_disabled: float = 0.35
     # Percent of time to include contact conditioning matrix for motifs
     conditioning_prob_motif_only: float = 0.5
     # Percent of time to include inter-chain contact constraint in multimers
@@ -1317,7 +1321,7 @@ class DatasetConfig(BaseClassConfig):
     stochastic_scale_multiplier: float = 0.5
     # add gaussian noise to atom positions prior to rigid frame calculation
     # mostly redundant with stochastic paths, but may provide minor regularization
-    noise_atom_positions_angstroms: float = 0.02
+    noise_atom_positions_angstroms: float = 0.05
     # global backbone center jitter (translation) Å std dev; 0.0 to disable
     backbone_center_noise: float = 0.3
 
@@ -1337,8 +1341,10 @@ class DatasetConfig(BaseClassConfig):
 
     # Performance and debugging
     seed: int = "${shared.seed}"
-    # dataset cache
-    cache_num_res: int = 0  # min length to enable caching
+    # min length to enable caching (disabled if None)
+    cache_num_res: Optional[int] = None
+    # maximum number of entries in the cache
+    max_cache_entries: int = 10000
     # debug/test, take first N rows of metadata_csv
     debug_head_samples: Optional[int] = None
 
@@ -1365,14 +1371,15 @@ class ExperimentTrainingConfig(BaseClassConfig):
 
     # Auxiliary losses
     aux_loss_weight: float = 1.0  # default 0.0 in multiflow
-    aux_loss_t_pass: float = 0.5  # minimum t for aux loss
+    aux_loss_t_pass: float = 0.35  # minimum t for aux loss
     # atom positions, num atoms dep on angles modeled (0=3, 1=5, 7=14)
-    aux_bb_atom_loss_weight: float = 0.25
+    # dependent on getting translations, rotations, and torsions right
+    aux_bb_atom_loss_weight: float = 0.1
     # backbone pairwise distances
     aux_bb_pair_loss_weight_local: float = 0.25
     aux_bb_pair_loss_weight_global: float = 0.15
     # multimer interchain contacts
-    aux_multimer_interface_loss_weight: float = 0.25
+    aux_multimer_interface_loss_weight: float = 0.2
     # multimer interchain clashes
     aux_multimer_clash_loss_weight: float = 0.1
     # b factors (if provided in experimental structure)
@@ -1382,9 +1389,9 @@ class ExperimentTrainingConfig(BaseClassConfig):
     # Predicted aligned error (PAE) confidence
     aux_pae_loss_weight: float = 0.05
     # hot spots inter-chain contact loss
-    aux_hot_spots_loss_weight: float = 0.1
+    aux_hot_spots_loss_weight: float = 0.2
     # contact conditioning constraint loss
-    aux_contact_conditioning_loss_weight: float = 0.1
+    aux_contact_conditioning_loss_weight: float = 0.2
 
 
 @dataclass
@@ -1417,14 +1424,17 @@ class ExperimentTrainerConfig(BaseClassConfig):
     strategy: Optional[str] = (
         "${ternary:${equals: ${shared.local}, True}, 'auto', 'ddp_find_unused_parameters_true'}"
     )
-    overfit_batches: int = 0
     min_epochs: int = 1  # prevents early stopping
     max_epochs: int = 200
+    # limit training batches to a fraction [0,1] or number (2+) of batches
+    limit_train_batches: Union[float, int] = 1.0
+    # force overfiting by using a fraction/number of batches. Don't shuffle dataloader.
+    overfit_batches: Union[float, int] = 0
     deterministic: bool = False
     # Perform validation every `n` epochs.
     check_val_every_n_epoch: int = 5
     # Enable gradient accumulation
-    accumulate_grad_batches: int = 4
+    accumulate_grad_batches: int = 1
     # weights / tensor precision
     precision: Union[str, int] = "${shared.precision}"
     # logging

@@ -7,7 +7,7 @@ from cogeneration.config.base import ModelESMCombinerConfig
 from cogeneration.models.esm_frozen import get_frozen_esm
 
 
-def _mlp(in_dim: int, out_dim: int, hidden_dim: int) -> nn.Module:
+def mlp(in_dim: int, out_dim: int, hidden_dim: int) -> nn.Module:
     return nn.Sequential(
         nn.LayerNorm(in_dim),
         nn.Linear(in_dim, hidden_dim),
@@ -27,14 +27,16 @@ class ESMCombinerNetwork(nn.Module):
         self.cfg = cfg
 
         self.esm = get_frozen_esm(
-            model_key=cfg.esm_model_key, use_esm_attn_map=not self.cfg.only_single
+            model_key=cfg.esm_model_key,
+            use_esm_attn_map=not self.cfg.only_single,
+            precision=cfg.precision,
         )
 
         # learn a scalar mix over all single layers
         self.esm_single_combine = nn.Parameter(torch.zeros(self.esm.num_layers + 1))
 
         # take weighted sum of single layer as input (B, N, C) -> (B, N, node_dim)
-        self.seq_proj = _mlp(
+        self.seq_proj = mlp(
             in_dim=self.esm.embed_dim,
             out_dim=self.cfg.esm_proj_single_dim,
             hidden_dim=self.cfg.mlp_proj_hidden_dim,
@@ -43,7 +45,7 @@ class ESMCombinerNetwork(nn.Module):
 
         if not self.cfg.only_single:
             # pair reps come out flattened layers*heads (B, N, N, layers*heads) -> (B, N, N, edge_dim)
-            self.pair_proj = _mlp(
+            self.pair_proj = mlp(
                 in_dim=self.esm.num_layers * self.esm.num_heads,
                 out_dim=self.cfg.esm_proj_pair_dim,
                 hidden_dim=self.cfg.mlp_proj_hidden_dim,

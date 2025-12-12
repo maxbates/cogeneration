@@ -23,7 +23,9 @@ class EdgeFeatureNet(nn.Module):
         # linear layer for relative position
         self.linear_relpos = nn.Linear(self.cfg.feat_dim, self.cfg.feat_dim)
 
-        total_edge_feats = self.cfg.feat_dim * 3 + self.cfg.num_bins * 2
+        total_edge_feats = self.cfg.feat_dim * 3 + self.cfg.num_bins
+        if self.cfg.embed_self_condition:
+            total_edge_feats += self.cfg.num_bins
         if self.cfg.embed_chain:
             total_edge_feats += 1
         if self.cfg.embed_diffuse_mask:
@@ -99,14 +101,19 @@ class EdgeFeatureNet(nn.Module):
         dist_feats = calc_distogram(
             trans, min_bin=1e-4, max_bin=20.0, num_bins=self.cfg.num_bins
         )  # (B, N, N, num_bins)
-        sc_feats = calc_distogram(
-            trans_sc, min_bin=1e-4, max_bin=20.0, num_bins=self.cfg.num_bins
-        )  # (B, N, N, num_bins)
 
-        all_edge_feats = [cross_node_feats, relpos_feats, dist_feats, sc_feats]
+        all_edge_feats = [cross_node_feats, relpos_feats, dist_feats]
+
+        if self.cfg.embed_self_condition:
+            sc_feats = calc_distogram(
+                trans_sc, min_bin=1e-4, max_bin=20.0, num_bins=self.cfg.num_bins
+            )  # (B, N, N, num_bins)
+            all_edge_feats.append(sc_feats)
+
         if self.cfg.embed_chain:
             rel_chain = (chain_index[:, :, None] == chain_index[:, None, :]).float()
             all_edge_feats.append(rel_chain[..., None])
+
         if self.cfg.embed_diffuse_mask:
             diff_feat = self._cross_concat(diffuse_mask[..., None], num_batch, num_res)
             all_edge_feats.append(diff_feat)

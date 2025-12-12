@@ -2,7 +2,7 @@
 Unified ProteinMPNN runner
 
 This module provides a unified interface for running ProteinMPNN inverse folding:
-`inverse_fold_pdb_subprocess` (slow) - calls original ProteinMPNN run.py script for a PDB structure 
+`inverse_fold_pdb_subprocess` (slow) - calls original ProteinMPNN run.py script for a PDB structure
 `inverse_fold_pdb_native` (fast) - loads LigandMPNN model (cached in runner) and runs on a PDB structure
 `inverse_fold_batch` (fast) - on trans, rots, aatypes etc. tensors directly, bypassing PDB I/O overhead
 
@@ -10,25 +10,25 @@ Note that LigandMPNN does not support batching, so `inverse_fold_pdb_native` and
 
 Running natively requires `LigandMPNN` is installed, and location specified in the config.
 
-In theory, we improve parallelism using a `ProteinMPNNRunnerPool`, which is a pool 
+In theory, we improve parallelism using a `ProteinMPNNRunnerPool`, which is a pool
 of ProteinMPNNRunner instances that can be used to run inference on multiple structures in parallel.
 However, on MPS (on a Mac), MPS effectively serializes all inference requests. On CUDA, it may help some.
 
-Note: lots of Claude generated code here. Which I blame on LigandMPNN 
-having an outrageously complicated `main()` function and no straightforward 
-way to create a model, keep it in memory, and call the inference functions. 
+Note: lots of Claude generated code here. Which I blame on LigandMPNN
+having an outrageously complicated `main()` function and no straightforward
+way to create a model, keep it in memory, and call the inference functions.
 So much of it's main() is ported here to support some of its features.
 
 ================================================================================
 Claude generated note on batching / vectorized execution:
 
-ProteinMPNN/LigandMPNN models do NOT support true vectorized batching of multiple 
-different protein structures. This is a fundamental architectural limitation of 
+ProteinMPNN/LigandMPNN models do NOT support true vectorized batching of multiple
+different protein structures. This is a fundamental architectural limitation of
 these models. Here's why:
 
-1. **Single Structure Architecture**: The models are designed to process one protein 
-   structure at a time. The "batch_size" parameter in the model refers to the number 
-   of sequences to generate for a SINGLE structure, not the number of different 
+1. **Single Structure Architecture**: The models are designed to process one protein
+   structure at a time. The "batch_size" parameter in the model refers to the number
+   of sequences to generate for a SINGLE structure, not the number of different
    structures to process simultaneously.
 
 2. **Structure-Specific Features**: Each protein structure has its own unique:
@@ -37,7 +37,7 @@ these models. Here's why:
    - Residue-residue contact maps
    - Geometric features (distances, angles)
    - Ligand context (for LigandMPNN)
-   
+
    These cannot be meaningfully batched together as they have different dimensions
    and semantic meanings.
 

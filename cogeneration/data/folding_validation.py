@@ -734,9 +734,10 @@ class FoldingValidator:
                 print(f"header:         {row[MetricName.header]}")
                 print(f"df_seq:         {df_seq}")
                 print(f"folded_pdb_seq: {folded_pdb_seq}")
-                print(
-                    f"chains:         {"".join([str(x) for x in folded_feats[dpc.chain_index].tolist()])}"
+                chains = "".join(
+                    [str(x) for x in folded_feats[dpc.chain_index].tolist()]
                 )
+                print(f"chains:           {chains}")
                 print(f"task:           {task}")
                 print(f"PDB:            {row[MetricName.folded_pdb_path]}")
                 print(f"num folds:      {len(folded_df)}")

@@ -27,6 +27,7 @@ def _get_chunk_size(
     is_training: bool,
     edge_embed: torch.Tensor,  # (B, N, N, c_z)
 ) -> Optional[int]:
+    """Get chunk size for triangular attention. Not enabled during training, instead assume checkpointing"""
     if not is_training:
         if edge_embed.shape[1] > CHUNK_SIZE_THRESHOLD:
             chunk_size_tri_attn = min(128, edge_embed.shape[1] // 2)
@@ -252,6 +253,7 @@ class PairformerModule(nn.Module):
                     edge_mask,
                     chunk_size_tri_attn,
                     self.cfg.use_kernels,
+                    use_reentrant=False,
                 )
             else:
                 node_embed, edge_embed = layer(
@@ -301,6 +303,7 @@ class PairformerNoSeqModule(nn.Module):
                     edge_mask,
                     chunk_size_tri_attn,
                     self.cfg.use_kernels,
+                    use_reentrant=False,
                 )
             else:
                 edge_embed = layer(

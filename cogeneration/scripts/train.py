@@ -1,3 +1,4 @@
+import copy
 import os
 from textwrap import dedent
 
@@ -19,12 +20,23 @@ from cogeneration.config.base import Config
 from cogeneration.dataset.datasets import DatasetConstructor
 from cogeneration.dataset.protein_dataloader import ProteinData
 from cogeneration.models.module import FlowModule
-from cogeneration.scripts.utils import get_available_device, print_timing
+from cogeneration.scripts.utils import (
+    MemoryMonitorCallback,
+    get_available_device,
+    print_timing,
+)
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
 from cogeneration.util.log import rank_zero_logger
 
 log = rank_zero_logger(__name__)
 torch.set_float32_matmul_precision("high")
+torch.multiprocessing.set_sharing_strategy("file_system")
+
+
+# Enable memory-efficient attention backends in PyTorch when available
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 
 class Experiment:
@@ -116,6 +128,9 @@ class Experiment:
 
         callbacks.append(TQDMProgressBar(refresh_rate=1))
 
+        # Add memory monitoring (signal-only mode, use kill -SIGUSR1 <PID> to trigger)
+        callbacks.append(MemoryMonitorCallback())
+
         if self.cfg.experiment.debug:
             # Debug mode uses only one device and no workers
             self._train_device_ids = [self._train_device_ids[0]]
@@ -135,9 +150,15 @@ class Experiment:
             # Set up w&b logging
             logger = WandbLogger(**self.cfg.experiment.wandb.asdict())
             # Model checkpoints
-            callbacks.append(
-                ModelCheckpoint(**self.cfg.experiment.checkpointer.asdict())
-            )
+            checkpoint_cfg = self.cfg.experiment.checkpointer.asdict()
+            callbacks.append(ModelCheckpoint(**checkpoint_cfg))
+            # Save every n training steps
+            # TODO - clean up, use cfg explicitly
+            n_step_cfg = copy.deepcopy(checkpoint_cfg)
+            del n_step_cfg["every_n_epochs"]
+            n_step_cfg["every_n_train_steps"] = 2000
+            n_step_cfg["monitor"] = "train/loss"
+            callbacks.append(ModelCheckpoint(**n_step_cfg))
 
         # Save config if main process
         local_rank = DDPInfo.from_env().local_rank
