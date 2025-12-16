@@ -1071,7 +1071,11 @@ class DataSamplerConfig(BaseClassConfig):
     # table lookups in format: ${table:${shared.gpu_memory_gb},key1,value1,...}
     # appropriate ceilings depend on model architecture, esp number of triangle / IPA blocks.
     max_batch_size: int = "${table:${shared.gpu_memory_gb},40,64,80,128}"
-    max_num_res_squared: int = "${table:${shared.gpu_memory_gb},40,320000,80,640000}"
+    max_num_res_squared: int = "${table:${shared.gpu_memory_gb},40,280000,80,600000}"
+    # triangle attention scales ~O(N^3) in sequence length N
+    max_num_res_cubed: int = (
+        "${table:${shared.gpu_memory_gb},40,135000000,80,260000000}"
+    )
 
 
 @dataclass
@@ -1374,7 +1378,7 @@ class ExperimentTrainingConfig(BaseClassConfig):
     aux_loss_t_pass: float = 0.35  # minimum t for aux loss
     # atom positions, num atoms dep on angles modeled (0=3, 1=5, 7=14)
     # dependent on getting translations, rotations, and torsions right
-    aux_bb_atom_loss_weight: float = 0.1
+    aux_bb_atom_loss_weight: float = 0.02
     # backbone pairwise distances
     aux_bb_pair_loss_weight_local: float = 0.25
     aux_bb_pair_loss_weight_global: float = 0.15

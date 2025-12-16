@@ -46,7 +46,7 @@ class Experiment:
         # Support warm starts
         if cfg.experiment.warm_start_ckpt is not None:
             ckpt_dir = os.path.dirname(cfg.experiment.warm_start_ckpt)
-            log.info(f"Warm starting from {ckpt_dir}")
+            log.info(f"🚩 Warm starting from {ckpt_dir}")
             assert os.path.exists(
                 ckpt_dir
             ), f"Warm start directory {ckpt_dir} does not exist."

@@ -158,9 +158,11 @@ class LengthBatcher:
         # and limit batch sizes to avoid OOM.
         sample_order = []
         for seq_len, len_df in replica_csv.groupby(self.modeled_length_col):
+            seq_len_int = int(seq_len)
             max_batch_size = min(
                 self.max_batch_size,
-                self._sampler_cfg.max_num_res_squared // int(seq_len) ** 2 + 1,
+                self._sampler_cfg.max_num_res_squared // (seq_len_int**2) + 1,
+                self._sampler_cfg.max_num_res_cubed // (seq_len_int**3) + 1,
             )
             num_batches = math.ceil(len(len_df) / max_batch_size)
             for i in range(num_batches):

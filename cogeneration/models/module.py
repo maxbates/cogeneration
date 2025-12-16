@@ -151,31 +151,70 @@ class FlowModule(LightningModule):
             **self.cfg.experiment.optimizer.asdict(),
         )
 
-    def load_state_dict(self, state_dict, strict=True):
-        """
-        Load state dict, gracefully handling missing frozen ESM keys.
-
-        The frozen ESM model excludes itself from checkpoints to save space,
-        since it's loaded separately from pretrained weights. This allows
-        warm starting from checkpoints without ESM weights.
-        """
+    def load_state_dict(self, state_dict, strict: bool = True):
+        # Special handling for warm start checkpoints, to not require ESM keys
         if strict:
-            # Check what keys are expected vs what we have
-            current_keys = set(self.state_dict().keys())
+            # Check if ESM keys are in the checkpoint
+            # (they should be omitted from checkpoint, loaded separately)
             checkpoint_keys = set(state_dict.keys())
+            checkpoint_has_esm = any(".esm_combiner.esm." in k for k in checkpoint_keys)
 
+            # Get model state dict
+            # Note FrozenEsmModel.state_dict() returns {} so don't expect ESM keys in state_dict() even if module enabled
+            current_state = self.state_dict()
+            current_keys = set(current_state.keys())
+
+            # check if ESM is enabled
+            esm_enabled = any("esm_combiner" in k for k in current_keys)
+
+            # Check for keys missing in checkpoint, excluding ESM keys
             missing_keys = current_keys - checkpoint_keys
+            non_esm_missing_keys = {
+                k for k in missing_keys if ".esm_combiner.esm." not in k
+            }
+            if non_esm_missing_keys:
+                raise RuntimeError(
+                    f"Cannot warm start: {len(non_esm_missing_keys)} keys missing from checkpoint.\n"
+                    f"This usually means the model architecture changed.\n"
+                    f"Missing keys: {list(non_esm_missing_keys)}"
+                )
 
-            # Separate ESM keys from other missing keys
-            esm_missing = {k for k in missing_keys if ".esm_combiner.esm." in k}
-            other_missing = missing_keys - esm_missing
+            # Check for ESM combiner keys in checkpoint but not enabled
+            if not esm_enabled:
+                esm_combiner_keys = {k for k in checkpoint_keys if "esm_combiner" in k}
+                if esm_combiner_keys:
+                    raise RuntimeError(
+                        f"Cannot warm start: ESM combiner keys found in checkpoint but ESM is not enabled."
+                    )
 
-            # If only ESM keys are missing, that's expected - load with strict=False
-            # If other keys are missing, let PyTorch raise the error
-            if esm_missing and not other_missing:
+            # Check for size mismatches in ESM combiner params (incompatible ESM model)
+            if esm_enabled:
+                esm_combiner_mismatches = []
+                for key in checkpoint_keys & current_keys:
+                    if "esm_combiner" in key and ".esm_combiner.esm." not in key:
+                        if state_dict[key].shape != current_state[key].shape:
+                            esm_combiner_mismatches.append(
+                                f"{key}: ckpt{state_dict[key].shape} vs current{current_state[key].shape}"
+                            )
+
+                if esm_combiner_mismatches:
+                    raise RuntimeError(
+                        f"Cannot load checkpoint: ESM combiner size mismatch detected.\n"
+                        f"The checkpoint was trained with a different ESM model size.\n"
+                        f"Mismatched parameters ({len(esm_combiner_mismatches)}):\n"
+                        + "\n".join(f"  - {m}" for m in esm_combiner_mismatches[:5])
+                        + (
+                            f"\n  ... and {len(esm_combiner_mismatches) - 5} more"
+                            if len(esm_combiner_mismatches) > 5
+                            else ""
+                        )
+                        + f"\n\nTo fix: Use the same ESM model as the checkpoint, or train from scratch."
+                    )
+
+            # Checkpoint looks compatible, set strict=False, and let ESM be loaded separately.
+            if not checkpoint_has_esm and esm_enabled:
                 self._log.info(
-                    f"Warm start: skipping {len(esm_missing)} frozen ESM keys "
-                    "(will be loaded from pretrained)"
+                    "Checkpoint has no ESM weights (expected), loading with strict=False"
                 )
                 strict = False
 
@@ -551,7 +590,7 @@ class FlowModule(LightningModule):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             self._log.info(
-                f"Step {self.global_step}: Cleared cache and ran garbage collection"
+                f"🗑️ Step {self.global_step}: Cleared cache and ran garbage collection"
             )
 
         return train_loss
