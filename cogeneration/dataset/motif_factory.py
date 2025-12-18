@@ -416,6 +416,71 @@ class MotifFactory:
 
         return diffuse_mask
 
+    def generate_single_scaffold_diffuse_mask(
+        self,
+        res_mask: torch.Tensor,
+        plddt_mask: torch.Tensor,
+        chain_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Generate a `diffuse_mask` with a single scaffold segment inside a single chain.
+        The scaffold is placed in the interior of the chain, leaving the ends as motifs.
+        """
+        num_res = res_mask.shape[0]
+
+        # Pick a random chain as boundaries
+        bound_start, bound_stop_exclusive, bound_length, _ = self._pick_chain_bounds(
+            res_mask=res_mask, plddt_mask=plddt_mask, chain_idx=chain_idx
+        )
+
+        # Determine scaffold length
+        scaffold_len_max = min(
+            self.cfg.max_motif_len + 1,
+            ceil(num_res * self.cfg.max_percent_motifs),
+            bound_length - 2 * self.cfg.min_padding,  # leave room for boundaries
+        )
+        scaffold_len_min = max(
+            self.cfg.min_motif_len,
+            min(
+                self.cfg.max_motif_len // 2,
+                floor(num_res * self.cfg.min_percent_motifs),
+            ),
+        )
+        if scaffold_len_max <= scaffold_len_min:
+            scaffold_len_min = max(1, scaffold_len_max - 1)
+
+        scaffold_length = self.rng.integers(
+            low=scaffold_len_min,
+            high=scaffold_len_max,
+        )
+
+        # Determine scaffold start position
+        scaffold_start_min = bound_start + self.cfg.min_padding
+        scaffold_start_max = (
+            bound_stop_exclusive - scaffold_length - self.cfg.min_padding
+        )
+
+        if scaffold_start_max <= scaffold_start_min:
+            # Can't fit scaffold with padding on both sides, place with minimal padding
+            scaffold_start = scaffold_start_min
+            scaffold_length = min(
+                scaffold_length,
+                bound_stop_exclusive - scaffold_start - self.cfg.min_padding,
+            )
+        else:
+            scaffold_start = self.rng.integers(
+                low=scaffold_start_min,
+                high=scaffold_start_max + 1,
+            )
+
+        scaffold_end = scaffold_start + scaffold_length
+
+        # Create diffuse mask: scaffold=1, motifs (boundaries)=0
+        diffuse_mask = torch.zeros(num_res, dtype=torch.float32)
+        diffuse_mask[scaffold_start:scaffold_end] = 1.0
+
+        return diffuse_mask
+
     def generate_multiple_motif_diffuse_mask(
         self,
         res_mask: torch.Tensor,
@@ -712,6 +777,12 @@ class MotifFactory:
         """
         if strategy == DatasetInpaintingMotifStrategy.single_motif:
             return self.generate_single_motif_diffuse_mask(
+                res_mask=res_mask,
+                plddt_mask=plddt_mask,
+                chain_idx=chain_idx,
+            )
+        elif strategy == DatasetInpaintingMotifStrategy.single_scaffold:
+            return self.generate_single_scaffold_diffuse_mask(
                 res_mask=res_mask,
                 plddt_mask=plddt_mask,
                 chain_idx=chain_idx,

@@ -96,6 +96,47 @@ class TestMotifFactory:
         expected_ones = set(range(N)) - set(zeros.tolist())
         assert set(ones.tolist()) == expected_ones
 
+    def test_generate_single_scaffold_diffuse_mask(self):
+        # There should be exactly one contiguous scaffold of length 5
+        cfg = DatasetInpaintingConfig(
+            min_motif_len=5,
+            max_motif_len=5,
+            min_percent_motifs=0.0,
+            max_percent_motifs=1.0,
+            min_padding=2,
+        )
+
+        rng = default_rng(0)
+        factory = MotifFactory(cfg=cfg, rng=rng)
+
+        N = 20
+        res_mask = torch.ones(N, dtype=torch.float32)
+        plddt_mask = torch.ones(N, dtype=torch.float32)
+        chain_idx = torch.zeros(N, dtype=torch.float32)
+        mask = factory.generate_single_scaffold_diffuse_mask(
+            res_mask=res_mask,
+            plddt_mask=plddt_mask,
+            chain_idx=chain_idx,
+        )
+        assert isinstance(mask, torch.Tensor)
+        assert mask.shape == (N,)
+        assert mask.dtype == torch.float32
+
+        # Identify scaffold region (ones)
+        mask_arr = mask.numpy()
+        ones = np.where(mask_arr == 1)[0]
+        assert ones.size == 5
+        assert ones[-1] - ones[0] + 1 == ones.size
+
+        # Ensure scaffold is not at the very start or end (padding)
+        assert ones[0] >= cfg.min_padding
+        assert ones[-1] < N - cfg.min_padding
+
+        # Ensure all other positions are motifs (zeros)
+        zeros = np.where(mask_arr == 0)[0]
+        expected_zeros = set(range(N)) - set(ones.tolist())
+        assert set(zeros.tolist()) == expected_zeros
+
     def test_generate_segments_from_diffuse_mask_fixed_scale(self):
         """
         Test that generate_segments_from_diffuse_mask produces correct segments

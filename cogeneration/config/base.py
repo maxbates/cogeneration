@@ -1146,6 +1146,8 @@ class DatasetInpaintingMotifStrategy(StrEnum):
 
     # single motif
     single_motif = "single_motif"
+    # single scaffold inside a chain
+    single_scaffold = "single_scaffold"
     # [min_num_motifs, max_num_motifs], skewed toward fewer
     variable_motifs = "variable_motifs"
     # sample 1 res position, sample N, mask closest N neighbors
