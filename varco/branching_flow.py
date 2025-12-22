@@ -4,7 +4,7 @@ Simple implementation of branching flows.
 Sample some proteins of length N (translations, later sequence and rotations) using LengthBatched protein dataset
 Sample a motif_mask (only support internal motif scaffolding for now so always have "real" parent)
 Define a tree, which inserts scaffold residues over trajectory with anchors at intermediate time points, and alignment of length A
-Sample some number of roots, starting points X0 for the motifs + roots
+Sample some number of roots, starting points at t=0 for the motifs + roots
 
 Sample some intermediate time t
 Corrupt to X_t, using brownian bridge from 0 to each anchor, continuing up to time t
@@ -13,22 +13,18 @@ A simple model predicts base (endpoint prediction), split (remaining children co
 Losses are base (MSE), split (poisson-like), and deletion (BCE)
 
 Then, a sampler (no tree) iterates to get base (endpoint prediction), sample split events, sample deletion events
-Evaluation: MMD between X1 and the sampled points, and compare size distribution
 
 TODOs / features:
-- Cleaner motif defining
-  - improve base distribution, i.e. a protein with motifs
-  - pass through res_mask and chain_idx
-  - use multiple motif scaffolding strategies
-  - move to unconditional dataset, use MotifFactory here to get motifs/scaffolds so easier to seed scaffolds
 - support sequence with an protein insertion logits (and sequence logits)
   - also predict insertion logits, which are sampled on insertions, rather than cloning the existing residue
+- support a mini frozen ESM model up front (once we have sequence)
+  - requires handling padding correctly, since inputs no longer same length
+- make sure we handle positional embedding correctly (i.e. ~ arange on current sequence, but handle chain_idx)
 - improve sampling
   - motif guidance for positions
-  - add validation loss (e.g. folding validation?) and validation_step (and data loader that includes scaffold nuclei)
-- support a mini frozen ESM model up front (once we have sequence)
-- make sure we handle positional embedding correctly (i.e. ~ arange on current sequence, but handle chain_idx)
+  - add validation loss (e.g. folding validation?)
 - support rotations with an IGSO(3) bridge
+- Ensure we support all motif strategies
 - use a Config
 - simplify tree plan and coupling
   - maintain ~rough order in alignment space of final ordering (i.e. anchors mixed in with leaves)
@@ -37,6 +33,7 @@ TODOs / features:
   - speed up corruption
 """
 
+import datetime
 import gc
 import math
 import os
@@ -74,7 +71,7 @@ from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.embed import PositionalEmbeddingMethod
 from cogeneration.type.task import DataTask
 
-""" Tree Plan """
+""" Data Flow """
 
 # B = batch size
 # N = sampled positions in data (t=1)
@@ -98,6 +95,86 @@ from cogeneration.type.task import DataTask
 # Data flow (sampling):
 # DataCorrupted - packed (B, P_max) state, mutated in-place with insert/delete
 # SampleTrajectory - list of DataCorrupted snapshots and ModelPrediction per step
+
+
+""" Tensor Utilities """
+
+
+def gather_and_pad(
+    source: torch.Tensor,  # (B, N, ...)
+    index: torch.Tensor,  # (B, P)
+    mask: torch.Tensor,  # (B, P)
+    fill_value: float = 0.0,
+) -> torch.Tensor:  # (B, P, ...)
+    """
+    Gather from source along dim=1 using index, then fill padding positions with fill_value.
+
+    Handles arbitrary trailing dimensions by expanding index and mask.
+    For positions where mask is False, the result is set to fill_value.
+
+    Args:
+        source: (B, N, ...) tensor to gather from
+        index: (B, P) indices into dim=1 of source (must be in [0, N-1])
+        mask: (B, P) boolean mask; True for valid positions, False for padding
+        fill_value: value to fill where mask is False
+
+    Returns:
+        (B, P, ...) tensor with gathered values where mask is True, fill_value otherwise
+    """
+    trailing_shape = source.shape[2:]
+    idx = index
+    for _ in trailing_shape:
+        idx = idx.unsqueeze(-1)
+    idx = idx.expand(-1, -1, *trailing_shape)  # (B, P, ...)
+
+    gathered = source.gather(1, idx)  # (B, P, ...)
+
+    if not trailing_shape:
+        fill = torch.full_like(gathered, fill_value)
+        return torch.where(mask, gathered, fill)
+    else:
+        m = mask
+        for _ in trailing_shape:
+            m = m.unsqueeze(-1)
+        m = m.expand_as(gathered)
+        fill = torch.full_like(gathered, fill_value)
+        return torch.where(m, gathered, fill)
+
+
+def pad_and_stack(
+    tensors: List[torch.Tensor],  # (B, P, ...)
+    max_len: int,
+    fill_value: float = 0.0,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:  # (B, P_max, ...)
+    """
+    Pad a list of 1D or 2D tensors to max_len and stack into a batch.
+
+    Args:
+        tensors: list of (P, ...) tensors with varying P
+        max_len: target length to pad to
+        fill_value: value to fill padding positions
+        dtype: output dtype (defaults to first tensor's dtype)
+
+    Returns:
+        (B, P_max, ...) tensor
+    """
+    B = len(tensors)
+    if B == 0:
+        raise ValueError("Empty tensor list")
+
+    first = tensors[0]
+    dtype = dtype or first.dtype
+    trailing_shape = first.shape[1:]  # () for 1D, (D,) for 2D
+
+    out = torch.full((B, max_len, *trailing_shape), fill_value, dtype=dtype)
+    for b, t in enumerate(tensors):
+        L = t.shape[0]
+        out[b, :L] = t.to(dtype)
+    return out
+
+
+""" Tree Plan """
 
 
 @dataclass
@@ -137,7 +214,7 @@ class TreePlan:
         # Coalesce within each group by repeated adjacent merges.
         # For scaffold span groups (gid < span_gid), bias merges toward the boundaries so the
         # coalescent "collapses" inwards from both ends (both boundaries can in-fill).
-        p_interior: float = 0.95,
+        p_interior: float = 0.98,
         # Number of deletion leaves are sampled from a Poisson distribution with rate p_deletion * # scaffold positions.
         p_deletion: float = 0.20,
     ) -> "TreePlan":
@@ -877,29 +954,9 @@ class BatchedTreePlan:
             raise ValueError(
                 f"Expected x to have at least 2 dims (B, N, ...); got {x.shape}"
             )
-
-        device = x.device
-        B, N = x.shape[:2]
-        trailing_shape = x.shape[2:]
-        A = self.leaf_map.shape[1]
-
-        # Expand leaf_map indices for arbitrary trailing dims
-        idx = self.leaf_map.to(device=device).clamp_min(0)  # (B, A)
-        for _ in trailing_shape:
-            idx = idx.unsqueeze(-1)
-        idx = idx.expand(B, A, *trailing_shape)  # (B, A, ...)
-
-        # Gather from data space to tree space
-        x_broadcast = x.gather(1, idx)  # (B, A, ...)
-
-        # Mask: only keep leaf values, fill non-leaves with fill_value
-        mask = self.leaf_mask.to(device=device)  # (B, A)
-        for _ in trailing_shape:
-            mask = mask.unsqueeze(-1)
-        mask = mask.expand_as(x_broadcast)  # (B, A, ...)
-
-        fill = torch.full_like(x_broadcast, fill_value)
-        return torch.where(mask, x_broadcast, fill)
+        leaf_idx = self.leaf_map.to(device=x.device).clamp_min(0)  # (B, A)
+        leaf_mask = self.leaf_mask.to(device=x.device)  # (B, A)
+        return gather_and_pad(x, leaf_idx, mask=leaf_mask, fill_value=fill_value)
 
     @classmethod
     def collate(cls, plans: List["TreePlan"]) -> "BatchedTreePlan":
@@ -910,80 +967,86 @@ class BatchedTreePlan:
         A_max = max(int(p.num_nodes) for p in plans)
         R_max = max(int(p.roots.numel()) for p in plans)
 
-        # topology
-        topo_order = torch.zeros((B, A_max), dtype=torch.long)
-        motif_mask = torch.zeros((B, A_max), dtype=torch.bool)
-        roots = torch.full((B, R_max), -1, dtype=torch.long)
-        roots_mask = torch.zeros((B, R_max), dtype=torch.bool)
-        parent_idx = torch.full((B, A_max), -1, dtype=torch.long)
-        children_idx = torch.full((B, A_max, 2), -1, dtype=torch.long)
-        total_leaves = torch.zeros((B, A_max), dtype=torch.long)
-        leaf_deleted = torch.zeros((B, A_max), dtype=torch.bool)
-
-        # times
-        birth_time = torch.full((B, A_max), float("inf"), dtype=torch.float32)
-        split_time = torch.full((B, A_max), float("inf"), dtype=torch.float32)
-        delete_time = torch.full((B, A_max), float("inf"), dtype=torch.float32)
-
-        # tree -> data mapping
-        leaf_map = torch.zeros((B, A_max), dtype=torch.long)
-
-        for b, p in enumerate(plans):
-            A_i = int(p.num_nodes)
-            R_i = int(p.roots.numel())
-
-            # topology
-            topo_order[b, :A_i] = p.topo_order.to(torch.long)
-            if A_i < A_max:
-                topo_order[b, A_i:] = torch.arange(A_i, A_max, dtype=torch.long)
-            motif_mask[b, :A_i] = p.motif_mask.to(torch.bool)
-            roots[b, :R_i] = p.roots.to(torch.long)
-            roots_mask[b, :R_i] = True
-            parent_idx[b, :A_i] = p.parent_idx.to(torch.long)
-            children_idx[b, :A_i, :] = p.children_idx.to(torch.long)
-            total_leaves[b, :A_i] = p.total_leaves.to(torch.long)
-            leaf_deleted[b, :A_i] = p.leaf_deleted.to(torch.bool)
-
-            # times
-            birth_time[b, :A_i] = p.birth_time.to(torch.float32)
-            split_time[b, :A_i] = p.split_time.to(torch.float32)
-            delete_time[b, :A_i] = p.delete_time.to(torch.float32)
-
-            # tree -> data mapping
-            leaf_map[b, :A_i] = p.leaf_map.to(torch.long)
+        # roots_mask derived from per-sample root lengths
+        roots_mask = (
+            torch.arange(R_max)[None, :]
+            < torch.tensor([p.roots.numel() for p in plans])[:, None]
+        )
 
         return cls(
-            topo_order=topo_order,
-            motif_mask=motif_mask,
-            roots=roots,
+            # pad topo_order with -1 so accidental use raises an error
+            topo_order=pad_and_stack(
+                [p.topo_order for p in plans], A_max, fill_value=-1, dtype=torch.long
+            ),
+            motif_mask=pad_and_stack(
+                [p.motif_mask for p in plans], A_max, fill_value=0, dtype=torch.bool
+            ),
+            roots=pad_and_stack(
+                [p.roots for p in plans], R_max, fill_value=-1, dtype=torch.long
+            ),
             roots_mask=roots_mask,
-            parent_idx=parent_idx,
-            children_idx=children_idx,
-            total_leaves=total_leaves,
-            leaf_deleted=leaf_deleted,
-            birth_time=birth_time,
-            split_time=split_time,
-            delete_time=delete_time,
-            leaf_map=leaf_map,
+            parent_idx=pad_and_stack(
+                [p.parent_idx for p in plans], A_max, fill_value=-1, dtype=torch.long
+            ),
+            children_idx=pad_and_stack(
+                [p.children_idx for p in plans], A_max, fill_value=-1, dtype=torch.long
+            ),
+            total_leaves=pad_and_stack(
+                [p.total_leaves for p in plans], A_max, fill_value=0, dtype=torch.long
+            ),
+            leaf_deleted=pad_and_stack(
+                [p.leaf_deleted for p in plans], A_max, fill_value=0, dtype=torch.bool
+            ),
+            birth_time=pad_and_stack(
+                [p.birth_time for p in plans],
+                A_max,
+                fill_value=float("inf"),
+                dtype=torch.float32,
+            ),
+            split_time=pad_and_stack(
+                [p.split_time for p in plans],
+                A_max,
+                fill_value=float("inf"),
+                dtype=torch.float32,
+            ),
+            delete_time=pad_and_stack(
+                [p.delete_time for p in plans],
+                A_max,
+                fill_value=float("inf"),
+                dtype=torch.float32,
+            ),
+            leaf_map=pad_and_stack(
+                [p.leaf_map for p in plans], A_max, fill_value=0, dtype=torch.long
+            ),
         )
+
+
+""" Data / Batch structs """
 
 
 @dataclass
 class DataSample:
     """Per-sample data (length N) at time t=1."""
 
-    trans_1: torch.Tensor  # (N, 3)
-    motif_mask: torch.Tensor  # (N,) bool
     tree_plan: TreePlan
+    motif_mask: torch.Tensor  # (N,) bool
+    res_mask: torch.Tensor  # (N,) int
+    chain_idx: torch.Tensor  # (N,) int
+    trans_1: torch.Tensor  # (N, 3)
 
 
 @dataclass
 class DataBatch:
-    """Batched data for training."""
+    """
+    Batched data for training.
+    Use LengthBatcher, so all data samples have the same length N (no padding).
+    """
 
-    trans_1: torch.Tensor  # (B, N, 3)
-    motif_mask: torch.Tensor  # (B, N) bool
     tree: BatchedTreePlan
+    motif_mask: torch.Tensor  # (B, N) bool
+    res_mask: torch.Tensor  # (B, N) int
+    chain_idx: torch.Tensor  # (B, N) int
+    trans_1: torch.Tensor  # (B, N, 3)
 
 
 @dataclass
@@ -991,9 +1054,11 @@ class DataCorrupted:
     """Model input: corrupted and packed (length P_max) points present at time t"""
 
     t: torch.Tensor  # (B,)
-    trans_t: torch.Tensor  # (B, P_max, 3)
-    birth_time: torch.Tensor  # (B, P_max) 0.0 for motifs & roots, +inf for padding
     motif_mask: torch.Tensor  # (B, P_max) bool; True for fixed motif positions
+    birth_time: torch.Tensor  # (B, P_max) 0.0 for motifs & roots, +inf for padding
+    res_mask: torch.Tensor  # (B, P_max) int
+    chain_idx: torch.Tensor  # (B, P_max) int
+    trans_t: torch.Tensor  # (B, P_max, 3)
     remaining_insertions: Optional[torch.Tensor] = (
         None  # (B, P_max) supervised target, remaining splits per present token
     )
@@ -1015,9 +1080,11 @@ class DataCorrupted:
         """Detach and clone the data, e.g. to save in trajectory"""
         return DataCorrupted(
             t=self.t.detach().clone(),
-            trans_t=self.trans_t.detach().clone(),
-            birth_time=self.birth_time.detach().clone(),
             motif_mask=self.motif_mask.detach().clone(),
+            birth_time=self.birth_time.detach().clone(),
+            res_mask=self.res_mask.detach().clone(),
+            chain_idx=self.chain_idx.detach().clone(),
+            trans_t=self.trans_t.detach().clone(),
             remaining_insertions=(
                 self.remaining_insertions.detach().clone()
                 if self.remaining_insertions is not None
@@ -1065,10 +1132,10 @@ class DataCorrupted:
         P_new = int(out_lens.max().item())
 
         # Vectorized building of gather indices using cumsum + searchsorted
-        cumsum = multiplicity.cumsum(dim=1)  # (B, P)
+        cumsum = multiplicity.cumsum(dim=1).contiguous()  # (B, P)
         out_pos = (
             torch.arange(P_new, device=device).unsqueeze(0).expand(B, -1)
-        )  # (B, P_new)
+        ).contiguous()  # (B, P_new)
         # For each out_pos, find source index
         gather_idx = torch.searchsorted(cumsum, out_pos, right=True)  # (B, P_new)
         gather_idx = gather_idx.clamp(0, P - 1)
@@ -1081,27 +1148,12 @@ class DataCorrupted:
         new_valid = out_pos < out_lens.unsqueeze(1)
         is_insertion = is_insertion & new_valid
 
-        # TODO - consider padding helper as add domains
-
         # Update birth_time for inserted positions to current time t, set padding to inf
-        new_birth = torch.gather(self.birth_time, 1, gather_idx)
+        new_birth = gather_and_pad(
+            self.birth_time, gather_idx, new_valid, fill_value=float("inf")
+        )
         new_birth = torch.where(
             is_insertion, torch.full_like(new_birth, t_birth), new_birth
-        )
-        new_birth = torch.where(
-            new_valid, new_birth, torch.full_like(new_birth, float("inf"))
-        )
-
-        # inserted children inherit parent's motif status (don't expect indels in motifs)
-        new_motif = torch.gather(self.motif_mask, 1, gather_idx)
-        new_motif = torch.where(new_valid, new_motif, torch.zeros_like(new_motif))
-
-        # translations, zero-padded
-        new_trans = torch.gather(
-            self.trans_t, 1, gather_idx.unsqueeze(-1).expand(-1, -1, 3)
-        )
-        new_trans = torch.where(
-            new_valid.unsqueeze(-1), new_trans, torch.zeros_like(new_trans)
         )
 
         # Skip mapping optional supervised fields, make sure not defined (not used while sampling)
@@ -1110,13 +1162,18 @@ class DataCorrupted:
 
         new_batch = DataCorrupted(
             t=self.t.clone(),
-            trans_t=new_trans,
+            motif_mask=gather_and_pad(
+                self.motif_mask, gather_idx, new_valid, fill_value=0
+            ),
             birth_time=new_birth,
-            motif_mask=new_motif,
+            res_mask=gather_and_pad(self.res_mask, gather_idx, new_valid, fill_value=0),
+            chain_idx=gather_and_pad(
+                self.chain_idx, gather_idx, new_valid, fill_value=0
+            ),
+            trans_t=gather_and_pad(self.trans_t, gather_idx, new_valid, fill_value=0.0),
         )
 
-        insertion_mask = is_insertion & new_valid
-        return new_batch, insertion_mask
+        return new_batch, is_insertion
 
 
 @dataclass
@@ -1124,10 +1181,12 @@ class DataBridged:
     """Corrupted and aligned (length A) points at time t"""
 
     t: torch.Tensor  # (B,)
-    trans_t: torch.Tensor  # (B, A, 3)
-    birth_time: torch.Tensor  # (B, A) 0.0 for roots
     present_mask: torch.Tensor  # (B, A)
     motif_mask: torch.Tensor  # (B, A) bool
+    birth_time: torch.Tensor  # (B, A) 0.0 for roots
+    res_mask: torch.Tensor  # (B, A)
+    chain_idx: torch.Tensor  # (B, A)
+    trans_t: torch.Tensor  # (B, A, 3)
     # supervision
     remaining_insertions: torch.Tensor  # (B, A) target count per aligned node
     deleted: torch.Tensor  # (B, A) bool, aligned deletion label (leaf only)
@@ -1172,48 +1231,23 @@ class DataBridged:
 
     def pack_present(self) -> DataCorrupted:
         """Pack aligned (A) state into present (P_max) state for model input."""
-        B, A, D = self.trans_t.shape
         idx_pack, pack_mask, P_b, P_max = self._pack_indices()
-
-        trans_t_pack = self.trans_t.gather(
-            1, idx_pack.unsqueeze(-1).expand(-1, -1, D)
-        )  # (B, P_max, D)
-        birth_time_pack = self.birth_time.gather(1, idx_pack)  # (B, P_max)
-        motif_mask_pack = self.motif_mask.gather(1, idx_pack)  # (B, P_max)
-        remaining_insertions_pack = self.remaining_insertions.gather(
-            1, idx_pack
-        )  # (B, P_max)
-        deleted_pack = self.deleted.gather(1, idx_pack)  # (B, P_max)
-
-        trans_t_pack = trans_t_pack * pack_mask.unsqueeze(-1).float()  # zero pad
-        birth_time_pack = torch.where(
-            pack_mask,
-            birth_time_pack,
-            torch.full_like(
-                birth_time_pack, float("inf")
-            ),  # infinite birth time for pad tokens
-        )
-        motif_mask_pack = torch.where(
-            pack_mask, motif_mask_pack, torch.zeros_like(motif_mask_pack)
-        )
-        remaining_insertions_pack = torch.where(
-            pack_mask,
-            remaining_insertions_pack,
-            torch.zeros_like(remaining_insertions_pack),  # 0 pad
-        )
-        deleted_pack = torch.where(
-            pack_mask,
-            deleted_pack,
-            torch.zeros_like(deleted_pack),
-        )
 
         return DataCorrupted(
             t=self.t,
-            trans_t=trans_t_pack,
-            birth_time=birth_time_pack,
-            motif_mask=motif_mask_pack,
-            remaining_insertions=remaining_insertions_pack,
-            deleted=deleted_pack,
+            motif_mask=gather_and_pad(
+                self.motif_mask, idx_pack, pack_mask, fill_value=0
+            ),
+            birth_time=gather_and_pad(
+                self.birth_time, idx_pack, pack_mask, fill_value=float("inf")
+            ),
+            res_mask=gather_and_pad(self.res_mask, idx_pack, pack_mask, fill_value=0),
+            chain_idx=gather_and_pad(self.chain_idx, idx_pack, pack_mask, fill_value=0),
+            trans_t=gather_and_pad(self.trans_t, idx_pack, pack_mask, fill_value=0.0),
+            remaining_insertions=gather_and_pad(
+                self.remaining_insertions, idx_pack, pack_mask, fill_value=0
+            ),
+            deleted=gather_and_pad(self.deleted, idx_pack, pack_mask, fill_value=0),
         )
 
     def validate(self) -> None:
@@ -1254,13 +1288,20 @@ class ModelPrediction:
 
 
 @dataclass
-class SampleTrajectory:
-    samples: List[DataCorrupted] = field(
-        default_factory=list
-    )  # samples at each time step
-    pred: List[ModelPrediction] = field(
-        default_factory=list
-    )  # predictions at each time step
+class Trajectory:
+    """
+    Base trajectory class storing samples at each timestep.
+    Samples should be detached and cloned before saving to trajectory.
+    """
+
+    samples: List[DataCorrupted] = field(default_factory=list)
+
+
+@dataclass
+class SampleTrajectory(Trajectory):
+    """Trajectory from sampling, includes model predictions."""
+
+    pred: List[ModelPrediction] = field(default_factory=list)
 
 
 """ Protein Dataset + DataLoader """
@@ -1285,14 +1326,15 @@ class ProteinDataset(BaseDataset):
                 max_num_res=256,
                 num_chains=[1, 2],
             ),
-            # Always bridge a scaffold inside a single chain
+            # Support all motif strategies
             inpainting=DatasetInpaintingConfig(
-                strategy=DatasetInpaintingMotifStrategy.single_scaffold,
+                strategy=DatasetInpaintingMotifStrategy.ALL,
             ),
             # override interpolated props
             max_eval_length=256,
             seed=0,
         )
+
         super().__init__(
             cfg=dataset_cfg,
             task=DataTask.inpainting,
@@ -1303,16 +1345,22 @@ class ProteinDataset(BaseDataset):
     def __getitem__(self, idx) -> DataSample:
         feats = super().__getitem__(idx)
 
+        motif_mask = feats[bp.motif_mask].bool()
+        res_mask = feats[bp.res_mask].int()
+        chain_idx = feats[bp.chain_idx].int()
+
+        # domains
         trans_1 = feats[bp.trans_1]
-        motif_mask = feats[bp.motif_mask]
 
         tree_plan = TreePlan.generate(motif_mask=motif_mask)
         tree_plan.validate()
 
         return DataSample(
-            trans_1=trans_1,
-            motif_mask=motif_mask,
             tree_plan=tree_plan,
+            motif_mask=motif_mask,
+            res_mask=res_mask,
+            chain_idx=chain_idx,
+            trans_1=trans_1,
         )
 
 
@@ -1337,16 +1385,21 @@ class ProteinDataLoader(DataLoader):
 
     @staticmethod
     def collate_fn(batch: List[DataSample]) -> DataBatch:
-        trans_1 = torch.stack([item.trans_1 for item in batch])  # (B, N, 3)
-        motif_mask = torch.stack([item.motif_mask for item in batch])  # (B, N)
-
+        # Special handling for tree collation
         plans = [item.tree_plan for item in batch]
         tree = BatchedTreePlan.collate(plans)
 
+        motif_mask = torch.stack([item.motif_mask for item in batch])  # (B, N)
+        res_mask = torch.stack([item.res_mask for item in batch])  # (B, N)
+        chain_idx = torch.stack([item.chain_idx for item in batch])  # (B, N)
+        trans_1 = torch.stack([item.trans_1 for item in batch])  # (B, N, 3)
+
         return DataBatch(
-            trans_1=trans_1,
-            motif_mask=motif_mask,
             tree=tree,
+            motif_mask=motif_mask,
+            res_mask=res_mask,
+            chain_idx=chain_idx,
+            trans_1=trans_1,
         )
 
 
@@ -1392,8 +1445,8 @@ class BranchFlowModel(nn.Module):
         self.point_dim = 3
         self.pos_embed_dim = 32
 
-        # x_t (point_dim), t (1), birth_time (1), motif_mask (1), pos_embed
-        self.input_dim = self.point_dim + 1 + 1 + 1 + self.pos_embed_dim
+        # x_t (point_dim), t (1), birth_time (1), motif_mask (1), chain_idx (1), pos_embed
+        self.input_dim = self.point_dim + 1 + 1 + 1 + 1 + self.pos_embed_dim
         self.model_dim = 64
 
         self.input_proj = nn.Linear(self.input_dim, self.model_dim)
@@ -1404,7 +1457,7 @@ class BranchFlowModel(nn.Module):
             batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
-        self.x1_pred = nn.Linear(self.model_dim, self.point_dim)
+        self.trans_pred = nn.Linear(self.model_dim, self.point_dim)
         self.split_rate_pred = nn.Linear(self.model_dim, 1)
         self.split_pooled_log1p_rate_pred = nn.Linear(self.model_dim, 1)
         self.del_logits_pred = nn.Linear(self.model_dim, 1)
@@ -1416,6 +1469,7 @@ class BranchFlowModel(nn.Module):
         # attention mask to mask out positions not alive yet / padded
         key_padding_mask = ~valid
 
+        # TODO - respect chain_idx to get positions (i.e. instead of just arange)
         pos_embed = get_index_embedding(
             torch.arange(P, device=batch.trans_t.device).unsqueeze(0).expand(B, -1),
             embed_size=self.pos_embed_dim,
@@ -1432,6 +1486,7 @@ class BranchFlowModel(nn.Module):
                 .float()
                 .clamp(0.0, 1.0),  # (B, P, 1) clamp +inf padding to 1.0
                 batch.motif_mask[:, :, None].float(),  # (B, P, 1)
+                batch.chain_idx[:, :, None].int(),  # (B, P, 1)
                 pos_embed,  # (B, P, pos_embed_dim)
             ],
             dim=-1,
@@ -1440,7 +1495,8 @@ class BranchFlowModel(nn.Module):
         x_t = self.input_proj(x_t)
         x_t = self.transformer(x_t, src_key_padding_mask=key_padding_mask)
 
-        x1_pred = self.x1_pred(x_t)
+        # Predict translations
+        pred_trans_1 = self.trans_pred(x_t)
 
         # Predict nonnegative remaining-splits rates (Poisson-like regression)
         split_rate = F.softplus(self.split_rate_pred(x_t)).squeeze(-1)  # (B, P)
@@ -1456,7 +1512,7 @@ class BranchFlowModel(nn.Module):
         )  # (B,)
 
         return ModelPrediction(
-            pred_trans_1=x1_pred,
+            pred_trans_1=pred_trans_1,
             pred_split_rate=split_rate,
             pred_split_pooled_log1p_rate=split_pooled_log1p_rate,
             pred_del_logits=del_logits,
@@ -1496,9 +1552,9 @@ class Coupler(ABC, Generic[CouplingT]):
     @abstractmethod
     def corrupt(
         self,
-        x1: torch.Tensor,
         tree: BatchedTreePlan,
         t: torch.Tensor,
+        x1: torch.Tensor,
         x0: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, CouplingT]:
         raise NotImplementedError
@@ -1541,26 +1597,26 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
         )
 
     def build_anchor_alignment(
-        self, x1: torch.Tensor, tree: BatchedTreePlan  # (B, N, 3)
+        self, trans_1: torch.Tensor, tree: BatchedTreePlan
     ) -> torch.Tensor:
-        """Build translation anchors for all nodes (leaves + internal) from leaf endpoints x1.
+        """Build translation anchors for all nodes (leaves + internal) from leaf endpoints trans at t=1.
 
         Assumptions for this toy:
         - Leaf endpoints are broadcast into leaf slots using tree.leaf_map.
         - Internal nodes ("anchors") are derived purely from topology + descendant weights.
         """
-        if x1.ndim != 3 or x1.shape[-1] != 3:
+        if trans_1.ndim != 3 or trans_1.shape[-1] != 3:
             raise ValueError(
-                f"Expected x1 to have shape (B, N, 3); got {tuple(x1.shape)}"
+                f"Expected trans_1 to have shape (B, N, 3); got {tuple(trans_1.shape)}"
             )
 
-        device = x1.device
-        B, N, _ = x1.shape
+        device = trans_1.device
+        B, N, _ = trans_1.shape
         A = tree.parent_idx.shape[1]
 
-        # Broadcast x1 endpoints into leaf slots, zeros for internal nodes
+        # Broadcast trans@1 endpoints into leaf slots, zeros for internal nodes
         anchor = tree.broadcast_to_leaves(
-            x1.to(torch.float32), fill_value=0.0
+            trans_1.to(torch.float32), fill_value=0.0
         )  # (B, A, 3)
 
         # Build internal anchors bottom-up (children -> parent).
@@ -1619,9 +1675,9 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
 
     def corrupt(
         self,
-        x1: torch.Tensor,  # (B, N, 3)
         tree: BatchedTreePlan,
         t: torch.Tensor,  # (B,)
+        x1: torch.Tensor,  # (B, N, 3)
         x0: Optional[torch.Tensor] = None,  # (B, R_max, 3)
     ) -> Tuple[torch.Tensor, TranslationCoupling]:
         """Corrupt translations to time t using the shared tree plan.
@@ -1630,14 +1686,16 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
             trans_t_aligned: (B, A, 3)
             coupling: minimal coupling info for losses (anchors + tree)
         """
-        if x1.ndim != 3 or x1.shape[-1] != 3:
+        trans_1 = x1
+        if trans_1.ndim != 3 or trans_1.shape[-1] != 3:
             raise ValueError(
-                f"Expected x1 to have shape (B, N, 3); got {tuple(x1.shape)}"
+                f"Expected trans_1 to have shape (B, N, 3); got {tuple(trans_1.shape)}"
             )
 
-        device = x1.device
-        B, N, _ = x1.shape
+        device = trans_1.device
+        B, N, _ = trans_1.shape
         A = int(tree.parent_idx.shape[1])
+        trans_0 = x0
 
         # Determine how many roots are used per example in this batch
         R_max = int(tree.roots_mask.sum(dim=1).max().item())
@@ -1645,52 +1703,59 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
             raise ValueError("No roots in tree plan")
 
         # Sample / validate base roots
-        if x0 is None:
-            x0 = self.sample_base(num_batch=B, num_roots=R_max, device=device)
-        if x0.ndim != 3 or x0.shape[0] != B or x0.shape[-1] != 3:
+        if trans_0 is None:
+            trans_0 = self.sample_base(num_batch=B, num_roots=R_max, device=device)
+        if trans_0.ndim != 3 or trans_0.shape[0] != B or trans_0.shape[-1] != 3:
             raise ValueError(
-                f"Expected x0 to have shape (B, R, 3); got {tuple(x0.shape)}"
+                f"Expected x0 to have shape (B, R, 3); got {tuple(trans_0.shape)}"
             )
 
-        # Build x0_aligned by broadcasting first root and then writing per-example roots into tree root slots
+        # Build trans_0_aligned by broadcasting first root and then writing per-example roots into tree root slots
         # TODO - consider zero array init instead of clone
-        x0_aligned = x0[:, :1, :].expand(B, A, 3).contiguous().clone()
+        trans_0_aligned = trans_0[:, :1, :].expand(B, A, 3).contiguous().clone()
         for b in range(B):
             roots_i = tree.roots[b][tree.roots_mask[b]].to(torch.long)
             for j, r in enumerate(roots_i.tolist()):
-                if j >= x0.shape[1]:
+                if j >= trans_0.shape[1]:
                     break
-                x0_aligned[b, r, :] = x0[b, j, :]
+                trans_0_aligned[b, r, :] = trans_0[b, j, :]
 
         # Build domain anchors (leaf endpoints + internal merges)
-        anchor_aligned = self.build_anchor_alignment(x1=x1, tree=tree)
+        anchor_aligned = self.build_anchor_alignment(trans_1=trans_1, tree=tree)
 
         # Save the coupling for losses
         coupling = TranslationCoupling(anchors=anchor_aligned, tree=tree)
 
         # Track creation states at each node's birth time (shared across siblings)
         creation_state = (
-            x0_aligned.to(dtype=torch.float32).clone().contiguous()
+            trans_0_aligned.to(dtype=torch.float32).clone().contiguous()
         )  # (B, A, 3)
 
         # Topological pass: sample each parent's state at split time once, then assign to both children
         for k in range(A):
             node_idx = tree.topo_order[:, k]  # (B,)
+            valid_node = node_idx >= 0  # topo_order padding = -1
+            node_idx_safe = node_idx.clamp(min=0)  # clamp for gather
 
-            t0 = tree.birth_time.gather(1, node_idx.unsqueeze(1)).squeeze(1)  # (B,)
-            st = tree.split_time.gather(1, node_idx.unsqueeze(1)).squeeze(1)  # (B,)
+            t0 = tree.birth_time.gather(1, node_idx_safe.unsqueeze(1)).squeeze(
+                1
+            )  # (B,)
+            st = tree.split_time.gather(1, node_idx_safe.unsqueeze(1)).squeeze(
+                1
+            )  # (B,)
 
             is_leaf = ~torch.isfinite(st)
-            if bool(is_leaf.all()):
+            should_skip = is_leaf | ~valid_node
+            if bool(should_skip.all()):
                 continue
 
             node_creation = creation_state.gather(
-                1, node_idx.view(B, 1, 1).expand(-1, 1, 3)
+                1, node_idx_safe.view(B, 1, 1).expand(-1, 1, 3)
             ).squeeze(
                 1
             )  # (B, 3)
             node_anchor = anchor_aligned.gather(
-                1, node_idx.view(B, 1, 1).expand(-1, 1, 3)
+                1, node_idx_safe.view(B, 1, 1).expand(-1, 1, 3)
             ).squeeze(
                 1
             )  # (B, 3)
@@ -1703,17 +1768,19 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
             )  # (B, 3)
 
             kids = (
-                tree.children_idx.gather(1, node_idx.view(B, 1, 1).expand(-1, 1, 2))
+                tree.children_idx.gather(
+                    1, node_idx_safe.view(B, 1, 1).expand(-1, 1, 2)
+                )
                 .to(torch.long)
                 .squeeze(1)
             )  # (B, 2)
 
-            bidx = torch.arange(B, device=device)
+            batch_idx = torch.arange(B, device=device)
             for j in range(2):
                 c = kids[:, j]
-                valid = (c >= 0) & (~is_leaf)
+                valid = (c >= 0) & ~should_skip
                 if bool(valid.any()):
-                    creation_state[bidx[valid], c[valid]] = node_at_split[valid]
+                    creation_state[batch_idx[valid], c[valid]] = node_at_split[valid]
 
         # Evaluate node states at time t (bridge from creation_state at birth_time to anchor at 1)
         t_mat = t.unsqueeze(1).expand(B, A)  # (B, A)
@@ -1741,9 +1808,10 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
         dt: float,
         birth_time: torch.Tensor,  # (B, P)
     ) -> torch.Tensor:
-        if x_t.shape != x1_pred.shape:
+        trans_pred = x1_pred
+        if x_t.shape != trans_pred.shape:
             raise ValueError(
-                f"x_t and x1_pred must match shape; got {tuple(x_t.shape)} vs {tuple(x1_pred.shape)}"
+                f"x_t and x1_pred must match shape; got {tuple(x_t.shape)} vs {tuple(trans_pred.shape)}"
             )
         if x_t.ndim != 3 or x_t.shape[-1] != 3:
             raise ValueError(
@@ -1758,7 +1826,7 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
         )  # (B, P, 1)
 
         denom = (1.0 - t).clamp_min(1e-4).view(B, 1, 1)
-        v = (x1_pred - x_t) / denom
+        v = (trans_pred - x_t) / denom
         x_next = x_t + v * float(dt)
 
         if (self.sigma is not None) and float(self.sigma) > 0.0 and float(dt) > 0.0:
@@ -1785,28 +1853,37 @@ class TreeInterpolant:
         self,
         batch: DataBatch,
         t: torch.Tensor,  # (B,)
-        x0: Optional[torch.Tensor] = None,
+        trans_0: Optional[torch.Tensor] = None,
     ) -> Tuple[DataBridged, TranslationCoupling]:
         tree = batch.tree.to(self.device)
         trans_1 = batch.trans_1.to(self.device)
         t = t.to(self.device)
-        if x0 is not None:
-            x0 = x0.to(self.device)
+        if trans_0 is not None:
+            trans_0 = trans_0.to(self.device)
+
+        res_mask = batch.tree.broadcast_to_leaves(
+            x=batch.res_mask.to(self.device), fill_value=0
+        )
+        chain_idx = batch.tree.broadcast_to_leaves(
+            x=batch.chain_idx.to(self.device), fill_value=0
+        )
 
         trans_t, trans_coupling = self.translation_coupler.corrupt(
-            x1=trans_1,
             tree=tree,
             t=t,
-            x0=x0,
+            x1=trans_1,
+            x0=trans_0,
         )
         trans_coupling.validate()
 
         bridged = DataBridged(
             t=t,
-            trans_t=trans_t,
-            birth_time=tree.birth_time,
             present_mask=tree.present_mask(t=t),
             motif_mask=tree.motif_mask,
+            birth_time=tree.birth_time,
+            res_mask=res_mask,
+            chain_idx=chain_idx,
+            trans_t=trans_t,
             remaining_insertions=tree.remaining_insertions_t(t=t),
             deleted=tree.leaf_deleted,
         )
@@ -1827,36 +1904,153 @@ class TreeInterpolant:
 
         return self.corrupt_to(batch=batch, t=t)
 
+    @staticmethod
+    def _sample_initial_positions(
+        motif_mask: torch.Tensor,  # (B, N)
+        min_scaffold_nuclei: int = 1,
+        max_scaffold_nuclei: int = 10,
+        seed: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Sample initial positions for branching flow sampling.
+
+        For each batch element:
+        - All motif positions (motif_mask == True) are included
+        - Each scaffold span (contiguous motif_mask == False) contributes K sampled roots,
+          where K is sampled uniformly from [min_scaffold_nuclei, min(max_scaffold_nuclei, span_len)]
+
+        Returns:
+            init_length: (B,) long - number of initial positions per batch element
+            motif_idx: (B, P_max) long - source index in original (N,) data for motif positions,
+                       -1 for scaffold root positions. Padding is implicit: positions >= init_length.
+        """
+        device = motif_mask.device
+        B, N = motif_mask.shape
+        motif_mask = motif_mask.bool()
+
+        rng = torch.Generator(device="cpu")
+        if seed is None:
+            seed = int(torch.seed() % (2**31 - 1))
+        rng.manual_seed(int(seed))
+
+        def rand_int(high: int) -> int:
+            return int(torch.randint(0, high, (1,), generator=rng).item())
+
+        # For each batch element, compute indices and whether they map to original data
+        # motif_idx_val >= 0 means motif (value is source index), -1 means scaffold root
+        init_indices_list: List[List[int]] = []
+
+        for b in range(B):
+            mask_b = motif_mask[b]  # (N,)
+            # indices stores: source index for motifs, -1 for scaffold roots
+            indices: List[int] = []
+
+            i = 0
+            while i < N:
+                if mask_b[i].item():
+                    # Motif position - include with source index
+                    indices.append(i)
+                    i += 1
+                else:
+                    # Scaffold span - find extent
+                    span_start = i
+                    while i < N and not mask_b[i].item():
+                        i += 1
+                    span_len = i - span_start
+
+                    # Sample K roots for this span
+                    k_hi = min(max_scaffold_nuclei, span_len)
+                    k_lo = min(min_scaffold_nuclei, k_hi)
+                    target_k = (
+                        k_lo if k_lo == k_hi else (k_lo + rand_int(k_hi - k_lo + 1))
+                    )
+
+                    # Add -1 for each scaffold root (they don't map to original data)
+                    for _ in range(target_k):
+                        indices.append(-1)
+
+            init_indices_list.append(indices)
+
+        # Compute init_length and P_max
+        init_lengths = [len(indices) for indices in init_indices_list]
+        P_max = max(init_lengths) if init_lengths else 0
+
+        # Build output tensors
+        init_length = torch.tensor(
+            init_lengths, dtype=torch.long, device=device
+        )  # (B,)
+        # Padding value is -1, same as scaffold roots, but distinguished by position >= init_length
+        motif_idx = torch.full((B, P_max), -1, dtype=torch.long, device=device)
+
+        for b in range(B):
+            L = init_lengths[b]
+            motif_idx[b, :L] = torch.tensor(
+                init_indices_list[b], dtype=torch.long, device=device
+            )
+
+        return init_length, motif_idx
+
     def _init_sampling_batch(
         self,
-        num_batch: int,
-        num_roots: int,
-        motif_mask: Optional[torch.Tensor] = None,
+        data: DataBatch,
+        min_scaffold_nuclei: int = 1,
+        max_scaffold_nuclei: int = 10,
+        seed: Optional[int] = None,
     ) -> DataCorrupted:
         """
         Initialize a batch of samples for sampling.
+
+        Uses _sample_initial_positions to determine which positions to include at t=0:
+        - Motif positions are gathered from data (res_mask, chain_idx)
+        - Scaffold roots get fresh samples from base prior
         """
+        device = self.device
+        B, N = data.motif_mask.shape
 
-        if motif_mask is None:
-            motif_mask = torch.zeros(
-                (num_batch, num_roots), dtype=torch.bool, device=self.device
-            )
+        # Get initial position layout
+        init_length, motif_idx = self._sample_initial_positions(
+            motif_mask=data.motif_mask.to(device),
+            min_scaffold_nuclei=min_scaffold_nuclei,
+            max_scaffold_nuclei=max_scaffold_nuclei,
+            seed=seed,
+        )
 
-        t = (
-            torch.ones((num_batch,), dtype=torch.float32, device=self.device)
-            * self.min_t
+        # Set up masks / indices
+        P_max = motif_idx.shape[1]
+        pos_idx = torch.arange(P_max, device=device).unsqueeze(0)  # (1, P_max)
+        valid_mask = pos_idx < init_length.unsqueeze(1)  # (B, P_max)
+        is_motif = (motif_idx >= 0) & valid_mask  # (B, P_max)
+
+        motif_mask = is_motif
+
+        birth_time = torch.full((B, P_max), float("inf"), device=device)
+        birth_time[valid_mask] = 0.0
+
+        # Gather some features from data using motif_idx (clamp to 0 for valid gather idx)
+        # For scaffold roots (motif_idx=-1) and padding, fill with 0
+        gather_idx = motif_idx.clamp(min=0)  # (B, P_max)
+        res_mask = gather_and_pad(
+            data.res_mask.to(device), gather_idx, is_motif, fill_value=0
         )
-        birth_time = torch.zeros(
-            (num_batch, num_roots), dtype=torch.float32, device=self.device
+        chain_idx = gather_and_pad(
+            data.chain_idx.to(device), gather_idx, is_motif, fill_value=0
         )
+
+        # Sample random translations for all positions, zero pad to keep clean
         trans_0 = self.translation_coupler.sample_base(
-            num_batch=num_batch, num_roots=num_roots, device=self.device
+            num_batch=B, num_roots=P_max, device=device
         )
+        trans_0 = trans_0 * is_motif.unsqueeze(-1).float()
+
+        # init batch at min_t
+        t = torch.full((B,), self.min_t, dtype=torch.float32, device=device)
 
         return DataCorrupted(
             t=t,
-            birth_time=birth_time,
             motif_mask=motif_mask,
+            birth_time=birth_time,
+            res_mask=res_mask,
+            chain_idx=chain_idx,
             trans_t=trans_0,
         )
 
@@ -1901,24 +2095,19 @@ class TreeInterpolant:
     def sample(
         self,
         model: BranchFlowModel,
-        num_batch: int = 1,
-        num_roots: int = 50,
+        data: DataBatch,
         num_steps: int = 200,
     ) -> SampleTrajectory:
-        model.eval()
         device = self.device
 
         # Create initial batch, which we edit in-place through the trajectory
-        # TODO - support taking input structure with motifs, use motif guidance
-        batch = self._init_sampling_batch(
-            num_batch=num_batch,
-            num_roots=num_roots,
-            motif_mask=None,
-        )
+        num_batch, _ = data.motif_mask.shape
+        batch = self._init_sampling_batch(data=data)
 
         traj = SampleTrajectory()
         traj.samples.append(batch.detach_clone())
 
+        model.eval()
         with torch.no_grad():
             t_grid = torch.linspace(self.min_t, 1.0, steps=num_steps, device=device)
             for step in range(num_steps):
@@ -1971,6 +2160,8 @@ class TreeInterpolant:
                     batch.trans_t = (
                         batch.trans_t + insert_mask.unsqueeze(-1).float() * trans_noise
                     )
+
+                # TODO - recenter
 
                 # Save
                 traj.samples.append(batch.detach_clone())
@@ -2234,70 +2425,52 @@ class BranchingFlowVisualizer:
             return "gif", animation.ImageMagickWriter(fps=10)
         return "gif", animation.PillowWriter(fps=10)
 
-    def visualize_corruption(
+    def plot_trajectory(
         self,
-        batch: DataBatch,
+        traj: Trajectory,
         out_dir: Optional[str] = None,
-        times: Optional[List[float]] = None,
-    ):
-        self.interpolant.set_device(batch.trans_1.device)
+        filename: str = "trajectory",
+    ) -> str:
+        """Plot a trajectory animation from any Trajectory (corruption or sampling)."""
         if out_dir is None:
             out_dir = tempfile.mkdtemp()
-        if times is None:
-            times = list(np.linspace(0.0, 1.0, 50))
-        times = sorted(times)
+        os.makedirs(out_dir, exist_ok=True)
 
-        num_batch = batch.trans_1.shape[0]
-        num_plots = min(num_batch, 4)  # only plot first 4 structures
+        if not traj.samples:
+            raise ValueError("Trajectory has no samples to plot")
 
         ext, writer = self._get_anim_writer()
-        anim_path = os.path.join(out_dir, f"corruption.{ext}")
+        anim_path = os.path.join(out_dir, f"{filename}.{ext}")
         os.makedirs(out_dir, exist_ok=True)
-        print(f"💾 Saving corruption animation to {anim_path}")
+        print(f"💾 Saving trajectory animation to {anim_path}")
 
-        # define a consistent x0
-        num_roots = int(batch.tree.roots_mask.sum(dim=1)[:num_plots].max().item())
-        x0 = self.translation_coupler.sample_base(
-            num_batch=num_batch,
-            num_roots=num_roots,
-            device=batch.trans_1.device,
-        )
+        num_batch = traj.samples[0].trans_t.shape[0]
+        num_plots = min(num_batch, 4)
 
-        # use trans_1 for camera limits
-        trans_1 = batch.trans_1.cpu().numpy()  # (B, N, 3)
-        trans_1_min = trans_1.min(axis=1)  # (B, 3)
-        trans_1_max = trans_1.max(axis=1)  # (B, 3)
+        # Compute camera limits from all trajectory samples
+        device = traj.samples[0].trans_t.device
+        trans_min = torch.zeros(3, device=device)
+        trans_max = torch.zeros(3, device=device)
+        for sample in traj.samples:
+            valid = sample.valid_mask & (
+                torch.arange(num_batch).unsqueeze(1) < num_plots
+            )
+            trans_t = sample.trans_t[valid]  # (num_plots*P, 3)
+            trans_min = torch.min(trans_min, trans_t.min(dim=0).values)
+            trans_max = torch.max(trans_max, trans_t.max(dim=0).values)
+        trans_min = np.tile(trans_min.cpu().numpy(), (num_batch, 1))
+        trans_max = np.tile(trans_max.cpu().numpy(), (num_batch, 1))
 
         num_cols = min(num_plots, 2)
         num_rows = math.ceil(num_plots / num_cols)
         fig = plt.figure(figsize=(10 * num_cols, 10 * num_rows))
-        plt.subplots_adjust(
-            left=0.01, right=0.99, bottom=0.01, top=0.95, wspace=0.25, hspace=0.30
-        )
 
         with writer.saving(fig, anim_path, dpi=100):
-            for time in tqdm(
-                times, desc="visualize_corruption() timesteps", leave=False
-            ):
-                bridged, trans_coupling = self.interpolant.corrupt_to(
-                    batch=batch,
-                    t=torch.ones(num_batch, device=batch.trans_1.device) * time,
-                    x0=x0,
-                )
-                corrupted = bridged.pack_present()
-
-                valid_mask = (
-                    corrupted.valid_mask.cpu().numpy().astype(bool)
-                )  # (B, P_max)
-                trans_t = corrupted.trans_t.cpu().numpy()  # (B, P_max, 3)
-                motif_mask_aligned = (
-                    batch.tree.motif_mask.cpu().numpy().astype(bool)
-                )  # (B, A)
-
-                idx_pack, _, _, _ = DataBridged.pack_present_indices(
-                    bridged.present_mask
-                )
-                idx_pack = idx_pack.cpu().numpy()  # (B, P_max)
+            for sample in tqdm(traj.samples, desc="plot_trajectory()", leave=False):
+                valid_mask = sample.valid_mask.cpu().numpy().astype(bool)  # (B, P_max)
+                trans_t = sample.trans_t.cpu().numpy()  # (B, P_max, 3)
+                motif_mask = sample.motif_mask.cpu().numpy().astype(bool)  # (B, P_max)
+                t_val = sample.t[0].item() if sample.t.numel() > 0 else 0.0
 
                 fig.clf()
                 for i in range(num_plots):
@@ -2315,77 +2488,81 @@ class BranchingFlowVisualizer:
                     )
 
                     trans_t_alive = trans_t[i][valid_mask[i]]  # (P, 3)
-                    node_ids_alive = idx_pack[i][valid_mask[i]]  # (P,)
+                    motif_alive = motif_mask[i][valid_mask[i]]  # (P,)
+                    n_alive = trans_t_alive.shape[0]
 
-                    # Leaf/anchor status from tree.total_leaves (supports deletion-duplicate leaves).
-                    node_ids_t = torch.tensor(node_ids_alive, dtype=torch.long)
-                    node_total = (
-                        batch.tree.total_leaves[i].gather(0, node_ids_t).cpu().numpy()
-                    )
-                    is_leaf = node_total == 1
-                    is_anchor = ~is_leaf
-
-                    # Motif status is stored directly in aligned tree space
-                    is_motif = motif_mask_aligned[i][node_ids_alive]
-                    is_scaffold_leaf = is_leaf & (~is_motif)
-
-                    # Underlying data index broadcast is still useful for color-coding
-                    # TODO - planar color coding for anchors (since dont map to leaf)
-                    ref_idx = batch.tree.leaf_map[i].gather(0, node_ids_t).cpu().numpy()
-
-                    ax.set_title(
-                        f"t = {time:.2f} (N={trans_t_alive.shape[0]}/{trans_1.shape[1]})"
-                    )
-                    if trans_t_alive.shape[0] > 0:
-                        vmax = int(trans_1[i].shape[0]) - 1
-                        # motifs as small points, anchors + scaffolds as large points
-                        sizes = np.full(
-                            (trans_t_alive.shape[0],), 40.0, dtype=np.float32
-                        )
-                        sizes[is_leaf & is_motif] = 15.0
-
-                        # anchors get a black outline
-                        edgecolors = np.zeros(
-                            (trans_t_alive.shape[0], 4), dtype=np.float32
-                        )
-                        edgecolors[is_anchor] = np.array(
-                            [0.0, 0.0, 0.0, 1.0], dtype=np.float32
-                        )
-                        linewidths = np.where(is_anchor, 1.0, 0.0).astype(np.float32)
+                    ax.set_title(f"t = {t_val:.2f} (N={n_alive})")
+                    if n_alive > 0:
+                        # Color by position index, motifs smaller
+                        color_idx = np.arange(n_alive)
+                        sizes = np.where(motif_alive, 15.0, 40.0)
 
                         ax.scatter(
                             trans_t_alive[:, 0],
                             trans_t_alive[:, 1],
                             trans_t_alive[:, 2],
-                            c=ref_idx,
+                            c=color_idx,
                             cmap="Spectral",
                             vmin=0,
-                            vmax=vmax,
+                            vmax=max(n_alive - 1, 1),
                             s=sizes,
-                            edgecolors=edgecolors,
-                            linewidths=linewidths,
                             depthshade=True,
                             alpha=0.75,
                         )
                     ax.view_init(elev=25, azim=45)
-                    # set camera limits
-                    ax.set_xlim(trans_1_min[i][0], trans_1_max[i][0])
-                    ax.set_ylim(trans_1_min[i][1], trans_1_max[i][1])
-                    ax.set_zlim(trans_1_min[i][2], trans_1_max[i][2])
+                    ax.set_xlim(trans_min[i][0], trans_max[i][0])
+                    ax.set_ylim(trans_min[i][1], trans_max[i][1])
+                    ax.set_zlim(trans_min[i][2], trans_max[i][2])
 
                 writer.grab_frame()
 
         plt.close(fig)
         return anim_path
 
+    def visualize_corruption(
+        self,
+        batch: DataBatch,
+        out_dir: Optional[str] = None,
+        times: Optional[List[float]] = None,
+    ) -> str:
+        """Create a corruption trajectory and plot it."""
+        self.interpolant.set_device(batch.trans_1.device)
+        if times is None:
+            times = list(np.linspace(0.0, 1.0, 50))
+        times = sorted(times)
+
+        num_batch = batch.trans_1.shape[0]
+
+        # Define a consistent trans_0 for the whole trajectory
+        num_roots = int(batch.tree.roots_mask.sum(dim=1).max().item())
+        trans_0 = self.translation_coupler.sample_base(
+            num_batch=num_batch,
+            num_roots=num_roots,
+            device=batch.trans_1.device,
+        )
+
+        # Build the trajectory
+        samples: List[DataCorrupted] = []
+        for time in tqdm(times, desc="visualize_corruption() step", leave=False):
+            bridged, _ = self.interpolant.corrupt_to(
+                batch=batch,
+                t=torch.ones(num_batch, device=batch.trans_1.device) * time,
+                trans_0=trans_0,
+            )
+            samples.append(bridged.pack_present())
+
+        traj = Trajectory(samples=samples)
+        return self.plot_trajectory(traj, out_dir=out_dir)
+
 
 """ Module """
 
 
 class BranchFlowModule(pl.LightningModule):
-    def __init__(self):
+    def __init__(self, output_dir: str = "varco/outputs"):
         super().__init__()
 
+        self.output_dir = output_dir
         self.model = BranchFlowModel()
         self.loss_calculator = BranchFlowLossCalculator()
         self.interpolant = TreeInterpolant()
@@ -2430,6 +2607,22 @@ class BranchFlowModule(pl.LightningModule):
 
         return loss.total_loss
 
+    def validation_step(self, batch: DataBatch, batch_idx: int) -> None:
+        self.interpolant.set_device(self.device)
+
+        sample_traj = self.interpolant.sample(
+            model=self.model,
+            data=batch,
+        )
+
+        viz = BranchingFlowVisualizer(sigma=1.0)
+        val_dir = os.path.join(self.output_dir, "val", f"epoch{self.current_epoch:03d}")
+        viz.plot_trajectory(
+            sample_traj,
+            out_dir=val_dir,
+            filename=f"val_sample_{batch_idx:03d}",
+        )
+
 
 """ Training """
 
@@ -2441,24 +2634,32 @@ def train(
 ):
     pl.seed_everything(seed, workers=True)
 
+    # Create output directory for this run
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join("varco/outputs", timestamp)
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"📁 Output directory: {output_dir}")
+
     data_module = ProteinDataModule(
         dataset=ProteinDataset(),
         num_workers=0,  # debugging
     )
 
-    # Debugging: plot a corrruption planning tree
+    # Debugging: plot a corruption planning tree
     datum = data_module.dataset[0]
-    datum.tree_plan.plot()
+    debug_dir = os.path.join(output_dir, "debug")
+    datum.tree_plan.plot(path=os.path.join(debug_dir, "init_tree_plan.png"))
 
     # Debugging: visualize the corruption process once using a real training batch.
     viz = BranchingFlowVisualizer(sigma=1.0)
     debug_batch = next(iter(data_module.train_dataloader(rank=0, num_replicas=1)))
-    viz.visualize_corruption(batch=debug_batch)
+    viz.visualize_corruption(batch=debug_batch, out_dir=debug_dir)
 
-    module = BranchFlowModule()
+    module = BranchFlowModule(output_dir=output_dir)
 
+    ckpt_dir = os.path.join(output_dir, "ckpt")
     checkpoint_callback = ModelCheckpoint(
-        dirpath="varco/ckpt",
+        dirpath=ckpt_dir,
         filename="varco-{epoch:02d}",
         save_top_k=1,
         save_last=True,
@@ -2469,8 +2670,8 @@ def train(
         accelerator="auto",
         devices=devices,
         max_epochs=max_epochs,
-        check_val_every_n_epoch=min(max_epochs, 5),
-        limit_val_batches=20,
+        check_val_every_n_epoch=1,
+        limit_val_batches=1,
         callbacks=[checkpoint_callback],
         enable_progress_bar=True,
     )
