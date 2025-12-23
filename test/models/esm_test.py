@@ -334,3 +334,154 @@ class TestFrozenEsmModel:
         )
         # should not invoke the underlying esm.forward again
         assert call_counter["n"] == 1
+
+
+class TestPadMask:
+    """Tests for pad_mask functionality in ESM frozen model."""
+
+    def test_sequence_data_with_pad_mask(self, esm2_alphabet):
+        """Test that pad_mask correctly sets padding tokens."""
+        B, N = 2, 10
+        aatypes = torch.randint(0, 20, (B, N))  # canonical residues only
+        chain_idx = torch.ones_like(aatypes)
+
+        # All residues valid, but some positions are padding
+        res_mask = torch.ones_like(aatypes)
+        pad_mask = torch.ones_like(aatypes)
+        pad_mask[0, 7:] = 0  # First sequence: pad last 3 positions
+        pad_mask[1, 5:] = 0  # Second sequence: pad last 5 positions
+
+        seq_data = SequenceData.from_af2(
+            aatypes, chain_idx, esm2_alphabet, res_mask=res_mask, pad_mask=pad_mask
+        )
+
+        # Expected: padded positions should use padding token
+        assert seq_data.aa_sequence.shape[0] == B
+        # Verify padding tokens exist in the sequence
+        assert (seq_data.aa_sequence == esm2_alphabet.padding_idx).any()
+
+    def test_pad_mask_and_res_mask_interaction(self, esm2_alphabet):
+        """Test that res_mask takes precedence over pad_mask."""
+        B, N = 1, 10
+        aatypes = torch.randint(0, 20, (B, N))
+        chain_idx = torch.ones_like(aatypes)
+
+        # Position 3: both masks False (should become 'X', not padding)
+        # Position 5: only res_mask False (should become 'X')
+        # Position 7: only pad_mask False (should become padding)
+        res_mask = torch.ones_like(aatypes)
+        res_mask[0, 3] = 0
+        res_mask[0, 5] = 0
+
+        pad_mask = torch.ones_like(aatypes)
+        pad_mask[0, 3] = 0
+        pad_mask[0, 7] = 0
+
+        seq_data = SequenceData.from_af2(
+            aatypes, chain_idx, esm2_alphabet, res_mask=res_mask, pad_mask=pad_mask
+        )
+
+        # Extract the sequence (accounting for BOS token at position 0)
+        seq = seq_data.aa_sequence[0]
+        X_idx = esm2_alphabet.get_idx("X")
+        pad_idx = esm2_alphabet.padding_idx
+
+        # Position 3 and 5 should be 'X' (res_mask precedence)
+        # Position 7 should be padding
+        # Note: +1 offset for BOS token
+        assert seq[4] == X_idx  # Position 3 + BOS
+        assert seq[6] == X_idx  # Position 5 + BOS
+        assert seq[8] == pad_idx  # Position 7 + BOS
+
+    def test_backward_compatibility_no_pad_mask(self, esm2_alphabet):
+        """Test that omitting pad_mask preserves existing behavior."""
+        B, N = 1, 10
+        aatypes = torch.randint(0, 20, (B, N))
+        chain_idx = torch.ones_like(aatypes)
+        res_mask = torch.ones_like(aatypes)
+        res_mask[0, 3] = 0  # Mark position 3 as invalid
+
+        # Old call (no pad_mask)
+        seq_data_old = SequenceData.from_af2(
+            aatypes, chain_idx, esm2_alphabet, res_mask=res_mask
+        )
+
+        # New call (pad_mask=None)
+        seq_data_new = SequenceData.from_af2(
+            aatypes, chain_idx, esm2_alphabet, res_mask=res_mask, pad_mask=None
+        )
+
+        # Should produce identical results
+        assert torch.equal(seq_data_old.aa_sequence, seq_data_new.aa_sequence)
+        assert torch.equal(seq_data_old.non_linker_mask, seq_data_new.non_linker_mask)
+
+    def test_variable_length_batch_with_pad_mask(self):
+        """Test pad_mask with variable-length sequences."""
+        model = FrozenEsmModel(
+            ModelESMKey.DUMMY, use_esm_attn_map=False, caching=False
+        )
+
+        B, max_len = 3, 15
+        aatypes = torch.randint(0, 21, (B, max_len))
+        chain_idx = torch.ones_like(aatypes)
+
+        # Variable lengths: [15, 10, 7]
+        lengths = [15, 10, 7]
+        res_mask = torch.ones_like(aatypes)  # All valid residues
+        pad_mask = torch.zeros_like(aatypes)
+        for b, length in enumerate(lengths):
+            pad_mask[b, :length] = 1
+
+        token_reps, pair_reps, logits = model(
+            aatypes, chain_idx, res_mask=res_mask, pad_mask=pad_mask
+        )
+
+        # Verify correct shapes
+        assert token_reps.shape[0] == B
+        assert logits.shape[0] == B
+
+        # Verify each sequence has correct length
+        for b, length in enumerate(lengths):
+            assert token_reps[b, :length].abs().sum() > 0  # Non-zero outputs
+
+    def test_esm_combiner_with_pad_mask(self):
+        """Test pad_mask flows correctly through ESMCombiner."""
+        from cogeneration.config.base import ModelESMCombinerConfig
+        from cogeneration.models.esm_combiner import ESMCombinerNetwork
+
+        cfg = ModelESMCombinerConfig(
+            esm_model_key=ModelESMKey.DUMMY,
+            only_single=True,
+            node_embed_size=64,
+            edge_embed_size=64,
+            esm_proj_single_dim=64,
+            mlp_proj_hidden_dim=128,
+        )
+
+        combiner = ESMCombinerNetwork(cfg)
+
+        B, N = 2, 10
+        node_dim, edge_dim = 64, 64
+
+        init_node_embed = torch.randn(B, N, node_dim)
+        init_edge_embed = torch.randn(B, N, N, edge_dim)
+        aatypes_t = torch.randint(0, 21, (B, N))
+        chain_index = torch.ones_like(aatypes_t)
+
+        # Create pad_mask with variable lengths
+        res_mask = torch.ones_like(aatypes_t)
+        pad_mask = torch.ones_like(aatypes_t)
+        pad_mask[0, 7:] = 0
+        pad_mask[1, 5:] = 0
+
+        node_out, edge_out = combiner(
+            init_node_embed=init_node_embed,
+            init_edge_embed=init_edge_embed,
+            aatypes_t=aatypes_t,
+            chain_index=chain_index,
+            res_mask=res_mask,
+            pad_mask=pad_mask,
+        )
+
+        assert node_out.shape == (B, N, node_dim)
+        assert edge_out.shape == (B, N, N, edge_dim)

@@ -80,6 +80,40 @@ class BatchFeaturizer:
         feats[bp.chain_idx] = new_chain_idx.long()
 
     @staticmethod
+    def infer_res_index(
+        chain_idx: torch.Tensor,  # (B, N) chain indices
+        valid_mask: Optional[
+            torch.Tensor
+        ] = None,  # (B, N) bool mask for valid positions
+    ) -> torch.Tensor:
+        """
+        Compute residue positions that restart from 1 at each chain break.
+        """
+        B, P = chain_idx.shape
+        device = chain_idx.device
+
+        if valid_mask is None:
+            valid_mask = torch.ones_like(chain_idx, dtype=torch.bool)
+
+        res_idx = torch.zeros_like(chain_idx, dtype=torch.long)
+
+        for b in range(B):
+            # Get chain indices for this batch item
+            batch_chain_idx = chain_idx[b]  # (P,)
+            batch_valid = valid_mask[b]  # (P,)
+
+            # For each unique chain, assign positions starting from 1
+            for cid in torch.unique(batch_chain_idx):
+                chain_mask = (batch_chain_idx == cid) & batch_valid
+                if chain_mask.any():
+                    # Count positions within this chain (1-indexed)
+                    chain_positions = torch.cumsum(chain_mask.long(), dim=0)
+                    # Only assign to positions in this chain
+                    res_idx[b][chain_mask] = chain_positions[chain_mask]
+
+        return res_idx
+
+    @staticmethod
     def reset_residue_index(feats: BatchFeatures):
         """
         Re-number `res_index`, assuming `feats` is flat i.e. a single sample.

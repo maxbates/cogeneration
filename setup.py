@@ -83,6 +83,7 @@ tools.setup(
     packages=tools.find_packages(),
     package_dir={
         'cogeneration': './cogeneration',
+        'varco': './varco',
     },
     install_requires=install_requires,
     extras_require={

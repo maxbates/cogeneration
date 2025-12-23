@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -59,6 +59,7 @@ class ESMCombinerNetwork(nn.Module):
         aatypes_t: torch.Tensor,  # (B, N)
         chain_index: torch.Tensor,  # (B, N)
         res_mask: torch.Tensor,  # (B, N)
+        pad_mask: Optional[torch.Tensor] = None,  # (B, N)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         edge_mask = res_mask[:, None] * res_mask[:, :, None]
 
@@ -67,6 +68,7 @@ class ESMCombinerNetwork(nn.Module):
             aatypes=aatypes_t,
             chain_index=chain_index,
             res_mask=res_mask,
+            pad_mask=pad_mask,
         )
 
         esm_single = esm_single.detach()  # (B, N, nLayers, node_dim)

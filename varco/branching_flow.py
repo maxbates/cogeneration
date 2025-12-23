@@ -22,15 +22,10 @@ Fix backlog:
 
 TODOs / features:
 - sequence: also predict insertion logits, which are sampled on insertions, and replace the parent's residue
-- support a mini frozen ESM model up front (once we have sequence)
-  - requires handling padding correctly, since inputs no longer same length
-- make sure we handle positional embedding correctly (i.e. ~ arange on current sequence, but handle chain_idx)
 - improve sampling
   - motif guidance for positions
   - add validation loss (e.g. folding validation?)
 - support rotations with an IGSO(3) bridge
-- Ensure we support all motif strategies, including at start/end
-- use a Config
 - simplify tree plan and coupling
   - instead of iterating over topology, group by depth and process in parallel: O(A) -> O(depth)
     - compute and track node depth (+ max depth)as part of TreePlan
@@ -46,29 +41,29 @@ import gc
 import math
 import os
 import tempfile
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, Generic, List, Optional, Tuple, TypeVar
 
+import hydra
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
-from pytorch_lightning.callbacks import ModelCheckpoint
+from omegaconf import OmegaConf
+from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
+from pytorch_lightning.loggers.wandb import WandbLogger
+from pytorch_lightning.trainer import Trainer
+from pytorch_lightning.utilities.model_summary import ModelSummary
 from sklearn import datasets
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from cogeneration.config.base import (
-    Config,
-    DatasetConfig,
-    DatasetFilterConfig,
-    DatasetInpaintingConfig,
-    DatasetInpaintingMotifStrategy,
-)
+from cogeneration.config.base import Config, DataConfig
 from cogeneration.data.const import (
     ANG_TO_NM_SCALE,
     MASK_TOKEN_INDEX,
@@ -82,12 +77,19 @@ from cogeneration.data.residue_constants import (
     restypes_with_x,
 )
 from cogeneration.dataset.datasets import BaseDataset
+from cogeneration.dataset.featurizer import BatchFeaturizer
 from cogeneration.dataset.protein_dataloader import LengthBatcher
-from cogeneration.models.embed import get_index_embedding
+from cogeneration.models.attention.attention_trunk import AttentionTrunk
+from cogeneration.models.edge_feature_net import EdgeFeatureNet
+from cogeneration.models.embed import get_index_embedding, get_time_embedding
+from cogeneration.models.esm_combiner import ESMCombinerNetwork
 from cogeneration.models.utils import get_model_size_str
+from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.embed import PositionalEmbeddingMethod
 from cogeneration.type.task import DataTask
+from cogeneration.util.log import rank_zero_logger
+from varco.config import VarcoConfig, VarcoDatasetConfig, VarcoModelConfig
 
 """ Data Flow """
 
@@ -1095,6 +1097,10 @@ class DataCorrupted:
     @property
     def remaining_total(self) -> torch.Tensor:  # (B,)
         """Sum of remaining insertions for all present tokens"""
+        if self.remaining_insertions is None:
+            return torch.zeros(
+                (self.t.shape[0],), device=self.t.device, dtype=torch.long
+            )
         return (self.remaining_insertions * self.valid_mask.long()).sum(dim=1).long()
 
     def detach_clone(self) -> "DataCorrupted":
@@ -1348,31 +1354,10 @@ class ProteinDataset(BaseDataset):
 
     def __init__(
         self,
+        cfg: VarcoDatasetConfig,
     ):
-        # Define DatasetConfig for inpainting
-        dataset_cfg = DatasetConfig(
-            # Use PDB and AFDB
-            enable_cogeneration_pdb=True,
-            enable_cogeneration_afdb=True,
-            enable_cogeneration_redesigns=False,
-            enable_multiflow_redesigned=False,
-            enable_multiflow_synthetic=False,
-            debug_head_samples=1000,
-            filter=DatasetFilterConfig(
-                max_num_res=256,
-                num_chains=[1, 2],
-            ),
-            # Support all motif strategies
-            inpainting=DatasetInpaintingConfig(
-                strategy=DatasetInpaintingMotifStrategy.ALL,
-            ),
-            # override interpolated props
-            max_eval_length=256,
-            seed=0,
-        )
-
         super().__init__(
-            cfg=dataset_cfg,
+            cfg=cfg,
             task=DataTask.inpainting,
             eval=False,
             use_test=False,
@@ -1417,7 +1402,7 @@ class ProteinDataLoader(DataLoader):
             batch_size=batch_size,
             num_workers=num_workers,
             collate_fn=ProteinDataLoader.collate_fn,
-            prefetch_factor=None if num_workers == 0 else 2,
+            prefetch_factor=None if num_workers == 0 else 1,
             **kwargs,
         )
 
@@ -1448,17 +1433,16 @@ class ProteinDataModule(pl.LightningDataModule):
 
     def __init__(
         self,
+        cfg: DataConfig,
         dataset: ProteinDataset,
-        num_workers: int = max(1, os.cpu_count() - 2),
     ):
         super().__init__()
-        self._full_cfg = Config().interpolate()
+        self.cfg = cfg
         self.dataset = dataset
-        self.num_workers = num_workers
 
     def train_dataloader(self, rank=None, num_replicas=None) -> DataLoader:
         batch_sampler = LengthBatcher(
-            sampler_cfg=self._full_cfg.data.sampler,
+            sampler_cfg=self.cfg.sampler,
             metadata_csv=self.dataset.csv,
             modeled_length_col=self.dataset.cfg.modeled_trim_method.to_dataset_column(),
             rank=rank or 0,
@@ -1468,112 +1452,176 @@ class ProteinDataModule(pl.LightningDataModule):
         return ProteinDataLoader(
             dataset=self.dataset,
             batch_sampler=batch_sampler,
-            num_workers=self.num_workers,
+            num_workers=self.cfg.loader.num_workers,
         )
 
     def val_dataloader(self) -> DataLoader:
-        return ProteinDataLoader(self.dataset)
+        return ProteinDataLoader(
+            dataset=self.dataset,
+            batch_size=1,
+            num_workers=0,
+        )
 
 
 """ Model """
 
 
 class BranchFlowModel(nn.Module):
-    def __init__(self):
+    def __init__(self, cfg: VarcoModelConfig):
         super().__init__()
+        self.cfg = cfg
 
-        self.point_dim = 3
-        self.pos_embed_dim = 32
         self.num_aatype_tokens = NUM_TOKENS + 1  # 21: 20 amino acids + X
+        self.pos_embed_dim = self.cfg.hyper_params.pos_embed_size
+        self.time_embed_dim = self.cfg.hyper_params.timestep_embed_size
+        self.node_dim = self.cfg.hyper_params.node_embed_size
+        self.edge_dim = self.cfg.hyper_params.edge_embed_size
 
-        # x_t (point_dim), t (1), birth_time (1), motif_mask (1), chain_idx (1), pos_embed, aatypes_onehot (21)
         self.input_dim = (
-            self.point_dim + 1 + 1 + 1 + 1 + self.pos_embed_dim + self.num_aatype_tokens
+            3  # trans_t
+            + 1  # birth_time
+            + 1  # motif_mask
+            + 1  # chain_idx
+            + self.time_embed_dim  # time_embed
+            + self.pos_embed_dim  # pos_embed
+            + self.num_aatype_tokens  # aatypes_onehot
         )
-        self.model_dim = 64
 
-        self.input_proj = nn.Linear(self.input_dim, self.model_dim)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.model_dim,
-            nhead=8,
-            dim_feedforward=4 * self.model_dim,
-            batch_first=True,
+        self.node_feature_net = nn.Linear(self.input_dim, self.node_dim)
+
+        self.edge_feature_net = EdgeFeatureNet(cfg=self.cfg.edge_features)
+
+        if self.cfg.esm_combiner.enabled:
+            self.esm_combiner = ESMCombinerNetwork(cfg=self.cfg.esm_combiner)
+
+        self.trunk = AttentionTrunk(
+            cfg=self.cfg.trunk,
+            attn_cfg=self.cfg.attention,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
-        self.trans_pred = nn.Linear(self.model_dim, self.point_dim)
-        self.split_rate_pred = nn.Linear(self.model_dim, 1)
-        self.split_pooled_log1p_rate_pred = nn.Linear(self.model_dim, 1)
-        self.del_logits_pred = nn.Linear(self.model_dim, 1)
 
-        # Amino acid prediction MLP
+        self.trans_pred = nn.Linear(self.node_dim, 3)
+
         self.aatype_pred = nn.Sequential(
-            nn.Linear(self.model_dim, self.model_dim),
+            nn.Linear(self.node_dim, self.node_dim),
             nn.ReLU(),
-            nn.Linear(self.model_dim, self.model_dim),
+            nn.Linear(self.node_dim, self.node_dim),
             nn.ReLU(),
-            nn.Linear(self.model_dim, self.num_aatype_tokens),
+            nn.Linear(self.node_dim, self.num_aatype_tokens),
         )
+
+        # Insertions and deletions
+        self.split_rate_pred = nn.Linear(self.node_dim, 1)
+        self.split_pooled_log1p_rate_pred = nn.Linear(self.node_dim, 1)
+        self.del_logits_pred = nn.Linear(self.node_dim, 1)
 
     def forward(self, batch: DataCorrupted) -> ModelPrediction:
         B, P, _ = batch.trans_t.shape
 
-        valid = batch.valid_mask.bool()  # (B, P)
-        # attention mask to mask out positions not alive yet / padded
-        key_padding_mask = ~valid
+        valid = batch.valid_mask.float()  # (B, P)
+        edge_valid = valid[:, None] * valid[:, None]  # (B, P, P)
 
-        # TODO - respect chain_idx to get positions (i.e. instead of just arange)
+        res_idx = BatchFeaturizer.infer_res_index(
+            chain_idx=batch.chain_idx,
+            valid_mask=batch.valid_mask,
+        )  # (B, P)
         pos_embed = get_index_embedding(
-            torch.arange(P, device=batch.trans_t.device).unsqueeze(0).expand(B, -1),
+            res_idx,
             embed_size=self.pos_embed_dim,
             max_len=1024,
             pos_embed_method=PositionalEmbeddingMethod.rotary,
-        )
+        )  # (B, P, pos_embed_dim)
         pos_embed = pos_embed * batch.valid_mask.unsqueeze(-1).float()
+
+        time_embed = get_time_embedding(
+            timesteps=batch.t,
+            embedding_dim=self.time_embed_dim,
+            max_positions=1024,
+        )[:, None, :].repeat(
+            1, P, 1
+        )  # (B, P, time_embed_dim)
+        time_embed = time_embed * batch.valid_mask.unsqueeze(-1).float()
 
         # One-hot encode aatypes_t
         aatypes_onehot = F.one_hot(
             batch.aatypes_t.long(), num_classes=self.num_aatype_tokens
         ).float()  # (B, P, 21)
 
-        x_t = torch.cat(
+        # clamp birth_time +inf padding to 1.0
+        birth_time = batch.birth_time[:, :, None].float().clamp(0.0, 1.0)
+
+        input_feats = torch.cat(
             [
                 batch.trans_t,  # (B, P, 3)
-                batch.t[:, None, None].expand(B, P, 1),  # (B, P, 1)
-                batch.birth_time[:, :, None]
-                .float()
-                .clamp(0.0, 1.0),  # (B, P, 1) clamp +inf padding to 1.0
+                birth_time,  # (B, P, 1)
                 batch.motif_mask[:, :, None].float(),  # (B, P, 1)
                 batch.chain_idx[:, :, None].int(),  # (B, P, 1)
+                time_embed,  # (B, P, time_embed_dim)
                 pos_embed,  # (B, P, pos_embed_dim)
                 aatypes_onehot,  # (B, P, 21)
             ],
             dim=-1,
         )
+        node_embed = self.node_feature_net(input_feats)  # (B, P, node_dim)
+        node_embed = node_embed * valid.unsqueeze(-1)
 
-        x_t = self.input_proj(x_t)
-        x_t = self.transformer(x_t, src_key_padding_mask=key_padding_mask)
+        edge_embed = self.edge_feature_net(
+            node_embed=node_embed,
+            trans=batch.trans_t,
+            trans_sc=None,
+            edge_mask=edge_valid,
+            diffuse_mask=batch.motif_mask,
+            chain_index=batch.chain_idx,
+            contact_conditioning=None,
+        )  # (B, P, P, edge_dim)
+        edge_embed = edge_embed * edge_valid.unsqueeze(-1)
+
+        init_node_embed = node_embed
+        init_edge_embed = edge_embed
+        if self.cfg.esm_combiner.enabled:
+            node_embed, edge_embed = self.esm_combiner(
+                init_node_embed=init_node_embed,
+                init_edge_embed=init_edge_embed,
+                aatypes_t=batch.aatypes_t,
+                chain_index=batch.chain_idx,
+                res_mask=torch.ones_like(valid),
+                pad_mask=valid,
+            )
+
+        # Trunk
+        node_embed, edge_embed = self.trunk(
+            init_node_embed=init_node_embed,
+            init_edge_embed=init_edge_embed,
+            node_embed=node_embed,
+            edge_embed=edge_embed,
+            node_mask=valid,
+            edge_mask=edge_valid,
+            rigid=None,
+            r3_t=batch.t,
+        )
 
         # Predict translations
-        pred_trans_1 = self.trans_pred(x_t)
+        pred_trans_1 = self.trans_pred(node_embed)
 
         # Predict amino acid logits
-        pred_aatype_logits = self.aatype_pred(x_t)  # (B, P, 21)
+        pred_aatype_logits = self.aatype_pred(node_embed)  # (B, P, 21)
         # Ensure mask logits disabled
         if self.num_aatype_tokens == NUM_TOKENS + 1:
             pred_aatype_logits[:, :, MASK_TOKEN_INDEX] = -1e9
 
         # Predict nonnegative remaining-splits rates (Poisson-like regression)
-        split_rate = F.softplus(self.split_rate_pred(x_t)).squeeze(-1)  # (B, P)
-        del_logits = self.del_logits_pred(x_t).squeeze(-1)  # (B, P)
+        split_rate = F.softplus(self.split_rate_pred(node_embed)).squeeze(-1)  # (B, P)
 
         # Masked mean pool over alive tokens to predict total remaining insertions per example
         valid_count = valid.sum(dim=1, keepdim=True).float().clamp(min=1)  # (B, 1)
-        pooled = (x_t * valid.unsqueeze(-1).float()).sum(
+        pooled = (node_embed * valid.unsqueeze(-1)).sum(
             dim=1
         ) / valid_count  # (B, model_dim)
         split_pooled_log1p_rate = self.split_pooled_log1p_rate_pred(pooled).squeeze(
             -1
         )  # (B,)
+
+        # Predict deletion logits
+        del_logits = self.del_logits_pred(node_embed).squeeze(-1)  # (B, P)
 
         return ModelPrediction(
             pred_trans_1=pred_trans_1,
@@ -1666,7 +1714,6 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
     ) -> torch.Tensor:
         """Build translation anchors for all nodes (leaves + internal) from leaf endpoints trans at t=1.
 
-        Assumptions for this toy:
         - Leaf endpoints are broadcast into leaf slots using tree.leaf_map.
         - Internal nodes ("anchors") are derived purely from topology + descendant weights.
         """
@@ -2721,6 +2768,7 @@ class TreeInterpolant:
         model: BranchFlowModel,
         data: DataBatch,
         num_steps: int = 200,
+        traj_frames: Optional[int] = None,
     ) -> SampleTrajectory:
         device = self.device
 
@@ -2734,7 +2782,13 @@ class TreeInterpolant:
         model.eval()
         with torch.no_grad():
             t_grid = torch.linspace(self.min_t, 1.0, steps=num_steps, device=device)
-            for step in tqdm(range(num_steps), desc="Sampling", leave=False):
+            pbar = tqdm(
+                enumerate(range(num_steps)),
+                total=num_steps,
+                desc="Sampling",
+                leave=False,
+            )
+            for step_num, step in pbar:
                 t_val = float(t_grid[step].item())
                 t_next = (
                     float(t_grid[step + 1].item())
@@ -2748,7 +2802,9 @@ class TreeInterpolant:
                     (num_batch,), t_val, dtype=torch.float32, device=device
                 )
                 pred = model.forward(batch)
-                traj.pred.append(pred.detach_clone())
+
+                if traj_frames is None or step_num % traj_frames == 0:
+                    traj.pred.append(pred.detach_clone())
 
                 # Euler step for alive tokens' translations
                 trans_next = self.translation_coupler.euler_step(
@@ -2802,7 +2858,19 @@ class TreeInterpolant:
                 # TODO - recenter
 
                 # Save
-                traj.samples.append(batch.detach_clone())
+                if traj_frames is None or step_num % traj_frames == 0:
+                    traj.samples.append(batch.detach_clone())
+
+                # Update progress bar with batch dimensions
+                B, P = batch.trans_t.shape[:2]
+                pbar.set_postfix_str(f"B={B} P={P}")
+
+                # Cleanup
+                if step_num % 10 == 0:
+                    if torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
+
+            pbar.close()
 
         return traj
 
@@ -3152,41 +3220,80 @@ class BranchingFlowVisualizer:
         return letters, colors
 
     @staticmethod
-    def _draw_sequence_bar(ax: plt.Axes, aatypes: np.ndarray, motif_mask: np.ndarray):
-        """Draw sequence as colored squares with AA letters; underline motifs."""
-        # TODO - support max-width and break over lines if we need to... janky but better than truncating!
+    def _create_sequence_artists(ax: plt.Axes, max_len: int):
+        """Pre-create all artists needed for sequence visualization."""
         letters, colors = BranchingFlowVisualizer._aa_letters_and_colors()
-        n = len(aatypes)
-        ax.set_xlim(0, n)
-        ax.set_ylim(-0.3 if motif_mask.any() else 0, 1)
+
+        ax.set_xlim(0, max_len)
+        ax.set_ylim(-0.3, 1)
         ax.set_aspect("equal", adjustable="box")
         ax.axis("off")
-        for i, aa_idx in enumerate(aatypes):
-            aa_idx = int(aa_idx) if aa_idx < len(letters) else 20
-            ax.add_patch(
-                plt.Rectangle(
-                    (i, 0), 1, 1, facecolor=colors[aa_idx], edgecolor="white", lw=0.5
-                )
+
+        rectangles = []
+        texts = []
+        motif_rects = []
+
+        for i in range(max_len):
+            # AA background rectangle
+            rect = plt.Rectangle(
+                (i, 0), 1, 1, facecolor=colors[0], edgecolor="white", lw=0.5
             )
-            ax.text(
+            ax.add_patch(rect)
+            rectangles.append(rect)
+
+            # AA letter text
+            text = ax.text(
                 i + 0.5,
                 0.5,
-                letters[aa_idx],
+                letters[0],
                 ha="center",
                 va="center",
                 fontsize=8,
                 color="k",
             )
-            if motif_mask[i]:
-                ax.add_patch(
-                    plt.Rectangle((i, -0.25), 1, 0.15, facecolor="black", lw=0)
-                )
+            texts.append(text)
+
+            # Motif underline rectangle
+            motif_rect = plt.Rectangle((i, -0.25), 1, 0.15, facecolor="black", lw=0)
+            ax.add_patch(motif_rect)
+            motif_rects.append(motif_rect)
+
+        return rectangles, texts, motif_rects, letters, colors
+
+    @staticmethod
+    def _update_sequence_bar(
+        rectangles,
+        texts,
+        motif_rects,
+        letters,
+        colors,
+        aatypes: np.ndarray,
+        motif_mask: np.ndarray,
+    ):
+        """Update pre-created artists with new sequence data."""
+        n = len(aatypes)
+
+        for i in range(len(rectangles)):
+            if i < n:
+                # Update visible artists
+                aa_idx = int(aatypes[i]) if aatypes[i] < len(letters) else 20
+                rectangles[i].set_facecolor(colors[aa_idx])
+                rectangles[i].set_visible(True)
+                texts[i].set_text(letters[aa_idx])
+                texts[i].set_visible(True)
+                motif_rects[i].set_visible(bool(motif_mask[i]))
+            else:
+                # Hide unused artists
+                rectangles[i].set_visible(False)
+                texts[i].set_visible(False)
+                motif_rects[i].set_visible(False)
 
     def plot_trajectory(
         self,
         traj: Trajectory,
         out_dir: Optional[str] = None,
         filename: str = "trajectory",
+        max_frames: Optional[int] = 50,
     ) -> str:
         """Plot a trajectory animation from any Trajectory (corruption or sampling)."""
         if out_dir is None:
@@ -3204,10 +3311,11 @@ class BranchingFlowVisualizer:
         num_batch = traj.samples[0].trans_t.shape[0]
         num_plots = min(num_batch, 4)
 
-        # Compute camera limits from all trajectory samples
+        # Compute camera limits and max sequence length from all trajectory samples
         device = traj.samples[0].trans_t.device
         trans_min = torch.zeros(3, device=device)
         trans_max = torch.zeros(3, device=device)
+        max_seq_len = 0
         for sample in traj.samples:
             valid = sample.valid_mask
             valid = valid & (
@@ -3216,6 +3324,9 @@ class BranchingFlowVisualizer:
             trans_t = sample.trans_t[valid]  # (num_plots*P, 3)
             trans_min = torch.min(trans_min, trans_t.min(dim=0).values)
             trans_max = torch.max(trans_max, trans_t.max(dim=0).values)
+            # Track max sequence length across all plots
+            for i in range(num_plots):
+                max_seq_len = max(max_seq_len, int(sample.valid_mask[i].sum().item()))
         trans_min = np.tile(trans_min.cpu().numpy(), (num_batch, 1))
         trans_max = np.tile(trans_max.cpu().numpy(), (num_batch, 1))
 
@@ -3231,57 +3342,96 @@ class BranchingFlowVisualizer:
             wspace=0.05,
         )
 
+        fig.subplots_adjust(
+            left=0.03,
+            right=0.97,
+            bottom=0.03,
+            top=0.95,
+            wspace=0.05,
+            hspace=0.05,
+        )
+
+        # Create all axes and sequence artists once before the animation loop
+        axes_seq = []
+        axes_3d = []
+        seq_artists = (
+            []
+        )  # Store (rectangles, texts, motif_rects, letters, colors) for each plot
+        for i in range(num_plots):
+            row, col = divmod(i, num_cols)
+            ax_seq = fig.add_subplot(gs[row * 2, col])
+            ax_3d = fig.add_subplot(gs[row * 2 + 1, col], projection="3d")
+            ax_3d.set_xticks([])
+            ax_3d.set_yticks([])
+            ax_3d.set_zticks([])
+            ax_3d.view_init(elev=25, azim=45)
+            ax_3d.set_xlim(trans_min[i][0], trans_max[i][0])
+            ax_3d.set_ylim(trans_min[i][1], trans_max[i][1])
+            ax_3d.set_zlim(trans_min[i][2], trans_max[i][2])
+            axes_seq.append(ax_seq)
+            axes_3d.append(ax_3d)
+
+            # Pre-create sequence artists for this plot
+            artists = BranchingFlowVisualizer._create_sequence_artists(
+                ax_seq, max_seq_len
+            )
+            seq_artists.append(artists)
+
+        # Downsample to max_frames
+        if max_frames is not None and len(traj.samples) > max_frames:
+            sample_indices = np.linspace(
+                0, len(traj.samples) - 1, max_frames, dtype=int
+            )
+        else:
+            sample_indices = np.arange(len(traj.samples))
+
         with writer.saving(fig, anim_path, dpi=100):
-            for sample in tqdm(traj.samples, desc="plot_trajectory()", leave=False):
+            for idx in tqdm(sample_indices, desc="plot_trajectory()", leave=False):
+                sample = traj.samples[idx]
                 valid_mask = sample.valid_mask.cpu().numpy().astype(bool)  # (B, P_max)
                 trans_t = sample.trans_t.cpu().numpy()  # (B, P_max, 3)
                 aatypes_t = sample.aatypes_t.cpu().numpy()  # (B, P_max)
                 motif_mask = sample.motif_mask.cpu().numpy().astype(bool)  # (B, P_max)
                 t_val = sample.t[0].item() if sample.t.numel() > 0 else 0.0
 
-                fig.clf()
-                gs = fig.add_gridspec(
-                    num_rows * 2,
-                    num_cols,
-                    height_ratios=[2, 10] * num_rows,
-                    hspace=0.02,
-                    wspace=0.05,
-                )
-
                 for i in range(num_plots):
-                    row, col = divmod(i, num_cols)
                     valid_i = valid_mask[i]
                     trans_alive = trans_t[i][valid_i]  # (P, 3)
                     aatypes_alive = aatypes_t[i][valid_i]  # (P,)
                     motif_alive = motif_mask[i][valid_i]  # (P,)
                     n_alive = trans_alive.shape[0]
 
-                    # Sequence bar axis
-                    ax_seq = fig.add_subplot(gs[row * 2, col])
+                    # Update sequence bar using pre-created artists
+                    rectangles, texts, motif_rects, letters, colors = seq_artists[i]
                     if n_alive > 0:
-                        BranchingFlowVisualizer._draw_sequence_bar(
-                            ax_seq, aatypes_alive, motif_alive
+                        BranchingFlowVisualizer._update_sequence_bar(
+                            rectangles,
+                            texts,
+                            motif_rects,
+                            letters,
+                            colors,
+                            aatypes_alive,
+                            motif_alive,
                         )
                     else:
-                        ax_seq.axis("off")
+                        # Hide all artists when no sequence
+                        for rect, text, motif_rect in zip(
+                            rectangles, texts, motif_rects
+                        ):
+                            rect.set_visible(False)
+                            text.set_visible(False)
+                            motif_rect.set_visible(False)
 
-                    # 3D structure axis
-                    ax = fig.add_subplot(gs[row * 2 + 1, col], projection="3d")
+                    # Structure
+                    ax = axes_3d[i]
+                    ax.clear()
                     ax.set_xticks([])
                     ax.set_yticks([])
                     ax.set_zticks([])
-                    fig.subplots_adjust(
-                        left=0.03,
-                        right=0.97,
-                        bottom=0.03,
-                        top=0.95,
-                        wspace=0.05,
-                        hspace=0.05,
-                    )
-
                     ax.set_title(f"t = {t_val:.2f} (N={n_alive})")
                     if n_alive > 0:
                         # Color by position index, motifs smaller
+                        # TODO - option to color by birth time
                         color_idx = np.arange(n_alive)
                         sizes = np.where(motif_alive, 15.0, 40.0)
 
@@ -3312,6 +3462,7 @@ class BranchingFlowVisualizer:
         batch: DataBatch,
         out_dir: Optional[str] = None,
         times: Optional[List[float]] = None,
+        filename: str = "corruption",
     ) -> str:
         """Create a corruption trajectory and plot it."""
         self.interpolant.set_device(batch.trans_1.device)
@@ -3331,7 +3482,7 @@ class BranchingFlowVisualizer:
 
         # Build the trajectory
         samples: List[DataCorrupted] = []
-        for time in tqdm(times, desc="visualize_corruption() step", leave=False):
+        for time in tqdm(times, desc="visualize_corruption() corrupt", leave=False):
             bridged, _ = self.interpolant.corrupt_to(
                 batch=batch,
                 t=torch.ones(num_batch, device=batch.trans_1.device) * time,
@@ -3340,51 +3491,86 @@ class BranchingFlowVisualizer:
             samples.append(bridged.pack_present())
 
         traj = Trajectory(samples=samples)
-        return self.plot_trajectory(traj, out_dir=out_dir)
+        return self.plot_trajectory(traj=traj, out_dir=out_dir, filename=filename)
 
 
 """ Module """
 
 
 class BranchFlowModule(pl.LightningModule):
-    def __init__(self, output_dir: str = "varco/outputs"):
+    def __init__(self, cfg: VarcoConfig):
         super().__init__()
 
-        self.output_dir = output_dir
-        self.model = BranchFlowModel()
+        self.cfg = cfg
+        self.save_hyperparameters("cfg")
+
+        self.model = BranchFlowModel(cfg=self.cfg.model)
         self.loss_calculator = BranchFlowLossCalculator()
         self.interpolant = TreeInterpolant()
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
-        return torch.optim.Adam(self.model.parameters(), lr=1e-3)
+        return torch.optim.AdamW(
+            params=self.model.parameters(),
+            **self.cfg.experiment.optimizer.asdict(),
+        )
 
-    def on_train_start(self) -> None:
-        model_size = get_model_size_str(self.model)
-        print(f"Model size: {model_size}")
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure):
+        """Override to time"""
+        backward_start = time.perf_counter()
+        optimizer.step(closure=optimizer_closure)
+        backward_time = time.perf_counter() - backward_start
+        self.log("time/backward_ms", backward_time * 1000)
 
     def forward(self, batch: DataCorrupted) -> ModelPrediction:
         return self.model(batch)
 
     def training_step(self, batch: DataBatch, batch_idx: int) -> torch.Tensor:
         self.interpolant.set_device(self.device)
+
+        # Time corruption (CPU time, no synchronization needed)
+        corrupt_start = time.perf_counter()
         bridged, couplings = self.interpolant.corrupt_batch(batch=batch)
+        corrupt_time = time.perf_counter() - corrupt_start
 
         corrupted = bridged.pack_present()
 
+        # Time forward pass
+        forward_start = time.perf_counter()
         pred = self.forward(corrupted)
+        forward_time = time.perf_counter() - forward_start
 
+        # Time loss calculation (part of forward)
+        loss_start = time.perf_counter()
         loss = self.loss_calculator.calculate(
             batch=corrupted, pred=pred, couplings=couplings
         )
+        loss_time = time.perf_counter() - loss_start
 
-        self.log("L/train", loss.total_loss.item(), prog_bar=True)
-        self.log("L/trans", loss.base_trans_loss.item(), prog_bar=True)
-        self.log("L/cdist", loss.pairwise_loss.item())
-        self.log("L/seq", loss.base_seq_loss.item(), prog_bar=True)
-        self.log("L/split", loss.split_token_loss.item(), prog_bar=True)
-        self.log("L/split_pooled", loss.split_pooled_loss.item())
-        self.log("L/del", loss.del_loss.item(), prog_bar=True)
-        self.log("aux/t", bridged.t.mean().item())
+        self.log("L/train", loss.total_loss, prog_bar=True)
+        self.log("L/trans", loss.base_trans_loss, prog_bar=True)
+        self.log("L/cdist", loss.pairwise_loss)
+        self.log("L/seq", loss.base_seq_loss, prog_bar=True)
+        self.log("L/split", loss.split_token_loss, prog_bar=True)
+        self.log("L/split_pooled", loss.split_pooled_loss)
+        self.log("L/del", loss.del_loss, prog_bar=True)
+        self.log("aux/t", bridged.t.mean())
+
+        # Timing statistics (in milliseconds)
+        self.log("t/corrupt", corrupt_time * 1000)
+        self.log("t/forward", forward_time * 1000)
+        self.log("t/loss", loss_time * 1000)
+
+        # Corruption time as function of batch size
+        batch_size = corrupted.trans_t.shape[0]
+        self.log("aux/batch_size", float(batch_size))
+        self.log(
+            "t/corrupt_per_batch", corrupt_time * 1000 / batch_size, prog_bar=False
+        )
+
+        # Corruption time as function of t value (bucketed)
+        mean_t = bridged.t.mean().detach().item()
+        t_bucket = round(mean_t * 10) / 5.0  # Round to nearest 0.2
+        self.log(f"t/corrupt_t{t_bucket:.1f}_ms", corrupt_time * 1000, prog_bar=False)
 
         # MPS clean up
         if batch_idx % 100 == 0 and torch.backends.mps.is_available():
@@ -3405,74 +3591,141 @@ class BranchFlowModule(pl.LightningModule):
         )
 
         viz = BranchingFlowVisualizer(sigma=1.0)
-        val_dir = os.path.join(self.output_dir, "val", f"epoch{self.current_epoch:03d}")
+        val_dir = os.path.join(
+            self.cfg.inference.predict_dir, "val", f"epoch{self.current_epoch:03d}"
+        )
         viz.plot_trajectory(
             sample_traj,
             out_dir=val_dir,
-            filename=f"val_sample_{batch_idx:03d}",
+            filename=f"val_sample_{batch_idx}",
         )
+
+        # TODO compute a loss (e.g. folding validation) use for model checkpointer
 
 
 """ Training """
 
 
-def train(
-    max_epochs: int = 20,
-    devices: int = 1,
-    seed: int = 0,
-):
-    pl.seed_everything(seed, workers=True)
+torch.set_float32_matmul_precision("high")
+torch.multiprocessing.set_sharing_strategy("file_system")
 
-    # Create output directory for this run
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join("varco/outputs", timestamp)
-    os.makedirs(output_dir, exist_ok=True)
-    print(f"📁 Output directory: {output_dir}")
+# Enable memory-efficient attention backends in PyTorch when available
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-    data_module = ProteinDataModule(
-        dataset=ProteinDataset(),
-        num_workers=0,  # debugging
-    )
 
-    # Debugging: plot a corruption planning tree
-    datum = data_module.dataset[0]
-    debug_dir = os.path.join(output_dir, "debug")
-    datum.tree_plan.plot(path=os.path.join(debug_dir, "init_tree_plan.png"))
+class Experiment:
+    def __init__(self, cfg: VarcoConfig):
+        self.cfg = cfg
+        self.logger = rank_zero_logger(__name__)
 
-    # Debugging: visualize the corruption process once using a real training batch.
-    viz = BranchingFlowVisualizer(sigma=1.0)
-    debug_batch = next(iter(data_module.train_dataloader(rank=0, num_replicas=1)))
-    viz.visualize_corruption(batch=debug_batch, out_dir=debug_dir)
+    def setup(self):
+        pl.seed_everything(self.cfg.shared.seed, workers=True)
 
-    module = BranchFlowModule(output_dir=output_dir)
+        # Handle DDP set up in case pytorch lightning doesn't handle it
+        # (e.g. on mac laptop)
+        setup_ddp(
+            trainer_strategy=self.cfg.experiment.trainer.strategy,
+            accelerator=self.cfg.experiment.trainer.accelerator,
+            rank=str(DDPInfo.from_env().rank),
+            world_size=str(self.cfg.experiment.num_devices),
+        )
 
-    ckpt_dir = os.path.join(output_dir, "ckpt")
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=ckpt_dir,
-        filename="varco-{epoch:02d}",
-        save_top_k=1,
-        save_last=True,
-        verbose=True,
-    )
+        # Create output directory for this run
+        predict_dir = self.cfg.inference.predict_dir
+        os.makedirs(predict_dir, exist_ok=True)
+        print(f"📁 Output directory: {predict_dir}")
 
-    trainer = pl.Trainer(
-        accelerator="auto",
-        devices=devices,
-        max_epochs=max_epochs,
-        check_val_every_n_epoch=1,
-        limit_val_batches=1,
-        callbacks=[checkpoint_callback],
-        enable_progress_bar=True,
-    )
+        self.data_module = ProteinDataModule(
+            dataset=ProteinDataset(cfg=self.cfg.dataset),
+            cfg=self.cfg.data,
+        )
 
-    trainer.fit(module, datamodule=data_module)
+        self.module = BranchFlowModule(cfg=self.cfg)
+        self.logger.info("\n" + str(ModelSummary(self.module, max_depth=2)))
 
-    print(f"Training complete")
-    print(f"💾 ckpt saved to {checkpoint_callback.best_model_path}")
-    print(f"🏆 Best validation loss: {checkpoint_callback.best_model_score}")
+    def debug(self):
+        debug_dir = os.path.join(self.cfg.inference.predict_dir, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
 
-    return module
+        # Plot corruption planning trees
+        for i in range(10):
+            datum = self.data_module.dataset[i]
+            datum.tree_plan.plot(path=os.path.join(debug_dir, f"init_tree_plan_{i}.png"))
+
+        # Visualize corruption processes
+        viz = BranchingFlowVisualizer(sigma=1.0)
+        data_loader = self.data_module.train_dataloader(rank=0, num_replicas=1)
+        for i, debug_batch in enumerate(data_loader):
+            if i > 10:
+                break
+            viz.visualize_corruption(batch=debug_batch, out_dir=debug_dir, filename=f"debug_corruption_{i}")
+
+    def save_config(self, wandb_logger: WandbLogger):
+        # Save config if main process
+        local_rank = DDPInfo.from_env().local_rank
+        if local_rank == 0:
+            # write locally
+            ckpt_dir = self.cfg.experiment.checkpointer.dirpath
+            self.logger.info(
+                f"Checkpoints, config, validations etc. will be saved to: {ckpt_dir}"
+            )
+            os.makedirs(ckpt_dir, exist_ok=True)
+            cfg_path = os.path.join(ckpt_dir, "config.yaml")
+            with open(cfg_path, "w") as f:
+                OmegaConf.save(config=self.cfg, f=f.name)
+
+            # write to w&b
+            if wandb_logger is not None and isinstance(wandb_logger, WandbLogger):
+                wandb_logger.experiment.config.update(self.cfg.flatdict())
+
+    def train(self):
+        # Set up w&b logging
+        wandb_logger = WandbLogger(**self.cfg.experiment.wandb.asdict())
+
+        callbacks = []
+
+        callbacks.append(TQDMProgressBar(refresh_rate=1))
+
+        # Model checkpoints
+        checkpoint_cfg = self.cfg.experiment.checkpointer.asdict()
+        checkpoint_cfg["monitor"] = "L/train"
+        callbacks.append(ModelCheckpoint(**checkpoint_cfg))
+
+        self.save_config(wandb_logger=wandb_logger)
+
+        self.logger.info("Setting up Trainer...")
+        trainer = Trainer(
+            **self.cfg.experiment.trainer.asdict(),
+            callbacks=callbacks,
+            logger=wandb_logger,
+            use_distributed_sampler=False,  # TODO - ddp
+            devices=self.cfg.experiment.num_devices,
+            enable_model_summary=False,  # manual model summary
+        )
+
+        trainer.fit(self.module, datamodule=self.data_module)
+
+        self.logger.info(f"Training complete")
+        self.logger.info(f"💾 ckpt saved to {self.cfg.experiment.checkpointer.dirpath}")
+        self.logger.info(
+            f"🏆 Best validation loss: {self.cfg.experiment.checkpointer.monitor}"
+        )
+
+        return self.module
+
+
+@hydra.main(config_path=".", config_name="varco", version_base=None)
+def main(cfg: VarcoConfig):
+    cfg = OmegaConf.to_object(cfg)
+    cfg = cfg.interpolate()
+
+    experiment = Experiment(cfg=cfg)
+    experiment.setup()
+    experiment.debug()
+    experiment.train()
 
 
 if __name__ == "__main__":
-    train()
+    main()

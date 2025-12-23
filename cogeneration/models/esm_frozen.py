@@ -216,10 +216,26 @@ class SequenceData:
         chain_idx: torch.Tensor,  # (B, N) chain identifiers
         esm_dict: Alphabet,  # alphabet/dictionary from ESM model
         res_mask: torch.Tensor,  # (B, N) 1 for valid residues
+        pad_mask: Optional[torch.Tensor] = None,  # (B, N) 1 for non-padding positions
     ) -> "SequenceData":
         """
         End-to-end conversion: AF2-indices → ESM tokens with BOS/EOS/linkers.
         adapted from https://github.com/facebookresearch/esm/blob/main/esm/esmfold/v1/esmfold.py
+
+        Args:
+            aatypes: (B, N) AF2 amino acid indices (0-20, where 0=A, 20=X)
+            chain_idx: (B, N) chain identifiers for multi-chain sequences
+            esm_dict: ESM alphabet/dictionary
+            res_mask: (B, N) boolean mask where True indicates valid residues.
+                      Positions where False are set to ESM 'X' token (unknown/invalid residue).
+            pad_mask: (B, N) optional boolean mask where True indicates non-padding positions.
+                      Positions where False are set to ESM padding token.
+                      If None (default), behaves as if all positions are non-padding.
+
+                      When both res_mask and pad_mask are provided:
+                      - pad_mask is applied first (False → padding token)
+                      - res_mask is applied second (False → 'X' token)
+                      - This ensures res_mask takes precedence over pad_mask
         """
         B, N = aatypes.shape
 
@@ -237,10 +253,18 @@ class SequenceData:
         # shift by +1 so 0-based AA becomes 1..20 (0 is padding)
         seq = conv_table[aatypes + 1]
 
-        # Set positions not in res_mask to X, i.e. assume they are non-canonical or non-residues.
-        # with chain-independent trimming, this is probably a reasonable assumption.
-        # (also, avoid using <pad> for simplicity with flash attention, which drops it.)
-        seq = seq.masked_fill(~res_mask.bool(), X)
+        # Apply masking in order: pad_mask first, then res_mask
+        # This ensures invalid residues (res_mask=False) become 'X' even if marked as padding
+        if pad_mask is None:
+            # Backward compatible: set positions not in res_mask to X
+            seq = seq.masked_fill(~res_mask.bool(), X)
+        else:
+            # Two-mask approach:
+            # Step 1: Set padding positions (pad_mask == False) to padding token
+            seq = seq.masked_fill(~pad_mask.bool(), pad)
+            # Step 2: Set invalid residues (res_mask == False) to X token
+            # This overwrites any overlap, ensuring res_mask takes precedence
+            seq = seq.masked_fill(~res_mask.bool(), X)
 
         device, dtype = seq.device, seq.dtype
         sequences, residue_masks = [], []
@@ -308,11 +332,16 @@ class SequenceData:
         aatypes: torch.Tensor,
         esm_dict: Alphabet,
         res_mask: torch.Tensor,
+        pad_mask: Optional[torch.Tensor] = None,
     ) -> "SequenceData":
         B, L = aatypes.shape
         dummy_chain = torch.ones((B, L), dtype=torch.long, device=aatypes.device)
         return cls.from_af2(
-            aatypes, chain_idx=dummy_chain, esm_dict=esm_dict, res_mask=res_mask
+            aatypes,
+            chain_idx=dummy_chain,
+            esm_dict=esm_dict,
+            res_mask=res_mask,
+            pad_mask=pad_mask,
         )
 
 
@@ -462,16 +491,19 @@ class FrozenEsmModel(nn.Module):
         aatypes: torch.Tensor,
         chain_index: torch.Tensor,
         res_mask: Optional[torch.Tensor] = None,
+        pad_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         sequence_data = SequenceData.from_af2(
             aatypes=aatypes,
             chain_idx=chain_index,
             esm_dict=self.esm_dict,
             res_mask=res_mask,
+            pad_mask=pad_mask,
         )
 
         # Shared last-call cache across instances
-        if self.caching:
+        # Disable caching when pad_mask is provided (different pad_mask with same aatypes could give different results)
+        if self.caching and pad_mask is None:
             shared_key = str(self._model_key)
             prev = _SHARED_ESM_CACHE.get(shared_key)
             if prev is not None:
@@ -590,7 +622,7 @@ class FrozenEsmModel(nn.Module):
         # Pull out residues, drop linkers, pad, etc.
         logits = logits[residue_mask].view(B, N, logits.shape[-1])  # (B, N, 21)
 
-        if self.caching:
+        if self.caching and pad_mask is None:
             shared_key = str(self._model_key)
             _SHARED_ESM_CACHE[shared_key] = {
                 "shape": tuple(aatypes.shape),

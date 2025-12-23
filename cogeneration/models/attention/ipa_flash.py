@@ -6,6 +6,7 @@ from torch import nn
 from cogeneration.config.base import ModelIPAConfig
 from cogeneration.data.rigid import Rigid
 from cogeneration.models.attention.ipa_pytorch import InvariantPointAttention
+from cogeneration.util.log import rank_zero_logger
 
 # Try to import FlashIPA
 try:
@@ -17,6 +18,9 @@ except (ImportError, OSError):
     EdgeEmbedder = None
     EdgeEmbedderConfig = None
     LinearFactorizer = None
+
+
+logger = rank_zero_logger(__name__)
 
 
 class _EdgeToZFactor(nn.Module):
@@ -54,10 +58,13 @@ class MaybeFlashIPA(nn.Module):
         super().__init__()
         self.cfg = cfg
 
+        if cfg.use_flash_attn and FastIPA is None:
+            logger.error(
+                "FlashIPA is not installed, but use_flash_attn is True. Will fall back."
+            )
+
         use_flash_ipa = (
-            torch.cuda.is_available()
-            and getattr(cfg, "use_flash_attn", False)
-            and FastIPA is not None
+            torch.cuda.is_available() and cfg.use_flash_attn and FastIPA is not None
         )
         self.is_flash = bool(use_flash_ipa)
         self.impl = FastIPA(cfg) if self.is_flash else InvariantPointAttention(cfg)
