@@ -14,9 +14,14 @@ Losses are base (MSE), split (poisson-like), and deletion (BCE)
 
 Then, a sampler (no tree) iterates to get base (endpoint prediction), sample split events, sample deletion events
 
+Fix backlog:
+- sample_base should take motif_mask as argument, not num_roots
+  - translations base shold be all positions
+  - aatypes base should be all positions and then masked to set motifs to actual sequence
+- improve sequence viz
+
 TODOs / features:
-- support sequence with an protein insertion logits (and sequence logits)
-  - also predict insertion logits, which are sampled on insertions, rather than cloning the existing residue
+- sequence: also predict insertion logits, which are sampled on insertions, and replace the parent's residue
 - support a mini frozen ESM model up front (once we have sequence)
   - requires handling padding correctly, since inputs no longer same length
 - make sure we handle positional embedding correctly (i.e. ~ arange on current sequence, but handle chain_idx)
@@ -24,9 +29,12 @@ TODOs / features:
   - motif guidance for positions
   - add validation loss (e.g. folding validation?)
 - support rotations with an IGSO(3) bridge
-- Ensure we support all motif strategies
+- Ensure we support all motif strategies, including at start/end
 - use a Config
 - simplify tree plan and coupling
+  - instead of iterating over topology, group by depth and process in parallel: O(A) -> O(depth)
+    - compute and track node depth (+ max depth)as part of TreePlan
+  - could we only compute anchors up to the t we sample, or do we need them at all intermediate times?
   - maintain ~rough order in alignment space of final ordering (i.e. anchors mixed in with leaves)
     - or at least, easier to get planar index (e.g. use for plotting)
   - speed up construction
@@ -61,8 +69,18 @@ from cogeneration.config.base import (
     DatasetInpaintingConfig,
     DatasetInpaintingMotifStrategy,
 )
-from cogeneration.data.const import ANG_TO_NM_SCALE, NM_TO_ANG_SCALE
-from cogeneration.data.noise_mask import centered_gaussian
+from cogeneration.data.const import (
+    ANG_TO_NM_SCALE,
+    MASK_TOKEN_INDEX,
+    NM_TO_ANG_SCALE,
+    NUM_TOKENS,
+)
+from cogeneration.data.noise_mask import centered_gaussian, uniform_categorical
+from cogeneration.data.residue_constants import (
+    restype_order_with_x,
+    restypes,
+    restypes_with_x,
+)
 from cogeneration.dataset.datasets import BaseDataset
 from cogeneration.dataset.protein_dataloader import LengthBatcher
 from cogeneration.models.embed import get_index_embedding
@@ -1033,6 +1051,7 @@ class DataSample:
     res_mask: torch.Tensor  # (N,) int
     chain_idx: torch.Tensor  # (N,) int
     trans_1: torch.Tensor  # (N, 3)
+    aatypes_1: torch.Tensor  # (N,)
 
 
 @dataclass
@@ -1047,6 +1066,7 @@ class DataBatch:
     res_mask: torch.Tensor  # (B, N) int
     chain_idx: torch.Tensor  # (B, N) int
     trans_1: torch.Tensor  # (B, N, 3)
+    aatypes_1: torch.Tensor  # (B, N)
 
 
 @dataclass
@@ -1059,6 +1079,7 @@ class DataCorrupted:
     res_mask: torch.Tensor  # (B, P_max) int
     chain_idx: torch.Tensor  # (B, P_max) int
     trans_t: torch.Tensor  # (B, P_max, 3)
+    aatypes_t: torch.Tensor  # (B, P_max)
     remaining_insertions: Optional[torch.Tensor] = (
         None  # (B, P_max) supervised target, remaining splits per present token
     )
@@ -1085,6 +1106,7 @@ class DataCorrupted:
             res_mask=self.res_mask.detach().clone(),
             chain_idx=self.chain_idx.detach().clone(),
             trans_t=self.trans_t.detach().clone(),
+            aatypes_t=self.aatypes_t.detach().clone(),
             remaining_insertions=(
                 self.remaining_insertions.detach().clone()
                 if self.remaining_insertions is not None
@@ -1171,6 +1193,9 @@ class DataCorrupted:
                 self.chain_idx, gather_idx, new_valid, fill_value=0
             ),
             trans_t=gather_and_pad(self.trans_t, gather_idx, new_valid, fill_value=0.0),
+            aatypes_t=gather_and_pad(
+                self.aatypes_t, gather_idx, new_valid, fill_value=MASK_TOKEN_INDEX
+            ),
         )
 
         return new_batch, is_insertion
@@ -1187,6 +1212,7 @@ class DataBridged:
     res_mask: torch.Tensor  # (B, A)
     chain_idx: torch.Tensor  # (B, A)
     trans_t: torch.Tensor  # (B, A, 3)
+    aatypes_t: torch.Tensor  # (B, A)
     # supervision
     remaining_insertions: torch.Tensor  # (B, A) target count per aligned node
     deleted: torch.Tensor  # (B, A) bool, aligned deletion label (leaf only)
@@ -1244,6 +1270,12 @@ class DataBridged:
             res_mask=gather_and_pad(self.res_mask, idx_pack, pack_mask, fill_value=0),
             chain_idx=gather_and_pad(self.chain_idx, idx_pack, pack_mask, fill_value=0),
             trans_t=gather_and_pad(self.trans_t, idx_pack, pack_mask, fill_value=0.0),
+            aatypes_t=gather_and_pad(
+                self.aatypes_t,
+                idx_pack,
+                pack_mask,
+                fill_value=MASK_TOKEN_INDEX,
+            ),
             remaining_insertions=gather_and_pad(
                 self.remaining_insertions, idx_pack, pack_mask, fill_value=0
             ),
@@ -1258,6 +1290,8 @@ class DataBridged:
             raise ValueError("present_mask shape mismatch")
         if self.motif_mask.shape != (B, A):
             raise ValueError("motif_mask shape mismatch")
+        if self.aatypes_t.shape != (B, A):
+            raise ValueError("aatypes_t shape mismatch")
         if self.remaining_insertions.shape != (B, A):
             raise ValueError("remaining_insertions shape mismatch")
         if self.deleted.shape != (B, A):
@@ -1271,6 +1305,7 @@ class ModelPrediction:
     """t=1 prediction for present state (length P)"""
 
     pred_trans_1: torch.Tensor  # (B, P, 3) base; predicted final/anchor positions
+    pred_aatype_logits: torch.Tensor  # (B, P, 21) base; amino acid logits
     pred_split_rate: torch.Tensor  # (B, P) non-negative remaining splits per token
     pred_split_pooled_log1p_rate: (
         torch.Tensor
@@ -1281,6 +1316,7 @@ class ModelPrediction:
         """Detach and clone the prediction, e.g. to save in trajectory"""
         return ModelPrediction(
             pred_trans_1=self.pred_trans_1.detach().clone(),
+            pred_aatype_logits=self.pred_aatype_logits.detach().clone(),
             pred_split_rate=self.pred_split_rate.detach().clone(),
             pred_split_pooled_log1p_rate=self.pred_split_pooled_log1p_rate.detach().clone(),
             pred_del_logits=self.pred_del_logits.detach().clone(),
@@ -1351,6 +1387,7 @@ class ProteinDataset(BaseDataset):
 
         # domains
         trans_1 = feats[bp.trans_1]
+        aatypes_1 = feats[bp.aatypes_1]
 
         tree_plan = TreePlan.generate(motif_mask=motif_mask)
         tree_plan.validate()
@@ -1361,6 +1398,7 @@ class ProteinDataset(BaseDataset):
             res_mask=res_mask,
             chain_idx=chain_idx,
             trans_1=trans_1,
+            aatypes_1=aatypes_1,
         )
 
 
@@ -1393,6 +1431,7 @@ class ProteinDataLoader(DataLoader):
         res_mask = torch.stack([item.res_mask for item in batch])  # (B, N)
         chain_idx = torch.stack([item.chain_idx for item in batch])  # (B, N)
         trans_1 = torch.stack([item.trans_1 for item in batch])  # (B, N, 3)
+        aatypes_1 = torch.stack([item.aatypes_1 for item in batch])  # (B, N)
 
         return DataBatch(
             tree=tree,
@@ -1400,6 +1439,7 @@ class ProteinDataLoader(DataLoader):
             res_mask=res_mask,
             chain_idx=chain_idx,
             trans_1=trans_1,
+            aatypes_1=aatypes_1,
         )
 
 
@@ -1444,9 +1484,12 @@ class BranchFlowModel(nn.Module):
 
         self.point_dim = 3
         self.pos_embed_dim = 32
+        self.num_aatype_tokens = NUM_TOKENS + 1  # 21: 20 amino acids + X
 
-        # x_t (point_dim), t (1), birth_time (1), motif_mask (1), chain_idx (1), pos_embed
-        self.input_dim = self.point_dim + 1 + 1 + 1 + 1 + self.pos_embed_dim
+        # x_t (point_dim), t (1), birth_time (1), motif_mask (1), chain_idx (1), pos_embed, aatypes_onehot (21)
+        self.input_dim = (
+            self.point_dim + 1 + 1 + 1 + 1 + self.pos_embed_dim + self.num_aatype_tokens
+        )
         self.model_dim = 64
 
         self.input_proj = nn.Linear(self.input_dim, self.model_dim)
@@ -1461,6 +1504,15 @@ class BranchFlowModel(nn.Module):
         self.split_rate_pred = nn.Linear(self.model_dim, 1)
         self.split_pooled_log1p_rate_pred = nn.Linear(self.model_dim, 1)
         self.del_logits_pred = nn.Linear(self.model_dim, 1)
+
+        # Amino acid prediction MLP
+        self.aatype_pred = nn.Sequential(
+            nn.Linear(self.model_dim, self.model_dim),
+            nn.ReLU(),
+            nn.Linear(self.model_dim, self.model_dim),
+            nn.ReLU(),
+            nn.Linear(self.model_dim, self.num_aatype_tokens),
+        )
 
     def forward(self, batch: DataCorrupted) -> ModelPrediction:
         B, P, _ = batch.trans_t.shape
@@ -1478,6 +1530,11 @@ class BranchFlowModel(nn.Module):
         )
         pos_embed = pos_embed * batch.valid_mask.unsqueeze(-1).float()
 
+        # One-hot encode aatypes_t
+        aatypes_onehot = F.one_hot(
+            batch.aatypes_t.long(), num_classes=self.num_aatype_tokens
+        ).float()  # (B, P, 21)
+
         x_t = torch.cat(
             [
                 batch.trans_t,  # (B, P, 3)
@@ -1488,6 +1545,7 @@ class BranchFlowModel(nn.Module):
                 batch.motif_mask[:, :, None].float(),  # (B, P, 1)
                 batch.chain_idx[:, :, None].int(),  # (B, P, 1)
                 pos_embed,  # (B, P, pos_embed_dim)
+                aatypes_onehot,  # (B, P, 21)
             ],
             dim=-1,
         )
@@ -1497,6 +1555,12 @@ class BranchFlowModel(nn.Module):
 
         # Predict translations
         pred_trans_1 = self.trans_pred(x_t)
+
+        # Predict amino acid logits
+        pred_aatype_logits = self.aatype_pred(x_t)  # (B, P, 21)
+        # Ensure mask logits disabled
+        if self.num_aatype_tokens == NUM_TOKENS + 1:
+            pred_aatype_logits[:, :, MASK_TOKEN_INDEX] = -1e9
 
         # Predict nonnegative remaining-splits rates (Poisson-like regression)
         split_rate = F.softplus(self.split_rate_pred(x_t)).squeeze(-1)  # (B, P)
@@ -1513,6 +1577,7 @@ class BranchFlowModel(nn.Module):
 
         return ModelPrediction(
             pred_trans_1=pred_trans_1,
+            pred_aatype_logits=pred_aatype_logits,
             pred_split_rate=split_rate,
             pred_split_pooled_log1p_rate=split_pooled_log1p_rate,
             pred_del_logits=del_logits,
@@ -1566,7 +1631,8 @@ class Coupler(ABC, Generic[CouplingT]):
         x1_pred: torch.Tensor,  # (B, P, d)
         t: torch.Tensor,  # (B,)
         dt: float,
-        birth_time: Optional[torch.Tensor] = None,  # (B, P)
+        birth_time: torch.Tensor,  # (B, P)
+        motif_mask: torch.Tensor,  # (B, P)
     ) -> torch.Tensor:
         """Single Euler(-Maruyama) step for sampling.
 
@@ -1577,11 +1643,10 @@ class Coupler(ABC, Generic[CouplingT]):
 
 @dataclass
 class TranslationCoupling(Coupling):
+    tree: BatchedTreePlan
+
     # domain-specific anchors (used for supervision)
     anchors: torch.Tensor  # (B, A, 3)
-
-    # shared tree plan (domain-agnostic)
-    tree: BatchedTreePlan
 
 
 class TranslationCoupler(Coupler[TranslationCoupling]):
@@ -1807,6 +1872,7 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
         t: torch.Tensor,  # (B,)
         dt: float,
         birth_time: torch.Tensor,  # (B, P)
+        motif_mask: torch.Tensor,  # (B, P)
     ) -> torch.Tensor:
         trans_pred = x1_pred
         if x_t.shape != trans_pred.shape:
@@ -1837,14 +1903,548 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
         return x_next * valid_fmask + x_t * (1.0 - valid_fmask)
 
 
+@dataclass
+class AATypesCoupling(Coupling):
+    """Coupling for amino acid types using CTMC bridge."""
+
+    tree: BatchedTreePlan
+
+    # Anchor tokens sampled from descendant distributions
+    anchors: torch.Tensor  # (B, A) long
+
+
+class AATypesCoupler(Coupler[AATypesCoupling]):
+    """
+    Coupler for amino acid types using a continuous-time Markov chain (CTMC) bridge.
+
+    Uses a uniform substitution CTMC (complete graph) with closed-form transition probabilities.
+    The bridge maintains creation_token at birth_time and anchor token at t=1 for each node.
+    """
+
+    K: int = NUM_TOKENS + 1  # 21 tokens (20 amino acids + mask/X token at index 20)
+
+    def __init__(
+        self,
+        beta: float = 3.0,
+        drift_temp: float = 1.0,
+        noise_scale: float = 0.5,
+        uncertainty_sharpness: float = 1.0,
+        leave_mass_cap: float = 0.25,
+    ):
+        """
+        beta: Total leaving rate for the CTMC (rate of jumping away from current state)
+        drift_temp: Temperature for softmax in euler_step (lower = sharper)
+        noise_scale: Scale for uniform noise added to step probabilities (0 = no noise)
+        uncertainty_sharpness: Exponent for uncertainty gating (higher = sharper gate)
+        leave_mass_cap: Maximum total off-diagonal (jump) probability per step
+        """
+        self.beta = beta
+        self.drift_temp = drift_temp
+        self.noise_scale = noise_scale
+        self.uncertainty_sharpness = uncertainty_sharpness
+        self.leave_mass_cap = leave_mass_cap
+
+    def sample_base(
+        self, num_batch: int, num_roots: int, device: torch.device
+    ) -> torch.Tensor:
+        """Sample uniform random amino acid types for base distribution (t=0)."""
+        return uniform_categorical(
+            num_batch, num_roots, num_tokens=self.K, device=device
+        )
+
+    def _transition_prob(
+        self,
+        delta: torch.Tensor,  # (...) time delta
+        same: bool = True,  # True if staying prob, False if transition prob
+    ) -> torch.Tensor:
+        """
+        Compute CTMC transition probability for uniform substitution model.
+
+        For a uniform substitution CTMC with leaving rate β:
+        - P_ii(Δ) = 1/K + (1 - 1/K) * exp(-λΔ)
+        - P_ij(Δ) = 1/K - (1/K) * exp(-λΔ)  for i ≠ j
+
+        where λ = β * K / (K - 1)
+        """
+        delta = delta.clamp_min(0.0)
+        lam = self.beta * self.K / (self.K - 1)
+        exp_term = torch.exp(-lam * delta)
+        inv_K = 1.0 / self.K
+
+        if same:
+            return inv_K + (1.0 - inv_K) * exp_term
+        else:
+            return inv_K - inv_K * exp_term
+
+    def _bridge_marginal(
+        self,
+        token_start: torch.Tensor,  # (M,) long, token at t0
+        token_end: torch.Tensor,  # (M,) long, token at t=1
+        s: torch.Tensor,  # (M,) time to sample at
+        t0: torch.Tensor,  # (M,) birth time
+    ) -> torch.Tensor:
+        """
+        Sample from CTMC bridge marginal at time s conditioned on endpoints.
+
+        For a CTMC bridge from X_{t0}=i to X_1=j, the marginal at time s is:
+        P(X_s = k | X_{t0} = i, X_1 = j) ∝ P(s - t0)_{i,k} * P(1 - s)_{k,j}
+        """
+        M = token_start.shape[0]
+        device = token_start.device
+
+        # Time intervals
+        delta_start = (s - t0).clamp_min(0.0)  # (M,)
+        delta_end = (1.0 - s).clamp_min(0.0)  # (M,)
+
+        # Build transition probability matrix rows
+        # P(s - t0)_{i,k} for all k
+        # P(1 - s)_{k,j} for all k
+        K = self.K
+
+        # Compute probabilities for each candidate token k
+        # P(s - t0)_{i,k}: probability of going from i to k in time (s - t0)
+        # P(1 - s)_{k,j}: probability of going from k to j in time (1 - s)
+
+        # For efficiency, compute staying vs leaving probabilities
+        p_stay_start = self._transition_prob(delta_start, same=True)  # (M,)
+        p_jump_start = self._transition_prob(delta_start, same=False)  # (M,)
+        p_stay_end = self._transition_prob(delta_end, same=True)  # (M,)
+        p_jump_end = self._transition_prob(delta_end, same=False)  # (M,)
+
+        # Build full probability vector for each token k
+        # P_{i,k}(Δ1) = p_stay_start if k == i else p_jump_start
+        # P_{k,j}(Δ2) = p_stay_end if k == j else p_jump_end
+
+        # Create one-hot indicators
+        k_range = torch.arange(K, device=device).unsqueeze(0)  # (1, K)
+        is_start = (k_range == token_start.unsqueeze(1)).float()  # (M, K)
+        is_end = (k_range == token_end.unsqueeze(1)).float()  # (M, K)
+
+        # Transition probs from start to each k
+        p_start_to_k = is_start * p_stay_start.unsqueeze(1) + (
+            1.0 - is_start
+        ) * p_jump_start.unsqueeze(
+            1
+        )  # (M, K)
+
+        # Transition probs from each k to end
+        p_k_to_end = is_end * p_stay_end.unsqueeze(1) + (
+            1.0 - is_end
+        ) * p_jump_end.unsqueeze(
+            1
+        )  # (M, K)
+
+        # Bridge marginal: P(X_s = k) ∝ P_{i,k}(Δ1) * P_{k,j}(Δ2)
+        probs = p_start_to_k * p_k_to_end  # (M, K)
+
+        # Normalize, handling zero-sum rows (invalid/padding nodes)
+        row_sums = probs.sum(dim=-1, keepdim=True)  # (M, 1)
+        has_mass = row_sums > 1e-12  # (M, 1)
+
+        # For rows with no mass (padding), use uniform distribution to allow multinomial
+        uniform_fallback = torch.ones(M, K, device=device) / K
+        probs = torch.where(
+            has_mass, probs / row_sums.clamp_min(1e-12), uniform_fallback
+        )
+
+        # Sample
+        sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (M,)
+
+        # For invalid rows, return the start token as fallback
+        sampled = torch.where(has_mass.squeeze(-1), sampled, token_start)
+
+        return sampled
+
+    def build_anchor_alignment(
+        self, aatypes_1: torch.Tensor, tree: BatchedTreePlan
+    ) -> torch.Tensor:
+        """
+        Build anchor tokens for all nodes (leaves + internal) from leaf endpoints at t=1.
+
+        For leaves: anchor is the one-hot token from aatypes_1
+        For internal nodes: anchor distribution is weighted mixture of descendant leaves,
+                           then we sample a single anchor token from this distribution.
+
+        Args:
+            aatypes_1: (B, N) amino acid types at t=1
+            tree: Batched tree plan
+
+        Returns:
+            anchor_tokens: (B, A) long, sampled anchor tokens for all nodes
+        """
+        if aatypes_1.ndim != 2:
+            raise ValueError(f"Expected aatypes_1 shape (B, N); got {aatypes_1.shape}")
+
+        device = aatypes_1.device
+        B, N = aatypes_1.shape
+        A = tree.parent_idx.shape[1]
+        K = self.K
+
+        # Broadcast aatypes_1 into leaf slots, MASK for internal/padding
+        leaf_tokens = tree.broadcast_to_leaves(
+            aatypes_1.to(torch.long), fill_value=MASK_TOKEN_INDEX
+        )  # (B, A)
+
+        # Build anchor probability distributions (B, A, K) bottom-up
+        # For leaves: one-hot of their token
+        # For internal: weighted sum of children's distributions
+        anchor_probs = torch.zeros(B, A, K, device=device)
+
+        # Initialize leaves with one-hot distributions
+        leaf_mask = tree.leaf_mask  # (B, A)
+        leaf_idx = leaf_tokens.clamp(0, K - 1)  # (B, A)
+        anchor_probs.scatter_(
+            -1,
+            leaf_idx.unsqueeze(-1),
+            leaf_mask.unsqueeze(-1).float(),
+        )
+
+        # Build internal node distributions bottom-up
+        # Since parent_idx > child_idx in topo order, iterate forward
+        for i in range(A):
+            w_i = tree.total_leaves[:, i]  # (B,)
+            exists = w_i > 0
+            is_internal = w_i > 1
+            valid = exists & is_internal
+            if not bool(valid.any()):
+                continue
+
+            kids = tree.children_idx[:, i, :]  # (B, 2)
+            k = kids.clamp_min(0)  # (B, 2)
+
+            # Gather child probability distributions using explicit advanced indexing
+            # anchor_probs[b, k[b, j], :] for each batch b and child j
+            batch_idx_2 = (
+                torch.arange(B, device=device).unsqueeze(1).expand(-1, 2)
+            )  # (B, 2)
+            child_probs = anchor_probs[batch_idx_2, k, :]  # (B, 2, K)
+
+            # Gather child weights
+            child_w = tree.total_leaves[batch_idx_2, k].float()  # (B, 2)
+            wsum = child_w.sum(dim=1, keepdim=True).clamp_min(1.0)  # (B, 1)
+
+            # Weighted average of child distributions
+            weights = (child_w / wsum).unsqueeze(-1)  # (B, 2, 1)
+            merged_probs = (child_probs * weights).sum(dim=1)  # (B, K)
+
+            # Write to internal node
+            batch_idx = torch.arange(B, device=device)
+            anchor_probs[batch_idx[valid], i, :] = merged_probs[valid]
+
+        # Add noise to anchor probabilities: mix in uniform distribution.
+        # This encourages the model to learn that anchor endpoints can vary.
+        # Leaves are set to data below.
+        if self.noise_scale > 0:
+            uniform_dist = torch.ones(B, A, K, device=device) / K
+            # Use noise_scale as mixing weight (clamped to reasonable range)
+            # e.g. noise_scale=0.5 -> 10% uniform
+            noise_weight = min(self.noise_scale * 0.2, 0.2)
+            anchor_probs = (
+                1.0 - noise_weight
+            ) * anchor_probs + noise_weight * uniform_dist
+
+        # Normalize probabilities, handling zero-sum rows (padding/invalid nodes)
+        row_sums = anchor_probs.sum(dim=-1, keepdim=True)  # (B, A, 1)
+        has_mass = row_sums > 1e-12  # (B, A, 1)
+
+        # For rows with no mass (padding), use uniform distribution to allow multinomial
+        uniform_fallback = torch.ones(B, A, K, device=device) / K
+        anchor_probs = torch.where(
+            has_mass, anchor_probs / row_sums.clamp_min(1e-12), uniform_fallback
+        )
+
+        # Sample anchor tokens from distributions (deterministic endpoints for this corruption call)
+        anchor_probs_flat = anchor_probs.view(-1, K)  # (B*A, K)
+        anchor_tokens = torch.multinomial(anchor_probs_flat, num_samples=1).squeeze(
+            -1
+        )  # (B*A,)
+        anchor_tokens = anchor_tokens.view(B, A)  # (B, A)
+
+        # For leaves, use the actual token (not sampled from distribution)
+        anchor_tokens = torch.where(leaf_mask, leaf_tokens, anchor_tokens)
+
+        # For padding nodes (no mass), use MASK token
+        anchor_tokens = torch.where(
+            has_mass.squeeze(-1),
+            anchor_tokens,
+            torch.full_like(anchor_tokens, MASK_TOKEN_INDEX),
+        )
+
+        return anchor_tokens
+
+    def corrupt(
+        self,
+        tree: BatchedTreePlan,
+        t: torch.Tensor,  # (B,)
+        x1: torch.Tensor,  # (B, N)
+        x0: Optional[torch.Tensor] = None,  # (B, R_max)
+    ) -> Tuple[torch.Tensor, AATypesCoupling]:
+        """
+        Corrupt amino acid types to time t using CTMC bridge and tree plan.
+        """
+        aatypes_1 = x1
+        if aatypes_1.ndim != 2:
+            raise ValueError(f"Expected aatypes_1 shape (B, N); got {aatypes_1.shape}")
+
+        device = aatypes_1.device
+        B, N = aatypes_1.shape
+        A = int(tree.parent_idx.shape[1])
+        aatypes_0 = x0
+
+        # Determine how many roots are used per example
+        R_max = int(tree.roots_mask.sum(dim=1).max().item())
+
+        # Sample / validate base roots
+        if aatypes_0 is None:
+            aatypes_0 = self.sample_base(num_batch=B, num_roots=R_max, device=device)
+        if aatypes_0.ndim != 2 or aatypes_0.shape[0] != B:
+            raise ValueError(f"Expected x0 shape (B, R); got {aatypes_0.shape}")
+
+        # Build aatypes_0_aligned by broadcasting first root, then writing per-example roots
+        aatypes_0_aligned = aatypes_0[:, :1].expand(B, A).contiguous().clone()  # (B, A)
+        for b in range(B):
+            roots_i = tree.roots[b][tree.roots_mask[b]].to(torch.long)
+            for j, r in enumerate(roots_i.tolist()):
+                if j >= aatypes_0.shape[1]:
+                    break
+                aatypes_0_aligned[b, r] = aatypes_0[b, j]
+
+        # Build anchor tokens (leaf endpoints + internal mixtures)
+        anchors = self.build_anchor_alignment(aatypes_1=aatypes_1, tree=tree)
+
+        # Save the coupling
+        coupling = AATypesCoupling(anchors=anchors, tree=tree)
+
+        # Track creation tokens at each node's birth time
+        creation_token = aatypes_0_aligned.clone()  # (B, A)
+
+        # Topological pass: sample each parent's token at split time, assign to children
+        for k in range(A):
+            node_idx = tree.topo_order[:, k]  # (B,)
+            valid_node = node_idx >= 0
+            node_idx_safe = node_idx.clamp(min=0)
+
+            t0 = tree.birth_time.gather(1, node_idx_safe.unsqueeze(1)).squeeze(
+                1
+            )  # (B,)
+            st = tree.split_time.gather(1, node_idx_safe.unsqueeze(1)).squeeze(
+                1
+            )  # (B,)
+
+            is_leaf = ~torch.isfinite(st)
+            should_skip = is_leaf | ~valid_node
+            if bool(should_skip.all()):
+                continue
+
+            # Gather node's creation token and anchor
+            node_creation = creation_token.gather(
+                1, node_idx_safe.unsqueeze(1)
+            ).squeeze(
+                1
+            )  # (B,)
+            node_anchor = anchors.gather(1, node_idx_safe.unsqueeze(1)).squeeze(
+                1
+            )  # (B,)
+
+            # Sample token at split time from bridge marginal
+            node_at_split = self._bridge_marginal(
+                token_start=node_creation,
+                token_end=node_anchor,
+                s=st,
+                t0=t0,
+            )  # (B,)
+
+            # Assign to children
+            kids = (
+                tree.children_idx.gather(
+                    1, node_idx_safe.view(B, 1, 1).expand(-1, 1, 2)
+                )
+                .to(torch.long)
+                .squeeze(1)
+            )  # (B, 2)
+            batch_idx = torch.arange(B, device=device)
+            for j in range(2):
+                c = kids[:, j]
+                valid = (c >= 0) & ~should_skip
+                if bool(valid.any()):
+                    creation_token[batch_idx[valid], c[valid]] = node_at_split[valid]
+
+        # Evaluate node tokens at time t (bridge from creation_token at birth_time to anchor at 1)
+        t_flat = t.unsqueeze(1).expand(B, A).reshape(-1)  # (B*A,)
+        b_flat = tree.birth_time.reshape(-1)  # (B*A,)
+        present_mask = tree.present_mask(t=t)  # (B, A)
+
+        aatypes_t_flat = self._bridge_marginal(
+            token_start=creation_token.reshape(-1),
+            token_end=anchors.reshape(-1),
+            s=t_flat,
+            t0=b_flat,
+        )  # (B*A,)
+        aatypes_t = aatypes_t_flat.view(B, A)
+
+        # Zero out non-present nodes (use MASK token)
+        aatypes_t = torch.where(
+            present_mask, aatypes_t, torch.full_like(aatypes_t, MASK_TOKEN_INDEX)
+        )
+
+        # Fix motif positions: use the anchor token (which equals the leaf token for leaves)
+        motif_mask = tree.motif_mask  # (B, A)
+        aatypes_t = torch.where(motif_mask, anchors, aatypes_t)
+
+        return aatypes_t, coupling
+
+    def _uncertainty_gate(
+        self,
+        x_t: torch.Tensor,  # (B, P) current tokens
+        probs: torch.Tensor,  # (B, P, K) predicted probabilities
+    ) -> torch.Tensor:
+        """
+        Compute uncertainty gate: 1 - p(current token), raised to sharpness.
+        Reduces jump probability when the model is confident about the current token.
+        """
+        K = self.K
+        # Get probability of current token
+        p_current = probs.gather(-1, x_t.long().clamp(0, K - 1).unsqueeze(-1)).squeeze(
+            -1
+        )
+        p_current = p_current.clamp(0.0, 1.0)  # (B, P)
+
+        # Uncertainty = (1 - p_current) ^ sharpness
+        uncertainty = (1.0 - p_current) ** self.uncertainty_sharpness
+        return uncertainty  # (B, P)
+
+    def _compute_step_probs(
+        self,
+        logits: torch.Tensor,  # (B, P, K) predicted logits for t=1
+        x_t: torch.Tensor,  # (B, P) current tokens
+        t: torch.Tensor,  # (B,) current time
+        dt: float,
+        valid_mask: torch.Tensor,  # (B, P) positions that are valid (born)
+    ) -> torch.Tensor:
+        """
+        Compute regularized step probabilities for discrete Euler sampling.
+        Applies temperature, uncertainty gate, noise, leave mass cap, and regularization.
+        """
+        B, P = x_t.shape
+        K = self.K
+        device = x_t.device
+
+        # Softmax with temperature
+        probs = F.softmax(logits / self.drift_temp, dim=-1)  # (B, P, K)
+
+        # Uncertainty gating
+        uncertainty = self._uncertainty_gate(x_t, probs)  # (B, P)
+
+        # Drift gain: 1 / (1 - t), clamped
+        t_clamped = t.clamp(0.0, 0.99)
+        drift_gain = 1.0 / (1.0 - t_clamped + 1e-4)
+        drift_gain = drift_gain.clamp(max=100.0).view(B, 1, 1)  # (B, 1, 1)
+
+        # Compute off-diagonal drift mass
+        step_probs = dt * drift_gain * probs * uncertainty.unsqueeze(-1)  # (B, P, K)
+
+        # Zero out current token (off-diagonal only)
+        current_onehot = F.one_hot(x_t.long().clamp(0, K - 1), num_classes=K).float()
+        step_probs = step_probs * (1.0 - current_onehot)
+
+        # Noise injection: add uniform mass to off-diagonal, scaled by sigma_t
+        if self.noise_scale > 0:
+            # sigma_t^2 ~ t(1-t), peaks at t=0.5
+            sigma_t_sq = (t * (1.0 - t)).view(B, 1, 1)  # (B, 1, 1)
+            noise_weight = self.noise_scale * dt * sigma_t_sq  # (B, 1, 1)
+
+            # Uniform over non-current tokens
+            uniform_noise = (1.0 - current_onehot) / max(K - 1, 1)
+            step_probs = step_probs + noise_weight * uniform_noise
+
+        # Cap leave mass
+        if self.leave_mass_cap is not None and self.leave_mass_cap > 0:
+            row_sum = step_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            shrink = (self.leave_mass_cap / row_sum).clamp_max(1.0)
+            step_probs = step_probs * shrink
+
+        # Regularize: set diagonal to 1 - sum(off-diagonal)
+        row_sum = step_probs.sum(dim=-1, keepdim=True)
+        step_probs = step_probs + current_onehot * (1.0 - row_sum)
+
+        # Clamp to valid range
+        step_probs = step_probs.clamp(min=0.0, max=1.0)
+
+        # For invalid positions: set to "stay" distribution (100% on current token)
+        # This avoids wasted compute and makes debugging clearer
+        stay_dist = current_onehot  # (B, P, K)
+        step_probs = torch.where(valid_mask.unsqueeze(-1), step_probs, stay_dist)
+
+        return step_probs
+
+    def euler_step(
+        self,
+        x_t: torch.Tensor,  # (B, P) current tokens
+        x1_pred: torch.Tensor,  # (B, P, K) predicted logits for t=1
+        t: torch.Tensor,  # (B,)
+        dt: float,
+        birth_time: torch.Tensor,  # (B, P)
+        motif_mask: torch.Tensor,  # (B, P)
+    ) -> torch.Tensor:
+        """Single Euler step for discrete amino acid sampling.
+
+        Uses discrete jump process with uncertainty gating and noise injection.
+        See _compute_step_probs for details on the probability computation.
+        """
+        B, P = x_t.shape
+        K = self.K
+
+        if x1_pred.shape != (B, P, K):
+            raise ValueError(f"Expected x1_pred shape (B, P, K); got {x1_pred.shape}")
+
+        # Valid positions are those born before current time
+        valid_mask = birth_time <= t[:, None]  # (B, P)
+
+        # Compute step probabilities with uncertainty gating, noise, and regularization
+        step_probs = self._compute_step_probs(
+            logits=x1_pred,
+            x_t=x_t,
+            t=t,
+            dt=dt,
+            valid_mask=valid_mask,
+        )
+
+        # Sample new tokens
+        x_next = torch.multinomial(step_probs.view(-1, K), num_samples=1).squeeze(-1)
+        x_next = x_next.view(B, P)
+
+        # Keep invalid positions unchanged
+        x_next = torch.where(valid_mask, x_next, x_t)
+
+        # Keep motif positions fixed
+        x_next = torch.where(motif_mask, x_t, x_next)
+
+        return x_next
+
+
 """ Interpolant supporting tree coupling """
+
+
+@dataclass
+class TreeCouplings:
+    """Container for all domain couplings from a single corruption call."""
+
+    translation: TranslationCoupling
+    aatypes: AATypesCoupling
 
 
 @dataclass
 class TreeInterpolant:
     device: torch.device = torch.device("cpu")
     min_t: float = 0.005
-    translation_coupler: Coupler[TranslationCoupling] = TranslationCoupler(sigma=1.0)
+    translation_coupler: Coupler[TranslationCoupling] = field(
+        default_factory=lambda: TranslationCoupler(sigma=1.0)
+    )
+    aatypes_coupler: Coupler[AATypesCoupling] = field(
+        default_factory=lambda: AATypesCoupler(
+            beta=3.0, drift_temp=1.0, noise_scale=0.5, uncertainty_sharpness=1.0
+        )
+    )
 
     def set_device(self, device: torch.device):
         self.device = device
@@ -1854,12 +2454,16 @@ class TreeInterpolant:
         batch: DataBatch,
         t: torch.Tensor,  # (B,)
         trans_0: Optional[torch.Tensor] = None,
-    ) -> Tuple[DataBridged, TranslationCoupling]:
+        aatypes_0: Optional[torch.Tensor] = None,
+    ) -> Tuple[DataBridged, TreeCouplings]:
         tree = batch.tree.to(self.device)
         trans_1 = batch.trans_1.to(self.device)
+        aatypes_1 = batch.aatypes_1.to(self.device)
         t = t.to(self.device)
         if trans_0 is not None:
             trans_0 = trans_0.to(self.device)
+        if aatypes_0 is not None:
+            aatypes_0 = aatypes_0.to(self.device)
 
         res_mask = batch.tree.broadcast_to_leaves(
             x=batch.res_mask.to(self.device), fill_value=0
@@ -1868,6 +2472,7 @@ class TreeInterpolant:
             x=batch.chain_idx.to(self.device), fill_value=0
         )
 
+        # Corrupt translations
         trans_t, trans_coupling = self.translation_coupler.corrupt(
             tree=tree,
             t=t,
@@ -1875,6 +2480,15 @@ class TreeInterpolant:
             x0=trans_0,
         )
         trans_coupling.validate()
+
+        # Corrupt aatypes
+        aatypes_t, aatypes_coupling = self.aatypes_coupler.corrupt(
+            tree=tree,
+            t=t,
+            x1=aatypes_1,
+            x0=aatypes_0,
+        )
+        aatypes_coupling.validate()
 
         bridged = DataBridged(
             t=t,
@@ -1884,16 +2498,16 @@ class TreeInterpolant:
             res_mask=res_mask,
             chain_idx=chain_idx,
             trans_t=trans_t,
+            aatypes_t=aatypes_t,
             remaining_insertions=tree.remaining_insertions_t(t=t),
             deleted=tree.leaf_deleted,
         )
         bridged.validate()
 
-        return bridged, trans_coupling
+        couplings = TreeCouplings(translation=trans_coupling, aatypes=aatypes_coupling)
+        return bridged, couplings
 
-    def corrupt_batch(
-        self, batch: DataBatch
-    ) -> Tuple[DataBridged, TranslationCoupling]:
+    def corrupt_batch(self, batch: DataBatch) -> Tuple[DataBridged, TreeCouplings]:
         # pick a single time to share across the batch,
         # simply so they have a similar number of insertion/deletions to simulate
         # since corruption is run across the batch
@@ -2042,6 +2656,15 @@ class TreeInterpolant:
         )
         trans_0 = trans_0 * is_motif.unsqueeze(-1).float()
 
+        # Initialize aatypes: motif positions from data, scaffold nuclei as uniform random
+        motif_aatypes = gather_and_pad(
+            data.aatypes_1.to(device), gather_idx, is_motif, fill_value=MASK_TOKEN_INDEX
+        )
+        scaffold_aatypes = uniform_categorical(
+            num_batch=B, num_res=P_max, num_tokens=len(restypes), device=device
+        )  # uniform over non-X restypes
+        aatypes_0 = torch.where(is_motif, motif_aatypes, scaffold_aatypes)
+
         # init batch at min_t
         t = torch.full((B,), self.min_t, dtype=torch.float32, device=device)
 
@@ -2052,6 +2675,7 @@ class TreeInterpolant:
             res_mask=res_mask,
             chain_idx=chain_idx,
             trans_t=trans_0,
+            aatypes_t=aatypes_0,
         )
 
     @staticmethod
@@ -2110,7 +2734,7 @@ class TreeInterpolant:
         model.eval()
         with torch.no_grad():
             t_grid = torch.linspace(self.min_t, 1.0, steps=num_steps, device=device)
-            for step in range(num_steps):
+            for step in tqdm(range(num_steps), desc="Sampling", leave=False):
                 t_val = float(t_grid[step].item())
                 t_next = (
                     float(t_grid[step + 1].item())
@@ -2133,8 +2757,20 @@ class TreeInterpolant:
                     t=batch.t,
                     dt=dt,
                     birth_time=batch.birth_time,
+                    motif_mask=batch.motif_mask,
                 )
                 batch.trans_t = trans_next
+
+                # Euler step for alive tokens' aatypes
+                aatypes_next = self.aatypes_coupler.euler_step(
+                    x_t=batch.aatypes_t,
+                    x1_pred=pred.pred_aatype_logits,
+                    t=batch.t,
+                    dt=dt,
+                    birth_time=batch.birth_time,
+                    motif_mask=batch.motif_mask,
+                )
+                batch.aatypes_t = aatypes_next
 
                 # Sample and apply insertion/deletion events, disallowed in motifs
                 is_root = batch.birth_time <= 0.0  # (B, P)
@@ -2161,6 +2797,8 @@ class TreeInterpolant:
                         batch.trans_t + insert_mask.unsqueeze(-1).float() * trans_noise
                     )
 
+                    # TODO - apply insertion logits, once we predict them
+
                 # TODO - recenter
 
                 # Save
@@ -2177,6 +2815,7 @@ class BranchFlowLosses:
     total_loss: torch.Tensor
     base_trans_loss: torch.Tensor  # MSE on translations
     pairwise_loss: torch.Tensor  # local pairwise distance loss
+    base_seq_loss: torch.Tensor  # CE on amino acid logits vs anchor tokens
     split_token_loss: torch.Tensor  # Poisson loss on per-token remaining splits
     split_pooled_loss: torch.Tensor  # aux Poisson loss on total remaining splits
     del_loss: torch.Tensor  # BCE on per-token logits (terminal tokens only)
@@ -2189,8 +2828,9 @@ class BranchFlowLossCalculator:
     # Local pairwise distance threshold (angstroms)
     proximity_threshold_ang: float = 7.0
     # Loss weights
-    trans_loss_weight: float = 1.0
+    trans_loss_weight: float = 2.0
     pairwise_dist_loss_weight: float = 0.2
+    seq_loss_weight: float = 1.0
     split_loss_weight: float = 0.2
     split_pooled_loss_weight: float = 0.025
     del_loss_weight: float = 0.2
@@ -2225,7 +2865,7 @@ class BranchFlowLossCalculator:
         denom = mask_f.sum(dim=(1, 2)).clamp_min(1.0)  # (B,)
         loss_per_batch = mse.sum(dim=(1, 2)) / denom  # (B,)
 
-        return loss_per_batch.mean().clamp(max=10.0) * self.trans_loss_weight
+        return (loss_per_batch.mean() * self.trans_loss_weight).clamp(max=10.0)
 
     def _pairwise_distance_loss(
         self,
@@ -2264,7 +2904,30 @@ class BranchFlowLossCalculator:
         denom = pair_mask.float().sum(dim=(1, 2)).clamp_min(1.0)
         loss_per_batch = dist_error.sum(dim=(1, 2)) / denom
 
-        return loss_per_batch.mean() * self.pairwise_dist_loss_weight
+        return (loss_per_batch.mean() * self.pairwise_dist_loss_weight).clamp(max=5.0)
+
+    def _seq_loss(
+        self,
+        pred_aatype_logits: torch.Tensor,  # (B, P, K)
+        target_anchor_tokens: torch.Tensor,  # (B, P) long
+        mask: torch.Tensor,  # (B, P)
+    ) -> torch.Tensor:
+        """Sequence loss: cross-entropy on amino acid logits vs anchor tokens."""
+        B, P, K = pred_aatype_logits.shape
+
+        # Flatten for cross-entropy: (B*P, K) and (B*P,)
+        logits_flat = pred_aatype_logits.view(-1, K)
+        targets_flat = target_anchor_tokens.view(-1)
+        mask_flat = mask.view(-1).float()
+
+        # Cross-entropy per token (reduction=none)
+        ce = F.cross_entropy(logits_flat, targets_flat, reduction="none")  # (B*P,)
+
+        # Masked mean
+        denom = mask_flat.sum().clamp_min(1.0)
+        seq_loss = (ce * mask_flat).sum() / denom
+
+        return (seq_loss * self.seq_loss_weight).clamp(max=10.0)
 
     def _split_token_loss(
         self,
@@ -2335,11 +2998,12 @@ class BranchFlowLossCalculator:
         self,
         batch: DataCorrupted,
         pred: ModelPrediction,
-        trans_coupling: TranslationCoupling,
+        couplings: TreeCouplings,
     ) -> BranchFlowLosses:
         B, P, D = batch.trans_t.shape
         assert pred.pred_trans_1.shape == (B, P, D)
 
+        trans_coupling = couplings.translation
         present_mask = trans_coupling.tree.present_mask(t=batch.t)  # (B, A)
         is_root = (trans_coupling.tree.parent_idx < 0).to(torch.long)
         valid_mask = batch.valid_mask  # (B, P_max)
@@ -2353,6 +3017,12 @@ class BranchFlowLossCalculator:
         )
         # zero pad
         trans_anchors_pack = trans_anchors_pack * pack_mask.unsqueeze(-1).float()
+
+        # Pack aatype anchor tokens (targets for sequence loss)
+        aatypes_coupling = couplings.aatypes
+        aatype_anchors_pack = aatypes_coupling.anchors.gather(1, idx_pack)  # (B, P_max)
+        # zero pad, will be masked
+        aatype_anchors_pack = aatype_anchors_pack * pack_mask.long()
 
         # Base loss on predicting existing residues' final positions
         base_loss = self._base_trans_loss(
@@ -2368,6 +3038,13 @@ class BranchFlowLossCalculator:
             mask=valid_mask,
         )
 
+        # Base sequence loss
+        base_seq_loss = self._seq_loss(
+            pred_aatype_logits=pred.pred_aatype_logits,
+            target_anchor_tokens=aatype_anchors_pack,
+            mask=valid_mask,
+        )
+
         # Insertion / split losses
         split_token_loss = self._split_token_loss(
             pred=pred,
@@ -2380,13 +3057,19 @@ class BranchFlowLossCalculator:
         del_loss = self._deletion_loss(pred=pred, batch=batch, mask=valid_mask)
 
         total_loss = (
-            base_loss + pairwise_loss + split_token_loss + split_pooled_loss + del_loss
+            base_loss
+            + pairwise_loss
+            + base_seq_loss
+            + split_token_loss
+            + split_pooled_loss
+            + del_loss
         )
 
         return BranchFlowLosses(
             total_loss=total_loss,
             base_trans_loss=base_loss,
             pairwise_loss=pairwise_loss,
+            base_seq_loss=base_seq_loss,
             split_token_loss=split_token_loss,
             split_pooled_loss=split_pooled_loss,
             del_loss=del_loss,
@@ -2425,6 +3108,80 @@ class BranchingFlowVisualizer:
             return "gif", animation.ImageMagickWriter(fps=10)
         return "gif", animation.PillowWriter(fps=10)
 
+    @staticmethod
+    def _aa_letters_and_colors() -> Tuple[List[str], np.ndarray]:
+        """Returns (letters, colors) for 21 amino acid types + X."""
+        letters = list(restypes_with_x)
+        letters[20] = "-"  # UNK
+
+        def tint(rgb, f):  # mix with white
+            return tuple((1 - f) * c + f for c in rgb)
+
+        NEG = (0.22, 0.47, 0.75)  # blue
+        POS = (0.84, 0.15, 0.16)  # red
+        POL = (0.17, 0.63, 0.17)  # green
+        NON = (0.75, 0.25, 0.75)  # purple
+        aa_map = {
+            # negative
+            "D": tint(NEG, 0.2),
+            "E": tint(NEG, 0.4),
+            # positive
+            "K": tint(POS, 0.2),
+            "R": tint(POS, 0.4),
+            "H": tint(POS, 0.8),
+            # polar
+            "N": tint(POL, 0.1),
+            "Q": tint(POL, 0.4),
+            "S": tint(POL, 0.5),
+            "T": tint(POL, 0.6),
+            "C": tint(POL, 0.3),
+            "Y": tint(POL, 0.7),
+            "W": tint(POL, 0.2),
+            # non-polar
+            "A": tint(NON, 0.8),
+            "V": tint(NON, 0.2),
+            "L": tint(NON, 0.1),
+            "I": tint(NON, 0.3),
+            "M": tint(NON, 0.4),
+            "F": tint(NON, 0.5),
+            "P": tint(NON, 0.6),
+            "G": tint(NON, 0.9),
+            "-": (0.9, 0.9, 0.9),
+        }
+        colors = np.array([aa_map[ltr] for ltr in letters])
+        return letters, colors
+
+    @staticmethod
+    def _draw_sequence_bar(ax: plt.Axes, aatypes: np.ndarray, motif_mask: np.ndarray):
+        """Draw sequence as colored squares with AA letters; underline motifs."""
+        # TODO - support max-width and break over lines if we need to... janky but better than truncating!
+        letters, colors = BranchingFlowVisualizer._aa_letters_and_colors()
+        n = len(aatypes)
+        ax.set_xlim(0, n)
+        ax.set_ylim(-0.3 if motif_mask.any() else 0, 1)
+        ax.set_aspect("equal", adjustable="box")
+        ax.axis("off")
+        for i, aa_idx in enumerate(aatypes):
+            aa_idx = int(aa_idx) if aa_idx < len(letters) else 20
+            ax.add_patch(
+                plt.Rectangle(
+                    (i, 0), 1, 1, facecolor=colors[aa_idx], edgecolor="white", lw=0.5
+                )
+            )
+            ax.text(
+                i + 0.5,
+                0.5,
+                letters[aa_idx],
+                ha="center",
+                va="center",
+                fontsize=8,
+                color="k",
+            )
+            if motif_mask[i]:
+                ax.add_patch(
+                    plt.Rectangle((i, -0.25), 1, 0.15, facecolor="black", lw=0)
+                )
+
     def plot_trajectory(
         self,
         traj: Trajectory,
@@ -2452,8 +3209,9 @@ class BranchingFlowVisualizer:
         trans_min = torch.zeros(3, device=device)
         trans_max = torch.zeros(3, device=device)
         for sample in traj.samples:
-            valid = sample.valid_mask & (
-                torch.arange(num_batch).unsqueeze(1) < num_plots
+            valid = sample.valid_mask
+            valid = valid & (
+                torch.arange(num_batch, device=device).unsqueeze(1) < num_plots
             )
             trans_t = sample.trans_t[valid]  # (num_plots*P, 3)
             trans_min = torch.min(trans_min, trans_t.min(dim=0).values)
@@ -2463,22 +3221,56 @@ class BranchingFlowVisualizer:
 
         num_cols = min(num_plots, 2)
         num_rows = math.ceil(num_plots / num_cols)
-        fig = plt.figure(figsize=(10 * num_cols, 10 * num_rows))
+        fig = plt.figure(figsize=(10 * num_cols, 12 * num_rows))
+        # 2 rows per plot: sequence bar (height 2) + 3D structure (height 10)
+        gs = fig.add_gridspec(
+            num_rows * 2,
+            num_cols,
+            height_ratios=[2, 10] * num_rows,
+            hspace=0.02,
+            wspace=0.05,
+        )
 
         with writer.saving(fig, anim_path, dpi=100):
             for sample in tqdm(traj.samples, desc="plot_trajectory()", leave=False):
                 valid_mask = sample.valid_mask.cpu().numpy().astype(bool)  # (B, P_max)
                 trans_t = sample.trans_t.cpu().numpy()  # (B, P_max, 3)
+                aatypes_t = sample.aatypes_t.cpu().numpy()  # (B, P_max)
                 motif_mask = sample.motif_mask.cpu().numpy().astype(bool)  # (B, P_max)
                 t_val = sample.t[0].item() if sample.t.numel() > 0 else 0.0
 
                 fig.clf()
+                gs = fig.add_gridspec(
+                    num_rows * 2,
+                    num_cols,
+                    height_ratios=[2, 10] * num_rows,
+                    hspace=0.02,
+                    wspace=0.05,
+                )
+
                 for i in range(num_plots):
-                    ax = fig.add_subplot(num_rows, num_cols, i + 1, projection="3d")
+                    row, col = divmod(i, num_cols)
+                    valid_i = valid_mask[i]
+                    trans_alive = trans_t[i][valid_i]  # (P, 3)
+                    aatypes_alive = aatypes_t[i][valid_i]  # (P,)
+                    motif_alive = motif_mask[i][valid_i]  # (P,)
+                    n_alive = trans_alive.shape[0]
+
+                    # Sequence bar axis
+                    ax_seq = fig.add_subplot(gs[row * 2, col])
+                    if n_alive > 0:
+                        BranchingFlowVisualizer._draw_sequence_bar(
+                            ax_seq, aatypes_alive, motif_alive
+                        )
+                    else:
+                        ax_seq.axis("off")
+
+                    # 3D structure axis
+                    ax = fig.add_subplot(gs[row * 2 + 1, col], projection="3d")
                     ax.set_xticks([])
                     ax.set_yticks([])
                     ax.set_zticks([])
-                    plt.subplots_adjust(
+                    fig.subplots_adjust(
                         left=0.03,
                         right=0.97,
                         bottom=0.03,
@@ -2487,10 +3279,6 @@ class BranchingFlowVisualizer:
                         hspace=0.05,
                     )
 
-                    trans_t_alive = trans_t[i][valid_mask[i]]  # (P, 3)
-                    motif_alive = motif_mask[i][valid_mask[i]]  # (P,)
-                    n_alive = trans_t_alive.shape[0]
-
                     ax.set_title(f"t = {t_val:.2f} (N={n_alive})")
                     if n_alive > 0:
                         # Color by position index, motifs smaller
@@ -2498,9 +3286,9 @@ class BranchingFlowVisualizer:
                         sizes = np.where(motif_alive, 15.0, 40.0)
 
                         ax.scatter(
-                            trans_t_alive[:, 0],
-                            trans_t_alive[:, 1],
-                            trans_t_alive[:, 2],
+                            trans_alive[:, 0],
+                            trans_alive[:, 1],
+                            trans_alive[:, 2],
                             c=color_idx,
                             cmap="Spectral",
                             vmin=0,
@@ -2579,22 +3367,23 @@ class BranchFlowModule(pl.LightningModule):
 
     def training_step(self, batch: DataBatch, batch_idx: int) -> torch.Tensor:
         self.interpolant.set_device(self.device)
-        bridged, trans_coupling = self.interpolant.corrupt_batch(batch=batch)
+        bridged, couplings = self.interpolant.corrupt_batch(batch=batch)
 
         corrupted = bridged.pack_present()
 
         pred = self.forward(corrupted)
 
         loss = self.loss_calculator.calculate(
-            batch=corrupted, pred=pred, trans_coupling=trans_coupling
+            batch=corrupted, pred=pred, couplings=couplings
         )
 
-        self.log("loss/train", loss.total_loss.item(), prog_bar=True)
-        self.log("loss/trans", loss.base_trans_loss.item(), prog_bar=True)
-        self.log("loss/pairwise", loss.pairwise_loss.item())
-        self.log("loss/split_token", loss.split_token_loss.item(), prog_bar=True)
-        self.log("loss/split_pooled", loss.split_pooled_loss.item(), prog_bar=True)
-        self.log("loss/del", loss.del_loss.item(), prog_bar=True)
+        self.log("L/train", loss.total_loss.item(), prog_bar=True)
+        self.log("L/trans", loss.base_trans_loss.item(), prog_bar=True)
+        self.log("L/cdist", loss.pairwise_loss.item())
+        self.log("L/seq", loss.base_seq_loss.item(), prog_bar=True)
+        self.log("L/split", loss.split_token_loss.item(), prog_bar=True)
+        self.log("L/split_pooled", loss.split_pooled_loss.item())
+        self.log("L/del", loss.del_loss.item(), prog_bar=True)
         self.log("aux/t", bridged.t.mean().item())
 
         # MPS clean up
