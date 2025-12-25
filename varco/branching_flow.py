@@ -1,42 +1,37 @@
 """
-Simple implementation of branching flows.
+Simple implementation of branching flows for protein scaffolding.
 
 Sample some proteins of length N (translations, later sequence and rotations) using LengthBatched protein dataset
-Sample a motif_mask (only support internal motif scaffolding for now so always have "real" parent)
-Define a tree, which inserts scaffold residues over trajectory with anchors at intermediate time points, and alignment of length A
-Sample some number of roots, starting points at t=0 for the motifs + roots
+Sample a motif_mask, with 1+ scaffolds
+Sample some number of roots per scaffold, starting points at t=0 for the motifs + roots
+Define a tree, with splits (anchors at intermediate time points) and deletions over trajectory
 
 Sample some intermediate time t
-Corrupt to X_t, using brownian bridge from 0 to each anchor, continuing up to time t
+Corrupt to X_t, using stochastic bridge from 0 to each anchor, continuing up to time t
 
 A simple model predicts base (endpoint prediction), split (remaining children count), and deletion (destined to delete probability)
-Losses are base (MSE), split (poisson-like), and deletion (BCE)
 
 Then, a sampler (no tree) iterates to get base (endpoint prediction), sample split events, sample deletion events
 
 Fix backlog:
-- sample_base should take motif_mask as argument, not num_roots
-  - translations base shold be all positions
-  - aatypes base should be all positions and then masked to set motifs to actual sequence
-- improve sequence viz
 
 TODOs / features:
-- sequence: also predict insertion logits, which are sampled on insertions, and replace the parent's residue
 - improve sampling
   - motif guidance for positions
   - add validation loss (e.g. folding validation?)
+  - cap sampling length to avoid overloading gpu memory
 - support rotations with an IGSO(3) bridge
-- simplify tree plan and coupling
-  - instead of iterating over topology, group by depth and process in parallel: O(A) -> O(depth)
-    - compute and track node depth (+ max depth)as part of TreePlan
-  - could we only compute anchors up to the t we sample, or do we need them at all intermediate times?
-  - maintain ~rough order in alignment space of final ordering (i.e. anchors mixed in with leaves)
-    - or at least, easier to get planar index (e.g. use for plotting)
-  - speed up construction
-  - speed up corruption
+- sequence: also predict insertion logits, which are sampled on insertions, and replace the parent's residue
+- improve visualizations
+  - sequence needs to be easier to read
+  - speed
+- tree
+  - bias splits earlier, deletions later
+  - allow more roots than leaves in a scaffold, learn to delete them
 """
 
 import datetime
+import functools
 import gc
 import math
 import os
@@ -44,7 +39,7 @@ import tempfile
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, Generic, List, Optional, Tuple, TypeVar
+from typing import Callable, Dict, Generic, List, Optional, Tuple, TypeVar
 
 import hydra
 import matplotlib.animation as animation
@@ -118,6 +113,46 @@ from varco.config import VarcoConfig, VarcoDatasetConfig, VarcoModelConfig
 
 
 """ Tensor Utilities """
+
+
+class SeededRNG:
+    """Seeded random number generator wrapping torch.Generator for reproducibility."""
+
+    def __init__(self, seed: Optional[int] = None, device: str = "cpu"):
+        self.rng = torch.Generator(device=device)
+        if seed is None:
+            seed = int(torch.seed() % (2**31 - 1))
+        self.rng.manual_seed(int(seed))
+
+    def rand_int(self, high: int) -> int:
+        """Sample uniform integer from [0, high)."""
+        return int(torch.randint(0, high, (1,), generator=self.rng).item())
+
+    def rand_float(self) -> float:
+        """Sample uniform float from [0, 1)."""
+        return float(torch.rand(1, generator=self.rng).squeeze().item())
+
+    def rand(self, size: int, device: str = "cpu") -> torch.Tensor:
+        """Sample uniform floats from [0, 1) as a tensor"""
+        return torch.rand(size, generator=self.rng, device=device)
+
+    def sample_exp1(self) -> float:
+        """Sample from Exp(1) distribution via inverse CDF."""
+        u = float(torch.rand((), generator=self.rng).clamp_min(1e-12).item())
+        return -math.log(u)
+
+    def sample_poisson(self, lam: float) -> int:
+        """Sample from Poisson(lam) distribution using Knuth's algorithm."""
+        if lam <= 0.0:
+            return 0
+        L = math.exp(-lam)
+        k = 0
+        p = 1.0
+        while True:
+            k += 1
+            p *= self.rand_float()
+            if p <= L:
+                return k - 1
 
 
 def gather_and_pad(
@@ -212,6 +247,9 @@ class TreePlan:
     parent_idx: torch.Tensor  # (A,) long, -1 for roots
     children_idx: torch.Tensor  # (A, 2) long, -1 for leaves
     total_leaves: torch.Tensor  # (A,) long, descendant leaf counts
+    node_depth: (
+        torch.Tensor
+    )  # (A,) long, depth in tree (leaves=0, parent=max(child_depths)+1)
     leaf_deleted: torch.Tensor  # (A,) bool; True for deleted leaves, False otherwise
 
     # times
@@ -228,7 +266,7 @@ class TreePlan:
         cls,
         motif_mask: torch.Tensor,  # (N,)
         seed: Optional[int] = None,
-        min_t: float = 0.001,
+        min_t: float = 0.005,
         min_scaffold_nuclei: int = 1,
         max_scaffold_nuclei: int = 10,
         # Coalesce within each group by repeated adjacent merges.
@@ -238,19 +276,20 @@ class TreePlan:
         # Number of deletion leaves are sampled from a Poisson distribution with rate p_deletion * # scaffold positions.
         p_deletion: float = 0.20,
     ) -> "TreePlan":
-        """Generate a simple planar coalescent tree plan with sampled split/birth times.
+        f"""
+        Generate a simple planar coalescent tree plan with sampled split/birth/delete times.
 
-        - Scaffold spans (motif_mask == False) are grouped into disjoint contiguous groups.
-        - Each motif position is its own singleton group (never merges).
-        - For each scaffold span group, we sample a number of "nuclei" K in
-            [min_scaffold_nuclei, min(max_scaffold_nuclei, span_len)]
-        and we coalesce the span only until K active nodes remain.
-        Those K nodes become roots for that scaffold span.
-        - Merges are biased toward scaffold boundaries (left/right) with small probability of
-        random interior merges for variability.
+        Algorithm:
+        - Provide t=1 positions of motif tokens (motif_mask == True) and scaffold positions
+        - Augment the tree with K_del deletions, which are to-be-deleted leaves duplicating t=1 endpoints
+        - Determine scaffold groups, assign group id
+        - Coalesce scaffold groups independently until K_scaffold roots remain within the group
+        - Sample split times for internal nodes (aka "anchors")
+        - Sample deletion times for deletion leaves (must come after split)
+        - Define motif_mask etc. in aligned space (i.e. length A)
 
-        Note: this intentionally allows scaffold tokens to be present at t=0 (the nuclei), in
-        addition to motif tokens. This avoids needing special boundary-sourcing logic.
+        Note this intentionally allows scaffold tokens to be present at t=0 (the nuclei), in
+        addition to motif tokens, which avoids needing special boundary-sourcing logic.
         """
         if motif_mask.ndim != 1:
             raise ValueError(
@@ -267,120 +306,104 @@ class TreePlan:
         N_data = motif_mask.shape[0]
         motif_mask_b = motif_mask.to(torch.bool)
 
-        # Sample split times top-down from uniform base time distribution + exponential waiting time
-        # Use a local torch.Generator for determinism and to avoid global RNG interaction.
-        rng = torch.Generator(device="cpu")
-        if seed is None:
-            # fall back to a nondeterministic seed
-            seed = int(torch.seed() % (2**31 - 1))
-        rng.manual_seed(int(seed))
+        scaffold_idx = torch.where(~motif_mask_b)[0]
+        n_scaffold = int(scaffold_idx.numel())
 
-        def rand_int(high: int) -> int:
-            return int(torch.randint(0, high, (1,), generator=rng).item())
+        # RNG helper
+        rng = SeededRNG(seed=seed, device="cpu")
 
-        def rand_float() -> float:
-            return float(torch.rand(1, generator=rng).squeeze().item())
-
-        # --- Deletions: duplicate existing scaffold leaves and mark one of each pair as destined-to-delete.
-        # t=1 is augmented by inserting deletion leaves that duplicate an endpoint.
-        # Only scaffold positions are eligible.
-
-        leaf_ref: List[int] = list(range(N_data))  # leaf-order -> original data idx
-        leaf_del: List[bool] = [False for _ in range(N_data)]
-
-        scaffold_positions = [
-            i for i in range(N_data) if not bool(motif_mask_b[i].item())
-        ]
-        n_scaffold = len(scaffold_positions)
-
-        # Poisson sampler (Knuth), deterministic under our local RNG
-        def sample_poisson(lam: float) -> int:
-            if lam <= 0.0:
-                return 0
-            L = math.exp(-lam)
-            k = 0
-            p = 1.0
-            while True:
-                k += 1
-                p *= rand_float()
-                if p <= L:
-                    return k - 1
+        # --- Deletions
+        # Augment t=1 leaf sequence by inserting extra leaves that duplicate an existing scaffold leaf,
+        # and mark the node to-be-deleted.
 
         lam = p_deletion * float(n_scaffold)
-        k_del = sample_poisson(lam)
-        k_del = int(min(k_del, n_scaffold))
+        k_del = rng.sample_poisson(lam)
+        k_del = int(min(k_del, n_scaffold))  # cap to avoid blowups
 
-        for _ in range(k_del):
-            cur_scaffold_pos = [
-                j
-                for j, ref in enumerate(leaf_ref)
-                if not bool(motif_mask_b[ref].item())
-            ]
-            if len(cur_scaffold_pos) == 0:
-                break
-            pos = cur_scaffold_pos[rand_int(len(cur_scaffold_pos))]
-            ref_idx = leaf_ref[pos]
+        # dup_count[i] = how many deletion-duplicates to insert adjacent to original data index i
+        if k_del > 0 and n_scaffold > 0:
+            # Sample endpoints to dup WITH replacement on CPU (SeededRNG uses a CPU Generator)
+            scaffold_idx_cpu = scaffold_idx.to("cpu")
+            sample_j = torch.randint(
+                low=0,
+                high=n_scaffold,
+                size=(k_del,),
+                generator=rng.rng,
+                device="cpu",
+            )
+            sampled_data_idx = scaffold_idx_cpu[sample_j]  # (k_del,)
+            dup_count = torch.bincount(sampled_data_idx, minlength=N_data).to(
+                torch.long
+            )
+        else:
+            dup_count = torch.zeros((N_data,), dtype=torch.long, device="cpu")
 
-            insert_after = rand_float() < 0.5
-            ins_pos = pos + 1 if insert_after else pos
-            leaf_ref.insert(ins_pos, ref_idx)
-            leaf_del.insert(ins_pos, False)
+        # Build augmented leaf order (includes deletion duplicates)
+        # - build an augmented leaf_ref by repeating each original position 1 + dup_count times
+        # - mark the inserted repeats (beyond the first) as deleted
+        repeats = (1 + dup_count).to(torch.long)  # (N_data,)
+        leaf_ref_t_cpu = torch.repeat_interleave(
+            torch.arange(N_data, dtype=torch.long, device="cpu"), repeats
+        )  # (num_leaves,)
+        num_leaves = int(leaf_ref_t_cpu.numel())
 
-            # mark exactly one of the pair as deleted
-            if not insert_after:
-                orig_pos = pos + 1
-                dup_pos = pos
-            else:
-                orig_pos = pos
-                dup_pos = pos + 1
-            if rand_float() < 0.5:
-                leaf_del[orig_pos] = True
-            else:
-                leaf_del[dup_pos] = True
+        # Mark duplicates (all occurrences except the first in each block) as deleted.
+        # For motif positions, repeats==1 so they never get duplicates.
+        start = torch.cumsum(repeats, dim=0) - repeats  # (N_data,)
+        dup_mask = torch.ones((num_leaves,), dtype=torch.bool, device="cpu")
+        dup_mask[start] = False  # first occurrence is the "real" leaf
+        leaf_del_t = dup_mask  # duplicates are the deletion-leaves
+        num_deletions = int(leaf_del_t.sum().item())
 
-        num_leaves = len(leaf_ref)
-        num_deletions = int(sum(leaf_del))
+        # Move leaf-level bookkeeping to the target device
+        leaf_map_leaves = leaf_ref_t_cpu.to(device=device)  # (num_leaves,)
+        leaf_del_t = leaf_del_t.to(device=device)  # (num_leaves,)
 
-        # Group ids computed in *leaf order* (includes deletion duplicates).
-        group_ids_leaf = torch.full((num_leaves,), -1, dtype=torch.long, device=device)
+        # --- Group ID assignment
+        # Group ids computed in *leaf order* (includes deletion duplicates), fully vectorized.
+        # Scaffold spans (motif_mask == False) are grouped into disjoint contiguous groups.
+        # Each motif position gets its own singleton group id after scaffold-span ids.
 
-        def leaf_is_motif(j: int) -> bool:
-            return bool(motif_mask_b[leaf_ref[j]].item())
+        leaf_is_motif = motif_mask_b[leaf_map_leaves]  # (num_leaves,)
+        is_scaffold = ~leaf_is_motif
 
-        span_gid = 0
-        j = 0
-        while j < num_leaves:
-            if leaf_is_motif(j):
-                j += 1
-                continue
-            k = j
-            while k < num_leaves and (not leaf_is_motif(k)):
-                k += 1
-            group_ids_leaf[j:k] = span_gid
-            span_gid += 1
-            j = k
-
-        motif_leaf_positions = [j for j in range(num_leaves) if leaf_is_motif(j)]
-        for kk, pos in enumerate(motif_leaf_positions):
-            group_ids_leaf[pos] = span_gid + kk
-
+        # scaffold_start marks the first position of each scaffold span
+        scaffold_start = is_scaffold & torch.cat(
+            [torch.tensor([True], device=device), ~is_scaffold[:-1]]
+        )
+        span_id = (
+            torch.cumsum(scaffold_start.long(), dim=0) - 1
+        )  # (-1 for non-scaffold)
+        span_id = torch.where(
+            is_scaffold,
+            span_id,
+            torch.full_like(span_id, -1),
+        )
+        span_gid = int(scaffold_start.sum().item())
+        motif_index = torch.cumsum(leaf_is_motif.long(), dim=0) - 1
+        group_ids_leaf = torch.where(
+            is_scaffold,
+            span_id,
+            span_gid + motif_index,
+        )
         if bool((group_ids_leaf < 0).any().item()):
             raise RuntimeError("Failed to assign group_ids_leaf for all leaf positions")
 
-        leaf_map_leaves = torch.tensor(
-            leaf_ref, dtype=torch.long, device=device
-        )  # (num_leaves,)
+        # Active lists per group in sequence order
+        groups: Dict[int, List[int]] = {}
+        # Loop over groups is small (#scaffold spans + #motifs), so keep it simple.
+        for gid in torch.unique(group_ids_leaf).tolist():
+            idxs = torch.nonzero(group_ids_leaf == int(gid), as_tuple=False).view(-1)
+            groups[int(gid)] = idxs.tolist()
+
+        # --- Coalescence
+        # Iteratively merge adjacent nodes, tracking parent-child relationships and weights (num children)
+        # until we are left with K_scaffold roots for each scaffold span group.
 
         # Initialize leaf nodes (leaf ids are 0..num_leaves-1)
         parent: List[int] = [-1] * num_leaves
         children: List[List[int]] = [[-1, -1] for _ in range(num_leaves)]
         weight: List[int] = [1 for _ in range(num_leaves)]
-
-        # Active lists per group in sequence order
-        groups: Dict[int, List[int]] = {}
-        for j in range(num_leaves):
-            gid = int(group_ids_leaf[j].item())
-            groups.setdefault(gid, []).append(j)
 
         roots: List[int] = []
         for gid, active in groups.items():
@@ -391,26 +414,28 @@ class TreePlan:
                 span_len = len(active)
                 k_hi = min(max_scaffold_nuclei, span_len)
                 k_lo = min(min_scaffold_nuclei, k_hi)
-                target_k = k_lo if k_lo == k_hi else (k_lo + rand_int(k_hi - k_lo + 1))
+                K_scaffold = (
+                    k_lo if k_lo == k_hi else (k_lo + rng.rand_int(k_hi - k_lo + 1))
+                )
             else:
                 # Motif singleton groups are already len==1; enforce target 1.
-                target_k = 1
+                K_scaffold = 1
 
-            while len(active) > target_k:
+            while len(active) > K_scaffold:
                 # Choose which adjacent pair to merge.
                 if (
                     is_scaffold_span
                     and len(active) > 2
-                    and (rand_float() < (1.0 - p_interior))
+                    and (rng.rand_float() < (1.0 - p_interior))
                 ):
                     # Boundary-biased: merge leftmost or rightmost adjacent pair (50/50)
-                    if rand_float() < 0.5:
+                    if rng.rand_float() < 0.5:
                         i0 = 0
                     else:
                         i0 = len(active) - 2
                 else:
                     # Uniform random adjacent pair
-                    i0 = rand_int(len(active) - 1)
+                    i0 = rng.rand_int(len(active) - 1)
 
                 left = active[i0]
                 right = active[i0 + 1]
@@ -431,12 +456,32 @@ class TreePlan:
             # Whatever remains are the roots/nuclei for this group.
             roots.extend(active)
 
+        # Roots now track scaffold nuclei
         roots = sorted(set(roots))
 
+        # Tree now includes all nodes:
+        # A = motifs, scaffold leaves, splits/anchors, and deletions
         A = len(parent)
 
-        birth_time = torch.full((A,), float("inf"), dtype=torch.float32)
-        split_time = torch.full((A,), float("inf"), dtype=torch.float32)
+        # Structural topo falls out of construction,
+        # internal nodes are appended so parent ids > child ids.
+        topo_order = torch.arange(A - 1, -1, -1, dtype=torch.long)
+
+        # Compute node depth early for time sampling + traversals
+        # Process children/leaves (depth 0+) before parents (highest depth)
+        node_depth_list = [0] * A
+        for node in range(A):
+            # only internal nodes have depth > 0
+            if weight[node] > 1:
+                c0, c1 = children[node]
+                if c0 >= 0 and c1 >= 0:
+                    node_depth_list[node] = (
+                        max(node_depth_list[c0], node_depth_list[c1]) + 1
+                    )
+                elif c0 >= 0:
+                    node_depth_list[node] = node_depth_list[c0] + 1
+                elif c1 >= 0:
+                    node_depth_list[node] = node_depth_list[c1] + 1
 
         # leaf_map mapping is valid for leaves (< num_leaves) and 0 for internal nodes
         leaf_map = torch.zeros((A,), dtype=torch.long, device=device)
@@ -444,54 +489,73 @@ class TreePlan:
 
         leaf_deleted = torch.zeros((A,), dtype=torch.bool, device=device)
         if num_leaves > 0:
-            leaf_deleted[:num_leaves] = torch.tensor(
-                leaf_del, dtype=torch.bool, device=device
-            )
+            leaf_deleted[:num_leaves] = leaf_del_t
 
+        # --- Sample birth/split times
+
+        # setup split/deletion time tensors
+        birth_time = torch.full((A,), float("inf"), dtype=torch.float32)
+        split_time = torch.full((A,), float("inf"), dtype=torch.float32)
         delete_time = torch.full((A,), float("inf"), dtype=torch.float32)
 
         # Roots start at time 0
-        for r in roots:
-            birth_time[r] = 0.0
+        roots_t = torch.tensor(roots, dtype=torch.long, device=device)
+        birth_time[roots_t] = 0.0
 
-        def sample_exp1() -> float:
-            # Exp(1) via inverse CDF from Uniform(0,1)
-            u = float(torch.rand((), generator=rng).clamp_min(1e-12).item())
-            return -math.log(u)
+        # Depth-based time sampling (vectorized, across depths)
+        # Process parents before children (depth max_depth down to 0)
+        node_depth_t = torch.tensor(node_depth_list, dtype=torch.long, device=device)
+        weight_t = torch.tensor(weight, dtype=torch.long, device=device)
+        children_t = torch.tensor(children, dtype=torch.long, device=device)
+        max_depth = max(node_depth_list)
 
-        def sample_split_time_uniform(W: int, t0: float) -> float:
-            # next_split_time for Uniform[min_t,1-2*min_t]: 1 - (1 - t0) * exp(-E / (W-1))
-            if W <= 1:
-                return float("inf")
-            m = W - 1
-            E = sample_exp1()
-            s = 1.0 - (1.0 - t0) * math.exp(-E / float(m))
-            s = max(min_t, min(1.0 - 2 * min_t, s))
-            return s
-
-        # Structural topo: in this construction, internal nodes are appended so parent ids > child ids.
-        topo_order = torch.arange(A - 1, -1, -1, dtype=torch.long)
-
-        # Traverse parents before children and propagate birth times
-        for node in topo_order.tolist():
-            t0 = float(birth_time[node].item())
-            if not math.isfinite(t0):
+        for depth in range(max_depth, -1, -1):
+            # Find all nodes at this depth
+            nodes_at_depth = torch.where(node_depth_t == depth)[0]
+            if len(nodes_at_depth) == 0:
                 continue
 
-            W = int(weight[node])
-            if W <= 1:
-                split_time[node] = float("inf")
-                continue
+            # Get birth times and weights for nodes at this depth
+            t0_vec = birth_time[nodes_at_depth]
+            W_vec = weight_t[nodes_at_depth]
 
-            st = sample_split_time_uniform(W=W, t0=t0)
-            split_time[node] = st
+            # Filter to internal nodes with finite birth times
+            is_internal = W_vec > 1
+            has_finite_birth = torch.isfinite(t0_vec)
+            valid = is_internal & has_finite_birth
 
-            c0, c1 = children[node]
-            for c in (c0, c1):
-                if c >= 0:
-                    birth_time[c] = st
+            if valid.any():
+                valid_nodes = nodes_at_depth[valid]
+                t0_valid = t0_vec[valid]
+                W_valid = W_vec[valid]
 
-        # Sample delete times for deleted leaves using the paper/JL semantics:
+                # Exponential sampling for all valid nodes at this depth
+                # st = 1 - (1 - t0) * exp(-E / (W - 1)), where E ~ Exp(1)
+                E = -torch.log(
+                    rng.rand(len(valid_nodes), device=device).clamp_min(1e-12)
+                )
+                st = 1.0 - (1.0 - t0_valid) * torch.exp(
+                    -E / (W_valid - 1).clamp_min(1.0)
+                )
+                st = torch.clamp(st, min=min_t, max=1.0 - 2 * min_t)
+
+                # Write split times
+                split_time[valid_nodes] = st
+
+                # Propagate birth times to children
+                children_pairs = children_t[valid_nodes]  # (N_valid, 2)
+                for j in range(2):
+                    c_indices = children_pairs[:, j]
+                    valid_children = c_indices >= 0
+                    if valid_children.any():
+                        birth_time[c_indices[valid_children]] = st[valid_children]
+
+            # Set split_time to inf for leaves at this depth
+            leaf_mask = W_vec == 1
+            if leaf_mask.any():
+                split_time[nodes_at_depth[leaf_mask]] = float("inf")
+
+        # --- Sample delete times
         # A deleted leaf has an unconditional deletion time distributed as Uniform(0, 1),
         # conditioned on being AFTER the leaf's birth time (i.e. dt | dt > birth).
         #
@@ -500,39 +564,40 @@ class TreePlan:
         #
         # We enforce strict inequalities with tiny epsilons to avoid dt == birth or dt == 1
         # due to floating point edge cases.
-        min_delete_eps = 1e-6
-        max_delete_time = 1.0 - 1e-6
-        for i in range(num_leaves):
-            if not leaf_del[i]:
-                continue
-            b = float(birth_time[i].item())
-            if not math.isfinite(b):
-                continue
+        min_delete_eps = min_t
+        max_delete_time = 1.0 - min_t
 
-            u = rand_float()
+        # Set deletion times for nodes:
+        # - Marked as deleted (leaf_deleted)
+        # - Are leaf nodes (weight_t == 1)
+        # - Are valid nodes in sample i.e. have finite birth time
+        is_leaf = weight_t == 1
+        valid_deleted = leaf_deleted & is_leaf & torch.isfinite(birth_time)
+
+        num_deleted = valid_deleted.sum().item()
+        if num_deleted > 0:
+            b = birth_time[valid_deleted]
+
+            # Sample uniform random values for all deleted leaves at once
+            u = rng.rand(num_deleted, device=device)
+
+            # Compute deletion times: dt = birth + (1 - birth) * u
             dt = b + (1.0 - b) * u
 
-            # Numerical safety: ensure dt is strictly after birth.
-            if dt <= b + min_delete_eps:
-                dt = b + min_delete_eps
+            # Clamp to valid range [birth + min_delete_eps, max_delete_time]
+            # For births very close to 1, this ensures we have a valid deletion time
+            dt = torch.clamp_min(dt, min=b + min_delete_eps)
+            dt = torch.clamp_max(dt, max=max_delete_time)
 
-            # Numerical safety: ensure dt is strictly before 1.
-            if dt >= max_delete_time:
-                dt = max_delete_time
+            delete_time[valid_deleted] = dt
 
-            # If birth is extremely close to 1, fall back to the latest valid time.
-            # (This should be rare because split times are already clamped away from 1.)
-            if dt <= b:
-                dt = max_delete_time
-
-            delete_time[i] = dt
+        # --- Final bookkeeping
 
         # Build motif mask in aligned tree space (A,)
         # Leaves 0..num_leaves-1 inherit motif/scaffold status from their referenced data index.
         # Internal nodes are always False.
         motif_mask_aligned = torch.zeros((A,), dtype=torch.bool, device=device)
-        for i in range(num_leaves):
-            motif_mask_aligned[i] = bool(motif_mask_b[leaf_ref[i]].item())
+        motif_mask_aligned[:num_leaves] = motif_mask_b[leaf_map_leaves]
 
         parent_idx = torch.tensor(parent, dtype=torch.long, device=device)
         children_idx = torch.tensor(children, dtype=torch.long, device=device)
@@ -544,6 +609,7 @@ class TreePlan:
         split_time = split_time.to(device=device)
         delete_time = delete_time.to(device=device)
         topo_order = topo_order.to(device=device)
+        node_depth = node_depth_t.to(device=device)
 
         return cls(
             num_leaves=num_leaves,
@@ -555,6 +621,7 @@ class TreePlan:
             roots=roots_t,
             children_idx=children_idx,
             total_leaves=total_leaves,
+            node_depth=node_depth,
             leaf_deleted=leaf_deleted,
             birth_time=birth_time,
             split_time=split_time,
@@ -911,6 +978,7 @@ class BatchedTreePlan:
     parent_idx: torch.Tensor  # (B, A_max) long
     children_idx: torch.Tensor  # (B, A_max, 2) long
     total_leaves: torch.Tensor  # (B, A_max) long
+    node_depth: torch.Tensor  # (B, A_max) long
     leaf_deleted: torch.Tensor  # (B, A_max) bool
 
     # times
@@ -931,6 +999,7 @@ class BatchedTreePlan:
             parent_idx=self.parent_idx.to(device),
             children_idx=self.children_idx.to(device),
             total_leaves=self.total_leaves.to(device),
+            node_depth=self.node_depth.to(device),
             leaf_deleted=self.leaf_deleted.to(device),
             birth_time=self.birth_time.to(device),
             split_time=self.split_time.to(device),
@@ -951,15 +1020,16 @@ class BatchedTreePlan:
         """True for leaf nodes (total_leaves == 1), False for internal/padding."""
         return self.total_leaves == 1
 
+    @property
+    def is_internal(self) -> torch.Tensor:  # (B, A_max) bool
+        """True for internal nodes (total_leaves > 1), False for leaves/padding."""
+        return self.total_leaves > 1
+
     def remaining_insertions_t(
         self,
         t: torch.Tensor,  # (B,)
     ) -> torch.Tensor:  # (B, A) long
-        """Remaining insertions per node at time t.
-
-        Definition: for each present node, remaining insertions is (total_leaves - 1).
-        Non-present (and padded) nodes are 0.
-        """
+        """Remaining insertions per node at time t, i.e. total_leaves - 1 for present nodes."""
         present = self.present_mask(t=t).to(torch.long)
         remaining = (self.total_leaves - 1).clamp_min(0) * present
         return remaining.to(torch.long)
@@ -978,8 +1048,89 @@ class BatchedTreePlan:
         leaf_mask = self.leaf_mask.to(device=x.device)  # (B, A)
         return gather_and_pad(x, leaf_idx, mask=leaf_mask, fill_value=fill_value)
 
+    def traverse_bottom_up(
+        self,
+        node_values: torch.Tensor,  # (B, A, ...)
+        # combine_fn(batch_idx, node_idx, children, child_weights, node_values) -> parent_values
+        combine_fn: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            torch.Tensor,
+        ],
+    ) -> torch.Tensor:
+        """Traverse tree bottom-up (children before parents) to compute node values."""
+        max_depth = int(self.node_depth.max().item())
+        for depth in range(1, max_depth + 1):
+            at_depth = self.node_depth == depth
+            valid = at_depth & self.is_internal & (self.total_leaves > 0)
+            if not valid.any():
+                continue
+            batch_idx, node_idx = torch.where(valid)
+            children = self.children_idx[batch_idx, node_idx, :]  # (N_valid, 2)
+            # Gather child weights properly using batch indices
+            child_weights = torch.stack(
+                [
+                    self.total_leaves[batch_idx, children[:, 0]],
+                    self.total_leaves[batch_idx, children[:, 1]],
+                ],
+                dim=1,
+            )  # (N_valid, 2)
+            parent_values = combine_fn(
+                batch_idx, node_idx, children, child_weights, node_values
+            )
+            node_values[batch_idx, node_idx] = parent_values
+        return node_values
+
+    def traverse_top_down(
+        self,
+        creation_state: torch.Tensor,  # (B, A, ...)
+        target_state: torch.Tensor,  # (B, A, ...)
+        # split_fn(node_creation, node_target, node_t0, node_st) -> node_at_split
+        split_fn: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor
+        ],
+        max_split_time: Optional[torch.Tensor] = None,  # (B, A) optional time cutoff
+    ) -> torch.Tensor:
+        """Traverse tree top-down (parents before children) to propagate states.
+
+        Args:
+            creation_state: (B, A, ...) initial states at birth times
+            target_state: (B, A, ...) target states at t=1
+            split_fn: callable to sample bridge at split time
+            max_split_time: (B, A) optional cutoff; skip splits happening after this time (e.g. corruption t)
+        """
+        max_depth = int(self.node_depth.max().item())
+        for depth in range(max_depth, 0, -1):
+            at_depth = self.node_depth == depth
+            valid = (
+                at_depth
+                & self.is_internal
+                & torch.isfinite(self.split_time)
+                & (self.total_leaves > 0)
+            )
+
+            if max_split_time is not None:
+                valid = valid & (self.split_time <= max_split_time)
+
+            if not valid.any():
+                continue
+            batch_idx, node_idx = torch.where(valid)
+            node_t0 = self.birth_time[batch_idx, node_idx]
+            node_st = self.split_time[batch_idx, node_idx]
+            node_creation = creation_state[batch_idx, node_idx]
+            node_target = target_state[batch_idx, node_idx]
+            node_at_split = split_fn(node_creation, node_target, node_t0, node_st)
+            children = self.children_idx[batch_idx, node_idx, :]
+            for j in range(2):
+                c_indices = children[:, j]
+                valid_children = c_indices >= 0
+                if valid_children.any():
+                    creation_state[
+                        batch_idx[valid_children], c_indices[valid_children]
+                    ] = node_at_split[valid_children]
+        return creation_state
+
     @classmethod
-    def collate(cls, plans: List["TreePlan"]) -> "BatchedTreePlan":
+    def collate(cls, plans: List[TreePlan]) -> "BatchedTreePlan":
         B = len(plans)
         if B == 0:
             raise ValueError("Empty batch")
@@ -1013,6 +1164,9 @@ class BatchedTreePlan:
             ),
             total_leaves=pad_and_stack(
                 [p.total_leaves for p in plans], A_max, fill_value=0, dtype=torch.long
+            ),
+            node_depth=pad_and_stack(
+                [p.node_depth for p in plans], A_max, fill_value=0, dtype=torch.long
             ),
             leaf_deleted=pad_and_stack(
                 [p.leaf_deleted for p in plans], A_max, fill_value=0, dtype=torch.bool
@@ -1518,7 +1672,7 @@ class BranchFlowModel(nn.Module):
         B, P, _ = batch.trans_t.shape
 
         valid = batch.valid_mask.float()  # (B, P)
-        edge_valid = valid[:, None] * valid[:, None]  # (B, P, P)
+        edge_valid = valid[:, None, :] * valid[:, :, None]  # (B, P, P)
 
         res_idx = BatchFeaturizer.infer_res_index(
             chain_idx=batch.chain_idx,
@@ -1658,18 +1812,198 @@ class Coupler(ABC, Generic[CouplingT]):
 
     @abstractmethod
     def sample_base(
-        self, num_batch: int, num_roots: int, device: torch.device
+        self,
+        motif_mask: torch.Tensor,  # (B, N) bool - True for motif positions
+        x1: torch.Tensor,  # (B, N, ...) endpoint values at t=1
+        device: torch.device,
     ) -> torch.Tensor:
+        """Sample base distribution values at t=0.
+
+        Args:
+            motif_mask: (B, N) bool mask where True indicates motif positions
+            x1: (B, N, ...) endpoint values at t=1 (for motifs to preserve)
+            device: device to create tensors on
+
+        Returns:
+            x0: (B, N, ...) base values at t=0
+        """
         raise NotImplementedError
 
     @abstractmethod
+    def combine_anchors(
+        self,
+        child_anchors: torch.Tensor,  # (N_valid, 2, ...)
+        child_weights: torch.Tensor,  # (N_valid, 2)
+    ) -> torch.Tensor:
+        """Combine two child anchor values into parent anchor.
+
+        Args:
+            child_anchors: (N_valid, 2, ...) anchor values for the two children
+            child_weights: (N_valid, 2) total_leaves weights for the two children
+
+        Returns:
+            parent_anchors: (N_valid, ...) combined anchor for parent
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def sample_bridge(
+        self,
+        x_start: torch.Tensor,
+        x_end: torch.Tensor,
+        s: torch.Tensor,
+        t0: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample bridge from x_start at t0 to x_end at t=1, evaluated at time s.
+
+        Args:
+            x_start: Start values at time t0
+            x_end: End values at time t=1
+            s: Time to evaluate bridge
+            t0: Birth time
+
+        Returns:
+            Sampled values at time s
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def post_process(
+        self,
+        x_t: torch.Tensor,
+        present_mask: torch.Tensor,
+        motif_mask: torch.Tensor,
+        anchors: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply domain-specific masking for present_mask and motif_mask.
+
+        Args:
+            x_t: (B, A, ...) values at time t before masking
+            present_mask: (B, A) True for nodes present at time t
+            motif_mask: (B, A) True for motif nodes
+            anchors: (B, A, ...) anchor values
+
+        Returns:
+            x_t: (B, A, ...) masked values
+        """
+        raise NotImplementedError
+
+    def build_anchors(
+        self,
+        x1: torch.Tensor,
+        tree: BatchedTreePlan,
+        fill_value: float = 0.0,
+    ) -> torch.Tensor:
+        """Generic anchor building using depth-based traversal.
+
+        Args:
+            x1: (B, N, ...) endpoint values at t=1
+            tree: Batched tree plan
+            fill_value: Value to use for padding/internal nodes initially
+
+        Returns:
+            anchors: (B, A, ...) anchor values for all nodes
+        """
+        anchors = tree.broadcast_to_leaves(x1, fill_value=fill_value)
+
+        def combine_fn(batch_idx, node_idx, children, child_weights, node_values):
+            child_anchors = torch.stack(
+                [
+                    node_values[batch_idx, children[:, 0]],
+                    node_values[batch_idx, children[:, 1]],
+                ],
+                dim=1,
+            )
+            return self.combine_anchors(
+                child_anchors=child_anchors, child_weights=child_weights
+            )
+
+        return tree.traverse_bottom_up(anchors, combine_fn)
+
     def corrupt(
         self,
         tree: BatchedTreePlan,
-        t: torch.Tensor,
-        x1: torch.Tensor,
-        x0: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, CouplingT]:
+        t: torch.Tensor,  # (B,)
+        x1: torch.Tensor,  # (B, N, ...)
+        x0: Optional[torch.Tensor] = None,  # (B, A, ...)
+    ) -> Tuple[torch.Tensor, Coupling]:
+        """Generic corruption using depth-based traversal.
+
+        Args:
+            tree: Batched tree plan
+            t: (B,) corruption time for each example
+            x1: (B, N, ...) endpoint values at t=1
+            x0: (B, A, ...) optional base values at t=0 (aligned to tree)
+
+        Returns:
+            x_t: (B, A, ...) corrupted values at time t
+            coupling: Domain-specific coupling object
+        """
+        device = x1.device
+        B = x1.shape[0]
+        A = tree.parent_idx.shape[1]
+
+        if x0 is None:
+            # Broadcast x1 to aligned space (copies leaves, fills internal nodes)
+            x1_aligned = tree.broadcast_to_leaves(x1, fill_value=0)
+            # Sample base distribution for all positions
+            x0 = self.sample_base(
+                motif_mask=tree.motif_mask,
+                x1=x1_aligned,
+                device=device,
+            )
+
+        anchors = self.build_anchors(x1=x1, tree=tree)
+
+        creation_state = x0.clone()
+        t_expanded = t.unsqueeze(1).expand(B, A)
+
+        def split_fn(node_creation, node_target, node_t0, node_st):
+            return self.sample_bridge(
+                x_start=node_creation,
+                x_end=node_target,
+                s=node_st,
+                t0=node_t0,
+            )
+
+        creation_state = tree.traverse_top_down(
+            creation_state=creation_state,
+            target_state=anchors,
+            split_fn=split_fn,
+            max_split_time=t_expanded,
+        )
+
+        present_mask = tree.present_mask(t=t)
+
+        x_t = self.sample_bridge(
+            x_start=creation_state,
+            x_end=anchors,
+            s=t_expanded,
+            t0=tree.birth_time,
+        )
+
+        if x_t.dtype.is_floating_point and not torch.isfinite(x_t).all():
+            raise RuntimeError(
+                "sample_bridge produced non-finite values. "
+                "Domain couplers must clamp time deltas for unborn nodes."
+            )
+
+        x_t = self.post_process(
+            x_t=x_t,
+            present_mask=present_mask,
+            motif_mask=tree.motif_mask,
+            anchors=anchors,
+        )
+
+        return x_t, self._make_coupling(anchors=anchors, tree=tree)
+
+    @abstractmethod
+    def _make_coupling(
+        self,
+        anchors: torch.Tensor,
+        tree: BatchedTreePlan,
+    ) -> Coupling:
+        """Create domain-specific coupling object."""
         raise NotImplementedError
 
     @abstractmethod
@@ -1702,215 +2036,73 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
         self.sigma = sigma
 
     def sample_base(
-        self, num_batch: int, num_roots: int, device: torch.device
-    ) -> torch.Tensor:
-        return (
-            centered_gaussian(num_batch, num_roots, n_bb_atoms=3, device=device)
-            * NM_TO_ANG_SCALE
-        )
-
-    def build_anchor_alignment(
-        self, trans_1: torch.Tensor, tree: BatchedTreePlan
-    ) -> torch.Tensor:
-        """Build translation anchors for all nodes (leaves + internal) from leaf endpoints trans at t=1.
-
-        - Leaf endpoints are broadcast into leaf slots using tree.leaf_map.
-        - Internal nodes ("anchors") are derived purely from topology + descendant weights.
-        """
-        if trans_1.ndim != 3 or trans_1.shape[-1] != 3:
-            raise ValueError(
-                f"Expected trans_1 to have shape (B, N, 3); got {tuple(trans_1.shape)}"
-            )
-
-        device = trans_1.device
-        B, N, _ = trans_1.shape
-        A = tree.parent_idx.shape[1]
-
-        # Broadcast trans@1 endpoints into leaf slots, zeros for internal nodes
-        anchor = tree.broadcast_to_leaves(
-            trans_1.to(torch.float32), fill_value=0.0
-        )  # (B, A, 3)
-
-        # Build internal anchors bottom-up (children -> parent).
-        # In this construction, parent ids > child ids, so iterating i from 0..A-1 ensures children exist first.
-        for i in range(A):
-            w_i = tree.total_leaves[:, i]
-            exists = w_i > 0
-            is_internal = w_i > 1
-            valid = exists & is_internal
-            if not bool(valid.any()):
-                continue
-
-            kids = tree.children_idx[:, i, :]  # (B, 2)
-            k = kids.clamp_min(0)
-            child_anchor = anchor.gather(
-                1, k.unsqueeze(-1).expand(-1, 2, 3)
-            )  # (B, 2, 3)
-
-            child_w = tree.total_leaves.gather(1, k)  # (B, 2)
-            wsum = (child_w.sum(dim=1).clamp_min(1)).to(torch.float32)  # (B,)
-
-            merged = child_anchor[:, 0, :] * (
-                child_w[:, 0].to(torch.float32) / wsum
-            ).unsqueeze(-1) + child_anchor[:, 1, :] * (
-                child_w[:, 1].to(torch.float32) / wsum
-            ).unsqueeze(
-                -1
-            )  # (B, 3)
-
-            bidx = torch.arange(B, device=device)
-            anchor[bidx[valid], i, :] = merged[valid]
-
-        return anchor
-
-    def _bridge_brownian(
         self,
-        x_start: torch.Tensor,  # (M, 3)
-        x_end: torch.Tensor,  # (M, 3)
-        s: torch.Tensor,  # (M,)
-        t0: torch.Tensor,  # (M,)
+        motif_mask: torch.Tensor,  # (B, N) bool
+        x1: torch.Tensor,  # (B, N, 3)
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Sample gaussian translations for all positions at t=0."""
+        B, N = motif_mask.shape
+        return centered_gaussian(B, N, n_bb_atoms=3, device=device) * NM_TO_ANG_SCALE
+
+    def combine_anchors(
+        self,
+        child_anchors: torch.Tensor,  # (N_valid, 2, 3)
+        child_weights: torch.Tensor,  # (N_valid, 2)
+    ) -> torch.Tensor:
+        """Weighted average of child translation anchors."""
+        wsum = child_weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+        weights = child_weights.float() / wsum.float()  # (N_valid, 2)
+        return (child_anchors * weights.unsqueeze(-1)).sum(dim=1)  # (N_valid, 3)
+
+    def sample_bridge(
+        self,
+        x_start: torch.Tensor,
+        x_end: torch.Tensor,
+        s: torch.Tensor,
+        t0: torch.Tensor,
     ) -> torch.Tensor:
         """Sample Brownian-bridge marginal at time s from (x_start at t0) to (x_end at 1)."""
-        denom = (1.0 - t0).clamp_min(1e-6)
-        u = ((s - t0) / denom).clamp(0.0, 1.0)
-        mean = x_start + u.unsqueeze(-1) * (x_end - x_start)
+        original_shape = x_start.shape
+        flat_start = x_start.view(-1, 3)
+        flat_end = x_end.view(-1, 3)
+        flat_s = s.reshape(-1)
+        flat_t0 = t0.reshape(-1)
+
+        denom = (1.0 - flat_t0).clamp_min(1e-6)
+        u = ((flat_s - flat_t0) / denom).clamp(0.0, 1.0)
+        mean = flat_start + u.unsqueeze(-1) * (flat_end - flat_start)
 
         if self.sigma is None:
-            return mean
+            return mean.view(original_shape)
 
-        var = ((s - t0).clamp_min(0.0) * (1.0 - s).clamp_min(0.0) / denom).clamp_min(
-            0.0
-        )
+        var = (
+            (flat_s - flat_t0).clamp_min(0.0) * (1.0 - flat_s).clamp_min(0.0) / denom
+        ).clamp_min(0.0)
         std = (var.sqrt() * self.sigma).to(mean.dtype)
         eps = torch.randn_like(mean)
-        return mean + std.unsqueeze(-1) * eps
+        return (mean + std.unsqueeze(-1) * eps).view(original_shape)
 
-    def corrupt(
+    def post_process(
         self,
-        tree: BatchedTreePlan,
-        t: torch.Tensor,  # (B,)
-        x1: torch.Tensor,  # (B, N, 3)
-        x0: Optional[torch.Tensor] = None,  # (B, R_max, 3)
-    ) -> Tuple[torch.Tensor, TranslationCoupling]:
-        """Corrupt translations to time t using the shared tree plan.
-
-        Returns:
-            trans_t_aligned: (B, A, 3)
-            coupling: minimal coupling info for losses (anchors + tree)
-        """
-        trans_1 = x1
-        if trans_1.ndim != 3 or trans_1.shape[-1] != 3:
-            raise ValueError(
-                f"Expected trans_1 to have shape (B, N, 3); got {tuple(trans_1.shape)}"
-            )
-
-        device = trans_1.device
-        B, N, _ = trans_1.shape
-        A = int(tree.parent_idx.shape[1])
-        trans_0 = x0
-
-        # Determine how many roots are used per example in this batch
-        R_max = int(tree.roots_mask.sum(dim=1).max().item())
-        if R_max <= 0:
-            raise ValueError("No roots in tree plan")
-
-        # Sample / validate base roots
-        if trans_0 is None:
-            trans_0 = self.sample_base(num_batch=B, num_roots=R_max, device=device)
-        if trans_0.ndim != 3 or trans_0.shape[0] != B or trans_0.shape[-1] != 3:
-            raise ValueError(
-                f"Expected x0 to have shape (B, R, 3); got {tuple(trans_0.shape)}"
-            )
-
-        # Build trans_0_aligned by broadcasting first root and then writing per-example roots into tree root slots
-        # TODO - consider zero array init instead of clone
-        trans_0_aligned = trans_0[:, :1, :].expand(B, A, 3).contiguous().clone()
-        for b in range(B):
-            roots_i = tree.roots[b][tree.roots_mask[b]].to(torch.long)
-            for j, r in enumerate(roots_i.tolist()):
-                if j >= trans_0.shape[1]:
-                    break
-                trans_0_aligned[b, r, :] = trans_0[b, j, :]
-
-        # Build domain anchors (leaf endpoints + internal merges)
-        anchor_aligned = self.build_anchor_alignment(trans_1=trans_1, tree=tree)
-
-        # Save the coupling for losses
-        coupling = TranslationCoupling(anchors=anchor_aligned, tree=tree)
-
-        # Track creation states at each node's birth time (shared across siblings)
-        creation_state = (
-            trans_0_aligned.to(dtype=torch.float32).clone().contiguous()
-        )  # (B, A, 3)
-
-        # Topological pass: sample each parent's state at split time once, then assign to both children
-        for k in range(A):
-            node_idx = tree.topo_order[:, k]  # (B,)
-            valid_node = node_idx >= 0  # topo_order padding = -1
-            node_idx_safe = node_idx.clamp(min=0)  # clamp for gather
-
-            t0 = tree.birth_time.gather(1, node_idx_safe.unsqueeze(1)).squeeze(
-                1
-            )  # (B,)
-            st = tree.split_time.gather(1, node_idx_safe.unsqueeze(1)).squeeze(
-                1
-            )  # (B,)
-
-            is_leaf = ~torch.isfinite(st)
-            should_skip = is_leaf | ~valid_node
-            if bool(should_skip.all()):
-                continue
-
-            node_creation = creation_state.gather(
-                1, node_idx_safe.view(B, 1, 1).expand(-1, 1, 3)
-            ).squeeze(
-                1
-            )  # (B, 3)
-            node_anchor = anchor_aligned.gather(
-                1, node_idx_safe.view(B, 1, 1).expand(-1, 1, 3)
-            ).squeeze(
-                1
-            )  # (B, 3)
-
-            node_at_split = self._bridge_brownian(
-                x_start=node_creation,
-                x_end=node_anchor,
-                s=st,
-                t0=t0,
-            )  # (B, 3)
-
-            kids = (
-                tree.children_idx.gather(
-                    1, node_idx_safe.view(B, 1, 1).expand(-1, 1, 2)
-                )
-                .to(torch.long)
-                .squeeze(1)
-            )  # (B, 2)
-
-            batch_idx = torch.arange(B, device=device)
-            for j in range(2):
-                c = kids[:, j]
-                valid = (c >= 0) & ~should_skip
-                if bool(valid.any()):
-                    creation_state[batch_idx[valid], c[valid]] = node_at_split[valid]
-
-        # Evaluate node states at time t (bridge from creation_state at birth_time to anchor at 1)
-        t_mat = t.unsqueeze(1).expand(B, A)  # (B, A)
-        b_mat = tree.birth_time  # (B, A)
-        present_mask = tree.present_mask(t=t)  # (B, A)
-
-        trans_t = self._bridge_brownian(
-            x_start=creation_state.view(-1, 3),
-            x_end=anchor_aligned.view(-1, 3),
-            s=t_mat.reshape(-1),
-            t0=b_mat.reshape(-1),
-        ).view(B, A, 3)
-
-        trans_t = torch.where(
-            present_mask.unsqueeze(-1), trans_t, torch.zeros_like(trans_t)
+        x_t: torch.Tensor,
+        present_mask: torch.Tensor,
+        motif_mask: torch.Tensor,
+        anchors: torch.Tensor,
+    ) -> torch.Tensor:
+        """Zero out non-present nodes."""
+        return torch.where(
+            present_mask.unsqueeze(-1),
+            x_t,
+            torch.zeros_like(x_t),
         )
 
-        return trans_t, coupling
+    def _make_coupling(
+        self,
+        anchors: torch.Tensor,
+        tree: BatchedTreePlan,
+    ) -> TranslationCoupling:
+        return TranslationCoupling(anchors=anchors, tree=tree)
 
     def euler_step(
         self,
@@ -1959,6 +2151,9 @@ class AATypesCoupling(Coupling):
     # Anchor tokens sampled from descendant distributions
     anchors: torch.Tensor  # (B, A) long
 
+    # Anchor probability distributions (before sampling)
+    anchor_probs: torch.Tensor  # (B, A, K)
+
 
 class AATypesCoupler(Coupler[AATypesCoupling]):
     """
@@ -1992,12 +2187,31 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
         self.leave_mass_cap = leave_mass_cap
 
     def sample_base(
-        self, num_batch: int, num_roots: int, device: torch.device
+        self,
+        motif_mask: torch.Tensor,  # (B, N) bool
+        x1: torch.Tensor,  # (B, N) amino acid indices
+        device: torch.device,
     ) -> torch.Tensor:
-        """Sample uniform random amino acid types for base distribution (t=0)."""
-        return uniform_categorical(
-            num_batch, num_roots, num_tokens=self.K, device=device
-        )
+        """Sample base distribution amino acid types at t=0.
+
+        Preserves motif sequences and samples random sequences for scaffolds.
+        """
+        B, N = motif_mask.shape
+        # Sample uniform random amino acids for all positions
+        x0 = uniform_categorical(B, N, num_tokens=self.K, device=device)
+        # Preserve motif sequences from x1
+        x0 = torch.where(motif_mask, x1, x0)
+        return x0
+
+    def combine_anchors(
+        self,
+        child_anchors: torch.Tensor,  # (N_valid, 2, K) probability distributions
+        child_weights: torch.Tensor,  # (N_valid, 2)
+    ) -> torch.Tensor:
+        """Weighted mixture of child probability distributions."""
+        wsum = child_weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+        weights = (child_weights.float() / wsum).unsqueeze(-1)  # (N_valid, 2, 1)
+        return (child_anchors * weights).sum(dim=1)  # (N_valid, K)
 
     def _transition_prob(
         self,
@@ -2103,14 +2317,11 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
         return sampled
 
     def build_anchor_alignment(
-        self, aatypes_1: torch.Tensor, tree: BatchedTreePlan
-    ) -> torch.Tensor:
-        """
-        Build anchor tokens for all nodes (leaves + internal) from leaf endpoints at t=1.
-
-        For leaves: anchor is the one-hot token from aatypes_1
-        For internal nodes: anchor distribution is weighted mixture of descendant leaves,
-                           then we sample a single anchor token from this distribution.
+        self,
+        aatypes_1: torch.Tensor,
+        tree: BatchedTreePlan,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build anchor tokens and probability distributions bottom-up.
 
         Args:
             aatypes_1: (B, N) amino acid types at t=1
@@ -2118,6 +2329,7 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
 
         Returns:
             anchor_tokens: (B, A) long, sampled anchor tokens for all nodes
+            anchor_probs: (B, A, K) probability distributions for all nodes
         """
         if aatypes_1.ndim != 2:
             raise ValueError(f"Expected aatypes_1 shape (B, N); got {aatypes_1.shape}")
@@ -2127,218 +2339,126 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
         A = tree.parent_idx.shape[1]
         K = self.K
 
-        # Broadcast aatypes_1 into leaf slots, MASK for internal/padding
         leaf_tokens = tree.broadcast_to_leaves(
-            aatypes_1.to(torch.long), fill_value=MASK_TOKEN_INDEX
-        )  # (B, A)
+            aatypes_1.to(torch.long),
+            fill_value=MASK_TOKEN_INDEX,
+        )
 
-        # Build anchor probability distributions (B, A, K) bottom-up
-        # For leaves: one-hot of their token
-        # For internal: weighted sum of children's distributions
         anchor_probs = torch.zeros(B, A, K, device=device)
 
-        # Initialize leaves with one-hot distributions
-        leaf_mask = tree.leaf_mask  # (B, A)
-        leaf_idx = leaf_tokens.clamp(0, K - 1)  # (B, A)
+        leaf_mask = tree.leaf_mask
+        leaf_idx = leaf_tokens.clamp(0, K - 1)
         anchor_probs.scatter_(
             -1,
             leaf_idx.unsqueeze(-1),
             leaf_mask.unsqueeze(-1).float(),
         )
 
-        # Build internal node distributions bottom-up
-        # Since parent_idx > child_idx in topo order, iterate forward
-        for i in range(A):
-            w_i = tree.total_leaves[:, i]  # (B,)
-            exists = w_i > 0
-            is_internal = w_i > 1
-            valid = exists & is_internal
-            if not bool(valid.any()):
-                continue
+        def combine_fn(batch_idx, node_idx, children, child_weights, node_values):
+            child_probs = torch.stack(
+                [
+                    node_values[batch_idx, children[:, 0]],
+                    node_values[batch_idx, children[:, 1]],
+                ],
+                dim=1,
+            )
+            return self.combine_anchors(
+                child_anchors=child_probs,
+                child_weights=child_weights,
+            )
 
-            kids = tree.children_idx[:, i, :]  # (B, 2)
-            k = kids.clamp_min(0)  # (B, 2)
+        anchor_probs = tree.traverse_bottom_up(anchor_probs, combine_fn)
 
-            # Gather child probability distributions using explicit advanced indexing
-            # anchor_probs[b, k[b, j], :] for each batch b and child j
-            batch_idx_2 = (
-                torch.arange(B, device=device).unsqueeze(1).expand(-1, 2)
-            )  # (B, 2)
-            child_probs = anchor_probs[batch_idx_2, k, :]  # (B, 2, K)
-
-            # Gather child weights
-            child_w = tree.total_leaves[batch_idx_2, k].float()  # (B, 2)
-            wsum = child_w.sum(dim=1, keepdim=True).clamp_min(1.0)  # (B, 1)
-
-            # Weighted average of child distributions
-            weights = (child_w / wsum).unsqueeze(-1)  # (B, 2, 1)
-            merged_probs = (child_probs * weights).sum(dim=1)  # (B, K)
-
-            # Write to internal node
-            batch_idx = torch.arange(B, device=device)
-            anchor_probs[batch_idx[valid], i, :] = merged_probs[valid]
-
-        # Add noise to anchor probabilities: mix in uniform distribution.
-        # This encourages the model to learn that anchor endpoints can vary.
-        # Leaves are set to data below.
         if self.noise_scale > 0:
             uniform_dist = torch.ones(B, A, K, device=device) / K
-            # Use noise_scale as mixing weight (clamped to reasonable range)
-            # e.g. noise_scale=0.5 -> 10% uniform
             noise_weight = min(self.noise_scale * 0.2, 0.2)
             anchor_probs = (
                 1.0 - noise_weight
             ) * anchor_probs + noise_weight * uniform_dist
 
-        # Normalize probabilities, handling zero-sum rows (padding/invalid nodes)
-        row_sums = anchor_probs.sum(dim=-1, keepdim=True)  # (B, A, 1)
-        has_mass = row_sums > 1e-12  # (B, A, 1)
+        row_sums = anchor_probs.sum(dim=-1, keepdim=True)
+        has_mass = row_sums > 1e-12
 
-        # For rows with no mass (padding), use uniform distribution to allow multinomial
         uniform_fallback = torch.ones(B, A, K, device=device) / K
         anchor_probs = torch.where(
-            has_mass, anchor_probs / row_sums.clamp_min(1e-12), uniform_fallback
+            has_mass,
+            anchor_probs / row_sums.clamp_min(1e-12),
+            uniform_fallback,
         )
 
-        # Sample anchor tokens from distributions (deterministic endpoints for this corruption call)
-        anchor_probs_flat = anchor_probs.view(-1, K)  # (B*A, K)
-        anchor_tokens = torch.multinomial(anchor_probs_flat, num_samples=1).squeeze(
-            -1
-        )  # (B*A,)
-        anchor_tokens = anchor_tokens.view(B, A)  # (B, A)
+        anchor_probs_flat = anchor_probs.view(-1, K)
+        anchor_tokens = torch.multinomial(
+            anchor_probs_flat,
+            num_samples=1,
+        ).squeeze(-1)
+        anchor_tokens = anchor_tokens.view(B, A)
 
-        # For leaves, use the actual token (not sampled from distribution)
         anchor_tokens = torch.where(leaf_mask, leaf_tokens, anchor_tokens)
 
-        # For padding nodes (no mass), use MASK token
         anchor_tokens = torch.where(
             has_mass.squeeze(-1),
             anchor_tokens,
             torch.full_like(anchor_tokens, MASK_TOKEN_INDEX),
         )
 
+        return anchor_tokens, anchor_probs
+
+    def build_anchors(
+        self,
+        x1: torch.Tensor,
+        tree: BatchedTreePlan,
+        fill_value: float = 0.0,
+    ) -> torch.Tensor:
+        """Override to call build_anchor_alignment and return tokens only."""
+        anchor_tokens, anchor_probs = self.build_anchor_alignment(
+            aatypes_1=x1,
+            tree=tree,
+        )
+        self._last_anchor_probs = anchor_probs
         return anchor_tokens
 
-    def corrupt(
+    def sample_bridge(
         self,
-        tree: BatchedTreePlan,
-        t: torch.Tensor,  # (B,)
-        x1: torch.Tensor,  # (B, N)
-        x0: Optional[torch.Tensor] = None,  # (B, R_max)
-    ) -> Tuple[torch.Tensor, AATypesCoupling]:
-        """
-        Corrupt amino acid types to time t using CTMC bridge and tree plan.
-        """
-        aatypes_1 = x1
-        if aatypes_1.ndim != 2:
-            raise ValueError(f"Expected aatypes_1 shape (B, N); got {aatypes_1.shape}")
+        x_start: torch.Tensor,
+        x_end: torch.Tensor,
+        s: torch.Tensor,
+        t0: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample CTMC bridge marginal at time s."""
+        original_shape = x_start.shape
+        return self._bridge_marginal(
+            token_start=x_start.reshape(-1),
+            token_end=x_end.reshape(-1),
+            s=s.reshape(-1),
+            t0=t0.reshape(-1),
+        ).view(original_shape)
 
-        device = aatypes_1.device
-        B, N = aatypes_1.shape
-        A = int(tree.parent_idx.shape[1])
-        aatypes_0 = x0
-
-        # Determine how many roots are used per example
-        R_max = int(tree.roots_mask.sum(dim=1).max().item())
-
-        # Sample / validate base roots
-        if aatypes_0 is None:
-            aatypes_0 = self.sample_base(num_batch=B, num_roots=R_max, device=device)
-        if aatypes_0.ndim != 2 or aatypes_0.shape[0] != B:
-            raise ValueError(f"Expected x0 shape (B, R); got {aatypes_0.shape}")
-
-        # Build aatypes_0_aligned by broadcasting first root, then writing per-example roots
-        aatypes_0_aligned = aatypes_0[:, :1].expand(B, A).contiguous().clone()  # (B, A)
-        for b in range(B):
-            roots_i = tree.roots[b][tree.roots_mask[b]].to(torch.long)
-            for j, r in enumerate(roots_i.tolist()):
-                if j >= aatypes_0.shape[1]:
-                    break
-                aatypes_0_aligned[b, r] = aatypes_0[b, j]
-
-        # Build anchor tokens (leaf endpoints + internal mixtures)
-        anchors = self.build_anchor_alignment(aatypes_1=aatypes_1, tree=tree)
-
-        # Save the coupling
-        coupling = AATypesCoupling(anchors=anchors, tree=tree)
-
-        # Track creation tokens at each node's birth time
-        creation_token = aatypes_0_aligned.clone()  # (B, A)
-
-        # Topological pass: sample each parent's token at split time, assign to children
-        for k in range(A):
-            node_idx = tree.topo_order[:, k]  # (B,)
-            valid_node = node_idx >= 0
-            node_idx_safe = node_idx.clamp(min=0)
-
-            t0 = tree.birth_time.gather(1, node_idx_safe.unsqueeze(1)).squeeze(
-                1
-            )  # (B,)
-            st = tree.split_time.gather(1, node_idx_safe.unsqueeze(1)).squeeze(
-                1
-            )  # (B,)
-
-            is_leaf = ~torch.isfinite(st)
-            should_skip = is_leaf | ~valid_node
-            if bool(should_skip.all()):
-                continue
-
-            # Gather node's creation token and anchor
-            node_creation = creation_token.gather(
-                1, node_idx_safe.unsqueeze(1)
-            ).squeeze(
-                1
-            )  # (B,)
-            node_anchor = anchors.gather(1, node_idx_safe.unsqueeze(1)).squeeze(
-                1
-            )  # (B,)
-
-            # Sample token at split time from bridge marginal
-            node_at_split = self._bridge_marginal(
-                token_start=node_creation,
-                token_end=node_anchor,
-                s=st,
-                t0=t0,
-            )  # (B,)
-
-            # Assign to children
-            kids = (
-                tree.children_idx.gather(
-                    1, node_idx_safe.view(B, 1, 1).expand(-1, 1, 2)
-                )
-                .to(torch.long)
-                .squeeze(1)
-            )  # (B, 2)
-            batch_idx = torch.arange(B, device=device)
-            for j in range(2):
-                c = kids[:, j]
-                valid = (c >= 0) & ~should_skip
-                if bool(valid.any()):
-                    creation_token[batch_idx[valid], c[valid]] = node_at_split[valid]
-
-        # Evaluate node tokens at time t (bridge from creation_token at birth_time to anchor at 1)
-        t_flat = t.unsqueeze(1).expand(B, A).reshape(-1)  # (B*A,)
-        b_flat = tree.birth_time.reshape(-1)  # (B*A,)
-        present_mask = tree.present_mask(t=t)  # (B, A)
-
-        aatypes_t_flat = self._bridge_marginal(
-            token_start=creation_token.reshape(-1),
-            token_end=anchors.reshape(-1),
-            s=t_flat,
-            t0=b_flat,
-        )  # (B*A,)
-        aatypes_t = aatypes_t_flat.view(B, A)
-
-        # Zero out non-present nodes (use MASK token)
-        aatypes_t = torch.where(
-            present_mask, aatypes_t, torch.full_like(aatypes_t, MASK_TOKEN_INDEX)
+    def post_process(
+        self,
+        x_t: torch.Tensor,
+        present_mask: torch.Tensor,
+        motif_mask: torch.Tensor,
+        anchors: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mask non-present nodes and fix motif sequence."""
+        x_t = torch.where(
+            present_mask,
+            x_t,
+            torch.full_like(x_t, MASK_TOKEN_INDEX),
         )
+        x_t = torch.where(motif_mask, anchors, x_t)
+        return x_t
 
-        # Fix motif positions: use the anchor token (which equals the leaf token for leaves)
-        motif_mask = tree.motif_mask  # (B, A)
-        aatypes_t = torch.where(motif_mask, anchors, aatypes_t)
-
-        return aatypes_t, coupling
+    def _make_coupling(
+        self,
+        anchors: torch.Tensor,
+        tree: BatchedTreePlan,
+    ) -> AATypesCoupling:
+        return AATypesCoupling(
+            anchors=anchors,
+            anchor_probs=self._last_anchor_probs,
+            tree=tree,
+        )
 
     def _uncertainty_gate(
         self,
@@ -2589,13 +2709,8 @@ class TreeInterpolant:
         B, N = motif_mask.shape
         motif_mask = motif_mask.bool()
 
-        rng = torch.Generator(device="cpu")
-        if seed is None:
-            seed = int(torch.seed() % (2**31 - 1))
-        rng.manual_seed(int(seed))
-
-        def rand_int(high: int) -> int:
-            return int(torch.randint(0, high, (1,), generator=rng).item())
+        # Use SeededRNG for determinism
+        rng = SeededRNG(seed=seed, device="cpu")
 
         # For each batch element, compute indices and whether they map to original data
         # motif_idx_val >= 0 means motif (value is source index), -1 means scaffold root
@@ -2623,7 +2738,7 @@ class TreeInterpolant:
                     k_hi = min(max_scaffold_nuclei, span_len)
                     k_lo = min(min_scaffold_nuclei, k_hi)
                     target_k = (
-                        k_lo if k_lo == k_hi else (k_lo + rand_int(k_hi - k_lo + 1))
+                        k_lo if k_lo == k_hi else (k_lo + rng.rand_int(k_hi - k_lo + 1))
                     )
 
                     # Add -1 for each scaffold root (they don't map to original data)
@@ -2697,20 +2812,21 @@ class TreeInterpolant:
             data.chain_idx.to(device), gather_idx, is_motif, fill_value=0
         )
 
-        # Sample random translations for all positions, zero pad to keep clean
-        trans_0 = self.translation_coupler.sample_base(
-            num_batch=B, num_roots=P_max, device=device
+        # Gather x1 values from data for motif positions (fill scaffolds with placeholder)
+        trans_1_gathered = gather_and_pad(
+            data.trans_1.to(device), gather_idx, is_motif, fill_value=0.0
         )
-        trans_0 = trans_0 * is_motif.unsqueeze(-1).float()
-
-        # Initialize aatypes: motif positions from data, scaffold nuclei as uniform random
-        motif_aatypes = gather_and_pad(
+        aatypes_1_gathered = gather_and_pad(
             data.aatypes_1.to(device), gather_idx, is_motif, fill_value=MASK_TOKEN_INDEX
         )
-        scaffold_aatypes = uniform_categorical(
-            num_batch=B, num_res=P_max, num_tokens=len(restypes), device=device
-        )  # uniform over non-X restypes
-        aatypes_0 = torch.where(is_motif, motif_aatypes, scaffold_aatypes)
+
+        # Sample base distributions using coupler interfaces
+        trans_0 = self.translation_coupler.sample_base(
+            motif_mask=is_motif, x1=trans_1_gathered, device=device
+        )
+        aatypes_0 = self.aatypes_coupler.sample_base(
+            motif_mask=is_motif, x1=aatypes_1_gathered, device=device
+        )
 
         # init batch at min_t
         t = torch.full((B,), self.min_t, dtype=torch.float32, device=device)
@@ -2854,6 +2970,7 @@ class TreeInterpolant:
                     )
 
                     # TODO - apply insertion logits, once we predict them
+                    # TODO - apply substitutions for sequence
 
                 # TODO - recenter
 
@@ -3177,8 +3294,9 @@ class BranchingFlowVisualizer:
         return "gif", animation.PillowWriter(fps=10)
 
     @staticmethod
-    def _aa_letters_and_colors() -> Tuple[List[str], np.ndarray]:
-        """Returns (letters, colors) for 21 amino acid types + X."""
+    @functools.lru_cache(maxsize=1)
+    def _aa_letters_and_colors() -> Tuple[Tuple[str, ...], np.ndarray]:
+        """Returns (letters, colors) for 21 amino acid types + X. Cached."""
         letters = list(restypes_with_x)
         letters[20] = "-"  # UNK
 
@@ -3217,7 +3335,7 @@ class BranchingFlowVisualizer:
             "-": (0.9, 0.9, 0.9),
         }
         colors = np.array([aa_map[ltr] for ltr in letters])
-        return letters, colors
+        return tuple(letters), colors
 
     @staticmethod
     def _create_sequence_artists(ax: plt.Axes, max_len: int):
@@ -3288,6 +3406,95 @@ class BranchingFlowVisualizer:
                 texts[i].set_visible(False)
                 motif_rects[i].set_visible(False)
 
+    @staticmethod
+    def _create_3d_scatter_artist(
+        ax: plt.Axes,
+        max_points: int,
+        trans_min: np.ndarray,
+        trans_max: np.ndarray,
+    ):
+        """Pre-create a 3D scatter artist with max_points capacity.
+
+        Returns a scatter object that can be updated via _update_3d_scatter.
+        """
+        # Initialize with zeros - we'll update positions/colors each frame
+        dummy_pos = np.zeros((max_points, 3))
+        dummy_colors = np.zeros(max_points)
+        dummy_sizes = np.ones(max_points) * 40.0
+
+        # Create the scatter plot (initially all hidden via alpha=0 for unused)
+        scat = ax.scatter(
+            dummy_pos[:, 0],
+            dummy_pos[:, 1],
+            dummy_pos[:, 2],
+            c=dummy_colors,
+            cmap="Spectral",
+            vmin=0,
+            vmax=1,
+            s=dummy_sizes,
+            depthshade=True,
+            alpha=0.75,
+        )
+
+        # Set axis properties once
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_zticks([])
+        ax.view_init(elev=25, azim=45)
+        ax.set_xlim(trans_min[0], trans_max[0])
+        ax.set_ylim(trans_min[1], trans_max[1])
+        ax.set_zlim(trans_min[2], trans_max[2])
+
+        return scat
+
+    @staticmethod
+    def _update_3d_scatter(
+        scat,
+        ax: plt.Axes,
+        trans_alive: np.ndarray,  # (n_alive, 3)
+        motif_alive: np.ndarray,  # (n_alive,)
+        max_points: int,
+        t_val: float,
+    ):
+        """Update pre-created 3D scatter artist with new data.
+
+        Pads positions to max_points and hides unused points by moving them off-screen.
+        """
+        n_alive = trans_alive.shape[0] if trans_alive.size > 0 else 0
+
+        # Pad positions to max_points (hide extras by making alpha 0 via color array)
+        if n_alive > 0:
+            # Prepare padded arrays
+            padded_pos = np.zeros((max_points, 3))
+            padded_pos[:n_alive] = trans_alive
+
+            # Color by position index
+            color_idx = np.zeros(max_points)
+            color_idx[:n_alive] = np.arange(n_alive)
+
+            # Sizes: motifs smaller
+            sizes = np.zeros(max_points)
+            sizes[:n_alive] = np.where(motif_alive, 15.0, 40.0)
+
+            # Alpha: visible for alive, 0 for hidden
+            alphas = np.zeros(max_points)
+            alphas[:n_alive] = 0.75
+
+            # Update scatter data
+            scat._offsets3d = (padded_pos[:, 0], padded_pos[:, 1], padded_pos[:, 2])
+            scat.set_array(color_idx)
+            scat.set_clim(0, max(n_alive - 1, 1))
+            scat.set_sizes(sizes)
+            # Note: per-point alpha not directly supported, but we use size=0 for hidden
+            # Set sizes to 0 for hidden points
+            sizes[n_alive:] = 0
+            scat.set_sizes(sizes)
+        else:
+            # No points - hide all
+            scat.set_sizes(np.zeros(max_points))
+
+        ax.set_title(f"t = {t_val:.2f} (N={n_alive})")
+
     def plot_trajectory(
         self,
         traj: Trajectory,
@@ -3357,17 +3564,11 @@ class BranchingFlowVisualizer:
         seq_artists = (
             []
         )  # Store (rectangles, texts, motif_rects, letters, colors) for each plot
+        scatter_artists = []  # Pre-created 3D scatter artists for each plot
         for i in range(num_plots):
             row, col = divmod(i, num_cols)
             ax_seq = fig.add_subplot(gs[row * 2, col])
             ax_3d = fig.add_subplot(gs[row * 2 + 1, col], projection="3d")
-            ax_3d.set_xticks([])
-            ax_3d.set_yticks([])
-            ax_3d.set_zticks([])
-            ax_3d.view_init(elev=25, azim=45)
-            ax_3d.set_xlim(trans_min[i][0], trans_max[i][0])
-            ax_3d.set_ylim(trans_min[i][1], trans_max[i][1])
-            ax_3d.set_zlim(trans_min[i][2], trans_max[i][2])
             axes_seq.append(ax_seq)
             axes_3d.append(ax_3d)
 
@@ -3376,6 +3577,12 @@ class BranchingFlowVisualizer:
                 ax_seq, max_seq_len
             )
             seq_artists.append(artists)
+
+            # Pre-create 3D scatter artist (avoids ax.clear() each frame)
+            scat = BranchingFlowVisualizer._create_3d_scatter_artist(
+                ax_3d, max_seq_len, trans_min[i], trans_max[i]
+            )
+            scatter_artists.append(scat)
 
         # Downsample to max_frames
         if max_frames is not None and len(traj.samples) > max_frames:
@@ -3422,35 +3629,15 @@ class BranchingFlowVisualizer:
                             text.set_visible(False)
                             motif_rect.set_visible(False)
 
-                    # Structure
-                    ax = axes_3d[i]
-                    ax.clear()
-                    ax.set_xticks([])
-                    ax.set_yticks([])
-                    ax.set_zticks([])
-                    ax.set_title(f"t = {t_val:.2f} (N={n_alive})")
-                    if n_alive > 0:
-                        # Color by position index, motifs smaller
-                        # TODO - option to color by birth time
-                        color_idx = np.arange(n_alive)
-                        sizes = np.where(motif_alive, 15.0, 40.0)
-
-                        ax.scatter(
-                            trans_alive[:, 0],
-                            trans_alive[:, 1],
-                            trans_alive[:, 2],
-                            c=color_idx,
-                            cmap="Spectral",
-                            vmin=0,
-                            vmax=max(n_alive - 1, 1),
-                            s=sizes,
-                            depthshade=True,
-                            alpha=0.75,
-                        )
-                    ax.view_init(elev=25, azim=45)
-                    ax.set_xlim(trans_min[i][0], trans_max[i][0])
-                    ax.set_ylim(trans_min[i][1], trans_max[i][1])
-                    ax.set_zlim(trans_min[i][2], trans_max[i][2])
+                    # Update 3D structure using pre-created scatter artist
+                    BranchingFlowVisualizer._update_3d_scatter(
+                        scat=scatter_artists[i],
+                        ax=axes_3d[i],
+                        trans_alive=trans_alive,
+                        motif_alive=motif_alive,
+                        max_points=max_seq_len,
+                        t_val=t_val,
+                    )
 
                 writer.grab_frame()
 
@@ -3471,13 +3658,26 @@ class BranchingFlowVisualizer:
         times = sorted(times)
 
         num_batch = batch.trans_1.shape[0]
+        device = batch.trans_1.device
+        tree = batch.tree.to(device)
 
-        # Define a consistent trans_0 for the whole trajectory
-        num_roots = int(batch.tree.roots_mask.sum(dim=1).max().item())
+        # Define consistent base samples for the whole trajectory (in aligned space)
+        # Broadcast x1 to get aligned space for motif preservation
+        trans_1_aligned = tree.broadcast_to_leaves(
+            batch.trans_1.to(device), fill_value=0
+        )
+        aatypes_1_aligned = tree.broadcast_to_leaves(
+            batch.aatypes_1.to(device), fill_value=MASK_TOKEN_INDEX
+        )
         trans_0 = self.translation_coupler.sample_base(
-            num_batch=num_batch,
-            num_roots=num_roots,
-            device=batch.trans_1.device,
+            motif_mask=tree.motif_mask,
+            x1=trans_1_aligned,
+            device=device,
+        )
+        aatypes_0 = self.interpolant.aatypes_coupler.sample_base(
+            motif_mask=tree.motif_mask,
+            x1=aatypes_1_aligned,
+            device=device,
         )
 
         # Build the trajectory
@@ -3485,8 +3685,9 @@ class BranchingFlowVisualizer:
         for time in tqdm(times, desc="visualize_corruption() corrupt", leave=False):
             bridged, _ = self.interpolant.corrupt_to(
                 batch=batch,
-                t=torch.ones(num_batch, device=batch.trans_1.device) * time,
+                t=torch.ones(num_batch, device=device) * time,
                 trans_0=trans_0,
+                aatypes_0=aatypes_0,
             )
             samples.append(bridged.pack_present())
 
@@ -3650,17 +3851,22 @@ class Experiment:
         os.makedirs(debug_dir, exist_ok=True)
 
         # Plot corruption planning trees
-        for i in range(10):
-            datum = self.data_module.dataset[i]
-            datum.tree_plan.plot(path=os.path.join(debug_dir, f"init_tree_plan_{i}.png"))
+        # for i in range(10):
+        #     datum = self.data_module.dataset[i]
+        #     datum.tree_plan.plot(
+        #         path=os.path.join(debug_dir, f"init_tree_plan_{i}.png")
+        #     )
 
         # Visualize corruption processes
-        viz = BranchingFlowVisualizer(sigma=1.0)
+        # 0 for deterministic bridges, >0 for stochasticity
+        viz = BranchingFlowVisualizer(sigma=0.0)
         data_loader = self.data_module.train_dataloader(rank=0, num_replicas=1)
         for i, debug_batch in enumerate(data_loader):
             if i > 10:
                 break
-            viz.visualize_corruption(batch=debug_batch, out_dir=debug_dir, filename=f"debug_corruption_{i}")
+            viz.visualize_corruption(
+                batch=debug_batch, out_dir=debug_dir, filename=f"debug_corruption_{i}"
+            )
 
     def save_config(self, wandb_logger: WandbLogger):
         # Save config if main process
