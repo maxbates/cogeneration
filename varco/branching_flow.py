@@ -1,7 +1,7 @@
 """
 Simple implementation of branching flows for protein scaffolding.
 
-Sample some proteins of length N (translations, later sequence and rotations) using LengthBatched protein dataset
+Sample some proteins of length N (translations, rotations, and sequence) using LengthBatched protein dataset
 Sample a motif_mask, with 1+ scaffolds
 Sample some number of roots per scaffold, starting points at t=0 for the motifs + roots
 Define a tree, with splits (anchors at intermediate time points) and deletions over trajectory
@@ -14,25 +14,17 @@ A simple model predicts base (endpoint prediction), split (remaining children co
 Then, a sampler (no tree) iterates to get base (endpoint prediction), sample split events, sample deletion events
 
 TODOs / features:
-- improve sampling
-  - add validation loss (e.g. folding validation?)
-- support rotations 
-  - new Coupler
-  - add rotmats_1_motifs and guidance
-  - IGSO(3) noise + bridge
-  - update plots to show 3 atoms per backbone
-  - saving trajectory maybe gets atom37 rep and uses existing plotting utils?
-- sequence
-  - also predict insertion logits, which are sampled on insertions, and replace the parent's residue
-  - support guidance potential
-- improve visualizations
-  - sequence needs to be easier to read
-  - speed
-- tree
-  - bias splits earlier, deletions later
-  - allow more roots than leaves in a scaffold, learn to delete them
+- copy cogeneration checkpoints
+- support cogeneration model warmstart
+- verify sampling capped at 512 (or max length)
+- train simple model
+- break up this file
+- visualize samping - show sample / model pred side by side
+- add validation loss (e.g. folding validation?)
+- support aatypes guidance potential, support particle-free ESM potential
 """
 
+import copy
 import datetime
 import functools
 import gc
@@ -42,7 +34,7 @@ import tempfile
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Generic, List, Optional, Tuple, TypeVar
+from typing import Callable, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
 import hydra
 import matplotlib.animation as animation
@@ -56,28 +48,39 @@ from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 from pytorch_lightning.loggers.wandb import WandbLogger
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.utilities.model_summary import ModelSummary
-from sklearn import datasets
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from cogeneration.config.base import Config, DataConfig
+from cogeneration.data import all_atom, so3_utils
 from cogeneration.data.const import (
     ANG_TO_NM_SCALE,
     MASK_TOKEN_INDEX,
     NM_TO_ANG_SCALE,
     NUM_TOKENS,
+    rigids_ang_to_nm,
+    rigids_nm_to_ang,
 )
-from cogeneration.data.noise_mask import centered_gaussian, uniform_categorical
+from cogeneration.data.noise_mask import (
+    centered_gaussian,
+    uniform_categorical,
+    uniform_so3,
+)
 from cogeneration.data.residue_constants import (
     restype_order_with_x,
     restypes,
     restypes_with_x,
 )
+from cogeneration.data.rigid import batch_center_of_mass, create_rigid
+from cogeneration.data.rigid_utils import Rigid
 from cogeneration.dataset.datasets import BaseDataset
 from cogeneration.dataset.featurizer import BatchFeaturizer
 from cogeneration.dataset.protein_dataloader import LengthBatcher
+from cogeneration.models.aa_pred import AminoAcidPredictionNet
 from cogeneration.models.attention.attention_trunk import AttentionTrunk
+from cogeneration.models.attention.ipa_attention import AttentionIPATrunk
+from cogeneration.models.attention.ipa_pytorch import Linear
 from cogeneration.models.edge_feature_net import EdgeFeatureNet
 from cogeneration.models.embed import get_index_embedding, get_time_embedding
 from cogeneration.models.esm_combiner import ESMCombinerNetwork
@@ -92,7 +95,9 @@ from varco.config import (
     VarcoDatasetConfig,
     VarcoInterpolantAATypesCouplerConfig,
     VarcoInterpolantConfig,
+    VarcoInterpolantRotationCouplerConfig,
     VarcoInterpolantTransCouplerConfig,
+    VarcoLossConfig,
     VarcoModelConfig,
     VarcoMotifGuidanceType,
 )
@@ -165,12 +170,68 @@ class SeededRNG:
             if p <= L:
                 return k - 1
 
+    def sample_beta(
+        self, size: int, alpha: float = 1.0, beta: float = 1.0, device: str = "cpu"
+    ) -> torch.Tensor:
+        """
+        Sample from Beta(alpha, beta) distribution.
+
+        Uses the ratio of gamma variates method: if X ~ Gamma(alpha, 1) and Y ~ Gamma(beta, 1),
+        then X / (X + Y) ~ Beta(alpha, beta).
+
+        For alpha < beta, the distribution is biased toward 0 (earlier times).
+        For alpha > beta, the distribution is biased toward 1 (later times).
+        For alpha = beta = 1, this is uniform on [0, 1].
+
+        Args:
+            size: Number of samples to generate
+            alpha: First shape parameter (controls left tail)
+            beta: Second shape parameter (controls right tail)
+            device: Device for output tensor
+
+        Returns:
+            Tensor of shape (size,) with samples in [0, 1]
+        """
+        if size == 0:
+            return torch.empty(0, device=device)
+        if alpha <= 0 or beta <= 0:
+            raise ValueError("alpha and beta must be positive")
+
+        # Sample from Gamma distributions using the Marsaglia and Tsang method
+        def sample_gamma(a: float, n: int) -> torch.Tensor:
+            if a < 1:
+                # For a < 1, use: Gamma(a) = Gamma(a+1) * U^(1/a)
+                g = sample_gamma(a + 1, n)
+                u = torch.rand(n, generator=self.rng, device="cpu")
+                return g * (u ** (1.0 / a))
+
+            d = a - 1.0 / 3.0
+            c = 1.0 / math.sqrt(9.0 * d)
+
+            samples = []
+            while len(samples) < n:
+                batch_size = max(n - len(samples), 64)
+                z = torch.randn(batch_size, generator=self.rng, device="cpu")
+                u = torch.rand(batch_size, generator=self.rng, device="cpu")
+
+                v = (1.0 + c * z) ** 3
+                valid = (z > -1.0 / c) & (
+                    torch.log(u) < 0.5 * z**2 + d * (1.0 - v + torch.log(v))
+                )
+                samples.extend((d * v)[valid].tolist())
+
+            return torch.tensor(samples[:n], device="cpu")
+
+        x = sample_gamma(alpha, size)
+        y = sample_gamma(beta, size)
+        return (x / (x + y)).to(device=device)
+
 
 def gather_and_pad(
     source: torch.Tensor,  # (B, N, ...)
     index: torch.Tensor,  # (B, P)
     mask: torch.Tensor,  # (B, P)
-    fill_value: float = 0.0,
+    fill_value: Union[float, torch.Tensor] = 0.0,
 ) -> torch.Tensor:  # (B, P, ...)
     """
     Gather from source along dim=1 using index, then fill padding positions with fill_value.
@@ -182,11 +243,13 @@ def gather_and_pad(
         source: (B, N, ...) tensor to gather from
         index: (B, P) indices into dim=1 of source (must be in [0, N-1])
         mask: (B, P) boolean mask; True for valid positions, False for padding
-        fill_value: value to fill where mask is False
+        fill_value: value to fill where mask is False. Can be a scalar float or
+                    a tensor with shape matching source trailing dimensions (...).
 
     Returns:
         (B, P, ...) tensor with gathered values where mask is True, fill_value otherwise
     """
+    B, P = index.shape
     trailing_shape = source.shape[2:]
     idx = index
     for _ in trailing_shape:
@@ -195,15 +258,22 @@ def gather_and_pad(
 
     gathered = source.gather(1, idx)  # (B, P, ...)
 
-    if not trailing_shape:
+    # Handle fill value - either scalar or tensor
+    if isinstance(fill_value, torch.Tensor):
+        # Tensor fill value: broadcast to (B, P, ...)
+        fill = fill_value.unsqueeze(0).unsqueeze(0).expand(B, P, *trailing_shape)
+        fill = fill.to(device=gathered.device, dtype=gathered.dtype)
+    else:
+        # Scalar fill value
         fill = torch.full_like(gathered, fill_value)
+
+    if not trailing_shape:
         return torch.where(mask, gathered, fill)
     else:
         m = mask
         for _ in trailing_shape:
             m = m.unsqueeze(-1)
         m = m.expand_as(gathered)
-        fill = torch.full_like(gathered, fill_value)
         return torch.where(m, gathered, fill)
 
 
@@ -258,10 +328,9 @@ class TreePlan:
     parent_idx: torch.Tensor  # (A,) long, -1 for roots
     children_idx: torch.Tensor  # (A, 2) long, -1 for leaves
     total_leaves: torch.Tensor  # (A,) long, descendant leaf counts
-    node_depth: (
-        torch.Tensor
-    )  # (A,) long, depth in tree (leaves=0, parent=max(child_depths)+1)
+    node_depth: torch.Tensor  # (A,) long, depth in tree (leaves=0, parents -> max)
     leaf_deleted: torch.Tensor  # (A,) bool; True for deleted leaves, False otherwise
+    planar_position: torch.Tensor  # (A,) float, pre-computed node position/order
 
     # times
     birth_time: torch.Tensor  # (A,) float, segment start time; roots are 0
@@ -286,21 +355,49 @@ class TreePlan:
         p_interior: float = 0.98,
         # Number of deletion leaves are sampled from a Poisson distribution with rate p_deletion * # scaffold positions.
         p_deletion: float = 0.20,
+        # Beta distribution parameters for biasing split/insertion times.
+        # With alpha < beta, splits are biased to occur earlier (closer to t=0).
+        # Default (1.0, 2.0) gives mean ~0.33, moving mass toward earlier times.
+        # Use (1.0, 1.0) for uniform sampling (no bias).
+        split_time_beta: tuple[float, float] = (1.0, 2.0),
+        # Beta distribution parameters for biasing deletion times.
+        # With alpha > beta, deletions are biased to occur later (closer to t=1).
+        # Default (2.0, 1.0) gives mean ~0.67, moving mass toward later times.
+        delete_time_beta: tuple[float, float] = (2.0, 1.0),
     ) -> "TreePlan":
-        f"""
+        """
         Generate a simple planar coalescent tree plan with sampled split/birth/delete times.
 
         Algorithm:
         - Provide t=1 positions of motif tokens (motif_mask == True) and scaffold positions
         - Augment the tree with K_del deletions, which are to-be-deleted leaves duplicating t=1 endpoints
         - Determine scaffold groups, assign group id
+        - Sample K_scaffold per scaffold span; if K_scaffold > span_len, create extra deleted roots
         - Coalesce scaffold groups independently until K_scaffold roots remain within the group
         - Sample split times for internal nodes (aka "anchors")
         - Sample deletion times for deletion leaves (must come after split)
         - Define motif_mask etc. in aligned space (i.e. length A)
+        - Compute planar_position, bookkeeping
 
-        Note this intentionally allows scaffold tokens to be present at t=0 (the nuclei), in
+        Note this scheme intentionally allows scaffold tokens to be present at t=0 (the roots), in
         addition to motif tokens, which avoids needing special boundary-sourcing logic.
+
+        Nodes are either leaves or internal.
+        Internal nodes are anchors, they always have children and a split time and are not themselves deleted.
+        Leaf types:
+        - Original leaves: leaf_map >= 0, leaf_deleted = False
+        - Deleted duplicate leaves: leaf_map >= 0, leaf_deleted = True
+        - Extra deleted roots: leaf_map = -1, leaf_deleted = True (no t=1 data reference)
+
+        Beyond tracking topology, the phases of tree construction yields a node ordering:
+        - Leaves (IDs 0..num_leaves-1)
+          - original data
+          - deletions (i.e. duplicates of original data)
+          - extra deleted roots (scaffold roots to be deleted)
+        - Internal nodes (IDs num_leaves..A-1)
+          - anchors from coalescence
+
+        However, when the tree (A) is packed (P), we use planar_position to order the nodes.
         """
         if motif_mask.ndim != 1:
             raise ValueError(
@@ -407,30 +504,61 @@ class TreePlan:
             idxs = torch.nonzero(group_ids_leaf == int(gid), as_tuple=False).view(-1)
             groups[int(gid)] = idxs.tolist()
 
-        # --- Coalescence
-        # Iteratively merge adjacent nodes, tracking parent-child relationships and weights (num children)
-        # until we are left with K_scaffold roots for each scaffold span group.
-
-        # Initialize leaf nodes (leaf ids are 0..num_leaves-1)
+        # --- Sample scaffold roots and create extra deleted roots
+        # Sample K_scaffold per scaffold span. If K_scaffold > span_len, create extra deleted
+        # root leaves now (before coalescence) to maintain contiguous leaf IDs.
         parent: List[int] = [-1] * num_leaves
         children: List[List[int]] = [[-1, -1] for _ in range(num_leaves)]
         weight: List[int] = [1 for _ in range(num_leaves)]
 
-        roots: List[int] = []
+        extra_deleted_roots: List[int] = []
+        extra_root_spans: List[Tuple[int, int]] = (
+            []
+        )  # (span_start, span_end) for planar positioning
+        scaffold_K: Dict[int, int] = {}  # gid -> K_scaffold
+
         for gid, active in groups.items():
             is_scaffold_span = gid < span_gid
 
-            # For scaffold spans: keep K nuclei (active nodes) instead of collapsing to 1.
             if is_scaffold_span:
                 span_len = len(active)
-                k_hi = min(max_scaffold_nuclei, span_len)
+                span_start_leaf = min(active)
+                span_end_leaf = max(active)
+                k_hi = max_scaffold_nuclei
                 k_lo = min(min_scaffold_nuclei, k_hi)
                 K_scaffold = (
                     k_lo if k_lo == k_hi else (k_lo + rng.rand_int(k_hi - k_lo + 1))
                 )
+                scaffold_K[gid] = K_scaffold
+
+                # Create extra deleted roots if K_scaffold > span_len
+                if K_scaffold > span_len:
+                    num_extra = K_scaffold - span_len
+                    for _ in range(num_extra):
+                        new_id = len(parent)
+                        parent.append(-1)  # root
+                        children.append([-1, -1])  # leaf
+                        weight.append(1)
+                        extra_deleted_roots.append(new_id)
+                        extra_root_spans.append((span_start_leaf, span_end_leaf))
+                        # Insert into active list at random position for planar ordering
+                        insert_pos = rng.rand_int(len(active) + 1)
+                        active.insert(insert_pos, new_id)
             else:
-                # Motif singleton groups are already len==1; enforce target 1.
-                K_scaffold = 1
+                scaffold_K[gid] = 1
+
+        # Track original num_leaves (before extra roots) for leaf_map/leaf_deleted assignment
+        num_leaves_original = num_leaves
+        # Update num_leaves to include extra deleted roots
+        num_leaves = len(parent)  # all nodes so far are leaves
+
+        # --- Coalescence
+        # Iteratively merge adjacent nodes, tracking parent-child relationships and weights (num children)
+        # until we are left with K_scaffold roots for each scaffold span group.
+        roots: List[int] = []
+        for gid, active in groups.items():
+            is_scaffold_span = gid < span_gid
+            K_scaffold = scaffold_K[gid]
 
             while len(active) > K_scaffold:
                 # Choose which adjacent pair to merge.
@@ -467,7 +595,7 @@ class TreePlan:
             # Whatever remains are the roots/nuclei for this group.
             roots.extend(active)
 
-        # Roots now track scaffold nuclei
+        # Roots now track scaffold nuclei. Not extra deleted roots.
         roots = sorted(set(roots))
 
         # Tree now includes all nodes:
@@ -494,13 +622,18 @@ class TreePlan:
                 elif c1 >= 0:
                     node_depth_list[node] = node_depth_list[c1] + 1
 
-        # leaf_map mapping is valid for leaves (< num_leaves) and 0 for internal nodes
-        leaf_map = torch.zeros((A,), dtype=torch.long, device=device)
-        leaf_map[:num_leaves] = leaf_map_leaves
+        # leaf_map mapping: valid for original leaves, -1 for internal nodes and extra deleted roots
+        leaf_map = torch.full((A,), -1, dtype=torch.long, device=device)
+        leaf_map[:num_leaves_original] = leaf_map_leaves
 
         leaf_deleted = torch.zeros((A,), dtype=torch.bool, device=device)
-        if num_leaves > 0:
-            leaf_deleted[:num_leaves] = leaf_del_t
+        if num_leaves_original > 0:
+            leaf_deleted[:num_leaves_original] = leaf_del_t
+
+        # Mark extra deleted roots (have no t=1 data reference, leaf_map stays -1)
+        if extra_deleted_roots:
+            extra_t = torch.tensor(extra_deleted_roots, dtype=torch.long, device=device)
+            leaf_deleted[extra_t] = True
 
         # --- Sample birth/split times
 
@@ -542,9 +675,10 @@ class TreePlan:
 
                 # Exponential sampling for all valid nodes at this depth
                 # st = 1 - (1 - t0) * exp(-E / (W - 1)), where E ~ Exp(1)
-                E = -torch.log(
-                    rng.rand(len(valid_nodes), device=device).clamp_min(1e-12)
-                )
+                # Use beta distribution to bias the base uniform toward earlier times
+                alpha, beta = split_time_beta
+                u = rng.sample_beta(len(valid_nodes), alpha, beta, device=device)
+                E = -torch.log(u.clamp_min(1e-12))
                 st = 1.0 - (1.0 - t0_valid) * torch.exp(
                     -E / (W_valid - 1).clamp_min(1.0)
                 )
@@ -589,8 +723,10 @@ class TreePlan:
         if num_deleted > 0:
             b = birth_time[valid_deleted]
 
-            # Sample uniform random values for all deleted leaves at once
-            u = rng.rand(num_deleted, device=device)
+            # Sample beta-distributed random values for all deleted leaves at once
+            # With alpha > beta, deletions are biased toward later times
+            alpha, beta = delete_time_beta
+            u = rng.sample_beta(int(num_deleted), alpha, beta, device=device)
 
             # Compute deletion times: dt = birth + (1 - birth) * u
             dt = b + (1.0 - b) * u
@@ -602,13 +738,53 @@ class TreePlan:
 
             delete_time[valid_deleted] = dt
 
+        # --- Compute planar_position
+        # Original leaves (non-duplicates) get sequential positions 0, 1, 2, ..., N_data-1
+        # Duplicate leaves get the same position as their original (same leaf_map value)
+        # Extra deleted roots get random position within their scaffold span
+        # Internal nodes get weighted average of children (computed bottom-up)
+        planar_pos = torch.zeros((A,), dtype=torch.float32, device=device)
+
+        # Build a mapping from data index to planar position (0, 1, ..., N_data-1)
+        data_idx_to_pos = torch.arange(N_data, dtype=torch.float32, device=device)
+
+        # Assign positions to original leaves (0..num_leaves_original-1) based on their leaf_map
+        # This handles both originals and duplicates correctly - duplicates share position
+        for i in range(num_leaves_original):
+            data_idx = int(leaf_map_leaves[i].item())
+            planar_pos[i] = data_idx_to_pos[data_idx]
+
+        # Extra deleted roots: sample random position within their span's leaf range
+        # span_start and span_end are node IDs of the first/last leaves in the span,
+        # which for simple cases equal their planar positions
+        for extra_id, (span_start, span_end) in zip(
+            extra_deleted_roots, extra_root_spans
+        ):
+            # Use the planar positions of the span boundaries, not node IDs
+            pos_start = planar_pos[span_start].item()
+            pos_end = planar_pos[span_end].item()
+            # Sample uniformly in [pos_start, pos_end + 1)
+            planar_pos[extra_id] = pos_start + rng.rand_float() * (
+                pos_end - pos_start + 1
+            )
+
+        # Internal nodes: bottom-up traversal (children before parents)
+        # topo_order is parent-before-child, so reverse it
+        # Use the Python lists (children, weight) since tensors aren't created yet
+        for node in topo_order.flip(0).tolist():
+            c0, c1 = children[node][0], children[node][1]
+            if c0 >= 0 and c1 >= 0:  # internal node
+                w0, w1 = float(weight[c0]), float(weight[c1])
+                denom = max(1e-6, w0 + w1)
+                planar_pos[node] = (planar_pos[c0] * w0 + planar_pos[c1] * w1) / denom
+
         # --- Final bookkeeping
 
         # Build motif mask in aligned tree space (A,)
         # Leaves 0..num_leaves-1 inherit motif/scaffold status from their referenced data index.
-        # Internal nodes are always False.
+        # Internal nodes and extra deleted roots are always False (scaffold-derived).
         motif_mask_aligned = torch.zeros((A,), dtype=torch.bool, device=device)
-        motif_mask_aligned[:num_leaves] = motif_mask_b[leaf_map_leaves]
+        motif_mask_aligned[:num_leaves_original] = motif_mask_b[leaf_map_leaves]
 
         parent_idx = torch.tensor(parent, dtype=torch.long, device=device)
         children_idx = torch.tensor(children, dtype=torch.long, device=device)
@@ -622,9 +798,13 @@ class TreePlan:
         topo_order = topo_order.to(device=device)
         node_depth = node_depth_t.to(device=device)
 
+        # Count total leaf nodes (including extra deleted roots) and deletions
+        total_leaf_nodes = int((total_leaves == 1).sum().item())
+        total_deletions = int(leaf_deleted.sum().item())
+
         return cls(
-            num_leaves=num_leaves,
-            num_deletions=num_deletions,
+            num_leaves=total_leaf_nodes,
+            num_deletions=total_deletions,
             num_nodes=A,
             topo_order=topo_order,
             motif_mask=motif_mask_aligned,
@@ -634,6 +814,7 @@ class TreePlan:
             total_leaves=total_leaves,
             node_depth=node_depth,
             leaf_deleted=leaf_deleted,
+            planar_position=planar_pos,
             birth_time=birth_time,
             split_time=split_time,
             delete_time=delete_time,
@@ -749,10 +930,17 @@ class TreePlan:
             raise ValueError(f"Unreachable nodes: {missing[:16]}")
 
         # leaf endpoint mapping validity
-        for i in range(min(A, N_leaf)):
+        for i in range(A):
             if int(self.total_leaves[i]) != 1:
-                continue
+                continue  # skip internal nodes
             idx = int(self.leaf_map[i].item())
+            if idx == -1:
+                # Deleted root with no data reference - must be marked as deleted
+                if not bool(self.leaf_deleted[i]):
+                    raise ValueError(
+                        f"Node {i} with leaf_map=-1 must be marked as deleted"
+                    )
+                continue
             if idx < 0 or idx >= N_data:
                 raise ValueError(f"leaf_map[{i}] out of range: {idx} (N_data={N_data})")
 
@@ -787,6 +975,7 @@ class TreePlan:
         motif_mask = self.motif_mask.detach().to("cpu").numpy().astype(bool)
         leaf_map = self.leaf_map.detach().to("cpu").numpy()
         leaf_deleted = self.leaf_deleted.detach().to("cpu").numpy().astype(bool)
+        planar_pos = self.planar_position.detach().to("cpu").numpy()
 
         A = int(self.num_nodes)
         N_leaf = int(self.num_leaves)
@@ -796,37 +985,6 @@ class TreePlan:
         )
         motif_marker_color = "black"
         scaffold_color = "blue"
-
-        # Compute a planar x-position per node based on descendant leaf positions.
-        # This keeps internal anchors visually located within their scaffold span, even though
-        # internal node ids are appended and would otherwise plot far to the right.
-        x_pos = np.full((A,), np.nan, dtype=np.float32)
-
-        # Leaf nodes are 0..N_leaf-1 (includes deletion duplicates).
-        for i in range(N_leaf):
-            x_pos[i] = float(i)
-
-        # Child-before-parent order
-        child_first = self.topo_order.detach().to("cpu").numpy()[::-1].tolist()
-        for node in child_first:
-            if not np.isfinite(birth[node]):
-                continue
-            if int(total[node]) <= 1:
-                continue
-            c0, c1 = int(children[node][0]), int(children[node][1])
-            if c0 < 0 or c1 < 0:
-                continue
-            if not np.isfinite(x_pos[c0]) or not np.isfinite(x_pos[c1]):
-                continue
-            w0 = float(total[c0])
-            w1 = float(total[c1])
-            denom = max(1e-6, w0 + w1)
-            x_pos[node] = (x_pos[c0] * w0 + x_pos[c1] * w1) / denom
-
-        # Fallback: any remaining unset node (shouldn't happen) uses its raw id
-        for i in range(A):
-            if not np.isfinite(x_pos[i]):
-                x_pos[i] = float(i)
 
         fig = plt.figure(figsize=(max(6.0, A / 8.0), 6.0), dpi=dpi)
         ax = fig.add_subplot(111)
@@ -841,7 +999,7 @@ class TreePlan:
                 continue
             y0 = max(0.0, min(1.0, y0))
             y1 = max(0.0, min(1.0, y1))
-            xi = float(x_pos[i])
+            xi = float(planar_pos[i])
             is_leaf = int(total[i]) == 1
             if is_leaf:
                 is_motif_leaf = bool(motif_mask[i])
@@ -862,7 +1020,7 @@ class TreePlan:
             y = max(0.0, min(1.0, y))
             # All connectors here are within scaffold span trees (motif singletons never merge).
             ax.plot(
-                [float(x_pos[p]), float(x_pos[child_idx])],
+                [float(planar_pos[p]), float(planar_pos[child_idx])],
                 [y, y],
                 linewidth=1.0,
                 color=scaffold_color,
@@ -879,7 +1037,7 @@ class TreePlan:
 
         if len(motif_roots) > 0:
             ax.scatter(
-                [float(x_pos[r]) for r in motif_roots],
+                [float(planar_pos[r]) for r in motif_roots],
                 [0.0] * len(motif_roots),
                 marker="o",
                 s=20,
@@ -888,7 +1046,7 @@ class TreePlan:
             )
         if len(scaffold_roots) > 0:
             ax.scatter(
-                [float(x_pos[r]) for r in scaffold_roots],
+                [float(planar_pos[r]) for r in scaffold_roots],
                 [0.0] * len(scaffold_roots),
                 marker="o",
                 s=20,
@@ -909,7 +1067,7 @@ class TreePlan:
         ]
         if len(motif_leaf_ids) > 0:
             ax.scatter(
-                [float(x_pos[i]) for i in motif_leaf_ids],
+                [float(planar_pos[i]) for i in motif_leaf_ids],
                 [1.0] * len(motif_leaf_ids),
                 marker="s",
                 s=14,
@@ -918,7 +1076,7 @@ class TreePlan:
             )
         if len(scaffold_leaf_ids) > 0:
             ax.scatter(
-                [float(x_pos[i]) for i in scaffold_leaf_ids],
+                [float(planar_pos[i]) for i in scaffold_leaf_ids],
                 [1.0] * len(scaffold_leaf_ids),
                 marker="s",
                 s=14,
@@ -927,7 +1085,7 @@ class TreePlan:
             )
         if len(deleted_leaf_ids) > 0:
             ax.scatter(
-                [float(x_pos[i]) for i in deleted_leaf_ids],
+                [float(planar_pos[i]) for i in deleted_leaf_ids],
                 [float(delete[i]) for i in deleted_leaf_ids],
                 marker="s",
                 s=28,
@@ -943,7 +1101,7 @@ class TreePlan:
         ]
         if len(internal_nodes) > 0:
             internal_y = [float(split[i]) for i in internal_nodes]
-            internal_x_plot = [float(x_pos[i]) for i in internal_nodes]
+            internal_x_plot = [float(planar_pos[i]) for i in internal_nodes]
             ax.scatter(
                 internal_x_plot,
                 internal_y,
@@ -961,7 +1119,9 @@ class TreePlan:
 
         # Time axis: 0 at top, 1 at bottom
         ax.set_ylim(1.02, -0.02)
-        ax.set_xlim(-1, max(float(x_pos.max()) + 1.0, float(self.num_leaves)))
+        # x-limit based on actual planar positions (extra deleted roots are within span, not at end)
+        N_data = self.num_leaves - self.num_deletions
+        ax.set_xlim(-1, max(float(planar_pos.max()) + 1.0, float(N_data)))
         ax.grid(True, linewidth=0.5, alpha=0.3)
         ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.02), borderaxespad=0.0)
 
@@ -991,6 +1151,7 @@ class BatchedTreePlan:
     total_leaves: torch.Tensor  # (B, A_max) long
     node_depth: torch.Tensor  # (B, A_max) long
     leaf_deleted: torch.Tensor  # (B, A_max) bool
+    planar_position: torch.Tensor  # (B, A_max) float
 
     # times
     birth_time: torch.Tensor  # (B, A_max) float
@@ -1012,6 +1173,7 @@ class BatchedTreePlan:
             total_leaves=self.total_leaves.to(device),
             node_depth=self.node_depth.to(device),
             leaf_deleted=self.leaf_deleted.to(device),
+            planar_position=self.planar_position.to(device),
             birth_time=self.birth_time.to(device),
             split_time=self.split_time.to(device),
             delete_time=self.delete_time.to(device),
@@ -1048,7 +1210,7 @@ class BatchedTreePlan:
     def broadcast_to_leaves(
         self,
         x: torch.Tensor,  # (B, N, ...)
-        fill_value: float = 0.0,
+        fill_value: Union[float, torch.Tensor] = 0.0,
     ) -> torch.Tensor:  # (B, A_max, ...)
         """Broadcast data from N-space to A-space, keeping only leaf positions."""
         if x.ndim < 2:
@@ -1056,7 +1218,9 @@ class BatchedTreePlan:
                 f"Expected x to have at least 2 dims (B, N, ...); got {x.shape}"
             )
         leaf_idx = self.leaf_map.to(device=x.device).clamp_min(0)  # (B, A)
-        leaf_mask = self.leaf_mask.to(device=x.device)  # (B, A)
+        # Exclude leaves with no data reference (leaf_map == -1, e.g. extra deleted roots)
+        has_data = self.leaf_map >= 0
+        leaf_mask = self.leaf_mask.to(device=x.device) & has_data.to(device=x.device)
         return gather_and_pad(x, leaf_idx, mask=leaf_mask, fill_value=fill_value)
 
     def traverse_bottom_up(
@@ -1088,7 +1252,7 @@ class BatchedTreePlan:
             parent_values = combine_fn(
                 batch_idx, node_idx, children, child_weights, node_values
             )
-            node_values[batch_idx, node_idx] = parent_values
+            node_values[batch_idx, node_idx] = parent_values.to(node_values.dtype)
         return node_values
 
     def traverse_top_down(
@@ -1131,6 +1295,7 @@ class BatchedTreePlan:
             node_target = target_state[batch_idx, node_idx]
             node_at_split = split_fn(node_creation, node_target, node_t0, node_st)
             children = self.children_idx[batch_idx, node_idx, :]
+            node_at_split = node_at_split.to(creation_state.dtype)
             for j in range(2):
                 c_indices = children[:, j]
                 valid_children = c_indices >= 0
@@ -1182,6 +1347,12 @@ class BatchedTreePlan:
             leaf_deleted=pad_and_stack(
                 [p.leaf_deleted for p in plans], A_max, fill_value=0, dtype=torch.bool
             ),
+            planar_position=pad_and_stack(
+                [p.planar_position for p in plans],
+                A_max,
+                fill_value=0.0,
+                dtype=torch.float32,
+            ),
             birth_time=pad_and_stack(
                 [p.birth_time for p in plans],
                 A_max,
@@ -1201,7 +1372,7 @@ class BatchedTreePlan:
                 dtype=torch.float32,
             ),
             leaf_map=pad_and_stack(
-                [p.leaf_map for p in plans], A_max, fill_value=0, dtype=torch.long
+                [p.leaf_map for p in plans], A_max, fill_value=-1, dtype=torch.long
             ),
         )
 
@@ -1218,6 +1389,7 @@ class DataSample:
     res_mask: torch.Tensor  # (N,) int
     chain_idx: torch.Tensor  # (N,) int
     trans_1: torch.Tensor  # (N, 3)
+    rotmats_1: torch.Tensor  # (N, 3, 3)
     aatypes_1: torch.Tensor  # (N,)
 
 
@@ -1233,6 +1405,7 @@ class DataBatch:
     res_mask: torch.Tensor  # (B, N) int
     chain_idx: torch.Tensor  # (B, N) int
     trans_1: torch.Tensor  # (B, N, 3)
+    rotmats_1: torch.Tensor  # (B, N, 3, 3)
     aatypes_1: torch.Tensor  # (B, N)
 
 
@@ -1246,10 +1419,14 @@ class DataCorrupted:
     res_mask: torch.Tensor  # (B, P_max) int
     chain_idx: torch.Tensor  # (B, P_max) int
     trans_t: torch.Tensor  # (B, P_max, 3)
+    rotmats_t: torch.Tensor  # (B, P_max, 3, 3)
     aatypes_t: torch.Tensor  # (B, P_max)
     trans_1_motifs: (
         torch.Tensor
     )  # (B, P_max, 3) true t=1 positions for motifs (for guidance)
+    rotmats_1_motifs: (
+        torch.Tensor
+    )  # (B, P_max, 3, 3) true t=1 rotations for motifs (for guidance)
     remaining_insertions: Optional[torch.Tensor] = (
         None  # (B, P_max) supervised target, remaining splits per present token
     )
@@ -1271,17 +1448,44 @@ class DataCorrupted:
             )
         return (self.remaining_insertions * self.valid_mask.long()).sum(dim=1).long()
 
-    def detach_clone(self) -> "DataCorrupted":
-        """Detach and clone the data, e.g. to save in trajectory"""
+    def to(self, device: torch.device) -> "DataCorrupted":
+        """Move all tensors to specified device"""
         return DataCorrupted(
+            t=self.t.to(device),
+            motif_mask=self.motif_mask.to(device),
+            birth_time=self.birth_time.to(device),
+            res_mask=self.res_mask.to(device),
+            chain_idx=self.chain_idx.to(device),
+            trans_t=self.trans_t.to(device),
+            rotmats_t=self.rotmats_t.to(device),
+            aatypes_t=self.aatypes_t.to(device),
+            trans_1_motifs=self.trans_1_motifs.to(device),
+            rotmats_1_motifs=self.rotmats_1_motifs.to(device),
+            remaining_insertions=(
+                self.remaining_insertions.to(device)
+                if self.remaining_insertions is not None
+                else None
+            ),
+            deleted=(self.deleted.to(device) if self.deleted is not None else None),
+        )
+
+    def detach_clone(self, device: Optional[torch.device] = None) -> "DataCorrupted":
+        """Detach and clone the data, e.g. to save in trajectory.
+
+        Args:
+            device: If provided, move tensors to this device (e.g. 'cpu' for trajectories)
+        """
+        result = DataCorrupted(
             t=self.t.detach().clone(),
             motif_mask=self.motif_mask.detach().clone(),
             birth_time=self.birth_time.detach().clone(),
             res_mask=self.res_mask.detach().clone(),
             chain_idx=self.chain_idx.detach().clone(),
             trans_t=self.trans_t.detach().clone(),
+            rotmats_t=self.rotmats_t.detach().clone(),
             aatypes_t=self.aatypes_t.detach().clone(),
             trans_1_motifs=self.trans_1_motifs.detach().clone(),
+            rotmats_1_motifs=self.rotmats_1_motifs.detach().clone(),
             remaining_insertions=(
                 self.remaining_insertions.detach().clone()
                 if self.remaining_insertions is not None
@@ -1291,16 +1495,19 @@ class DataCorrupted:
                 self.deleted.detach().clone() if self.deleted is not None else None
             ),
         )
+        if device is not None:
+            return result.to(device)
+        return result
 
     def apply_insertions_deletions(
         self,
         insertions: torch.Tensor,  # (B, P) bool
         deletions: torch.Tensor,  # (B, P) bool
         t_birth: float,
-    ) -> Tuple["DataCorrupted", torch.Tensor]:
+    ) -> Tuple["DataCorrupted", torch.Tensor, torch.Tensor]:
         """
         Apply insertions and deletions to create a new batch.
-        Returns new batch and positions where insertions occurred.
+        Returns new batch, positions where insertions occurred, and gather indices.
 
         Deletions remove positions from the sequence.
         Insertions duplicate positions, and child copies parent's features.
@@ -1357,6 +1564,9 @@ class DataCorrupted:
         assert self.remaining_insertions is None
         assert self.deleted is None
 
+        device = self.trans_t.device
+        identity = torch.eye(3, device=device, dtype=self.rotmats_t.dtype)
+
         new_batch = DataCorrupted(
             t=self.t.clone(),
             motif_mask=gather_and_pad(
@@ -1368,15 +1578,37 @@ class DataCorrupted:
                 self.chain_idx, gather_idx, new_valid, fill_value=0
             ),
             trans_t=gather_and_pad(self.trans_t, gather_idx, new_valid, fill_value=0.0),
+            rotmats_t=gather_and_pad(
+                self.rotmats_t, gather_idx, new_valid, fill_value=identity
+            ),
             aatypes_t=gather_and_pad(
                 self.aatypes_t, gather_idx, new_valid, fill_value=MASK_TOKEN_INDEX
             ),
             trans_1_motifs=gather_and_pad(
                 self.trans_1_motifs, gather_idx, new_valid, fill_value=0.0
             ),
+            rotmats_1_motifs=gather_and_pad(
+                self.rotmats_1_motifs, gather_idx, new_valid, fill_value=identity
+            ),
         )
 
-        return new_batch, is_insertion
+        return new_batch, is_insertion, gather_idx
+
+    def to_atom37(self) -> torch.Tensor:
+        """
+        Convert (trans_t, rotmats_t, aatypes_t) to atom37 representation.
+
+        Returns:
+            atom37: (B, P, 37, 3) atom positions in angstroms
+        """
+        return all_atom.atom37_from_trans_rot(
+            trans=self.trans_t,
+            rots=self.rotmats_t,
+            torsions=None,
+            aatype=self.aatypes_t,
+            res_mask=self.valid_mask.float(),
+            unknown_to_alanine=True,
+        )
 
 
 @dataclass
@@ -1390,20 +1622,32 @@ class DataBridged:
     res_mask: torch.Tensor  # (B, A)
     chain_idx: torch.Tensor  # (B, A)
     trans_t: torch.Tensor  # (B, A, 3)
+    rotmats_t: torch.Tensor  # (B, A, 3, 3)
     aatypes_t: torch.Tensor  # (B, A)
-    trans_1_motifs: (
-        torch.Tensor
-    )  # (B, A, 3) true t=1 positions for motifs (for guidance)
+    # guidance: t=1 values in motifs
+    trans_1_motifs: torch.Tensor  # (B, A, 3)
+    rotmats_1_motifs: torch.Tensor  # (B, A, 3, 3)
     # supervision
     remaining_insertions: torch.Tensor  # (B, A) target count per aligned node
     deleted: torch.Tensor  # (B, A) bool, aligned deletion label (leaf only)
+    # planar ordering for packing (preserves sequence order)
+    planar_position: torch.Tensor  # (B, A) float, position in sequence for sorting
 
     @staticmethod
     def pack_present_indices(
         present_mask: torch.Tensor,  # (B, A) bool
+        planar_position: torch.Tensor,  # (B, A) float
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """
         Derive packed indices deterministically from a (B, A) present mask.
+
+        planar_position is required to ensure consistent ordering between
+        model inputs and loss targets. Omitting it previously caused a critical bug
+        where targets were misaligned with predictions.
+
+        Args:
+            present_mask: (B, A) bool mask of present nodes
+            planar_position: (B, A) float, for ordering
 
         Returns:
             idx_pack: (B, P_max) P -> A mapping; aligned indices for packed slots
@@ -1415,11 +1659,23 @@ class DataBridged:
             raise ValueError(
                 f"present_mask must have shape (B, A); got {tuple(present_mask.shape)}"
             )
+        if planar_position.shape != present_mask.shape:
+            raise ValueError(
+                f"planar_position shape {tuple(planar_position.shape)} must match "
+                f"present_mask shape {tuple(present_mask.shape)}"
+            )
 
         B, A = present_mask.shape
         device = present_mask.device
 
-        sort_key = (~present_mask).to(torch.int32)
+        # Sort by: (1) not present (inf) vs present, (2) planar position (sequence order)
+        # Use a large value for non-present to push them to the end
+        sort_key = torch.where(
+            present_mask,
+            planar_position,
+            torch.full_like(planar_position, float("inf")),
+        )
+
         idx_sorted = torch.argsort(sort_key, dim=1, stable=True)  # (B, A)
 
         P_b = present_mask.sum(dim=1)  # (B,)
@@ -1434,11 +1690,14 @@ class DataBridged:
         return idx_pack, pack_mask, P_b, P_max
 
     def _pack_indices(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        return self.pack_present_indices(self.present_mask)
+        return self.pack_present_indices(self.present_mask, self.planar_position)
 
     def pack_present(self) -> DataCorrupted:
         """Pack aligned (A) state into present (P_max) state for model input."""
         idx_pack, pack_mask, P_b, P_max = self._pack_indices()
+        identity = torch.eye(
+            3, device=self.rotmats_t.device, dtype=self.rotmats_t.dtype
+        )
 
         return DataCorrupted(
             t=self.t,
@@ -1451,6 +1710,12 @@ class DataBridged:
             res_mask=gather_and_pad(self.res_mask, idx_pack, pack_mask, fill_value=0),
             chain_idx=gather_and_pad(self.chain_idx, idx_pack, pack_mask, fill_value=0),
             trans_t=gather_and_pad(self.trans_t, idx_pack, pack_mask, fill_value=0.0),
+            rotmats_t=gather_and_pad(
+                self.rotmats_t,
+                idx_pack,
+                pack_mask,
+                fill_value=identity,
+            ),
             aatypes_t=gather_and_pad(
                 self.aatypes_t,
                 idx_pack,
@@ -1459,6 +1724,12 @@ class DataBridged:
             ),
             trans_1_motifs=gather_and_pad(
                 self.trans_1_motifs, idx_pack, pack_mask, fill_value=0.0
+            ),
+            rotmats_1_motifs=gather_and_pad(
+                self.rotmats_1_motifs,
+                idx_pack,
+                pack_mask,
+                fill_value=identity,
             ),
             remaining_insertions=gather_and_pad(
                 self.remaining_insertions, idx_pack, pack_mask, fill_value=0
@@ -1478,10 +1749,16 @@ class DataBridged:
             raise ValueError("aatypes_t shape mismatch")
         if self.trans_1_motifs.shape != (B, A, D):
             raise ValueError("trans_1_motifs shape mismatch")
+        if self.rotmats_t.shape != (B, A, 3, 3):
+            raise ValueError("rotmats_t shape mismatch")
+        if self.rotmats_1_motifs.shape != (B, A, 3, 3):
+            raise ValueError("rotmats_1_motifs shape mismatch")
         if self.remaining_insertions.shape != (B, A):
             raise ValueError("remaining_insertions shape mismatch")
         if self.deleted.shape != (B, A):
             raise ValueError("deleted shape mismatch")
+        if self.planar_position.shape != (B, A):
+            raise ValueError("planar_position shape mismatch")
         if D != 3:
             raise ValueError("trans_t last dim must be 3")
 
@@ -1490,23 +1767,48 @@ class DataBridged:
 class ModelPrediction:
     """t=1 prediction for present state (length P)"""
 
-    pred_trans_1: torch.Tensor  # (B, P, 3) base; predicted final/anchor positions
-    pred_aatype_logits: torch.Tensor  # (B, P, 21) base; amino acid logits
+    pred_trans_1: torch.Tensor  # (B, P, 3) final/anchor positions
+    pred_rotmats_1: torch.Tensor  # (B, P, 3, 3) final/anchor rotations
+    pred_aatype_logits: torch.Tensor  # (B, P, 21) final/anchor aatype logits
+    pred_insertion_logits: (
+        torch.Tensor
+    )  # (B, P, 21) amino acid logits for inserted children
     pred_split_rate: torch.Tensor  # (B, P) non-negative remaining splits per token
     pred_split_pooled_log1p_rate: (
         torch.Tensor
     )  # (B,) log1p-space total remaining splits
     pred_del_logits: torch.Tensor  # (B, P) deletion logit per token
 
-    def detach_clone(self) -> "ModelPrediction":
-        """Detach and clone the prediction, e.g. to save in trajectory"""
+    def to(self, device: torch.device) -> "ModelPrediction":
+        """Move all tensors to specified device"""
         return ModelPrediction(
+            pred_trans_1=self.pred_trans_1.to(device),
+            pred_rotmats_1=self.pred_rotmats_1.to(device),
+            pred_aatype_logits=self.pred_aatype_logits.to(device),
+            pred_insertion_logits=self.pred_insertion_logits.to(device),
+            pred_split_rate=self.pred_split_rate.to(device),
+            pred_split_pooled_log1p_rate=self.pred_split_pooled_log1p_rate.to(device),
+            pred_del_logits=self.pred_del_logits.to(device),
+        )
+
+    def detach_clone(self, device: Optional[torch.device] = None) -> "ModelPrediction":
+        """Detach and clone the prediction, e.g. to save in trajectory.
+
+        Args:
+            device: If provided, move tensors to this device (e.g. 'cpu' for trajectories)
+        """
+        result = ModelPrediction(
             pred_trans_1=self.pred_trans_1.detach().clone(),
+            pred_rotmats_1=self.pred_rotmats_1.detach().clone(),
             pred_aatype_logits=self.pred_aatype_logits.detach().clone(),
+            pred_insertion_logits=self.pred_insertion_logits.detach().clone(),
             pred_split_rate=self.pred_split_rate.detach().clone(),
             pred_split_pooled_log1p_rate=self.pred_split_pooled_log1p_rate.detach().clone(),
             pred_del_logits=self.pred_del_logits.detach().clone(),
         )
+        if device is not None:
+            return result.to(device)
+        return result
 
 
 @dataclass
@@ -1552,6 +1854,7 @@ class ProteinDataset(BaseDataset):
 
         # domains
         trans_1 = feats[bp.trans_1]
+        rotmats_1 = feats[bp.rotmats_1]
         aatypes_1 = feats[bp.aatypes_1]
 
         tree_plan = TreePlan.generate(motif_mask=motif_mask)
@@ -1563,6 +1866,7 @@ class ProteinDataset(BaseDataset):
             res_mask=res_mask,
             chain_idx=chain_idx,
             trans_1=trans_1,
+            rotmats_1=rotmats_1,
             aatypes_1=aatypes_1,
         )
 
@@ -1582,7 +1886,8 @@ class ProteinDataLoader(DataLoader):
             batch_size=batch_size,
             num_workers=num_workers,
             collate_fn=ProteinDataLoader.collate_fn,
-            prefetch_factor=None if num_workers == 0 else 1,
+            prefetch_factor=None if num_workers == 0 else 2,
+            persistent_workers=False,
             **kwargs,
         )
 
@@ -1596,6 +1901,7 @@ class ProteinDataLoader(DataLoader):
         res_mask = torch.stack([item.res_mask for item in batch])  # (B, N)
         chain_idx = torch.stack([item.chain_idx for item in batch])  # (B, N)
         trans_1 = torch.stack([item.trans_1 for item in batch])  # (B, N, 3)
+        rotmats_1 = torch.stack([item.rotmats_1 for item in batch])  # (B, N, 3, 3)
         aatypes_1 = torch.stack([item.aatypes_1 for item in batch])  # (B, N)
 
         return DataBatch(
@@ -1604,6 +1910,7 @@ class ProteinDataLoader(DataLoader):
             res_mask=res_mask,
             chain_idx=chain_idx,
             trans_1=trans_1,
+            rotmats_1=rotmats_1,
             aatypes_1=aatypes_1,
         )
 
@@ -1658,8 +1965,7 @@ class BranchFlowModel(nn.Module):
         self.edge_dim = self.cfg.hyper_params.edge_embed_size
 
         self.input_dim = (
-            3  # trans_t
-            + 1  # birth_time
+            1  # birth_time
             + 1  # motif_mask
             + 1  # chain_idx
             + self.time_embed_dim  # time_embed
@@ -1667,7 +1973,13 @@ class BranchFlowModel(nn.Module):
             + self.num_aatype_tokens  # aatypes_onehot
         )
 
-        self.node_feature_net = nn.Linear(self.input_dim, self.node_dim)
+        # simpler MLP than NodeFeatureNet
+        self.node_feature_net = nn.Sequential(
+            nn.Linear(self.input_dim, self.node_dim),
+            nn.ReLU(),
+            nn.Linear(self.node_dim, self.node_dim),
+            nn.LayerNorm(self.node_dim),
+        )
 
         self.edge_feature_net = EdgeFeatureNet(cfg=self.cfg.edge_features)
 
@@ -1679,15 +1991,27 @@ class BranchFlowModel(nn.Module):
             attn_cfg=self.cfg.attention,
         )
 
-        self.trans_pred = nn.Linear(self.node_dim, 3)
-
-        self.aatype_pred = nn.Sequential(
-            nn.Linear(self.node_dim, self.node_dim),
-            nn.ReLU(),
-            nn.Linear(self.node_dim, self.node_dim),
-            nn.ReLU(),
-            nn.Linear(self.node_dim, self.num_aatype_tokens),
+        # IPA trunk for structure prediction (trans + rotmats using rigids in nm)
+        self.ipa_trunk = AttentionIPATrunk(
+            cfg=self.cfg.ipa,
+            perform_final_edge_update=self.cfg.seq_trunk.enabled,
+            perform_backbone_update=True,
+            predict_psi_torsions=False,
+            predict_all_torsions=False,
         )
+
+        # Seq trunk
+        if self.cfg.seq_trunk.enabled:
+            self.seq_trunk = AttentionTrunk(
+                cfg=self.cfg.seq_trunk,
+                attn_cfg=self.cfg.attention,
+            )
+
+        # Base amino acid logits
+        self.aatype_pred = AminoAcidPredictionNet(cfg=self.cfg.aa_pred)
+
+        # Insertion amino acid logits
+        self.insertion_logits_pred = AminoAcidPredictionNet(cfg=self.cfg.aa_pred)
 
         # Insertions and deletions
         self.split_rate_pred = nn.Linear(self.node_dim, 1)
@@ -1731,7 +2055,7 @@ class BranchFlowModel(nn.Module):
 
         input_feats = torch.cat(
             [
-                batch.trans_t,  # (B, P, 3)
+                # Note: trans_t not included - edge embedding + pairformer + IPA handle structure
                 birth_time,  # (B, P, 1)
                 batch.motif_mask[:, :, None].float(),  # (B, P, 1)
                 batch.chain_idx[:, :, None].int(),  # (B, P, 1)
@@ -1749,7 +2073,7 @@ class BranchFlowModel(nn.Module):
             trans=batch.trans_t,
             trans_sc=None,
             edge_mask=edge_valid,
-            diffuse_mask=batch.motif_mask,
+            diffuse_mask=~batch.motif_mask,
             chain_index=batch.chain_idx,
             contact_conditioning=None,
         )  # (B, P, P, edge_dim)
@@ -1779,14 +2103,63 @@ class BranchFlowModel(nn.Module):
             r3_t=batch.t,
         )
 
-        # Predict translations
-        pred_trans_1 = self.trans_pred(node_embed)
+        # IPA trunk predicts structure updates using rigid, nm scale internally
+        init_rigids = create_rigid(rots=batch.rotmats_t, trans=batch.trans_t)
+        init_rigids_nm = rigids_ang_to_nm(init_rigids)
+        node_embed, edge_embed, pred_rigids_nm, _ = self.ipa_trunk(
+            node_embed=node_embed,
+            edge_embed=edge_embed,
+            node_mask=valid,
+            edge_mask=edge_valid,
+            diffuse_mask=valid,
+            curr_rigids_nm=init_rigids_nm,
+        )
+
+        # Convert rigid back to angstroms for output
+        pred_rigids_ang = rigids_nm_to_ang(pred_rigids_nm)
+        pred_trans_1 = pred_rigids_ang.get_trans()  # (B, P, 3)
+        pred_rotmats_1 = pred_rigids_ang.get_rots().get_rot_mats()  # (B, P, 3, 3)
+
+        # Seq trunk
+        if self.cfg.seq_trunk.enabled:
+            node_embed, edge_embed = self.seq_trunk(
+                init_node_embed=init_node_embed,
+                init_edge_embed=init_edge_embed,
+                node_embed=node_embed,
+                edge_embed=edge_embed,
+                node_mask=valid,
+                edge_mask=edge_valid,
+                rigid=pred_rigids_nm,
+                r3_t=batch.t,
+            )
 
         # Predict amino acid logits
-        pred_aatype_logits = self.aatype_pred(node_embed)  # (B, P, 21)
-        # Ensure mask logits disabled
-        if self.num_aatype_tokens == NUM_TOKENS + 1:
-            pred_aatype_logits[:, :, MASK_TOKEN_INDEX] = -1e9
+        pred_aatype_logits, _ = self.aatype_pred(
+            node_embed=node_embed,
+            aatypes_t=batch.aatypes_t,
+            edge_embed=edge_embed,
+            node_mask=valid,
+            edge_mask=edge_valid,
+            pred_rigids_nm=pred_rigids_nm,
+            diffuse_mask=~batch.motif_mask,
+            chain_index=batch.chain_idx,
+            init_node_embed=init_node_embed,
+            init_edge_embed=init_edge_embed,
+        )  # (B, P, K)
+
+        # Predict insertion amino acid logits
+        pred_insertion_logits, _ = self.insertion_logits_pred(
+            node_embed=node_embed,
+            aatypes_t=batch.aatypes_t,
+            edge_embed=edge_embed,
+            node_mask=valid,
+            edge_mask=edge_valid,
+            pred_rigids_nm=pred_rigids_nm,
+            diffuse_mask=~batch.motif_mask,
+            chain_index=batch.chain_idx,
+            init_node_embed=init_node_embed,
+            init_edge_embed=init_edge_embed,
+        )  # (B, P, K)
 
         # Predict nonnegative remaining-splits rates (Poisson-like regression)
         split_rate = F.softplus(self.split_rate_pred(node_embed)).squeeze(-1)  # (B, P)
@@ -1805,7 +2178,9 @@ class BranchFlowModel(nn.Module):
 
         return ModelPrediction(
             pred_trans_1=pred_trans_1,
+            pred_rotmats_1=pred_rotmats_1,
             pred_aatype_logits=pred_aatype_logits,
+            pred_insertion_logits=pred_insertion_logits,
             pred_split_rate=split_rate,
             pred_split_pooled_log1p_rate=split_pooled_log1p_rate,
             pred_del_logits=del_logits,
@@ -1999,8 +2374,6 @@ class Coupler(ABC, Generic[CouplingT]):
             max_split_time=t_expanded,
         )
 
-        present_mask = tree.present_mask(t=t)
-
         x_t = self.sample_bridge(
             x_start=creation_state,
             x_end=anchors,
@@ -2016,7 +2389,7 @@ class Coupler(ABC, Generic[CouplingT]):
 
         x_t = self.post_process(
             x_t=x_t,
-            present_mask=present_mask,
+            present_mask=tree.present_mask(t=t),
             motif_mask=tree.motif_mask,
             anchors=anchors,
         )
@@ -2054,8 +2427,6 @@ class Coupler(ABC, Generic[CouplingT]):
 @dataclass
 class TranslationCoupling(Coupling):
     tree: BatchedTreePlan
-
-    # domain-specific anchors (used for supervision)
     anchors: torch.Tensor  # (B, A, 3)
 
 
@@ -2141,7 +2512,8 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
         birth_time: torch.Tensor,  # (B, P)
         motif_mask: torch.Tensor,  # (B, P)
         potential: Optional[torch.Tensor] = None,  # (B, P, 3) guidance VF
-    ) -> torch.Tensor:
+    ) -> torch.Tensor:  # (B, P, 3)
+        """Euler step for translation updates (all in angstroms)."""
         trans_pred = x1_pred
         if x_t.shape != trans_pred.shape:
             raise ValueError(
@@ -2185,10 +2557,7 @@ class AATypesCoupling(Coupling):
     """Coupling for amino acid types using CTMC bridge."""
 
     tree: BatchedTreePlan
-
-    # Anchor tokens sampled from descendant distributions
     anchors: torch.Tensor  # (B, A) long
-
     # Anchor probability distributions (before sampling)
     anchor_probs: torch.Tensor  # (B, A, K)
 
@@ -2615,6 +2984,286 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
         return x_next
 
 
+@dataclass
+class RotationCoupling(Coupling):
+    """Coupling for SO(3) rotations using geodesic bridge with IGSO3 noise."""
+
+    tree: BatchedTreePlan
+    anchors: torch.Tensor  # (B, A, 3, 3)
+
+
+class RotationCoupler(Coupler[RotationCoupling]):
+    """
+    Coupler for SO(3) rotations using geodesic interpolation with IGSO3 noise.
+
+    Implements stochastic bridges on SO(3) using the IGSO3 distribution for
+    intermediate noise. Supports geodesic interpolation between rotation matrices.
+    """
+
+    def __init__(self, cfg: VarcoInterpolantRotationCouplerConfig):
+        self.cfg = cfg
+        self._igso3: Optional[so3_utils.SampleIGSO3] = None
+        self._device: torch.device = torch.device("cpu")
+
+    def set_device(self, device: torch.device):
+        """Set device for IGSO3 sampler. Must be called before using."""
+        self._device = device
+        # Move IGSO3 to GPU for CUDA, but keep on CPU for MPS (VonMises issues)
+        if self._igso3 is not None and device.type != "mps":
+            self._igso3.to(device)
+
+    @property
+    def igso3(self) -> so3_utils.SampleIGSO3:
+        """Lazy initialization of IGSO3 sampler."""
+        if self._igso3 is None:
+            steps = 1000
+            sigma_grid = torch.logspace(
+                math.log10(self.cfg.igso3_sigma_min),
+                math.log10(self.cfg.igso3_sigma_max),
+                steps=steps,
+                dtype=torch.float64,
+            )
+            self._igso3 = so3_utils.SampleIGSO3(steps, sigma_grid, cache_dir=".cache")
+            if self._device is not None and self._device.type != "mps":
+                self._igso3.to(self._device)
+            self._igso3 = self._igso3.float()
+        return self._igso3
+
+    def _ensure_igso3_device(self, target_device: torch.device):
+        """Ensure IGSO3 is on correct device before sampling."""
+        igso3_device = self.igso3.sigma_grid.device
+        if target_device.type == "mps":
+            # IGSO3 stays on CPU for MPS, results moved after
+            return
+        if igso3_device != target_device:
+            self._igso3.to(target_device)
+
+    def sample_base(
+        self,
+        motif_mask: torch.Tensor,  # (B, N) bool
+        x1: torch.Tensor,  # (B, N, 3, 3) rotation matrices
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Sample uniform SO(3) rotations for scaffolds, keep motif rotations."""
+        B, N = motif_mask.shape
+        # Sample uniform SO(3) for all positions
+        return uniform_so3(B, N, device=device)
+
+    def combine_anchors(
+        self,
+        child_anchors: torch.Tensor,  # (N_valid, 2, 3, 3)
+        child_weights: torch.Tensor,  # (N_valid, 2)
+    ) -> torch.Tensor:
+        """Weighted geodesic average of two child rotation anchors."""
+        # Normalize weights
+        wsum = child_weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+        weights = child_weights.float() / wsum.float()  # (N_valid, 2)
+
+        # For two rotation matrices R0 and R1 with weights w0 and w1:
+        # Use geodesic interpolation: geodesic_t(w1, R1, R0)
+        # where w1 is the weight of the second child (first child has weight w0 = 1 - w1)
+        R0 = child_anchors[:, 0]  # (N_valid, 3, 3)
+        R1 = child_anchors[:, 1]  # (N_valid, 3, 3)
+        # w1 needs shape (N_valid, 1) to broadcast with rot_vf (N_valid, 3) -> (N_valid, 3)
+        w1 = weights[:, 1].unsqueeze(-1)  # (N_valid, 1)
+
+        # Geodesic from R0 toward R1, parameterized by w1
+        return so3_utils.geodesic_t(t=w1, mat=R1, base_mat=R0)  # (N_valid, 3, 3)
+
+    def sample_bridge(
+        self,
+        x_start: torch.Tensor,  # (..., 3, 3)
+        x_end: torch.Tensor,  # (..., 3, 3)
+        s: torch.Tensor,  # (...) current time
+        t0: torch.Tensor,  # (...) birth time
+    ) -> torch.Tensor:
+        """Sample SO(3) bridge marginal at time s from (x_start at t0) to (x_end at 1)."""
+        original_shape = x_start.shape  # (..., 3, 3)
+
+        # Flatten to (N, 3, 3) for processing
+        flat_start = x_start.reshape(-1, 3, 3)  # (N, 3, 3)
+        flat_end = x_end.reshape(-1, 3, 3)  # (N, 3, 3)
+        flat_s = s.reshape(-1)  # (N,)
+        flat_t0 = t0.reshape(-1)  # (N,)
+        N = flat_start.shape[0]
+
+        # Compute interpolation parameter u in [0, 1]
+        denom = (1.0 - flat_t0).clamp_min(1e-6)
+        u = ((flat_s - flat_t0) / denom).clamp(0.0, 1.0)  # (N,)
+
+        # Deterministic geodesic interpolation
+        # u needs shape (N, 1) to broadcast with rot_vf (N, 3) -> (N, 3)
+        mean = so3_utils.geodesic_t(
+            t=u.unsqueeze(-1),  # (N, 1)
+            mat=flat_end,
+            base_mat=flat_start,
+        )  # (N, 3, 3)
+
+        if self.cfg.sigma == 0.0:
+            return mean.view(original_shape)
+
+        # Stochastic bridge: add IGSO3 noise scaled by bridge variance
+        # Variance for Brownian bridge: (s - t0)(1 - s) / (1 - t0)
+        var = (
+            (flat_s - flat_t0).clamp_min(0.0) * (1.0 - flat_s).clamp_min(0.0) / denom
+        ).clamp_min(
+            0.0
+        )  # (N,)
+
+        # Scale variance by cfg.sigma and compute std for IGSO3
+        std = (var.sqrt() * self.cfg.sigma).clamp_min(1e-6)  # (N,)
+
+        # Sample IGSO3 noise and apply
+        self._ensure_igso3_device(mean.device)
+        sigma_for_igso3 = std.clamp(
+            self.cfg.igso3_sigma_min, self.cfg.igso3_sigma_max
+        ).to(self.igso3.sigma_grid.device)
+
+        # Only sample noise where std > min threshold
+        apply_mask = std > self.cfg.igso3_sigma_min
+        if apply_mask.any():
+            identity_noise = (
+                torch.eye(3, device=mean.device).unsqueeze(0).expand(N, -1, -1)
+            )
+            sigma_sel = sigma_for_igso3[apply_mask]
+            noise_sel = self.igso3.sample(sigma_sel, 1).to(mean.device)
+            noise_sel = noise_sel.squeeze(1)  # (N_apply, 3, 3)
+            intermediate_noise = identity_noise.clone()
+            intermediate_noise[apply_mask] = noise_sel
+            mean = torch.einsum("...ij,...jk->...ik", mean, intermediate_noise)
+
+        return mean.view(original_shape)
+
+    def post_process(
+        self,
+        x_t: torch.Tensor,  # (B, P, 3, 3)
+        present_mask: torch.Tensor,  # (B, P)
+        motif_mask: torch.Tensor,  # (B, P)
+        anchors: torch.Tensor,  # (B, P, 3, 3)
+    ) -> torch.Tensor:
+        """Set non-present nodes to identity rotation."""
+        identity = torch.eye(3, device=x_t.device, dtype=x_t.dtype)
+        return torch.where(
+            present_mask.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3, 3),
+            x_t,
+            identity.unsqueeze(0).unsqueeze(0).expand_as(x_t),
+        )
+
+    def _make_coupling(
+        self,
+        anchors: torch.Tensor,
+        tree: BatchedTreePlan,
+    ) -> RotationCoupling:
+        return RotationCoupling(anchors=anchors, tree=tree)
+
+    def _compute_sigma_t(
+        self,
+        t: torch.Tensor,  # (B,)
+        scale: torch.Tensor,  # (B,)
+    ) -> torch.Tensor:
+        """Compute time-dependent noise sigma for IGSO3.
+
+        Uses exponential schedule that decays toward t=1.
+        """
+        # sigma_t = sigma_max * exp(-rate * t)
+        # Peaks near t=0, decays toward t=1
+        sigma_max = self.cfg.igso3_sigma_max
+        rate = self.cfg.exp_rate
+        sigma_t = sigma_max * torch.exp(-rate * t) * scale
+        return sigma_t.clamp(self.cfg.igso3_sigma_min, self.cfg.igso3_sigma_max)
+
+    def euler_step(
+        self,
+        x_t: torch.Tensor,  # (B, P, 3, 3)
+        x1_pred: torch.Tensor,  # (B, P, 3, 3)
+        t: torch.Tensor,  # (B,)
+        dt: float,
+        birth_time: torch.Tensor,  # (B, P)
+        motif_mask: torch.Tensor,  # (B, P)
+        potential: Optional[torch.Tensor] = None,  # (B, P, 3) rotation vector field
+    ) -> torch.Tensor:
+        """
+        Single Euler step for rotation sampling using geodesic flow.
+
+        Uses calc_rot_vf to compute vector field and geodesic_t to step.
+        Optionally adds IGSO3 noise for stochastic sampling.
+        """
+        if x_t.shape != x1_pred.shape:
+            raise ValueError(
+                f"x_t and x1_pred must match shape; got {tuple(x_t.shape)} vs {tuple(x1_pred.shape)}"
+            )
+        if x_t.ndim != 4 or x_t.shape[-2:] != (3, 3):
+            raise ValueError(
+                f"Expected x_t to have shape (B, P, 3, 3); got {tuple(x_t.shape)}"
+            )
+        if potential is not None and potential.shape != (*x_t.shape[:2], 3):
+            raise ValueError(
+                f"potential must have shape (B, P, 3); got {tuple(potential.shape)}"
+            )
+
+        B, P = x_t.shape[:2]
+        device = x_t.device
+
+        # Mask for valid (born) positions
+        valid_mask = (
+            (birth_time <= t[:, None]).unsqueeze(-1).unsqueeze(-1)
+        )  # (B, P, 1, 1)
+
+        # VF scaling: 1 / (1 - t), clamped
+        # Using exponential schedule if configured
+        if self.cfg.exp_rate > 0:
+            r = self.cfg.exp_rate
+            denom = 1.0 - torch.exp(-r * (1.0 - t))
+            scaling = (r / denom.clamp_min(1e-8)).clamp_min(1e-4)
+        else:
+            scaling = (1.0 / (1.0 - t).clamp_min(1e-4)).clamp_min(1e-4)
+
+        # Compute rotation vector field: Log_{x_t}(x1_pred)
+        rot_vf = so3_utils.calc_rot_vf(mat_t=x_t, mat_1=x1_pred)  # (B, P, 3)
+
+        # Add guidance potential if provided
+        if potential is not None:
+            rot_vf = rot_vf + potential
+
+        # Geodesic step: geodesic_t(scaling * dt, x1_pred, x_t, rot_vf)
+        geodesic_time = (scaling * dt)[:, None, None]  # (B, 1, 1)
+        x_next = so3_utils.geodesic_t(
+            t=geodesic_time,
+            mat=x1_pred,
+            base_mat=x_t,
+            rot_vf=rot_vf,
+        )  # (B, P, 3, 3)
+
+        # Optionally add IGSO3 noise for stochastic sampling
+        if float(self.cfg.sigma) > 0.0 and float(dt) > 0.0:
+            self._ensure_igso3_device(device)
+
+            # Compute sigma_t scaled by sqrt(dt)
+            sigma_t = self._compute_sigma_t(t, scale=torch.ones_like(t))
+            sqrt_dt = math.sqrt(float(dt))
+            sigma_t = (sigma_t * sqrt_dt).to(self.igso3.sigma_grid.device)
+
+            apply_mask = sigma_t > self.cfg.igso3_sigma_min
+            if apply_mask.any():
+                sigma_sel = sigma_t[apply_mask]
+                identity_noise = (
+                    torch.eye(3, device=device)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .expand(B, P, -1, -1)
+                )
+                noise_sel = self.igso3.sample(sigma_sel, P).to(device)
+                noise_sel = noise_sel.reshape(apply_mask.sum(), P, 3, 3)
+                intermediate_noise = identity_noise.clone()
+                intermediate_noise[apply_mask] = noise_sel
+                x_next = torch.einsum("...ij,...jk->...ik", x_next, intermediate_noise)
+
+        # Keep unborn positions unchanged
+        x_next = torch.where(valid_mask.expand(-1, -1, 3, 3), x_next, x_t)
+
+        return x_next
+
+
 """ Interpolant supporting tree coupling """
 
 
@@ -2624,6 +3273,7 @@ class TreeCouplings:
 
     translation: TranslationCoupling
     aatypes: AATypesCoupling
+    rotation: RotationCoupling
 
 
 @dataclass
@@ -2633,31 +3283,38 @@ class TreeInterpolant:
     min_t: float = 0.005
     translation_coupler: Coupler[TranslationCoupling] = field(init=False)
     aatypes_coupler: Coupler[AATypesCoupling] = field(init=False)
+    rotation_coupler: RotationCoupler = field(init=False)
 
     def __post_init__(self):
         self.translation_coupler = TranslationCoupler(cfg=self.cfg.trans_coupler)
         self.aatypes_coupler = AATypesCoupler(cfg=self.cfg.aatypes_coupler)
+        self.rotation_coupler = RotationCoupler(cfg=self.cfg.rotation_coupler)
 
     def set_device(self, device: torch.device):
         self.device = device
+        self.rotation_coupler.set_device(device)  # for IGSO3 device
 
     def compute_motif_guidance_vf(
         self,
         t: torch.Tensor,  # (B,)
         pred_trans_1: torch.Tensor,  # (B, P, 3)
-        motif_targets: torch.Tensor,  # (B, P, 3) true positions at t=1
+        trans_1_motifs: torch.Tensor,  # (B, P, 3) true motif positions
+        pred_rotmats_1: torch.Tensor,  # (B, P, 3, 3)
+        rotmats_t: torch.Tensor,  # (B, P, 3, 3)
+        rotmats_1_motifs: torch.Tensor,  # (B, P, 3, 3) true motif rotations
         motif_mask: torch.Tensor,  # (B, P)
-    ) -> Optional[torch.Tensor]:  # (B, P, 3) or None
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Compute guidance velocity field pulling motif positions toward their targets.
+        Compute guidance velocity fields pulling motif positions toward their targets.
 
-        Returns None if guidance is disabled or no motifs present.
+        Returns (trans_guidance_vf, rotmats_guidance_vf), each (B, P, 3) or None.
+        Returns (None, None) if guidance is disabled or no motifs present.
         """
         guidance_cfg = self.cfg.motif_guidance
         if not guidance_cfg.enabled or not motif_mask.any():
-            return None
+            return None, None
 
-        B, P, _ = pred_trans_1.shape
+        B, P = motif_mask.shape
         t_clamped = t.clamp(min=1e-3, max=1.0 - 1e-3)
 
         # Compute scale based on config
@@ -2674,20 +3331,36 @@ class TreeInterpolant:
         else:
             raise ValueError(f"Unknown scale_type: {guidance_cfg.scale_type}")
 
-        # guidance_vf = scale * (true - pred)
-        guidance_vf = (motif_targets - pred_trans_1) * scale.view(B, 1, 1)
-
-        # limit to motifs
-        guidance_vf = guidance_vf * motif_mask.unsqueeze(-1).float()
+        # --- Translation guidance ---
+        trans_guidance_vf = (trans_1_motifs - pred_trans_1) * scale.view(B, 1, 1)
+        trans_guidance_vf = trans_guidance_vf * motif_mask.unsqueeze(-1).float()
 
         # Cap per-residue magnitude
         if guidance_cfg.max_step_force_ang > 0:
-            norm = guidance_vf.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-            guidance_vf = guidance_vf * (guidance_cfg.max_step_force_ang / norm).clamp(
-                max=1.0
-            )
+            norm = trans_guidance_vf.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            trans_guidance_vf = trans_guidance_vf * (
+                guidance_cfg.max_step_force_ang / norm
+            ).clamp(max=1.0)
 
-        return guidance_vf
+        # --- Rotation guidance ---
+        # Compute rotation vector fields in tangent space
+        rot_vf_to_target = so3_utils.calc_rot_vf(
+            mat_t=rotmats_t, mat_1=rotmats_1_motifs
+        )
+        rot_vf_to_pred = so3_utils.calc_rot_vf(mat_t=rotmats_t, mat_1=pred_rotmats_1)
+
+        # Guidance = scale * (target_vf - pred_vf)
+        rotmats_guidance_vf = (rot_vf_to_target - rot_vf_to_pred) * scale.view(B, 1, 1)
+        rotmats_guidance_vf = rotmats_guidance_vf * motif_mask.unsqueeze(-1).float()
+
+        # Cap per-residue rotation magnitude (in radians)
+        if guidance_cfg.max_rot_step_force_rad > 0:
+            norm = rotmats_guidance_vf.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            rotmats_guidance_vf = rotmats_guidance_vf * (
+                guidance_cfg.max_rot_step_force_rad / norm
+            ).clamp(max=1.0)
+
+        return trans_guidance_vf, rotmats_guidance_vf
 
     def corrupt_to(
         self,
@@ -2695,15 +3368,19 @@ class TreeInterpolant:
         t: torch.Tensor,  # (B,)
         trans_0: Optional[torch.Tensor] = None,
         aatypes_0: Optional[torch.Tensor] = None,
+        rotmats_0: Optional[torch.Tensor] = None,
     ) -> Tuple[DataBridged, TreeCouplings]:
         tree = batch.tree.to(self.device)
         trans_1 = batch.trans_1.to(self.device)
+        rotmats_1 = batch.rotmats_1.to(self.device)
         aatypes_1 = batch.aatypes_1.to(self.device)
         t = t.to(self.device)
         if trans_0 is not None:
             trans_0 = trans_0.to(self.device)
         if aatypes_0 is not None:
             aatypes_0 = aatypes_0.to(self.device)
+        if rotmats_0 is not None:
+            rotmats_0 = rotmats_0.to(self.device)
 
         res_mask = batch.tree.broadcast_to_leaves(
             x=batch.res_mask.to(self.device), fill_value=0
@@ -2716,7 +3393,21 @@ class TreeInterpolant:
         trans_1_motifs = tree.broadcast_to_leaves(x=trans_1, fill_value=0.0)
         trans_1_motifs = trans_1_motifs * tree.motif_mask.unsqueeze(-1).float()
 
-        # Corrupt translations
+        # Broadcast rotmats_1 in motifs to aligned space for motif guidance
+        identity = torch.eye(3, device=self.device, dtype=rotmats_1.dtype)
+        rotmats_1_motifs = tree.broadcast_to_leaves(
+            x=rotmats_1,
+            fill_value=identity,
+        )
+        # Zero out non-motif positions (set to identity)
+        rotmats_1_motifs = torch.where(
+            tree.motif_mask.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3, 3),
+            rotmats_1_motifs,
+            identity.unsqueeze(0).unsqueeze(0).expand_as(rotmats_1_motifs),
+        )
+
+        # Corrupt domains
+
         trans_t, trans_coupling = self.translation_coupler.corrupt(
             tree=tree,
             t=t,
@@ -2725,7 +3416,14 @@ class TreeInterpolant:
         )
         trans_coupling.validate()
 
-        # Corrupt aatypes
+        rotmats_t, rotation_coupling = self.rotation_coupler.corrupt(
+            tree=tree,
+            t=t,
+            x1=rotmats_1,
+            x0=rotmats_0,
+        )
+        rotation_coupling.validate()
+
         aatypes_t, aatypes_coupling = self.aatypes_coupler.corrupt(
             tree=tree,
             t=t,
@@ -2734,22 +3432,33 @@ class TreeInterpolant:
         )
         aatypes_coupling.validate()
 
+        # Recenter translations to maintain translation invariance
+        present_mask = tree.present_mask(t=t)
+        trans_t = trans_t - batch_center_of_mass(trans_t, mask=present_mask)[:, None]
+
         bridged = DataBridged(
             t=t,
-            present_mask=tree.present_mask(t=t),
+            present_mask=present_mask,
             motif_mask=tree.motif_mask,
             birth_time=tree.birth_time,
             res_mask=res_mask,
             chain_idx=chain_idx,
             trans_t=trans_t,
+            rotmats_t=rotmats_t,
             aatypes_t=aatypes_t,
             trans_1_motifs=trans_1_motifs,
+            rotmats_1_motifs=rotmats_1_motifs,
             remaining_insertions=tree.remaining_insertions_t(t=t),
             deleted=tree.leaf_deleted,
+            planar_position=tree.planar_position,
         )
         bridged.validate()
 
-        couplings = TreeCouplings(translation=trans_coupling, aatypes=aatypes_coupling)
+        couplings = TreeCouplings(
+            translation=trans_coupling,
+            aatypes=aatypes_coupling,
+            rotation=rotation_coupling,
+        )
         return bridged, couplings
 
     def corrupt_batch(self, batch: DataBatch) -> Tuple[DataBridged, TreeCouplings]:
@@ -2894,6 +3603,12 @@ class TreeInterpolant:
         trans_1_gathered = gather_and_pad(
             data.trans_1.to(device), gather_idx, is_motif, fill_value=0.0
         )
+        rotmats_1_gathered = gather_and_pad(
+            data.rotmats_1.to(device),
+            gather_idx,
+            is_motif,
+            fill_value=torch.eye(3, device=device, dtype=data.rotmats_1.dtype),
+        )
         aatypes_1_gathered = gather_and_pad(
             data.aatypes_1.to(device), gather_idx, is_motif, fill_value=MASK_TOKEN_INDEX
         )
@@ -2901,6 +3616,9 @@ class TreeInterpolant:
         # Sample base distributions using coupler interfaces
         trans_0 = self.translation_coupler.sample_base(
             motif_mask=is_motif, x1=trans_1_gathered, device=device
+        )
+        rotmats_0 = self.rotation_coupler.sample_base(
+            motif_mask=is_motif, x1=rotmats_1_gathered, device=device
         )
         aatypes_0 = self.aatypes_coupler.sample_base(
             motif_mask=is_motif, x1=aatypes_1_gathered, device=device
@@ -2916,8 +3634,10 @@ class TreeInterpolant:
             res_mask=res_mask,
             chain_idx=chain_idx,
             trans_t=trans_0,
+            rotmats_t=rotmats_0,
             aatypes_t=aatypes_0,
             trans_1_motifs=trans_1_gathered,
+            rotmats_1_motifs=rotmats_1_gathered,
         )
 
     @staticmethod
@@ -2972,7 +3692,7 @@ class TreeInterpolant:
         batch = self._init_sampling_batch(data=data)
 
         traj = SampleTrajectory()
-        traj.samples.append(batch.detach_clone())
+        traj.samples.append(batch.detach_clone(device=torch.device("cpu")))
 
         model.eval()
         with torch.no_grad():
@@ -2999,17 +3719,21 @@ class TreeInterpolant:
                 pred = model.forward(batch)
 
                 if traj_frames is None or step_num % traj_frames == 0:
-                    traj.pred.append(pred.detach_clone())
+                    traj.pred.append(pred.detach_clone(device=torch.device("cpu")))
 
-                # Compute motif guidance VF
-                trans_guidance_vf = self.compute_motif_guidance_vf(
+                # Compute motif guidance VFs
+                trans_guidance_vf, rotmats_guidance_vf = self.compute_motif_guidance_vf(
                     t=batch.t,
                     pred_trans_1=pred.pred_trans_1,
-                    motif_targets=batch.trans_1_motifs,
+                    trans_1_motifs=batch.trans_1_motifs,
+                    pred_rotmats_1=pred.pred_rotmats_1,
+                    rotmats_t=batch.rotmats_t,
+                    rotmats_1_motifs=batch.rotmats_1_motifs,
                     motif_mask=batch.motif_mask,
                 )
 
-                # Euler step for alive tokens' translations
+                # Euler steps for domains
+
                 trans_next = self.translation_coupler.euler_step(
                     x_t=batch.trans_t,
                     x1_pred=pred.pred_trans_1,
@@ -3021,7 +3745,17 @@ class TreeInterpolant:
                 )
                 batch.trans_t = trans_next
 
-                # Euler step for alive tokens' aatypes
+                rotmats_next = self.rotation_coupler.euler_step(
+                    x_t=batch.rotmats_t,
+                    x1_pred=pred.pred_rotmats_1,
+                    t=batch.t,
+                    dt=dt,
+                    birth_time=batch.birth_time,
+                    motif_mask=batch.motif_mask,
+                    potential=rotmats_guidance_vf,
+                )
+                batch.rotmats_t = rotmats_next
+
                 aatypes_next = self.aatypes_coupler.euler_step(
                     x_t=batch.aatypes_t,
                     x1_pred=pred.pred_aatype_logits,
@@ -3050,7 +3784,7 @@ class TreeInterpolant:
                 if at_limit.any():
                     insertions = insertions & ~at_limit.unsqueeze(1)
 
-                batch, insert_mask = batch.apply_insertions_deletions(
+                batch, insert_mask, gather_idx = batch.apply_insertions_deletions(
                     insertions=insertions,
                     deletions=deletions,
                     t_birth=t_next,  # born at t_next since after euler step
@@ -3065,14 +3799,70 @@ class TreeInterpolant:
                         batch.trans_t + insert_mask.unsqueeze(-1).float() * trans_noise
                     )
 
-                    # TODO - apply insertion logits, once we predict them
-                    # TODO - apply substitutions for sequence
+                    # Add small IGSO3 perturbation to inserted rotations
+                    # Inserted positions inherit parent's rotation from apply_insertions_deletions
+                    # Add noise to break symmetry
+                    B_new, P_new = batch.rotmats_t.shape[:2]
+                    self.rotation_coupler._ensure_igso3_device(device)
+                    # Use small sigma for perturbation
+                    sigma_insert = torch.full(
+                        (B_new,),
+                        self.cfg.rotation_coupler.igso3_sigma_min * 10,
+                        device=self.rotation_coupler.igso3.sigma_grid.device,
+                    )
+                    insert_noise = self.rotation_coupler.igso3.sample(
+                        sigma_insert, P_new
+                    ).to(
+                        device
+                    )  # (B, P, 3, 3)
+                    # Apply noise to inserted positions only
+                    rotmats_with_noise = torch.einsum(
+                        "...ij,...jk->...ik", batch.rotmats_t, insert_noise
+                    )
+                    batch.rotmats_t = torch.where(
+                        insert_mask.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3, 3),
+                        rotmats_with_noise,
+                        batch.rotmats_t,
+                    )
 
-                # TODO - recenter
+                    # Sample amino acids for inserted positions from parent's insertion logits
+                    K = pred.pred_insertion_logits.shape[-1]
+                    P_old = pred.pred_insertion_logits.shape[1]
+
+                    # Gather parent's insertion logits for new positions
+                    insertion_logits_gathered = pred.pred_insertion_logits.gather(
+                        1,
+                        gather_idx.unsqueeze(-1).expand(-1, -1, K).clamp(0, P_old - 1),
+                    )  # (B, P_new, K)
+
+                    # Convert to probs and mix in uniform noise (like _compute_step_probs)
+                    probs = F.softmax(
+                        insertion_logits_gathered, dim=-1
+                    )  # (B, P_new, K)
+                    uniform_dist = torch.ones_like(probs) / K
+                    probs = (
+                        1.0 - self.cfg.aatypes_coupler.noise_scale
+                    ) * probs + self.cfg.aatypes_coupler.noise_scale * uniform_dist
+
+                    # Sample from noisy distribution
+                    sampled_tokens = torch.multinomial(
+                        probs.view(-1, K), num_samples=1
+                    ).view(B_new, P_new)
+                    batch.aatypes_t = torch.where(
+                        insert_mask, sampled_tokens, batch.aatypes_t
+                    )
+
+                # Recenter translations to maintain translation invariance
+                batch.trans_t = (
+                    batch.trans_t
+                    - batch_center_of_mass(batch.trans_t, mask=batch.valid_mask)[
+                        :, None
+                    ]
+                )
 
                 # Save
                 if traj_frames is None or step_num % traj_frames == 0:
-                    traj.samples.append(batch.detach_clone())
+                    traj.samples.append(batch.detach_clone(device=torch.device("cpu")))
 
                 # Update progress bar with batch dimensions
                 B, P = batch.trans_t.shape[:2]
@@ -3094,9 +3884,11 @@ class TreeInterpolant:
 @dataclass
 class BranchFlowLosses:
     total_loss: torch.Tensor
-    base_trans_loss: torch.Tensor  # MSE on translations
+    trans_loss: torch.Tensor  # MSE on translations
     pairwise_loss: torch.Tensor  # local pairwise distance loss
-    base_seq_loss: torch.Tensor  # CE on amino acid logits vs anchor tokens
+    rot_vf_loss: torch.Tensor  # MSE on rotation vector field
+    base_seq_loss: torch.Tensor  # soft CE on amino acid logits vs anchor_probs
+    insertion_seq_loss: torch.Tensor  # soft CE on insertion logits vs anchor_probs
     split_token_loss: torch.Tensor  # Poisson loss on per-token remaining splits
     split_pooled_loss: torch.Tensor  # aux Poisson loss on total remaining splits
     del_loss: torch.Tensor  # BCE on per-token logits (terminal tokens only)
@@ -3104,49 +3896,42 @@ class BranchFlowLosses:
 
 @dataclass
 class BranchFlowLossCalculator:
-    # Time normalization clip (higher weight as t -> 1)
-    t_normalize_clip: float = 0.9
-    # Local pairwise distance threshold (angstroms)
-    proximity_threshold_ang: float = 7.0
-    # Loss weights
-    trans_loss_weight: float = 2.0
-    pairwise_dist_loss_weight: float = 0.2
-    seq_loss_weight: float = 1.0
-    split_loss_weight: float = 0.2
-    split_pooled_loss_weight: float = 0.025
-    del_loss_weight: float = 0.2
+    cfg: VarcoLossConfig
 
     def _time_norm_scale(self, t: torch.Tensor) -> torch.Tensor:
         """
         Compute time-based normalization scale: 1 - min(t, clip).
         Higher weight (smaller divisor) as t -> 1.
         """
-        return 1 - torch.min(t, torch.tensor(self.t_normalize_clip, device=t.device))
+        return 1 - torch.min(
+            t, torch.tensor(self.cfg.t_normalize_clip, device=t.device)
+        )
 
     def _base_trans_loss(
         self,
-        pred_trans: torch.Tensor,  # (B, P, 3)
-        target_trans: torch.Tensor,  # (B, P, 3)
+        pred_trans: torch.Tensor,  # (B, P, 3) in angstroms
+        target_trans: torch.Tensor,  # (B, P, 3) in angstroms
         t: torch.Tensor,  # (B,)
         mask: torch.Tensor,  # (B, P)
     ) -> torch.Tensor:
-        """Translation loss for anchor/final positions"""
+        """Translation loss for anchor/final positions."""
         B, P, D = pred_trans.shape
 
         # Time-based normalization (higher weight as t -> 1)
         t_norm = self._time_norm_scale(t=t).view(B, 1, 1)
 
+        # Scale both to nm for loss computation
         pred_scaled = pred_trans * ANG_TO_NM_SCALE / t_norm
         target_scaled = target_trans * ANG_TO_NM_SCALE / t_norm
         mse = (pred_scaled - target_scaled).square()  # (B, P, 3)
 
-        # Per-example masked mean (normalize by number of present positions)
+        # Per-example masked mean (normalize by number of present positions * 3 for xyz)
         mask_f = mask.unsqueeze(-1).float()  # (B, P, 1)
         mse = mse * mask_f
-        denom = mask_f.sum(dim=(1, 2)).clamp_min(1.0)  # (B,)
+        denom = mask_f.sum(dim=(1, 2)).clamp_min(1.0) * 3  # (B,) * 3 for xyz coords
         loss_per_batch = mse.sum(dim=(1, 2)) / denom  # (B,)
 
-        return (loss_per_batch.mean() * self.trans_loss_weight).clamp(max=10.0)
+        return loss_per_batch.mean().clamp(max=5.0) * self.cfg.trans_loss_weight
 
     def _pairwise_distance_loss(
         self,
@@ -3161,7 +3946,7 @@ class BranchFlowLossCalculator:
         # Time-based normalization (higher weight as t -> 1)
         t_norm = self._time_norm_scale(t=t).view(B, 1, 1)
 
-        # Compute pairwise distances (B, P, P)
+        # Compute pairwise distances in angstroms (B, P, P)
         with torch.no_grad():
             target_dists = torch.cdist(target_trans, target_trans)
         pred_dists = torch.cdist(pred_trans, pred_trans)
@@ -3170,14 +3955,14 @@ class BranchFlowLossCalculator:
         pair_mask = mask.unsqueeze(2) & mask.unsqueeze(1)  # (B, P, P)
 
         # Limit to local neighborhood in ground truth
-        proximity_mask = target_dists < self.proximity_threshold_ang
+        proximity_mask = target_dists < self.cfg.proximity_threshold_ang
         pair_mask = pair_mask & proximity_mask
 
         # Exclude self-pairs
         eye = torch.eye(P, device=pred_trans.device, dtype=torch.bool).unsqueeze(0)
         pair_mask = pair_mask & ~eye
 
-        # Squared distance error with time normalization
+        # Squared distance error with time normalization (scale to nm for loss)
         dist_error = ((pred_dists - target_dists) * ANG_TO_NM_SCALE / t_norm) ** 2
         dist_error = dist_error * pair_mask.float()
 
@@ -3185,42 +3970,136 @@ class BranchFlowLossCalculator:
         denom = pair_mask.float().sum(dim=(1, 2)).clamp_min(1.0)
         loss_per_batch = dist_error.sum(dim=(1, 2)) / denom
 
-        return (loss_per_batch.mean() * self.pairwise_dist_loss_weight).clamp(max=5.0)
+        return loss_per_batch.mean().clamp(max=5.0) * self.cfg.pairwise_dist_loss_weight
+
+    def _rot_vf_loss(
+        self,
+        pred_rotmats: torch.Tensor,  # (B, P, 3, 3)
+        target_rotmats: torch.Tensor,  # (B, P, 3, 3) anchors at t=1
+        rotmats_t: torch.Tensor,  # (B, P, 3, 3) current rotations
+        t: torch.Tensor,  # (B,)
+        mask: torch.Tensor,  # (B, P)
+    ) -> torch.Tensor:
+        """
+        Rotation vector field loss.
+        Computes MSE between predicted and target rotation vector fields.
+        The VF is Log_{rotmats_t}(target) - the tangent vector pointing to target.
+        """
+        B, P = mask.shape
+
+        # Time-based normalization (higher weight as t -> 1)
+        t_norm = self._time_norm_scale(t=t).view(B, 1, 1)
+
+        # Compute rotation vector fields: Log_{rotmats_t}(rotmats_1)
+        # pred_rot_vf: direction from rotmats_t to pred_rotmats
+        # target_rot_vf: direction from rotmats_t to target_rotmats (anchor)
+        pred_rot_vf = so3_utils.calc_rot_vf(
+            mat_t=rotmats_t.float(), mat_1=pred_rotmats.float()
+        )  # (B, P, 3)
+        target_rot_vf = so3_utils.calc_rot_vf(
+            mat_t=rotmats_t.float(), mat_1=target_rotmats.float()
+        )  # (B, P, 3)
+
+        # MSE on vector field with time normalization
+        rot_vf_error = (pred_rot_vf - target_rot_vf) / t_norm
+        mse = rot_vf_error.square()  # (B, P, 3)
+
+        # Per-example masked mean (normalize by number of present positions * 3 for xyz)
+        mask_f = mask.unsqueeze(-1).float()  # (B, P, 1)
+        mse = mse * mask_f
+        denom = mask_f.sum(dim=(1, 2)).clamp_min(1.0) * 3  # (B,) * 3 for xyz coords
+        loss_per_batch = mse.sum(dim=(1, 2)) / denom  # (B,)
+
+        return loss_per_batch.mean().clamp(max=5.0) * self.cfg.rot_vf_loss_weight
 
     def _seq_loss(
         self,
         pred_aatype_logits: torch.Tensor,  # (B, P, K)
         target_anchor_tokens: torch.Tensor,  # (B, P) long
+        t: torch.Tensor,  # (B,)
         mask: torch.Tensor,  # (B, P)
     ) -> torch.Tensor:
-        """Sequence loss: cross-entropy on amino acid logits vs anchor tokens."""
+        """Sequence loss: cross-entropy on amino acid logits vs anchor tokens.
+
+        Uses likelihood weighting (like cogeneration): divides CE by (1 - min(t, clip))
+        to emphasize predictions near t=1 where model should be most accurate.
+        """
         B, P, K = pred_aatype_logits.shape
 
-        # Flatten for cross-entropy: (B*P, K) and (B*P,)
-        logits_flat = pred_aatype_logits.view(-1, K)
-        targets_flat = target_anchor_tokens.view(-1)
-        mask_flat = mask.view(-1).float()
+        # Time-based normalization for likelihood weighting (higher weight as t -> 1)
+        t_norm = self._time_norm_scale(t=t).view(B, 1)  # (B, 1)
 
         # Cross-entropy per token (reduction=none)
-        ce = F.cross_entropy(logits_flat, targets_flat, reduction="none")  # (B*P,)
+        ce = F.cross_entropy(
+            pred_aatype_logits.view(-1, K),
+            target_anchor_tokens.view(-1),
+            reduction="none",
+        ).view(
+            B, P
+        )  # (B, P)
 
-        # Masked mean
-        denom = mask_flat.sum().clamp_min(1.0)
-        seq_loss = (ce * mask_flat).sum() / denom
+        # Apply time normalization (likelihood weighting)
+        ce = ce / t_norm  # (B, P)
 
-        return (seq_loss * self.seq_loss_weight).clamp(max=10.0)
+        # Mask out unknown residues
+        mask_f = mask.float()  # (B, P)
+        mask_f = mask_f * (target_anchor_tokens != MASK_TOKEN_INDEX).float()
+        # Masked mean per batch, then average over batch
+        denom = mask_f.sum(dim=1).clamp_min(1.0)  # (B,)
+        loss_per_batch = (ce * mask_f).sum(dim=1) / denom  # (B,)
+        seq_loss = loss_per_batch.mean()
+
+        return seq_loss.clamp(max=5.0) * self.cfg.seq_loss_weight
+
+    def _insertion_seq_loss(
+        self,
+        pred_insertion_logits: torch.Tensor,  # (B, P, K)
+        target_anchor_probs: torch.Tensor,  # (B, P, K)
+        mask: torch.Tensor,  # (B, P)
+    ) -> torch.Tensor:
+        """
+        Insertion sequence loss: soft cross-entropy on insertion logits vs anchor logits.
+        For internal nodes, this is the distribution of children's amino acid types.
+        For leaves, this is effectively cross-entropy on the final aatype.
+        """
+        if not mask.any():
+            return torch.tensor(0.0, device=pred_insertion_logits.device)
+
+        # Zero out mask token and renormalize target probs
+        target_probs_masked = target_anchor_probs.clone()
+        target_probs_masked[:, :, MASK_TOKEN_INDEX] = 0.0
+        target_probs_masked = target_probs_masked / target_probs_masked.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-8)
+
+        # Soft cross-entropy: -sum(target_probs * log_softmax(logits))
+        log_probs = F.log_softmax(pred_insertion_logits, dim=-1)  # (B, P, K)
+        ce_per_token = -(target_probs_masked * log_probs).sum(dim=-1)  # (B, P)
+
+        # Mask out positions where target was mostly the mask token
+        is_mostly_mask = target_anchor_probs[:, :, MASK_TOKEN_INDEX] >= 0.75
+        mask_f = mask.float() * (~is_mostly_mask).float()
+        denom = mask_f.sum().clamp_min(1.0)
+        insertion_loss = (ce_per_token * mask_f).sum() / denom
+
+        return insertion_loss.clamp(max=5.0) * self.cfg.seq_ins_loss_weight
 
     def _split_token_loss(
         self,
         pred: ModelPrediction,
         batch: DataCorrupted,
         mask: torch.Tensor,  # (B, P)
+        motif_mask: torch.Tensor,  # (B, P)
+        motif_weight: float = 0.1,
         eps: float = 1e-8,
     ) -> torch.Tensor:
         """
         Per-token Poisson Bregman divergence:
         D(k || r) = r - k + k * log(k/r)  for k > 0
         D(0 || r) = r                     for k = 0
+
+        Primary loss is on scaffolds (mask & ~motif_mask), with a smaller penalty
+        (motif_weight) applied to motif positions.
         """
         if batch.remaining_insertions is None:
             raise ValueError("batch.remaining_insertions is required for split loss")
@@ -3235,9 +4114,22 @@ class BranchFlowLossCalculator:
             rate,
         )
 
-        pad_f = mask.float()
-        denom = pad_f.sum(dim=1).clamp_min(1.0)  # (B,)
-        return ((token_loss * pad_f).sum(dim=1) / denom).mean() * self.split_loss_weight
+        # Scaffold loss (primary) and motif loss (small penalty)
+        scaffold_mask = mask & ~motif_mask
+        motif_loss_mask = mask & motif_mask
+
+        scaffold_denom = scaffold_mask.float().sum(dim=1).clamp_min(1.0)  # (B,)
+        scaffold_loss = (
+            (token_loss * scaffold_mask.float()).sum(dim=1) / scaffold_denom
+        ).mean()
+
+        motif_denom = motif_loss_mask.float().sum(dim=1).clamp_min(1.0)  # (B,)
+        motif_loss = (
+            (token_loss * motif_loss_mask.float()).sum(dim=1) / motif_denom
+        ).mean()
+
+        split_loss = scaffold_loss + motif_weight * motif_loss
+        return split_loss.clamp(max=3.0) * self.cfg.split_loss_weight
 
     def _split_pooled_loss(
         self,
@@ -3249,20 +4141,27 @@ class BranchFlowLossCalculator:
         pred_log1p = (
             pred.pred_split_pooled_log1p_rate
         )  # (B,) model predicts in log1p space
-        return F.mse_loss(pred_log1p, target_log) * self.split_pooled_loss_weight
+        pooled_loss = F.mse_loss(pred_log1p, target_log)
+        return pooled_loss.clamp(max=3.0) * self.cfg.split_pooled_loss_weight
 
     def _deletion_loss(
         self,
         pred: ModelPrediction,
         batch: DataCorrupted,
         mask: torch.Tensor,
+        motif_mask: torch.Tensor,  # (B, P)
+        motif_weight: float = 0.1,
     ) -> torch.Tensor:
-        """Deletion loss, supervised only on terminal tokens"""
+        """Deletion loss, supervised only on terminal tokens.
+
+        Primary loss is on scaffolds (mask & ~motif_mask), with a smaller penalty
+        (motif_weight) applied to motif positions.
+        """
         if batch.deleted is None:
             return torch.tensor(0.0, device=batch.trans_t.device)
 
-        del_mask = mask & (batch.remaining_insertions == 0)
-        if not bool(del_mask.any()):
+        terminal_mask = mask & (batch.remaining_insertions == 0)
+        if not bool(terminal_mask.any()):
             return torch.tensor(0.0, device=batch.trans_t.device)
 
         del_logits = pred.pred_del_logits  # (B, P)
@@ -3270,27 +4169,39 @@ class BranchFlowLossCalculator:
         bce = F.binary_cross_entropy_with_logits(
             del_logits, del_targets, reduction="none"
         )
-        denom = del_mask.float().sum().clamp_min(1.0)
-        del_loss = (bce * del_mask.float()).sum() / denom
 
-        return del_loss * self.del_loss_weight
+        # Scaffold loss (primary) and motif loss (small penalty)
+        scaffold_mask = terminal_mask & ~motif_mask
+        motif_loss_mask = terminal_mask & motif_mask
+
+        scaffold_denom = scaffold_mask.float().sum().clamp_min(1.0)
+        scaffold_loss = (bce * scaffold_mask.float()).sum() / scaffold_denom
+
+        motif_denom = motif_loss_mask.float().sum().clamp_min(1.0)
+        motif_loss = (bce * motif_loss_mask.float()).sum() / motif_denom
+
+        del_loss = scaffold_loss + motif_weight * motif_loss
+
+        return del_loss.clamp(max=3.0) * self.cfg.del_loss_weight
 
     def calculate(
         self,
         batch: DataCorrupted,
         pred: ModelPrediction,
         couplings: TreeCouplings,
+        bridged: DataBridged,
     ) -> BranchFlowLosses:
         B, P, D = batch.trans_t.shape
         assert pred.pred_trans_1.shape == (B, P, D)
 
         trans_coupling = couplings.translation
-        present_mask = trans_coupling.tree.present_mask(t=batch.t)  # (B, A)
-        is_root = (trans_coupling.tree.parent_idx < 0).to(torch.long)
         valid_mask = batch.valid_mask  # (B, P_max)
 
-        # Reconstruct the same packing indices used by TwoMoonsBridged.pack_present()
-        idx_pack, pack_mask, P_b, P_max = DataBridged.pack_present_indices(present_mask)
+        # Use the SAME packing indices that were used to create the model input.
+        # CRITICAL: must use bridged.planar_position for sorting to match pack_present()
+        idx_pack, pack_mask, P_b, P_max = DataBridged.pack_present_indices(
+            bridged.present_mask, bridged.planar_position
+        )
 
         # Pack translation anchors (i.e. targets) into (B, P_max, D) in the same order as model inputs/predictions
         trans_anchors_pack = trans_coupling.anchors.gather(
@@ -3299,14 +4210,38 @@ class BranchFlowLossCalculator:
         # zero pad
         trans_anchors_pack = trans_anchors_pack * pack_mask.unsqueeze(-1).float()
 
-        # Pack aatype anchor tokens (targets for sequence loss)
+        # Pack aatype anchor tokens (targets for base sequence loss)
         aatypes_coupling = couplings.aatypes
         aatype_anchors_pack = aatypes_coupling.anchors.gather(1, idx_pack)  # (B, P_max)
-        # zero pad, will be masked
-        aatype_anchors_pack = aatype_anchors_pack * pack_mask.long()
+        aatype_anchors_pack = aatype_anchors_pack * pack_mask.long()  # zero pad
 
-        # Base loss on predicting existing residues' final positions
-        base_loss = self._base_trans_loss(
+        # Pack anchor_probs for insertion sequence loss
+        K = aatypes_coupling.anchor_probs.shape[-1]  # 21
+        aatype_anchor_probs_pack = aatypes_coupling.anchor_probs.gather(
+            1, idx_pack.unsqueeze(-1).expand(-1, -1, K)
+        )  # (B, P_max, K)
+        aatype_anchor_probs_pack = (
+            aatype_anchor_probs_pack * pack_mask.unsqueeze(-1).float()
+        )
+
+        # Pack rotation anchors for rotation VF loss
+        rotation_coupling = couplings.rotation
+        # rotation_coupling.anchors is (B, A, 3, 3), pack to (B, P_max, 3, 3)
+        rot_anchors_pack = rotation_coupling.anchors.gather(
+            1, idx_pack.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3, 3)
+        )
+        # Set non-present to identity
+        identity = torch.eye(
+            3, device=rot_anchors_pack.device, dtype=rot_anchors_pack.dtype
+        )
+        rot_anchors_pack = torch.where(
+            pack_mask.unsqueeze(-1).unsqueeze(-1),
+            rot_anchors_pack,
+            identity.unsqueeze(0).unsqueeze(0).expand(B, P_max, -1, -1),
+        )
+
+        # Translations base loss + pairwise aux loss
+        trans_loss = self._base_trans_loss(
             pred_trans=pred.pred_trans_1,
             target_trans=trans_anchors_pack,
             t=batch.t,
@@ -3319,11 +4254,29 @@ class BranchFlowLossCalculator:
             mask=valid_mask,
         )
 
-        # Base sequence loss
+        # Rotation VF loss
+        rot_vf_loss = self._rot_vf_loss(
+            pred_rotmats=pred.pred_rotmats_1,
+            target_rotmats=rot_anchors_pack,
+            rotmats_t=batch.rotmats_t,
+            t=batch.t,
+            mask=valid_mask,
+        )
+
+        # Base sequence loss (hard CE against sampled anchor tokens)
         base_seq_loss = self._seq_loss(
             pred_aatype_logits=pred.pred_aatype_logits,
             target_anchor_tokens=aatype_anchors_pack,
+            t=batch.t,
             mask=valid_mask,
+        )
+
+        # Insertion sequence loss
+        # (soft CE against anchor_probs, only where future insertions exist)
+        insertion_seq_loss = self._insertion_seq_loss(
+            pred_insertion_logits=pred.pred_insertion_logits,
+            target_anchor_probs=aatype_anchor_probs_pack,
+            mask=valid_mask & (batch.remaining_insertions > 0),
         )
 
         # Insertion / split losses
@@ -3331,16 +4284,24 @@ class BranchFlowLossCalculator:
             pred=pred,
             batch=batch,
             mask=valid_mask,
+            motif_mask=batch.motif_mask,
         )
         split_pooled_loss = self._split_pooled_loss(pred=pred, batch=batch)
 
         # Deletion loss
-        del_loss = self._deletion_loss(pred=pred, batch=batch, mask=valid_mask)
+        del_loss = self._deletion_loss(
+            pred=pred,
+            batch=batch,
+            mask=valid_mask,
+            motif_mask=batch.motif_mask,
+        )
 
         total_loss = (
-            base_loss
+            trans_loss
+            + rot_vf_loss
             + pairwise_loss
             + base_seq_loss
+            + insertion_seq_loss
             + split_token_loss
             + split_pooled_loss
             + del_loss
@@ -3348,9 +4309,11 @@ class BranchFlowLossCalculator:
 
         return BranchFlowLosses(
             total_loss=total_loss,
-            base_trans_loss=base_loss,
+            trans_loss=trans_loss,
             pairwise_loss=pairwise_loss,
+            rot_vf_loss=rot_vf_loss,
             base_seq_loss=base_seq_loss,
+            insertion_seq_loss=insertion_seq_loss,
             split_token_loss=split_token_loss,
             split_pooled_loss=split_pooled_loss,
             del_loss=del_loss,
@@ -3434,12 +4397,39 @@ class BranchingFlowVisualizer:
         return tuple(letters), colors
 
     @staticmethod
-    def _create_sequence_artists(ax: plt.Axes, max_len: int):
-        """Pre-create all artists needed for sequence visualization."""
+    def _create_sequence_artists(
+        ax: plt.Axes, max_len: int, positions_per_row: int = 175
+    ):
+        """Pre-create all artists needed for sequence visualization with fixed-size boxes.
+
+        Uses a multi-row layout where each position has a fixed size box to ensure
+        text fits without getting squished. Sequence wraps across rows as needed.
+        Box size is consistent across all plots regardless of sequence length.
+
+        Args:
+            ax: The matplotlib axes to draw on
+            max_len: Maximum sequence length across all frames
+            positions_per_row: Fixed number of positions per row (default 175, fits 512 in 3 rows)
+
+        Returns:
+            Tuple of (rectangles, texts, motif_rects, letters, colors, positions_per_row)
+        """
         letters, colors = BranchingFlowVisualizer._aa_letters_and_colors()
 
-        ax.set_xlim(0, max_len)
-        ax.set_ylim(-0.3, 1)
+        # Fixed positions per row ensures consistent box size across plots
+        num_rows = math.ceil(max_len / positions_per_row)
+
+        # Fixed box dimensions
+        box_width = 1.0
+        box_height = 1.0
+        row_spacing = 0.3  # Space between rows (for motif underline + gap)
+        row_height = box_height + row_spacing
+
+        # Set axis limits for the grid layout (fixed width, variable height)
+        ax.set_xlim(-0.1, positions_per_row + 0.1)
+        # Y goes from top (row 0) to bottom (last row), with motif underlines below each row
+        total_height = num_rows * row_height
+        ax.set_ylim(-total_height - 0.1, 0.5)
         ax.set_aspect("equal", adjustable="box")
         ax.axis("off")
 
@@ -3448,17 +4438,29 @@ class BranchingFlowVisualizer:
         motif_rects = []
 
         for i in range(max_len):
+            row = i // positions_per_row
+            col = i % positions_per_row
+
+            # Y position: row 0 at top (y=0), subsequent rows below
+            y_base = -row * row_height
+            x_pos = col * box_width
+
             # AA background rectangle
             rect = plt.Rectangle(
-                (i, 0), 1, 1, facecolor=colors[0], edgecolor="white", lw=0.5
+                (x_pos, y_base - box_height),
+                box_width,
+                box_height,
+                facecolor=colors[0],
+                edgecolor="white",
+                lw=0.5,
             )
             ax.add_patch(rect)
             rectangles.append(rect)
 
-            # AA letter text
+            # AA letter text (centered in box)
             text = ax.text(
-                i + 0.5,
-                0.5,
+                x_pos + box_width / 2,
+                y_base - box_height / 2,
                 letters[0],
                 ha="center",
                 va="center",
@@ -3467,12 +4469,18 @@ class BranchingFlowVisualizer:
             )
             texts.append(text)
 
-            # Motif underline rectangle
-            motif_rect = plt.Rectangle((i, -0.25), 1, 0.15, facecolor="black", lw=0)
+            # Motif underline rectangle (below the box)
+            motif_rect = plt.Rectangle(
+                (x_pos, y_base - box_height - 0.25),
+                box_width,
+                0.15,
+                facecolor="black",
+                lw=0,
+            )
             ax.add_patch(motif_rect)
             motif_rects.append(motif_rect)
 
-        return rectangles, texts, motif_rects, letters, colors
+        return rectangles, texts, motif_rects, letters, colors, positions_per_row
 
     @staticmethod
     def _update_sequence_bar(
@@ -3505,18 +4513,21 @@ class BranchingFlowVisualizer:
     @staticmethod
     def _create_3d_scatter_artist(
         ax: plt.Axes,
-        max_points: int,
+        max_atoms: int,  # max residues * 3 (for N, CA, C atoms) or max residues if only_alpha_carbons
         trans_min: np.ndarray,
         trans_max: np.ndarray,
+        only_alpha_carbons: bool = False,
     ):
-        """Pre-create a 3D scatter artist with max_points capacity.
+        """Pre-create a 3D scatter artist with max_atoms capacity.
 
         Returns a scatter object that can be updated via _update_3d_scatter.
+        If only_alpha_carbons=True, shows 1 point per residue (alpha carbon only).
+        Otherwise, shows 3 backbone atoms per residue: N, CA, C.
         """
         # Initialize with zeros - we'll update positions/colors each frame
-        dummy_pos = np.zeros((max_points, 3))
-        dummy_colors = np.zeros(max_points)
-        dummy_sizes = np.ones(max_points) * 40.0
+        dummy_pos = np.zeros((max_atoms, 3))
+        dummy_colors = np.zeros(max_atoms)
+        dummy_sizes = np.ones(max_atoms) * 40.0
 
         # Create the scatter plot (initially all hidden via alpha=0 for unused)
         scat = ax.scatter(
@@ -3547,49 +4558,103 @@ class BranchingFlowVisualizer:
     def _update_3d_scatter(
         scat,
         ax: plt.Axes,
-        trans_alive: np.ndarray,  # (n_alive, 3)
-        motif_alive: np.ndarray,  # (n_alive,)
-        max_points: int,
+        backbone_pos: np.ndarray,  # (n_alive, 3, 3) - N, CA, C per residue, or (n_alive, 3) if only_alpha_carbons
+        motif_alive: np.ndarray,  # (n_alive,) - per residue
+        max_atoms: int,
         t_val: float,
+        only_alpha_carbons: bool = False,
+        remaining_insertions_alive: Optional[np.ndarray] = None,  # (n_alive,)
     ):
-        """Update pre-created 3D scatter artist with new data.
+        """Update pre-created 3D scatter artist with backbone atoms.
 
-        Pads positions to max_points and hides unused points by moving them off-screen.
+        If only_alpha_carbons=True: shows 1 point per residue (alpha carbon).
+        Otherwise: shows 3 atoms (N, CA, C) per residue with different sizes:
+        - CA: large (40)
+        - N, C: smaller (15)
+        Motif residues are shown with slightly smaller points.
+
+        During corruption (remaining_insertions_alive provided):
+        - Anchor sizes are 20 + 10 * remaining_insertions
+        - Terminal leaves (remaining_insertions == 0) get normal size (40)
         """
-        n_alive = trans_alive.shape[0] if trans_alive.size > 0 else 0
+        n_res = backbone_pos.shape[0] if backbone_pos.size > 0 else 0
 
-        # Pad positions to max_points (hide extras by making alpha 0 via color array)
-        if n_alive > 0:
-            # Prepare padded arrays
-            padded_pos = np.zeros((max_points, 3))
-            padded_pos[:n_alive] = trans_alive
+        if n_res > 0:
+            if only_alpha_carbons:
+                # backbone_pos is (n_res, 3) - just CA positions
+                n_atoms = n_res
+                flat_pos = backbone_pos  # (n_res, 3)
 
-            # Color by position index
-            color_idx = np.zeros(max_points)
-            color_idx[:n_alive] = np.arange(n_alive)
+                # Pad to max_atoms
+                padded_pos = np.zeros((max_atoms, 3))
+                padded_pos[:n_atoms] = flat_pos
 
-            # Sizes: motifs smaller
-            sizes = np.zeros(max_points)
-            sizes[:n_alive] = np.where(motif_alive, 15.0, 40.0)
+                # Color by residue index (Spectral colormap)
+                color_idx = np.zeros(max_atoms)
+                color_idx[:n_atoms] = np.arange(n_res)
 
-            # Alpha: visible for alive, 0 for hidden
-            alphas = np.zeros(max_points)
-            alphas[:n_alive] = 0.75
+                # Sizes: anchors (remaining > 0) get 30 + 10 * remaining, terminals get 20
+                if remaining_insertions_alive is not None:
+                    is_anchor = remaining_insertions_alive > 0
+                    base_sizes = np.where(
+                        is_anchor,
+                        30.0 + 10.0 * remaining_insertions_alive,
+                        20.0,
+                    )
+                else:
+                    base_sizes = np.full(n_res, 20.0)
+                motif_factor = np.where(motif_alive, 0.6, 1.0)
+                sizes = np.zeros(max_atoms)
+                sizes[:n_atoms] = base_sizes * motif_factor
+            else:
+                # backbone_pos is (n_res, 3, 3) - N, CA, C per residue
+                n_atoms = n_res * 3
+                # Flatten backbone positions: (n_res, 3, 3) -> (n_res * 3, 3)
+                # Order: N0, CA0, C0, N1, CA1, C1, ...
+                flat_pos = backbone_pos.reshape(-1, 3)  # (n_atoms, 3)
+
+                # Pad to max_atoms
+                padded_pos = np.zeros((max_atoms, 3))
+                padded_pos[:n_atoms] = flat_pos
+
+                # Color by residue index (all 3 atoms of same residue get same color)
+                color_idx = np.zeros(max_atoms)
+                res_colors = np.repeat(np.arange(n_res), 3)  # [0,0,0,1,1,1,...]
+                color_idx[:n_atoms] = res_colors
+
+                # Sizes: CA varies by anchor status, N/C always 10
+                # Anchors (remaining > 0): CA = 30 + 10 * remaining
+                # Terminals: CA = 20
+                if remaining_insertions_alive is not None:
+                    is_anchor = remaining_insertions_alive > 0
+                    ca_sizes = np.where(
+                        is_anchor,
+                        30.0 + 10.0 * remaining_insertions_alive,
+                        20.0,
+                    )
+                else:
+                    ca_sizes = np.full(n_res, 20.0)
+                # Interleave: [N, CA, C] = [10, ca_size, 10] for each residue
+                base_sizes = np.zeros(n_atoms)
+                base_sizes[0::3] = 10.0  # N atoms
+                base_sizes[1::3] = ca_sizes  # CA atoms
+                base_sizes[2::3] = 10.0  # C atoms
+
+                motif_expanded = np.repeat(motif_alive, 3)
+                motif_factor = np.where(motif_expanded, 0.6, 1.0)
+                sizes = np.zeros(max_atoms)
+                sizes[:n_atoms] = base_sizes * motif_factor
 
             # Update scatter data
             scat._offsets3d = (padded_pos[:, 0], padded_pos[:, 1], padded_pos[:, 2])
             scat.set_array(color_idx)
-            scat.set_clim(0, max(n_alive - 1, 1))
-            scat.set_sizes(sizes)
-            # Note: per-point alpha not directly supported, but we use size=0 for hidden
-            # Set sizes to 0 for hidden points
-            sizes[n_alive:] = 0
+            scat.set_clim(0, max(n_res - 1, 1))
             scat.set_sizes(sizes)
         else:
             # No points - hide all
-            scat.set_sizes(np.zeros(max_points))
+            scat.set_sizes(np.zeros(max_atoms))
 
-        ax.set_title(f"t = {t_val:.2f} (N={n_alive})")
+        ax.set_title(f"t = {t_val:.2f} (N={n_res})")
 
     def plot_trajectory(
         self,
@@ -3597,6 +4662,7 @@ class BranchingFlowVisualizer:
         out_dir: Optional[str] = None,
         filename: str = "trajectory",
         max_frames: Optional[int] = 50,
+        only_alpha_carbons: bool = True,  # faster; skips to_atom37
     ) -> str:
         """Plot a trajectory animation from any Trajectory (corruption or sampling)."""
         if out_dir is None:
@@ -3614,24 +4680,20 @@ class BranchingFlowVisualizer:
         num_batch = traj.samples[0].trans_t.shape[0]
         num_plots = min(num_batch, 4)
 
-        # Compute camera limits and max sequence length from all trajectory samples
-        device = traj.samples[0].trans_t.device
-        trans_min = torch.zeros(3, device=device)
-        trans_max = torch.zeros(3, device=device)
+        # Compute camera limits and max sequence length (variable-length across samples)
+        trans_min = np.full(3, np.inf)
+        trans_max = np.full(3, -np.inf)
         max_seq_len = 0
         for sample in traj.samples:
-            valid = sample.valid_mask
-            valid = valid & (
-                torch.arange(num_batch, device=device).unsqueeze(1) < num_plots
-            )
-            trans_t = sample.trans_t[valid]  # (num_plots*P, 3)
-            trans_min = torch.min(trans_min, trans_t.min(dim=0).values)
-            trans_max = torch.max(trans_max, trans_t.max(dim=0).values)
-            # Track max sequence length across all plots
-            for i in range(num_plots):
-                max_seq_len = max(max_seq_len, int(sample.valid_mask[i].sum().item()))
-        trans_min = np.tile(trans_min.cpu().numpy(), (num_batch, 1))
-        trans_max = np.tile(trans_max.cpu().numpy(), (num_batch, 1))
+            valid = sample.valid_mask[:num_plots].numpy()  # (num_plots, P)
+            trans = sample.trans_t[:num_plots].numpy()  # (num_plots, P, 3)
+            valid_trans = trans[valid]  # (N_valid, 3)
+            if valid_trans.shape[0] > 0:
+                trans_min = np.minimum(trans_min, valid_trans.min(axis=0))
+                trans_max = np.maximum(trans_max, valid_trans.max(axis=0))
+            max_seq_len = max(max_seq_len, valid.sum(axis=-1).max())
+        trans_min = np.tile(trans_min, (num_batch, 1))
+        trans_max = np.tile(trans_max, (num_batch, 1))
 
         num_cols = min(num_plots, 2)
         num_rows = math.ceil(num_plots / num_cols)
@@ -3657,9 +4719,8 @@ class BranchingFlowVisualizer:
         # Create all axes and sequence artists once before the animation loop
         axes_seq = []
         axes_3d = []
-        seq_artists = (
-            []
-        )  # Store (rectangles, texts, motif_rects, letters, colors) for each plot
+        # Store artists (rectangles, texts, motif_rects, letters, colors, positions_per_row)
+        seq_artists = []
         scatter_artists = []  # Pre-created 3D scatter artists for each plot
         for i in range(num_plots):
             row, col = divmod(i, num_cols)
@@ -3675,8 +4736,14 @@ class BranchingFlowVisualizer:
             seq_artists.append(artists)
 
             # Pre-create 3D scatter artist (avoids ax.clear() each frame)
+            # max_atoms = max_seq_len * 3 for backbone atoms (N, CA, C), or just max_seq_len for CA only
+            max_atoms = max_seq_len if only_alpha_carbons else max_seq_len * 3
             scat = BranchingFlowVisualizer._create_3d_scatter_artist(
-                ax_3d, max_seq_len, trans_min[i], trans_max[i]
+                ax_3d,
+                max_atoms,
+                trans_min[i],
+                trans_max[i],
+                only_alpha_carbons=only_alpha_carbons,
             )
             scatter_artists.append(scat)
 
@@ -3688,24 +4755,52 @@ class BranchingFlowVisualizer:
         else:
             sample_indices = np.arange(len(traj.samples))
 
+        # Pre-convert all frames to numpy (data is already on CPU from detach_clone)
+        # Use lists since sequence length varies across frames
+        samples_to_plot = [traj.samples[idx] for idx in sample_indices]
+        frames_np = []
+        for s in samples_to_plot:
+            frame = {
+                "valid": s.valid_mask.numpy().astype(bool),
+                "aatypes": s.aatypes_t.numpy(),
+                "motif": s.motif_mask.numpy().astype(bool),
+                "t": s.t[0].item() if s.t.numel() > 0 else 0.0,
+                "remaining": (
+                    s.remaining_insertions.numpy()
+                    if s.remaining_insertions is not None
+                    else None
+                ),
+                "positions": (
+                    s.trans_t.numpy()
+                    if only_alpha_carbons
+                    else s.to_atom37().numpy()[:, :, :3, :]
+                ),
+            }
+            frames_np.append(frame)
+
         with writer.saving(fig, anim_path, dpi=100):
-            for idx in tqdm(sample_indices, desc="plot_trajectory()", leave=False):
-                sample = traj.samples[idx]
-                valid_mask = sample.valid_mask.cpu().numpy().astype(bool)  # (B, P_max)
-                trans_t = sample.trans_t.cpu().numpy()  # (B, P_max, 3)
-                aatypes_t = sample.aatypes_t.cpu().numpy()  # (B, P_max)
-                motif_mask = sample.motif_mask.cpu().numpy().astype(bool)  # (B, P_max)
-                t_val = sample.t[0].item() if sample.t.numel() > 0 else 0.0
+            for frame in tqdm(frames_np, desc="plot_trajectory()", leave=False):
+                valid_mask = frame["valid"]  # (B, P_max)
+                aatypes_t = frame["aatypes"]  # (B, P_max)
+                motif_mask = frame["motif"]  # (B, P_max)
+                t_val = frame["t"]
+                remaining_insertions = frame["remaining"]  # (B, P_max) or None
+                positions = frame["positions"]  # (B, P_max, 3) or (B, P_max, 3, 3)
 
                 for i in range(num_plots):
                     valid_i = valid_mask[i]
-                    trans_alive = trans_t[i][valid_i]  # (P, 3)
+                    positions_alive = positions[i][valid_i]  # (P, 3) or (P, 3, 3)
                     aatypes_alive = aatypes_t[i][valid_i]  # (P,)
                     motif_alive = motif_mask[i][valid_i]  # (P,)
-                    n_alive = trans_alive.shape[0]
+                    remaining_insertions_alive = (
+                        remaining_insertions[i][valid_i]
+                        if remaining_insertions is not None
+                        else None
+                    )  # (P,) or None
+                    n_alive = positions_alive.shape[0]
 
                     # Update sequence bar using pre-created artists
-                    rectangles, texts, motif_rects, letters, colors = seq_artists[i]
+                    rectangles, texts, motif_rects, letters, colors, _ = seq_artists[i]
                     if n_alive > 0:
                         BranchingFlowVisualizer._update_sequence_bar(
                             rectangles,
@@ -3726,13 +4821,16 @@ class BranchingFlowVisualizer:
                             motif_rect.set_visible(False)
 
                     # Update 3D structure using pre-created scatter artist
+                    max_atoms = max_seq_len if only_alpha_carbons else max_seq_len * 3
                     BranchingFlowVisualizer._update_3d_scatter(
                         scat=scatter_artists[i],
                         ax=axes_3d[i],
-                        trans_alive=trans_alive,
+                        backbone_pos=positions_alive,
                         motif_alive=motif_alive,
-                        max_points=max_seq_len,
+                        max_atoms=max_atoms,
                         t_val=t_val,
+                        only_alpha_carbons=only_alpha_carbons,
+                        remaining_insertions_alive=remaining_insertions_alive,
                     )
 
                 writer.grab_frame()
@@ -3745,6 +4843,7 @@ class BranchingFlowVisualizer:
         batch: DataBatch,
         out_dir: Optional[str] = None,
         times: Optional[List[float]] = None,
+        only_alpha_carbons: bool = True,  # faster; skips to_atom37
         filename: str = "corruption",
     ) -> str:
         """Create a corruption trajectory and plot it."""
@@ -3763,6 +4862,13 @@ class BranchingFlowVisualizer:
             x1=tree.broadcast_to_leaves(batch.trans_1.to(device), fill_value=0),
             device=device,
         )
+        rotmats_0 = self.interpolant.rotation_coupler.sample_base(
+            motif_mask=tree.motif_mask,
+            x1=tree.broadcast_to_leaves(
+                batch.rotmats_1.to(device), fill_value=torch.eye(3, device=device)
+            ),
+            device=device,
+        )
         aatypes_0 = self.interpolant.aatypes_coupler.sample_base(
             motif_mask=tree.motif_mask,
             x1=tree.broadcast_to_leaves(
@@ -3778,12 +4884,18 @@ class BranchingFlowVisualizer:
                 batch=batch,
                 t=torch.ones(num_batch, device=device) * time,
                 trans_0=trans_0,
+                rotmats_0=rotmats_0,
                 aatypes_0=aatypes_0,
             )
             samples.append(bridged.pack_present())
 
         traj = Trajectory(samples=samples)
-        return self.plot_trajectory(traj=traj, out_dir=out_dir, filename=filename)
+        return self.plot_trajectory(
+            traj=traj,
+            out_dir=out_dir,
+            filename=filename,
+            only_alpha_carbons=only_alpha_carbons,
+        )
 
 
 """ Module """
@@ -3797,7 +4909,7 @@ class BranchFlowModule(pl.LightningModule):
         self.save_hyperparameters("cfg")
 
         self.model = BranchFlowModel(cfg=self.cfg.model)
-        self.loss_calculator = BranchFlowLossCalculator()
+        self.loss_calculator = BranchFlowLossCalculator(cfg=self.cfg.loss)
         self.interpolant = TreeInterpolant(cfg=self.cfg.interpolant)
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
@@ -3834,35 +4946,44 @@ class BranchFlowModule(pl.LightningModule):
         # Time loss calculation (part of forward)
         loss_start = time.perf_counter()
         loss = self.loss_calculator.calculate(
-            batch=corrupted, pred=pred, couplings=couplings
+            batch=corrupted, pred=pred, couplings=couplings, bridged=bridged
         )
         loss_time = time.perf_counter() - loss_start
 
         self.log("L/train", loss.total_loss, prog_bar=True)
-        self.log("L/trans", loss.base_trans_loss, prog_bar=True)
+        self.log("L/trans", loss.trans_loss, prog_bar=True)
+        self.log("L/rot", loss.rot_vf_loss, prog_bar=True)
         self.log("L/cdist", loss.pairwise_loss)
         self.log("L/seq", loss.base_seq_loss, prog_bar=True)
+        self.log("L/seq_ins", loss.insertion_seq_loss)
         self.log("L/split", loss.split_token_loss, prog_bar=True)
         self.log("L/split_pooled", loss.split_pooled_loss)
         self.log("L/del", loss.del_loss, prog_bar=True)
-        self.log("aux/t", bridged.t.mean())
 
-        # Timing statistics (in milliseconds)
-        self.log("t/corrupt", corrupt_time * 1000)
-        self.log("t/forward", forward_time * 1000)
-        self.log("t/loss", loss_time * 1000)
-
-        # Corruption time as function of batch size
+        # Timing statistics
         batch_size = corrupted.trans_t.shape[0]
-        self.log("aux/batch_size", float(batch_size))
+        self.log("t/t", bridged.t.mean())
+        self.log("t/batch_size", float(batch_size))
+        # skip startup noise
+        if batch_idx > 3:
+            self.log("t/forward", forward_time * 1000)
+            self.log("t/loss", loss_time * 1000)
+        # Corruption time as function of batch size
         self.log(
-            "t/corrupt_per_batch", corrupt_time * 1000 / batch_size, prog_bar=False
+            "t/corrupt_ms_per_batch", corrupt_time * 1000 / batch_size, prog_bar=False
         )
-
-        # Corruption time as function of t value (bucketed)
+        # Corruption time as function of t value (bucketed into 0.0-0.2, 0.2-0.4, ..., 0.8-1.0)
         mean_t = bridged.t.mean().detach().item()
-        t_bucket = round(mean_t * 10) / 5.0  # Round to nearest 0.2
-        self.log(f"t/corrupt_t{t_bucket:.1f}_ms", corrupt_time * 1000, prog_bar=False)
+        t_bin_idx = min(
+            int(mean_t * 5), 4
+        )  # 0-4 for bins [0.0-0.2), [0.2-0.4), ..., [0.8-1.0]
+        t_bin_start = t_bin_idx * 0.2
+        t_bin_end = t_bin_start + 0.2
+        self.log(
+            f"t/corrupt_ms_t{t_bin_start:.1f}-{t_bin_end:.1f}",
+            corrupt_time * 1000,
+            prog_bar=False,
+        )
 
         # MPS clean up
         if batch_idx % 100 == 0 and torch.backends.mps.is_available():
@@ -3937,23 +5058,26 @@ class Experiment:
         self.module = BranchFlowModule(cfg=self.cfg)
         self.logger.info("\n" + str(ModelSummary(self.module, max_depth=2)))
 
-    def debug(self):
+    def debug(self, n: int = 10):
+        if n <= 0:
+            return
+
         debug_dir = os.path.join(self.cfg.inference.predict_dir, "debug")
         os.makedirs(debug_dir, exist_ok=True)
 
         # Plot corruption planning trees
-        # for i in range(10):
-        #     datum = self.data_module.dataset[i]
-        #     datum.tree_plan.plot(
-        #         path=os.path.join(debug_dir, f"init_tree_plan_{i}.png")
-        #     )
+        for i in range(n):
+            datum = self.data_module.dataset[i]
+            datum.tree_plan.plot(
+                path=os.path.join(debug_dir, f"init_tree_plan_{i}.png")
+            )
 
         # Visualize corruption processes
         # 0 for deterministic bridges, >0 for stochasticity
         viz = BranchingFlowVisualizer(sigma=0.0)
         data_loader = self.data_module.train_dataloader(rank=0, num_replicas=1)
         for i, debug_batch in enumerate(data_loader):
-            if i > 10:
+            if i >= n:
                 break
             viz.visualize_corruption(
                 batch=debug_batch, out_dir=debug_dir, filename=f"debug_corruption_{i}"
@@ -3983,12 +5107,21 @@ class Experiment:
 
         callbacks = []
 
-        callbacks.append(TQDMProgressBar(refresh_rate=1))
+        # Simple progress bar
+        # callbacks.append(TQDMProgressBar(refresh_rate=1))
 
         # Model checkpoints
         checkpoint_cfg = self.cfg.experiment.checkpointer.asdict()
         checkpoint_cfg["monitor"] = "L/train"
         callbacks.append(ModelCheckpoint(**checkpoint_cfg))
+
+        # Save every n training steps
+        # TODO - clean up, use cfg explicitly
+        n_step_cfg = copy.deepcopy(checkpoint_cfg)
+        del n_step_cfg["every_n_epochs"]
+        n_step_cfg["every_n_train_steps"] = 2000
+        n_step_cfg["monitor"] = "L/train"
+        callbacks.append(ModelCheckpoint(**n_step_cfg))
 
         self.save_config(wandb_logger=wandb_logger)
 
@@ -4000,6 +5133,7 @@ class Experiment:
             use_distributed_sampler=False,  # TODO - ddp
             devices=self.cfg.experiment.num_devices,
             enable_model_summary=False,  # manual model summary
+            enable_progress_bar=True,
         )
 
         trainer.fit(self.module, datamodule=self.data_module)
@@ -4020,7 +5154,7 @@ def main(cfg: VarcoConfig):
 
     experiment = Experiment(cfg=cfg)
     experiment.setup()
-    # experiment.debug()
+    # experiment.debug(n=1)
     experiment.train()
 
 
