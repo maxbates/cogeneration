@@ -26,6 +26,7 @@ from cogeneration.config.base import (
     ModelHyperParamsConfig,
     SharedConfig,
 )
+from cogeneration.type.str_enum import StrEnum
 
 
 @dataclass
@@ -36,6 +37,81 @@ class VarcoDatasetConfig(DatasetConfig):
     enable_cogeneration_redesigns: bool = False
     enable_multiflow_redesigned: bool = False
     enable_multiflow_synthetic: bool = False
+
+
+class VarcoMotifGuidanceType(StrEnum):
+    """scale function for motif guidance"""
+
+    posterior_variance = "posterior_variance"
+    linear_decay = "linear_decay"
+
+
+@dataclass
+class VarcoInterpolantMotifGuidanceConfig(BaseClassConfig):
+    """Configuration for motif position guidance during sampling."""
+
+    enabled: bool = True
+    # Scale function
+    scale_type: VarcoMotifGuidanceType = VarcoMotifGuidanceType.posterior_variance
+    # For posterior_variance scale: max clamp value (for close to t=0)
+    var_scale_cap: float = 10.0
+    # For linear_decay scale: strength multiplier
+    linear_decay_strength: float = 1.0
+    # Per-step force cap (angstroms) - prevents huge single-step jumps
+    max_step_force_ang: float = 5.0
+
+
+@dataclass
+class VarcoInterpolantTransCouplerConfig(BaseClassConfig):
+    """Configuration for translation coupler (Brownian bridge)."""
+
+    # Sigma for Brownian bridge (0 for deterministic bridges)
+    sigma: float = 1.0
+
+
+@dataclass
+class VarcoInterpolantAATypesCouplerConfig(BaseClassConfig):
+    """Configuration for amino acid types coupler (CTMC bridge)."""
+
+    # Scale for uniform noise added to step probabilities
+    noise_scale: float = 1.0
+    # Total leaving rate for the CTMC
+    beta: float = 3.0
+    # Temperature for softmax in euler_step (lower = sharper)
+    drift_temp: float = 1.0
+    # Exponent for uncertainty gating
+    uncertainty_sharpness: float = 1.0
+    # Maximum total off-diagonal probability per step
+    leave_mass_cap: float = 0.25
+
+
+@dataclass
+class VarcoInterpolantSamplingConfig(BaseClassConfig):
+    """Configuration for Varco sampling behavior."""
+
+    # Maximum sequence length during sampling (to prevent GPU OOM)
+    # If exceeded, further insertions are blocked
+    max_length: int = 512
+
+
+@dataclass
+class VarcoInterpolantConfig(BaseClassConfig):
+    """Configuration for Varco interpolant / sampling behavior."""
+
+    sigma: float = 1.0  # 0 for deterministic bridges (legacy, prefer coupler configs)
+
+    trans_coupler: VarcoInterpolantTransCouplerConfig = field(
+        default_factory=VarcoInterpolantTransCouplerConfig
+    )
+    aatypes_coupler: VarcoInterpolantAATypesCouplerConfig = field(
+        default_factory=VarcoInterpolantAATypesCouplerConfig
+    )
+    motif_guidance: VarcoInterpolantMotifGuidanceConfig = field(
+        default_factory=VarcoInterpolantMotifGuidanceConfig
+    )
+    sampling: VarcoInterpolantSamplingConfig = field(
+        default_factory=VarcoInterpolantSamplingConfig
+    )
 
 
 @dataclass
@@ -83,6 +159,7 @@ class VarcoConfig(BaseClassConfig):
     dataset: VarcoDatasetConfig = field(default_factory=VarcoDatasetConfig)
     experiment: ExperimentConfig = field(default_factory=ExperimentConfig)
     inference: VarcoInferenceConfig = field(default_factory=VarcoInferenceConfig)
+    interpolant: VarcoInterpolantConfig = field(default_factory=VarcoInterpolantConfig)
     model: VarcoModelConfig = field(default_factory=VarcoModelConfig)
 
 

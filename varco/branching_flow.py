@@ -13,15 +13,18 @@ A simple model predicts base (endpoint prediction), split (remaining children co
 
 Then, a sampler (no tree) iterates to get base (endpoint prediction), sample split events, sample deletion events
 
-Fix backlog:
-
 TODOs / features:
 - improve sampling
-  - motif guidance for positions
   - add validation loss (e.g. folding validation?)
-  - cap sampling length to avoid overloading gpu memory
-- support rotations with an IGSO(3) bridge
-- sequence: also predict insertion logits, which are sampled on insertions, and replace the parent's residue
+- support rotations 
+  - new Coupler
+  - add rotmats_1_motifs and guidance
+  - IGSO(3) noise + bridge
+  - update plots to show 3 atoms per backbone
+  - saving trajectory maybe gets atom37 rep and uses existing plotting utils?
+- sequence
+  - also predict insertion logits, which are sampled on insertions, and replace the parent's residue
+  - support guidance potential
 - improve visualizations
   - sequence needs to be easier to read
   - speed
@@ -84,7 +87,15 @@ from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.embed import PositionalEmbeddingMethod
 from cogeneration.type.task import DataTask
 from cogeneration.util.log import rank_zero_logger
-from varco.config import VarcoConfig, VarcoDatasetConfig, VarcoModelConfig
+from varco.config import (
+    VarcoConfig,
+    VarcoDatasetConfig,
+    VarcoInterpolantAATypesCouplerConfig,
+    VarcoInterpolantConfig,
+    VarcoInterpolantTransCouplerConfig,
+    VarcoModelConfig,
+    VarcoMotifGuidanceType,
+)
 
 """ Data Flow """
 
@@ -1236,6 +1247,9 @@ class DataCorrupted:
     chain_idx: torch.Tensor  # (B, P_max) int
     trans_t: torch.Tensor  # (B, P_max, 3)
     aatypes_t: torch.Tensor  # (B, P_max)
+    trans_1_motifs: (
+        torch.Tensor
+    )  # (B, P_max, 3) true t=1 positions for motifs (for guidance)
     remaining_insertions: Optional[torch.Tensor] = (
         None  # (B, P_max) supervised target, remaining splits per present token
     )
@@ -1267,6 +1281,7 @@ class DataCorrupted:
             chain_idx=self.chain_idx.detach().clone(),
             trans_t=self.trans_t.detach().clone(),
             aatypes_t=self.aatypes_t.detach().clone(),
+            trans_1_motifs=self.trans_1_motifs.detach().clone(),
             remaining_insertions=(
                 self.remaining_insertions.detach().clone()
                 if self.remaining_insertions is not None
@@ -1356,6 +1371,9 @@ class DataCorrupted:
             aatypes_t=gather_and_pad(
                 self.aatypes_t, gather_idx, new_valid, fill_value=MASK_TOKEN_INDEX
             ),
+            trans_1_motifs=gather_and_pad(
+                self.trans_1_motifs, gather_idx, new_valid, fill_value=0.0
+            ),
         )
 
         return new_batch, is_insertion
@@ -1373,6 +1391,9 @@ class DataBridged:
     chain_idx: torch.Tensor  # (B, A)
     trans_t: torch.Tensor  # (B, A, 3)
     aatypes_t: torch.Tensor  # (B, A)
+    trans_1_motifs: (
+        torch.Tensor
+    )  # (B, A, 3) true t=1 positions for motifs (for guidance)
     # supervision
     remaining_insertions: torch.Tensor  # (B, A) target count per aligned node
     deleted: torch.Tensor  # (B, A) bool, aligned deletion label (leaf only)
@@ -1436,6 +1457,9 @@ class DataBridged:
                 pack_mask,
                 fill_value=MASK_TOKEN_INDEX,
             ),
+            trans_1_motifs=gather_and_pad(
+                self.trans_1_motifs, idx_pack, pack_mask, fill_value=0.0
+            ),
             remaining_insertions=gather_and_pad(
                 self.remaining_insertions, idx_pack, pack_mask, fill_value=0
             ),
@@ -1452,6 +1476,8 @@ class DataBridged:
             raise ValueError("motif_mask shape mismatch")
         if self.aatypes_t.shape != (B, A):
             raise ValueError("aatypes_t shape mismatch")
+        if self.trans_1_motifs.shape != (B, A, D):
+            raise ValueError("trans_1_motifs shape mismatch")
         if self.remaining_insertions.shape != (B, A):
             raise ValueError("remaining_insertions shape mismatch")
         if self.deleted.shape != (B, A):
@@ -2015,10 +2041,12 @@ class Coupler(ABC, Generic[CouplingT]):
         dt: float,
         birth_time: torch.Tensor,  # (B, P)
         motif_mask: torch.Tensor,  # (B, P)
+        potential: Optional[torch.Tensor] = None,  # (B, P, ...)
     ) -> torch.Tensor:
         """Single Euler(-Maruyama) step for sampling.
 
         Noise is controlled by the coupler instance (e.g. sigma); if sigma is None/0, this is deterministic.
+        Guidance potential can be provided to pull toward targets.
         """
         raise NotImplementedError
 
@@ -2032,8 +2060,8 @@ class TranslationCoupling(Coupling):
 
 
 class TranslationCoupler(Coupler[TranslationCoupling]):
-    def __init__(self, sigma: Optional[float] = 1.0):
-        self.sigma = sigma
+    def __init__(self, cfg: VarcoInterpolantTransCouplerConfig):
+        self.cfg = cfg
 
     def sample_base(
         self,
@@ -2073,13 +2101,13 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
         u = ((flat_s - flat_t0) / denom).clamp(0.0, 1.0)
         mean = flat_start + u.unsqueeze(-1) * (flat_end - flat_start)
 
-        if self.sigma is None:
+        if self.cfg.sigma == 0.0:
             return mean.view(original_shape)
 
         var = (
             (flat_s - flat_t0).clamp_min(0.0) * (1.0 - flat_s).clamp_min(0.0) / denom
         ).clamp_min(0.0)
-        std = (var.sqrt() * self.sigma).to(mean.dtype)
+        std = (var.sqrt() * self.cfg.sigma).to(mean.dtype)
         eps = torch.randn_like(mean)
         return (mean + std.unsqueeze(-1) * eps).view(original_shape)
 
@@ -2112,6 +2140,7 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
         dt: float,
         birth_time: torch.Tensor,  # (B, P)
         motif_mask: torch.Tensor,  # (B, P)
+        potential: Optional[torch.Tensor] = None,  # (B, P, 3) guidance VF
     ) -> torch.Tensor:
         trans_pred = x1_pred
         if x_t.shape != trans_pred.shape:
@@ -2122,6 +2151,11 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
             raise ValueError(
                 f"Expected x_t to have shape (B, P, 3); got {tuple(x_t.shape)}"
             )
+        if potential is not None:
+            if potential.shape != x_t.shape:
+                raise ValueError(
+                    f"potential and x_t must match shape; got {tuple(potential.shape)} vs {tuple(x_t.shape)}"
+                )
 
         B, P, _ = x_t.shape
         device = x_t.device
@@ -2132,11 +2166,15 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
 
         denom = (1.0 - t).clamp_min(1e-4).view(B, 1, 1)
         v = (trans_pred - x_t) / denom
+
+        if potential is not None:
+            v = v + potential
+
         x_next = x_t + v * float(dt)
 
-        if (self.sigma is not None) and float(self.sigma) > 0.0 and float(dt) > 0.0:
+        if float(self.cfg.sigma) > 0.0 and float(dt) > 0.0:
             x_next = x_next + torch.randn_like(x_next) * (
-                float(self.sigma) * math.sqrt(float(dt))
+                float(self.cfg.sigma) * math.sqrt(float(dt))
             )
 
         return x_next * valid_fmask + x_t * (1.0 - valid_fmask)
@@ -2167,24 +2205,9 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
 
     def __init__(
         self,
-        beta: float = 3.0,
-        drift_temp: float = 1.0,
-        noise_scale: float = 0.5,
-        uncertainty_sharpness: float = 1.0,
-        leave_mass_cap: float = 0.25,
+        cfg: VarcoInterpolantAATypesCouplerConfig,
     ):
-        """
-        beta: Total leaving rate for the CTMC (rate of jumping away from current state)
-        drift_temp: Temperature for softmax in euler_step (lower = sharper)
-        noise_scale: Scale for uniform noise added to step probabilities (0 = no noise)
-        uncertainty_sharpness: Exponent for uncertainty gating (higher = sharper gate)
-        leave_mass_cap: Maximum total off-diagonal (jump) probability per step
-        """
-        self.beta = beta
-        self.drift_temp = drift_temp
-        self.noise_scale = noise_scale
-        self.uncertainty_sharpness = uncertainty_sharpness
-        self.leave_mass_cap = leave_mass_cap
+        self.cfg = cfg
 
     def sample_base(
         self,
@@ -2228,7 +2251,7 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
         where λ = β * K / (K - 1)
         """
         delta = delta.clamp_min(0.0)
-        lam = self.beta * self.K / (self.K - 1)
+        lam = self.cfg.beta * self.K / (self.K - 1)
         exp_term = torch.exp(-lam * delta)
         inv_K = 1.0 / self.K
 
@@ -2369,9 +2392,9 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
 
         anchor_probs = tree.traverse_bottom_up(anchor_probs, combine_fn)
 
-        if self.noise_scale > 0:
+        if self.cfg.noise_scale > 0:
             uniform_dist = torch.ones(B, A, K, device=device) / K
-            noise_weight = min(self.noise_scale * 0.2, 0.2)
+            noise_weight = min(self.cfg.noise_scale * 0.15, 0.2)
             anchor_probs = (
                 1.0 - noise_weight
             ) * anchor_probs + noise_weight * uniform_dist
@@ -2477,7 +2500,7 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
         p_current = p_current.clamp(0.0, 1.0)  # (B, P)
 
         # Uncertainty = (1 - p_current) ^ sharpness
-        uncertainty = (1.0 - p_current) ** self.uncertainty_sharpness
+        uncertainty = (1.0 - p_current) ** self.cfg.uncertainty_sharpness
         return uncertainty  # (B, P)
 
     def _compute_step_probs(
@@ -2497,7 +2520,7 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
         device = x_t.device
 
         # Softmax with temperature
-        probs = F.softmax(logits / self.drift_temp, dim=-1)  # (B, P, K)
+        probs = F.softmax(logits / self.cfg.drift_temp, dim=-1)  # (B, P, K)
 
         # Uncertainty gating
         uncertainty = self._uncertainty_gate(x_t, probs)  # (B, P)
@@ -2515,19 +2538,19 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
         step_probs = step_probs * (1.0 - current_onehot)
 
         # Noise injection: add uniform mass to off-diagonal, scaled by sigma_t
-        if self.noise_scale > 0:
+        if self.cfg.noise_scale > 0:
             # sigma_t^2 ~ t(1-t), peaks at t=0.5
             sigma_t_sq = (t * (1.0 - t)).view(B, 1, 1)  # (B, 1, 1)
-            noise_weight = self.noise_scale * dt * sigma_t_sq  # (B, 1, 1)
+            noise_weight = self.cfg.noise_scale * dt * sigma_t_sq  # (B, 1, 1)
 
             # Uniform over non-current tokens
             uniform_noise = (1.0 - current_onehot) / max(K - 1, 1)
             step_probs = step_probs + noise_weight * uniform_noise
 
         # Cap leave mass
-        if self.leave_mass_cap is not None and self.leave_mass_cap > 0:
+        if self.cfg.leave_mass_cap is not None and self.cfg.leave_mass_cap > 0:
             row_sum = step_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            shrink = (self.leave_mass_cap / row_sum).clamp_max(1.0)
+            shrink = (self.cfg.leave_mass_cap / row_sum).clamp_max(1.0)
             step_probs = step_probs * shrink
 
         # Regularize: set diagonal to 1 - sum(off-diagonal)
@@ -2552,6 +2575,7 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
         dt: float,
         birth_time: torch.Tensor,  # (B, P)
         motif_mask: torch.Tensor,  # (B, P)
+        potential: Optional[torch.Tensor] = None,  # (B, P, K) guidance logits
     ) -> torch.Tensor:
         """Single Euler step for discrete amino acid sampling.
 
@@ -2563,6 +2587,8 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
 
         if x1_pred.shape != (B, P, K):
             raise ValueError(f"Expected x1_pred shape (B, P, K); got {x1_pred.shape}")
+
+        assert potential is None, "potential not yet supported"
 
         # Valid positions are those born before current time
         valid_mask = birth_time <= t[:, None]  # (B, P)
@@ -2602,19 +2628,66 @@ class TreeCouplings:
 
 @dataclass
 class TreeInterpolant:
+    cfg: VarcoInterpolantConfig
     device: torch.device = torch.device("cpu")
     min_t: float = 0.005
-    translation_coupler: Coupler[TranslationCoupling] = field(
-        default_factory=lambda: TranslationCoupler(sigma=1.0)
-    )
-    aatypes_coupler: Coupler[AATypesCoupling] = field(
-        default_factory=lambda: AATypesCoupler(
-            beta=3.0, drift_temp=1.0, noise_scale=0.5, uncertainty_sharpness=1.0
-        )
-    )
+    translation_coupler: Coupler[TranslationCoupling] = field(init=False)
+    aatypes_coupler: Coupler[AATypesCoupling] = field(init=False)
+
+    def __post_init__(self):
+        self.translation_coupler = TranslationCoupler(cfg=self.cfg.trans_coupler)
+        self.aatypes_coupler = AATypesCoupler(cfg=self.cfg.aatypes_coupler)
 
     def set_device(self, device: torch.device):
         self.device = device
+
+    def compute_motif_guidance_vf(
+        self,
+        t: torch.Tensor,  # (B,)
+        pred_trans_1: torch.Tensor,  # (B, P, 3)
+        motif_targets: torch.Tensor,  # (B, P, 3) true positions at t=1
+        motif_mask: torch.Tensor,  # (B, P)
+    ) -> Optional[torch.Tensor]:  # (B, P, 3) or None
+        """
+        Compute guidance velocity field pulling motif positions toward their targets.
+
+        Returns None if guidance is disabled or no motifs present.
+        """
+        guidance_cfg = self.cfg.motif_guidance
+        if not guidance_cfg.enabled or not motif_mask.any():
+            return None
+
+        B, P, _ = pred_trans_1.shape
+        t_clamped = t.clamp(min=1e-3, max=1.0 - 1e-3)
+
+        # Compute scale based on config
+        if guidance_cfg.scale_type == VarcoMotifGuidanceType.posterior_variance:
+            # scale = 0.5 * g² / ω² where g = κ/t, ω² = κ²/(t² + κ²), κ = 1-t
+            # see cogeneration interpolant for details
+            kappa = 1.0 - t_clamped
+            g = kappa / t_clamped
+            omega2 = kappa**2 / (t_clamped**2 + kappa**2)
+            scale = 0.5 * g * g / omega2
+            scale = scale.clamp(min=0.0, max=guidance_cfg.var_scale_cap)
+        elif guidance_cfg.scale_type == VarcoMotifGuidanceType.linear_decay:
+            scale = guidance_cfg.linear_decay_strength * (1.0 - t_clamped)
+        else:
+            raise ValueError(f"Unknown scale_type: {guidance_cfg.scale_type}")
+
+        # guidance_vf = scale * (true - pred)
+        guidance_vf = (motif_targets - pred_trans_1) * scale.view(B, 1, 1)
+
+        # limit to motifs
+        guidance_vf = guidance_vf * motif_mask.unsqueeze(-1).float()
+
+        # Cap per-residue magnitude
+        if guidance_cfg.max_step_force_ang > 0:
+            norm = guidance_vf.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            guidance_vf = guidance_vf * (guidance_cfg.max_step_force_ang / norm).clamp(
+                max=1.0
+            )
+
+        return guidance_vf
 
     def corrupt_to(
         self,
@@ -2638,6 +2711,10 @@ class TreeInterpolant:
         chain_idx = batch.tree.broadcast_to_leaves(
             x=batch.chain_idx.to(self.device), fill_value=0
         )
+
+        # Broadcast trans_1 in motifs to aligned space for motif guidance
+        trans_1_motifs = tree.broadcast_to_leaves(x=trans_1, fill_value=0.0)
+        trans_1_motifs = trans_1_motifs * tree.motif_mask.unsqueeze(-1).float()
 
         # Corrupt translations
         trans_t, trans_coupling = self.translation_coupler.corrupt(
@@ -2666,6 +2743,7 @@ class TreeInterpolant:
             chain_idx=chain_idx,
             trans_t=trans_t,
             aatypes_t=aatypes_t,
+            trans_1_motifs=trans_1_motifs,
             remaining_insertions=tree.remaining_insertions_t(t=t),
             deleted=tree.leaf_deleted,
         )
@@ -2839,6 +2917,7 @@ class TreeInterpolant:
             chain_idx=chain_idx,
             trans_t=trans_0,
             aatypes_t=aatypes_0,
+            trans_1_motifs=trans_1_gathered,
         )
 
     @staticmethod
@@ -2922,6 +3001,14 @@ class TreeInterpolant:
                 if traj_frames is None or step_num % traj_frames == 0:
                     traj.pred.append(pred.detach_clone())
 
+                # Compute motif guidance VF
+                trans_guidance_vf = self.compute_motif_guidance_vf(
+                    t=batch.t,
+                    pred_trans_1=pred.pred_trans_1,
+                    motif_targets=batch.trans_1_motifs,
+                    motif_mask=batch.motif_mask,
+                )
+
                 # Euler step for alive tokens' translations
                 trans_next = self.translation_coupler.euler_step(
                     x_t=batch.trans_t,
@@ -2930,6 +3017,7 @@ class TreeInterpolant:
                     dt=dt,
                     birth_time=batch.birth_time,
                     motif_mask=batch.motif_mask,
+                    potential=trans_guidance_vf,
                 )
                 batch.trans_t = trans_next
 
@@ -2954,6 +3042,14 @@ class TreeInterpolant:
                     t_val=t_val,
                     dt=dt,
                 )
+
+                # Enforce max_length: block insertions once we're at the limit
+                max_len = self.cfg.sampling.max_length
+                cur_lens = batch.valid_mask.sum(dim=1)  # (B,)
+                at_limit = cur_lens >= max_len  # (B,)
+                if at_limit.any():
+                    insertions = insertions & ~at_limit.unsqueeze(1)
+
                 batch, insert_mask = batch.apply_insertions_deletions(
                     insertions=insertions,
                     deletions=deletions,
@@ -3269,11 +3365,11 @@ class BranchingFlowVisualizer:
         self,
         sigma: Optional[float] = 1.0,
     ):
-        # Use couplers with sigma set explicitly
-        self.translation_coupler = TranslationCoupler(sigma=sigma)
-
         self.interpolant = TreeInterpolant(
-            translation_coupler=self.translation_coupler,
+            cfg=VarcoInterpolantConfig(
+                trans_coupler=VarcoInterpolantTransCouplerConfig(sigma=sigma),
+                aatypes_coupler=VarcoInterpolantAATypesCouplerConfig(drift_temp=sigma),
+            ),
         )
 
     @staticmethod
@@ -3662,21 +3758,16 @@ class BranchingFlowVisualizer:
         tree = batch.tree.to(device)
 
         # Define consistent base samples for the whole trajectory (in aligned space)
-        # Broadcast x1 to get aligned space for motif preservation
-        trans_1_aligned = tree.broadcast_to_leaves(
-            batch.trans_1.to(device), fill_value=0
-        )
-        aatypes_1_aligned = tree.broadcast_to_leaves(
-            batch.aatypes_1.to(device), fill_value=MASK_TOKEN_INDEX
-        )
-        trans_0 = self.translation_coupler.sample_base(
+        trans_0 = self.interpolant.translation_coupler.sample_base(
             motif_mask=tree.motif_mask,
-            x1=trans_1_aligned,
+            x1=tree.broadcast_to_leaves(batch.trans_1.to(device), fill_value=0),
             device=device,
         )
         aatypes_0 = self.interpolant.aatypes_coupler.sample_base(
             motif_mask=tree.motif_mask,
-            x1=aatypes_1_aligned,
+            x1=tree.broadcast_to_leaves(
+                batch.aatypes_1.to(device), fill_value=MASK_TOKEN_INDEX
+            ),
             device=device,
         )
 
@@ -3707,7 +3798,7 @@ class BranchFlowModule(pl.LightningModule):
 
         self.model = BranchFlowModel(cfg=self.cfg.model)
         self.loss_calculator = BranchFlowLossCalculator()
-        self.interpolant = TreeInterpolant()
+        self.interpolant = TreeInterpolant(cfg=self.cfg.interpolant)
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
         return torch.optim.AdamW(
@@ -3929,7 +4020,7 @@ def main(cfg: VarcoConfig):
 
     experiment = Experiment(cfg=cfg)
     experiment.setup()
-    experiment.debug()
+    # experiment.debug()
     experiment.train()
 
 
