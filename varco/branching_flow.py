@@ -14,11 +14,8 @@ A simple model predicts base (endpoint prediction), split (remaining children co
 Then, a sampler (no tree) iterates to get base (endpoint prediction), sample split events, sample deletion events
 
 TODOs / features:
-- copy cogeneration checkpoints
-- support cogeneration model warmstart
-- verify sampling capped at 512 (or max length)
-- train simple model
 - break up this file
+- ideally we could share loss calculator with cogeneration, e.g. using static methods
 - visualize samping - show sample / model pred side by side
 - add validation loss (e.g. folding validation?)
 - support aatypes guidance potential, support particle-free ESM potential
@@ -81,6 +78,8 @@ from cogeneration.models.aa_pred import AminoAcidPredictionNet
 from cogeneration.models.attention.attention_trunk import AttentionTrunk
 from cogeneration.models.attention.ipa_attention import AttentionIPATrunk
 from cogeneration.models.attention.ipa_pytorch import Linear
+from cogeneration.models.bfactors import BFactorModule
+from cogeneration.models.confidence import PLDDTModule
 from cogeneration.models.edge_feature_net import EdgeFeatureNet
 from cogeneration.models.embed import get_index_embedding, get_time_embedding
 from cogeneration.models.esm_combiner import ESMCombinerNetwork
@@ -227,12 +226,29 @@ class SeededRNG:
         return (x / (x + y)).to(device=device)
 
 
+def clone_detach(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Clone and detach an Optional tensor."""
+    if x is None:
+        return None
+    return x.detach().clone()
+
+
+def to_device(
+    x: Optional[torch.Tensor], device: torch.device
+) -> Optional[torch.Tensor]:
+    """Move an Optional tensor to a device."""
+    if x is None:
+        return None
+    return x.to(device=device)
+
+
 def gather_and_pad(
-    source: torch.Tensor,  # (B, N, ...)
+    source: Optional[torch.Tensor],  # (B, N, ...) or (B, N, N) if is_2d
     index: torch.Tensor,  # (B, P)
     mask: torch.Tensor,  # (B, P)
     fill_value: Union[float, torch.Tensor] = 0.0,
-) -> torch.Tensor:  # (B, P, ...)
+    is_2d: bool = False,
+) -> Optional[torch.Tensor]:  # (B, P, ...) or (B, P, P) if is_2d
     """
     Gather from source along dim=1 using index, then fill padding positions with fill_value.
 
@@ -240,16 +256,44 @@ def gather_and_pad(
     For positions where mask is False, the result is set to fill_value.
 
     Args:
-        source: (B, N, ...) tensor to gather from
+        source: (B, N, ...) tensor to gather from, or (B, N, N) if is_2d=True
         index: (B, P) indices into dim=1 of source (must be in [0, N-1])
         mask: (B, P) boolean mask; True for valid positions, False for padding
         fill_value: value to fill where mask is False. Can be a scalar float or
                     a tensor with shape matching source trailing dimensions (...).
+        is_2d: if True, source is (B, N, N) and we gather along both dim=1 and dim=2
+               to produce (B, P, P). Used for contact_conditioning matrices.
 
     Returns:
         (B, P, ...) tensor with gathered values where mask is True, fill_value otherwise
+        If is_2d=True, returns (B, P, P) tensor.
     """
+    if source is None:
+        return None
+
     B, P = index.shape
+
+    if is_2d:
+        # source is (B, N, N), gather along both dimensions to get (B, P, P)
+        # First gather rows: (B, N, N) -> (B, P, N)
+        idx_row = index.unsqueeze(-1).expand(-1, -1, source.shape[2])  # (B, P, N)
+        gathered_rows = source.gather(1, idx_row)  # (B, P, N)
+        # Then gather columns: (B, P, N) -> (B, P, P)
+        idx_col = index.unsqueeze(1).expand(-1, P, -1)  # (B, P, P)
+        gathered = gathered_rows.gather(2, idx_col)  # (B, P, P)
+
+        # Fill value for 2D case
+        if isinstance(fill_value, torch.Tensor):
+            fill = fill_value.unsqueeze(0).unsqueeze(0).expand(B, P, P)
+            fill = fill.to(device=gathered.device, dtype=gathered.dtype)
+        else:
+            fill = torch.full_like(gathered, fill_value)
+
+        # 2D mask: both row and column must be valid
+        mask_2d = mask.unsqueeze(2) & mask.unsqueeze(1)  # (B, P, P)
+        return torch.where(mask_2d, gathered, fill)
+
+    # Standard 1D case
     trailing_shape = source.shape[2:]
     idx = index
     for _ in trailing_shape:
@@ -1164,20 +1208,20 @@ class BatchedTreePlan:
     def to(self, device: torch.device) -> "BatchedTreePlan":
         """Move all tensors to the specified device."""
         return BatchedTreePlan(
-            topo_order=self.topo_order.to(device),
-            motif_mask=self.motif_mask.to(device),
-            roots=self.roots.to(device),
-            roots_mask=self.roots_mask.to(device),
-            parent_idx=self.parent_idx.to(device),
-            children_idx=self.children_idx.to(device),
-            total_leaves=self.total_leaves.to(device),
-            node_depth=self.node_depth.to(device),
-            leaf_deleted=self.leaf_deleted.to(device),
-            planar_position=self.planar_position.to(device),
-            birth_time=self.birth_time.to(device),
-            split_time=self.split_time.to(device),
-            delete_time=self.delete_time.to(device),
-            leaf_map=self.leaf_map.to(device),
+            topo_order=to_device(self.topo_order, device),
+            motif_mask=to_device(self.motif_mask, device),
+            roots=to_device(self.roots, device),
+            roots_mask=to_device(self.roots_mask, device),
+            parent_idx=to_device(self.parent_idx, device),
+            children_idx=to_device(self.children_idx, device),
+            total_leaves=to_device(self.total_leaves, device),
+            node_depth=to_device(self.node_depth, device),
+            leaf_deleted=to_device(self.leaf_deleted, device),
+            planar_position=to_device(self.planar_position, device),
+            birth_time=to_device(self.birth_time, device),
+            split_time=to_device(self.split_time, device),
+            delete_time=to_device(self.delete_time, device),
+            leaf_map=to_device(self.leaf_map, device),
         )
 
     def present_mask(
@@ -1209,10 +1253,18 @@ class BatchedTreePlan:
 
     def broadcast_to_leaves(
         self,
-        x: torch.Tensor,  # (B, N, ...)
+        x: torch.Tensor,  # (B, N, ...) or (B, N, N) if is_2d
         fill_value: Union[float, torch.Tensor] = 0.0,
-    ) -> torch.Tensor:  # (B, A_max, ...)
-        """Broadcast data from N-space to A-space, keeping only leaf positions."""
+        is_2d: bool = False,
+    ) -> torch.Tensor:  # (B, A_max, ...) or (B, A_max, A_max) if is_2d
+        """Broadcast data from N-space to A-space, keeping only leaf positions.
+
+        Args:
+            x: (B, N, ...) tensor to broadcast, or (B, N, N) if is_2d=True
+            fill_value: value for non-leaf positions
+            is_2d: if True, x is (B, N, N) and we broadcast along both dims
+                   to produce (B, A_max, A_max). Used for contact_conditioning.
+        """
         if x.ndim < 2:
             raise ValueError(
                 f"Expected x to have at least 2 dims (B, N, ...); got {x.shape}"
@@ -1221,7 +1273,9 @@ class BatchedTreePlan:
         # Exclude leaves with no data reference (leaf_map == -1, e.g. extra deleted roots)
         has_data = self.leaf_map >= 0
         leaf_mask = self.leaf_mask.to(device=x.device) & has_data.to(device=x.device)
-        return gather_and_pad(x, leaf_idx, mask=leaf_mask, fill_value=fill_value)
+        return gather_and_pad(
+            x, leaf_idx, mask=leaf_mask, fill_value=fill_value, is_2d=is_2d
+        )
 
     def traverse_bottom_up(
         self,
@@ -1391,6 +1445,9 @@ class DataSample:
     trans_1: torch.Tensor  # (N, 3)
     rotmats_1: torch.Tensor  # (N, 3, 3)
     aatypes_1: torch.Tensor  # (N,)
+    contact_conditioning: torch.Tensor  # (N, N) distance matrix for contact constraints
+    res_bfactor: torch.Tensor  # (N,) Ca temp b-factors (exp) or 0.0 (predicted)
+    res_plddt: torch.Tensor  # (N,) pLDDT scores (predicted) or 100.0 (exp)
 
 
 @dataclass
@@ -1407,6 +1464,11 @@ class DataBatch:
     trans_1: torch.Tensor  # (B, N, 3)
     rotmats_1: torch.Tensor  # (B, N, 3, 3)
     aatypes_1: torch.Tensor  # (B, N)
+    contact_conditioning: (
+        torch.Tensor
+    )  # (B, N, N) distance matrix for contact constraints
+    res_bfactor: torch.Tensor  # (B, N) Ca temp b-factors (exp) or 0.0 (predicted)
+    res_plddt: torch.Tensor  # (B, N) pLDDT scores (predicted) or 100.0 (exp)
 
 
 @dataclass
@@ -1427,12 +1489,21 @@ class DataCorrupted:
     rotmats_1_motifs: (
         torch.Tensor
     )  # (B, P_max, 3, 3) true t=1 rotations for motifs (for guidance)
+    contact_conditioning: Optional[
+        torch.Tensor
+    ]  # (B, P_max, P_max) contact constraints for edge modulation
+    res_bfactor: Optional[
+        torch.Tensor
+    ]  # (B, P_max) Ca temp b-factors (exp) or 0.0 (predicted)
+    res_plddt: Optional[
+        torch.Tensor
+    ]  # (B, P_max) pLDDT scores (predicted) or 100.0 (exp)
+
+    # supervision (corruption only)
     remaining_insertions: Optional[torch.Tensor] = (
-        None  # (B, P_max) supervised target, remaining splits per present token
+        None  # (B, P_max) remaining splits per present token
     )
-    deleted: Optional[torch.Tensor] = (
-        None  # (B, P_max) supervised target, 1 if destined-to-delete
-    )
+    deleted: Optional[torch.Tensor] = None  # (B, P_max) 1 if destined-to-delete
 
     @property
     def valid_mask(self) -> torch.Tensor:  # (B, P_max)
@@ -1451,22 +1522,21 @@ class DataCorrupted:
     def to(self, device: torch.device) -> "DataCorrupted":
         """Move all tensors to specified device"""
         return DataCorrupted(
-            t=self.t.to(device),
-            motif_mask=self.motif_mask.to(device),
-            birth_time=self.birth_time.to(device),
-            res_mask=self.res_mask.to(device),
-            chain_idx=self.chain_idx.to(device),
-            trans_t=self.trans_t.to(device),
-            rotmats_t=self.rotmats_t.to(device),
-            aatypes_t=self.aatypes_t.to(device),
-            trans_1_motifs=self.trans_1_motifs.to(device),
-            rotmats_1_motifs=self.rotmats_1_motifs.to(device),
-            remaining_insertions=(
-                self.remaining_insertions.to(device)
-                if self.remaining_insertions is not None
-                else None
-            ),
-            deleted=(self.deleted.to(device) if self.deleted is not None else None),
+            t=to_device(self.t, device),
+            motif_mask=to_device(self.motif_mask, device),
+            birth_time=to_device(self.birth_time, device),
+            res_mask=to_device(self.res_mask, device),
+            chain_idx=to_device(self.chain_idx, device),
+            trans_t=to_device(self.trans_t, device),
+            rotmats_t=to_device(self.rotmats_t, device),
+            aatypes_t=to_device(self.aatypes_t, device),
+            trans_1_motifs=to_device(self.trans_1_motifs, device),
+            rotmats_1_motifs=to_device(self.rotmats_1_motifs, device),
+            contact_conditioning=to_device(self.contact_conditioning, device),
+            res_bfactor=to_device(self.res_bfactor, device),
+            res_plddt=to_device(self.res_plddt, device),
+            remaining_insertions=to_device(self.remaining_insertions, device),
+            deleted=to_device(self.deleted, device),
         )
 
     def detach_clone(self, device: Optional[torch.device] = None) -> "DataCorrupted":
@@ -1476,24 +1546,21 @@ class DataCorrupted:
             device: If provided, move tensors to this device (e.g. 'cpu' for trajectories)
         """
         result = DataCorrupted(
-            t=self.t.detach().clone(),
-            motif_mask=self.motif_mask.detach().clone(),
-            birth_time=self.birth_time.detach().clone(),
-            res_mask=self.res_mask.detach().clone(),
-            chain_idx=self.chain_idx.detach().clone(),
-            trans_t=self.trans_t.detach().clone(),
-            rotmats_t=self.rotmats_t.detach().clone(),
-            aatypes_t=self.aatypes_t.detach().clone(),
-            trans_1_motifs=self.trans_1_motifs.detach().clone(),
-            rotmats_1_motifs=self.rotmats_1_motifs.detach().clone(),
-            remaining_insertions=(
-                self.remaining_insertions.detach().clone()
-                if self.remaining_insertions is not None
-                else None
-            ),
-            deleted=(
-                self.deleted.detach().clone() if self.deleted is not None else None
-            ),
+            t=clone_detach(self.t),
+            motif_mask=clone_detach(self.motif_mask),
+            birth_time=clone_detach(self.birth_time),
+            res_mask=clone_detach(self.res_mask),
+            chain_idx=clone_detach(self.chain_idx),
+            trans_t=clone_detach(self.trans_t),
+            rotmats_t=clone_detach(self.rotmats_t),
+            aatypes_t=clone_detach(self.aatypes_t),
+            trans_1_motifs=clone_detach(self.trans_1_motifs),
+            rotmats_1_motifs=clone_detach(self.rotmats_1_motifs),
+            contact_conditioning=clone_detach(self.contact_conditioning),
+            res_bfactor=clone_detach(self.res_bfactor),
+            res_plddt=clone_detach(self.res_plddt),
+            remaining_insertions=clone_detach(self.remaining_insertions),
+            deleted=clone_detach(self.deleted),
         )
         if device is not None:
             return result.to(device)
@@ -1590,6 +1657,20 @@ class DataCorrupted:
             rotmats_1_motifs=gather_and_pad(
                 self.rotmats_1_motifs, gather_idx, new_valid, fill_value=identity
             ),
+            # inserted positions inherit parent's contacts (always 0 for scaffolds)
+            contact_conditioning=gather_and_pad(
+                self.contact_conditioning,
+                gather_idx,
+                new_valid,
+                fill_value=0.0,
+                is_2d=True,
+            ),
+            res_bfactor=gather_and_pad(
+                self.res_bfactor, gather_idx, new_valid, fill_value=0.0
+            ),
+            res_plddt=gather_and_pad(
+                self.res_plddt, gather_idx, new_valid, fill_value=0.0
+            ),
         )
 
         return new_batch, is_insertion, gather_idx
@@ -1624,6 +1705,12 @@ class DataBridged:
     trans_t: torch.Tensor  # (B, A, 3)
     rotmats_t: torch.Tensor  # (B, A, 3, 3)
     aatypes_t: torch.Tensor  # (B, A)
+    # confidence metrics
+    res_bfactor: torch.Tensor  # (B, A) Ca temp b-factors (exp) or 0.0 (predicted)
+    res_plddt: torch.Tensor  # (B, A) pLDDT scores (predicted) or 100.0 (exp)
+    contact_conditioning: (
+        torch.Tensor
+    )  # (B, A, A) contact constraints (motif-motif only)
     # guidance: t=1 values in motifs
     trans_1_motifs: torch.Tensor  # (B, A, 3)
     rotmats_1_motifs: torch.Tensor  # (B, A, 3, 3)
@@ -1722,6 +1809,20 @@ class DataBridged:
                 pack_mask,
                 fill_value=MASK_TOKEN_INDEX,
             ),
+            res_bfactor=gather_and_pad(
+                self.res_bfactor, idx_pack, pack_mask, fill_value=0.0
+            ),
+            res_plddt=gather_and_pad(
+                self.res_plddt, idx_pack, pack_mask, fill_value=0.0
+            ),
+            # contact_conditioning: (B, A, A) -> (B, P, P) using 2D gather
+            contact_conditioning=gather_and_pad(
+                self.contact_conditioning,
+                idx_pack,
+                pack_mask,
+                fill_value=0.0,
+                is_2d=True,
+            ),
             trans_1_motifs=gather_and_pad(
                 self.trans_1_motifs, idx_pack, pack_mask, fill_value=0.0
             ),
@@ -1759,6 +1860,12 @@ class DataBridged:
             raise ValueError("deleted shape mismatch")
         if self.planar_position.shape != (B, A):
             raise ValueError("planar_position shape mismatch")
+        if self.res_bfactor.shape != (B, A):
+            raise ValueError("res_bfactor shape mismatch")
+        if self.res_plddt.shape != (B, A):
+            raise ValueError("res_plddt shape mismatch")
+        if self.contact_conditioning.shape != (B, A, A):
+            raise ValueError("contact_conditioning shape mismatch")
         if D != 3:
             raise ValueError("trans_t last dim must be 3")
 
@@ -1778,17 +1885,23 @@ class ModelPrediction:
         torch.Tensor
     )  # (B,) log1p-space total remaining splits
     pred_del_logits: torch.Tensor  # (B, P) deletion logit per token
+    pred_bfactor: Optional[torch.Tensor] = None  # (B, P, num_bins) bfactor logits
+    pred_plddt: Optional[torch.Tensor] = None  # (B, P, num_bins) pLDDT logits
 
     def to(self, device: torch.device) -> "ModelPrediction":
         """Move all tensors to specified device"""
         return ModelPrediction(
-            pred_trans_1=self.pred_trans_1.to(device),
-            pred_rotmats_1=self.pred_rotmats_1.to(device),
-            pred_aatype_logits=self.pred_aatype_logits.to(device),
-            pred_insertion_logits=self.pred_insertion_logits.to(device),
-            pred_split_rate=self.pred_split_rate.to(device),
-            pred_split_pooled_log1p_rate=self.pred_split_pooled_log1p_rate.to(device),
-            pred_del_logits=self.pred_del_logits.to(device),
+            pred_trans_1=to_device(self.pred_trans_1, device),
+            pred_rotmats_1=to_device(self.pred_rotmats_1, device),
+            pred_aatype_logits=to_device(self.pred_aatype_logits, device),
+            pred_insertion_logits=to_device(self.pred_insertion_logits, device),
+            pred_split_rate=to_device(self.pred_split_rate, device),
+            pred_split_pooled_log1p_rate=to_device(
+                self.pred_split_pooled_log1p_rate, device
+            ),
+            pred_del_logits=to_device(self.pred_del_logits, device),
+            pred_bfactor=to_device(self.pred_bfactor, device),
+            pred_plddt=to_device(self.pred_plddt, device),
         )
 
     def detach_clone(self, device: Optional[torch.device] = None) -> "ModelPrediction":
@@ -1798,13 +1911,17 @@ class ModelPrediction:
             device: If provided, move tensors to this device (e.g. 'cpu' for trajectories)
         """
         result = ModelPrediction(
-            pred_trans_1=self.pred_trans_1.detach().clone(),
-            pred_rotmats_1=self.pred_rotmats_1.detach().clone(),
-            pred_aatype_logits=self.pred_aatype_logits.detach().clone(),
-            pred_insertion_logits=self.pred_insertion_logits.detach().clone(),
-            pred_split_rate=self.pred_split_rate.detach().clone(),
-            pred_split_pooled_log1p_rate=self.pred_split_pooled_log1p_rate.detach().clone(),
-            pred_del_logits=self.pred_del_logits.detach().clone(),
+            pred_trans_1=clone_detach(self.pred_trans_1),
+            pred_rotmats_1=clone_detach(self.pred_rotmats_1),
+            pred_aatype_logits=clone_detach(self.pred_aatype_logits),
+            pred_insertion_logits=clone_detach(self.pred_insertion_logits),
+            pred_split_rate=clone_detach(self.pred_split_rate),
+            pred_split_pooled_log1p_rate=clone_detach(
+                self.pred_split_pooled_log1p_rate
+            ),
+            pred_del_logits=clone_detach(self.pred_del_logits),
+            pred_bfactor=clone_detach(self.pred_bfactor),
+            pred_plddt=clone_detach(self.pred_plddt),
         )
         if device is not None:
             return result.to(device)
@@ -1857,6 +1974,11 @@ class ProteinDataset(BaseDataset):
         rotmats_1 = feats[bp.rotmats_1]
         aatypes_1 = feats[bp.aatypes_1]
 
+        # conditioning + confidence
+        contact_conditioning = feats[bp.contact_conditioning]
+        res_bfactor = feats[bp.res_bfactor]
+        res_plddt = feats[bp.res_plddt]
+
         tree_plan = TreePlan.generate(motif_mask=motif_mask)
         tree_plan.validate()
 
@@ -1868,6 +1990,9 @@ class ProteinDataset(BaseDataset):
             trans_1=trans_1,
             rotmats_1=rotmats_1,
             aatypes_1=aatypes_1,
+            contact_conditioning=contact_conditioning,
+            res_bfactor=res_bfactor,
+            res_plddt=res_plddt,
         )
 
 
@@ -1903,6 +2028,11 @@ class ProteinDataLoader(DataLoader):
         trans_1 = torch.stack([item.trans_1 for item in batch])  # (B, N, 3)
         rotmats_1 = torch.stack([item.rotmats_1 for item in batch])  # (B, N, 3, 3)
         aatypes_1 = torch.stack([item.aatypes_1 for item in batch])  # (B, N)
+        contact_conditioning = torch.stack(
+            [item.contact_conditioning for item in batch]
+        )  # (B, N, N)
+        res_bfactor = torch.stack([item.res_bfactor for item in batch])  # (B, N)
+        res_plddt = torch.stack([item.res_plddt for item in batch])  # (B, N)
 
         return DataBatch(
             tree=tree,
@@ -1912,6 +2042,9 @@ class ProteinDataLoader(DataLoader):
             trans_1=trans_1,
             rotmats_1=rotmats_1,
             aatypes_1=aatypes_1,
+            contact_conditioning=contact_conditioning,
+            res_bfactor=res_bfactor,
+            res_plddt=res_plddt,
         )
 
 
@@ -2011,12 +2144,22 @@ class BranchFlowModel(nn.Module):
         self.aatype_pred = AminoAcidPredictionNet(cfg=self.cfg.aa_pred)
 
         # Insertion amino acid logits
-        self.insertion_logits_pred = AminoAcidPredictionNet(cfg=self.cfg.aa_pred)
+        self.insertion_logits_pred = nn.Sequential(
+            nn.Linear(self.node_dim + self.num_aatype_tokens * 2, self.node_dim),
+            nn.ReLU(),
+            nn.Linear(self.node_dim, self.num_aatype_tokens),
+        )
 
         # Insertions and deletions
         self.split_rate_pred = nn.Linear(self.node_dim, 1)
         self.split_pooled_log1p_rate_pred = nn.Linear(self.node_dim, 1)
         self.del_logits_pred = nn.Linear(self.node_dim, 1)
+
+        # Confidence prediction modules (from cogeneration)
+        if self.cfg.bfactor.enabled:
+            self.bfactor_net = BFactorModule(cfg=self.cfg.bfactor)
+        if self.cfg.plddt.enabled:
+            self.plddt_net = PLDDTModule(cfg=self.cfg.plddt)
 
     def forward(self, batch: DataCorrupted) -> ModelPrediction:
         B, P, _ = batch.trans_t.shape
@@ -2055,10 +2198,9 @@ class BranchFlowModel(nn.Module):
 
         input_feats = torch.cat(
             [
-                # Note: trans_t not included - edge embedding + pairformer + IPA handle structure
                 birth_time,  # (B, P, 1)
                 batch.motif_mask[:, :, None].float(),  # (B, P, 1)
-                batch.chain_idx[:, :, None].int(),  # (B, P, 1)
+                batch.chain_idx[:, :, None].float(),  # (B, P, 1)
                 time_embed,  # (B, P, time_embed_dim)
                 pos_embed,  # (B, P, pos_embed_dim)
                 aatypes_onehot,  # (B, P, 21)
@@ -2075,7 +2217,7 @@ class BranchFlowModel(nn.Module):
             edge_mask=edge_valid,
             diffuse_mask=~batch.motif_mask,
             chain_index=batch.chain_idx,
-            contact_conditioning=None,
+            contact_conditioning=batch.contact_conditioning,  # may be None
         )  # (B, P, P, edge_dim)
         edge_embed = edge_embed * edge_valid.unsqueeze(-1)
 
@@ -2146,20 +2288,25 @@ class BranchFlowModel(nn.Module):
             init_node_embed=init_node_embed,
             init_edge_embed=init_edge_embed,
         )  # (B, P, K)
+        pred_aatype_logits = pred_aatype_logits * valid.unsqueeze(-1).float()
 
         # Predict insertion amino acid logits
-        pred_insertion_logits, _ = self.insertion_logits_pred(
-            node_embed=node_embed,
-            aatypes_t=batch.aatypes_t,
-            edge_embed=edge_embed,
-            node_mask=valid,
-            edge_mask=edge_valid,
-            pred_rigids_nm=pred_rigids_nm,
-            diffuse_mask=~batch.motif_mask,
-            chain_index=batch.chain_idx,
-            init_node_embed=init_node_embed,
-            init_edge_embed=init_edge_embed,
+        pred_insertion_logits = self.insertion_logits_pred(
+            torch.cat(
+                [
+                    node_embed,  # (B, P, node_dim)
+                    # aatypes_t one-hot (B, P, K)
+                    F.one_hot(
+                        batch.aatypes_t.long().clamp(0, self.num_aatype_tokens - 1),
+                        num_classes=self.num_aatype_tokens,
+                    ).float(),
+                    # stopgrad pred logits (B, P, K)
+                    pred_aatype_logits.detach(),
+                ],
+                dim=-1,
+            )
         )  # (B, P, K)
+        pred_insertion_logits = pred_insertion_logits * valid.unsqueeze(-1).float()
 
         # Predict nonnegative remaining-splits rates (Poisson-like regression)
         split_rate = F.softplus(self.split_rate_pred(node_embed)).squeeze(-1)  # (B, P)
@@ -2176,6 +2323,15 @@ class BranchFlowModel(nn.Module):
         # Predict deletion logits
         del_logits = self.del_logits_pred(node_embed).squeeze(-1)  # (B, P)
 
+        # Confidence predictions
+        pred_bfactor = None
+        if self.cfg.bfactor.enabled:
+            pred_bfactor = self.bfactor_net(node_embed=node_embed)  # (B, P, num_bins)
+
+        pred_plddt = None
+        if self.cfg.plddt.enabled:
+            pred_plddt = self.plddt_net(node_embed=node_embed)  # (B, P, num_bins)
+
         return ModelPrediction(
             pred_trans_1=pred_trans_1,
             pred_rotmats_1=pred_rotmats_1,
@@ -2184,6 +2340,8 @@ class BranchFlowModel(nn.Module):
             pred_split_rate=split_rate,
             pred_split_pooled_log1p_rate=split_pooled_log1p_rate,
             pred_del_logits=del_logits,
+            pred_bfactor=pred_bfactor,
+            pred_plddt=pred_plddt,
         )
 
 
@@ -2761,13 +2919,6 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
 
         anchor_probs = tree.traverse_bottom_up(anchor_probs, combine_fn)
 
-        if self.cfg.noise_scale > 0:
-            uniform_dist = torch.ones(B, A, K, device=device) / K
-            noise_weight = min(self.cfg.noise_scale * 0.15, 0.2)
-            anchor_probs = (
-                1.0 - noise_weight
-            ) * anchor_probs + noise_weight * uniform_dist
-
         row_sums = anchor_probs.sum(dim=-1, keepdim=True)
         has_mass = row_sums > 1e-12
 
@@ -2778,7 +2929,18 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
             uniform_fallback,
         )
 
-        anchor_probs_flat = anchor_probs.view(-1, K)
+        # Mix noise into anchor_probs to sample anchor tokens
+        noisy_anchor_probs = anchor_probs
+        if self.cfg.noise_scale > 0:
+            noise_weight = min(self.cfg.noise_scale * 0.15, 0.2)
+            noisy_anchor_probs = (
+                1.0 - noise_weight
+            ) * noisy_anchor_probs + noise_weight * uniform_fallback
+            noisy_anchor_probs = noisy_anchor_probs / noisy_anchor_probs.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-12)
+
+        anchor_probs_flat = noisy_anchor_probs.view(-1, K)
         anchor_tokens = torch.multinomial(
             anchor_probs_flat,
             num_samples=1,
@@ -3375,18 +3537,25 @@ class TreeInterpolant:
         rotmats_1 = batch.rotmats_1.to(self.device)
         aatypes_1 = batch.aatypes_1.to(self.device)
         t = t.to(self.device)
-        if trans_0 is not None:
-            trans_0 = trans_0.to(self.device)
-        if aatypes_0 is not None:
-            aatypes_0 = aatypes_0.to(self.device)
-        if rotmats_0 is not None:
-            rotmats_0 = rotmats_0.to(self.device)
+        trans_0 = to_device(trans_0, self.device)
+        aatypes_0 = to_device(aatypes_0, self.device)
+        rotmats_0 = to_device(rotmats_0, self.device)
 
         res_mask = batch.tree.broadcast_to_leaves(
             x=batch.res_mask.to(self.device), fill_value=0
         )
         chain_idx = batch.tree.broadcast_to_leaves(
             x=batch.chain_idx.to(self.device), fill_value=0
+        )
+        res_bfactor = batch.tree.broadcast_to_leaves(
+            x=batch.res_bfactor.to(self.device), fill_value=0.0
+        )
+        res_plddt = batch.tree.broadcast_to_leaves(
+            x=batch.res_plddt.to(self.device), fill_value=0.0
+        )
+        # contact_conditioning: (B, N, N) -> (B, A, A); inserted positions inherit parent's value (always 0 for scaffolds)
+        contact_conditioning = batch.tree.broadcast_to_leaves(
+            x=batch.contact_conditioning.to(self.device), fill_value=0.0, is_2d=True
         )
 
         # Broadcast trans_1 in motifs to aligned space for motif guidance
@@ -3399,7 +3568,6 @@ class TreeInterpolant:
             x=rotmats_1,
             fill_value=identity,
         )
-        # Zero out non-motif positions (set to identity)
         rotmats_1_motifs = torch.where(
             tree.motif_mask.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3, 3),
             rotmats_1_motifs,
@@ -3451,6 +3619,9 @@ class TreeInterpolant:
             remaining_insertions=tree.remaining_insertions_t(t=t),
             deleted=tree.leaf_deleted,
             planar_position=tree.planar_position,
+            res_bfactor=res_bfactor,
+            res_plddt=res_plddt,
+            contact_conditioning=contact_conditioning,
         )
         bridged.validate()
 
@@ -3462,12 +3633,11 @@ class TreeInterpolant:
         return bridged, couplings
 
     def corrupt_batch(self, batch: DataBatch) -> Tuple[DataBridged, TreeCouplings]:
-        # pick a single time to share across the batch,
+        # pick a single time to share across the batch, biased slightly toward later times,
         # simply so they have a similar number of insertion/deletions to simulate
         # since corruption is run across the batch
-        shared_t = (
-            torch.rand(1, device=self.device) * (1.0 - 2.0 * self.min_t) + self.min_t
-        )
+        shared_t = torch.rand(1, device=self.device) ** 0.8
+        shared_t = shared_t.clamp(min=self.min_t, max=1.0 - self.min_t)
         t = torch.ones(batch.trans_1.shape[0], device=self.device) * shared_t  # (B,)
 
         return self.corrupt_to(batch=batch, t=t)
@@ -3599,6 +3769,20 @@ class TreeInterpolant:
             data.chain_idx.to(device), gather_idx, is_motif, fill_value=0
         )
 
+        # contact_conditioning: (B, N, N) -> (B, P_max, P_max), zeros for scaffolds
+        contact_conditioning = gather_and_pad(
+            data.contact_conditioning.to(device),
+            gather_idx,
+            is_motif,
+            fill_value=0.0,
+            is_2d=True,
+        )
+        # confident confidence!
+        res_plddt = gather_and_pad(
+            data.res_plddt.to(device), gather_idx, is_motif, fill_value=90.0
+        )
+        res_bfactor = None
+
         # Gather x1 values from data for motif positions (fill scaffolds with placeholder)
         trans_1_gathered = gather_and_pad(
             data.trans_1.to(device), gather_idx, is_motif, fill_value=0.0
@@ -3638,6 +3822,9 @@ class TreeInterpolant:
             aatypes_t=aatypes_0,
             trans_1_motifs=trans_1_gathered,
             rotmats_1_motifs=rotmats_1_gathered,
+            contact_conditioning=contact_conditioning,
+            res_bfactor=res_bfactor,
+            res_plddt=res_plddt,
         )
 
     @staticmethod
@@ -3887,11 +4074,17 @@ class BranchFlowLosses:
     trans_loss: torch.Tensor  # MSE on translations
     pairwise_loss: torch.Tensor  # local pairwise distance loss
     rot_vf_loss: torch.Tensor  # MSE on rotation vector field
-    base_seq_loss: torch.Tensor  # soft CE on amino acid logits vs anchor_probs
+    base_seq_loss: torch.Tensor  # base sequence loss (token + anchor-prob)
+    base_seq_prob_loss: torch.Tensor  # soft CE on amino acid logits vs anchor_probs
+    base_seq_token_loss: (
+        torch.Tensor
+    )  # CE on amino acid logits vs sampled anchor tokens
     insertion_seq_loss: torch.Tensor  # soft CE on insertion logits vs anchor_probs
     split_token_loss: torch.Tensor  # Poisson loss on per-token remaining splits
     split_pooled_loss: torch.Tensor  # aux Poisson loss on total remaining splits
     del_loss: torch.Tensor  # BCE on per-token logits (terminal tokens only)
+    bfactor_loss: torch.Tensor  # CE on binned b-factor predictions
+    plddt_loss: torch.Tensor  # CE on binned pLDDT predictions
 
 
 @dataclass
@@ -3906,6 +4099,14 @@ class BranchFlowLossCalculator:
         return 1 - torch.min(
             t, torch.tensor(self.cfg.t_normalize_clip, device=t.device)
         )
+
+    @staticmethod
+    def log_clamp(x: torch.Tensor, threshold: float = 5.0) -> torch.Tensor:
+        """
+        Soft clamp using log compression above threshold.
+        Preserves gradients above threshold but at diminishing scale: threshold + log(1 + excess)
+        """
+        return torch.where(x > threshold, threshold + torch.log1p(x - threshold), x)
 
     def _base_trans_loss(
         self,
@@ -3931,7 +4132,10 @@ class BranchFlowLossCalculator:
         denom = mask_f.sum(dim=(1, 2)).clamp_min(1.0) * 3  # (B,) * 3 for xyz coords
         loss_per_batch = mse.sum(dim=(1, 2)) / denom  # (B,)
 
-        return loss_per_batch.mean().clamp(max=5.0) * self.cfg.trans_loss_weight
+        return (
+            self.log_clamp(loss_per_batch.mean(), threshold=5.0)
+            * self.cfg.trans_loss_weight
+        )
 
     def _pairwise_distance_loss(
         self,
@@ -3970,7 +4174,10 @@ class BranchFlowLossCalculator:
         denom = pair_mask.float().sum(dim=(1, 2)).clamp_min(1.0)
         loss_per_batch = dist_error.sum(dim=(1, 2)) / denom
 
-        return loss_per_batch.mean().clamp(max=5.0) * self.cfg.pairwise_dist_loss_weight
+        return (
+            self.log_clamp(loss_per_batch.mean(), threshold=5.0)
+            * self.cfg.pairwise_dist_loss_weight
+        )
 
     def _rot_vf_loss(
         self,
@@ -4010,20 +4217,19 @@ class BranchFlowLossCalculator:
         denom = mask_f.sum(dim=(1, 2)).clamp_min(1.0) * 3  # (B,) * 3 for xyz coords
         loss_per_batch = mse.sum(dim=(1, 2)) / denom  # (B,)
 
-        return loss_per_batch.mean().clamp(max=5.0) * self.cfg.rot_vf_loss_weight
+        return (
+            self.log_clamp(loss_per_batch.mean(), threshold=5.0)
+            * self.cfg.rot_vf_loss_weight
+        )
 
-    def _seq_loss(
+    def _seq_token_loss(
         self,
         pred_aatype_logits: torch.Tensor,  # (B, P, K)
         target_anchor_tokens: torch.Tensor,  # (B, P) long
         t: torch.Tensor,  # (B,)
         mask: torch.Tensor,  # (B, P)
     ) -> torch.Tensor:
-        """Sequence loss: cross-entropy on amino acid logits vs anchor tokens.
-
-        Uses likelihood weighting (like cogeneration): divides CE by (1 - min(t, clip))
-        to emphasize predictions near t=1 where model should be most accurate.
-        """
+        """Sequence loss: cross-entropy on amino acid logits vs sampled anchor tokens."""
         B, P, K = pred_aatype_logits.shape
 
         # Time-based normalization for likelihood weighting (higher weight as t -> 1)
@@ -4038,8 +4244,8 @@ class BranchFlowLossCalculator:
             B, P
         )  # (B, P)
 
-        # Apply time normalization (likelihood weighting)
-        ce = ce / t_norm  # (B, P)
+        # Apply softened time normalization (likelihood weighting, half strength)
+        ce = ce / (2.0 * t_norm)  # (B, P)
 
         # Mask out unknown residues
         mask_f = mask.float()  # (B, P)
@@ -4049,7 +4255,52 @@ class BranchFlowLossCalculator:
         loss_per_batch = (ce * mask_f).sum(dim=1) / denom  # (B,)
         seq_loss = loss_per_batch.mean()
 
-        return seq_loss.clamp(max=5.0) * self.cfg.seq_loss_weight
+        return (
+            self.log_clamp(seq_loss, threshold=5.0)
+            * self.cfg.seq_loss_weight
+            * self.cfg.seq_token_loss_weight
+        )
+
+    def _seq_prob_loss(
+        self,
+        pred_aatype_logits: torch.Tensor,  # (B, P, K)
+        target_anchor_probs: torch.Tensor,  # (B, P, K)
+        t: torch.Tensor,  # (B,)
+        mask: torch.Tensor,  # (B, P)
+    ) -> torch.Tensor:
+        """Sequence loss: soft cross-entropy on amino acid logits vs anchor probability targets."""
+        B, P, K = pred_aatype_logits.shape
+
+        # Time-based normalization for likelihood weighting (higher weight as t -> 1)
+        t_norm = self._time_norm_scale(t=t).view(B, 1)  # (B, 1)
+
+        # Zero out mask token and renormalize target probs
+        target_probs_masked = target_anchor_probs.clone()
+        target_probs_masked[:, :, MASK_TOKEN_INDEX] = 0.0
+        row_sums = target_probs_masked.sum(dim=-1, keepdim=True)
+        has_mass = row_sums.squeeze(-1) > 1e-8  # (B, P)
+        target_probs_masked = target_probs_masked / row_sums.clamp_min(1e-8)
+
+        # Soft cross-entropy: -sum(target_probs * log_softmax(logits))
+        log_probs = F.log_softmax(pred_aatype_logits, dim=-1)  # (B, P, K)
+        ce_per_token = -(target_probs_masked * log_probs).sum(dim=-1)  # (B, P)
+
+        # Apply softened time normalization (likelihood weighting, half strength)
+        ce_per_token = ce_per_token / (2.0 * t_norm)  # (B, P)
+
+        # Mask out positions where target was mostly the mask token
+        is_mostly_mask = target_anchor_probs[:, :, MASK_TOKEN_INDEX] >= 0.75  # (B, P)
+        mask_f = mask.float() * (~is_mostly_mask).float() * has_mass.float()
+
+        denom = mask_f.sum(dim=1).clamp_min(1.0)  # (B,)
+        loss_per_batch = (ce_per_token * mask_f).sum(dim=1) / denom  # (B,)
+        seq_loss = loss_per_batch.mean()
+
+        return (
+            self.log_clamp(seq_loss, threshold=5.0)
+            * self.cfg.seq_loss_weight
+            * self.cfg.seq_prob_loss_weight
+        )
 
     def _insertion_seq_loss(
         self,
@@ -4082,7 +4333,9 @@ class BranchFlowLossCalculator:
         denom = mask_f.sum().clamp_min(1.0)
         insertion_loss = (ce_per_token * mask_f).sum() / denom
 
-        return insertion_loss.clamp(max=5.0) * self.cfg.seq_ins_loss_weight
+        return (
+            self.log_clamp(insertion_loss, threshold=5.0) * self.cfg.seq_ins_loss_weight
+        )
 
     def _split_token_loss(
         self,
@@ -4129,7 +4382,7 @@ class BranchFlowLossCalculator:
         ).mean()
 
         split_loss = scaffold_loss + motif_weight * motif_loss
-        return split_loss.clamp(max=3.0) * self.cfg.split_loss_weight
+        return self.log_clamp(split_loss, threshold=3.0) * self.cfg.split_loss_weight
 
     def _split_pooled_loss(
         self,
@@ -4142,7 +4395,10 @@ class BranchFlowLossCalculator:
             pred.pred_split_pooled_log1p_rate
         )  # (B,) model predicts in log1p space
         pooled_loss = F.mse_loss(pred_log1p, target_log)
-        return pooled_loss.clamp(max=3.0) * self.cfg.split_pooled_loss_weight
+        return (
+            self.log_clamp(pooled_loss, threshold=3.0)
+            * self.cfg.split_pooled_loss_weight
+        )
 
     def _deletion_loss(
         self,
@@ -4182,7 +4438,112 @@ class BranchFlowLossCalculator:
 
         del_loss = scaffold_loss + motif_weight * motif_loss
 
-        return del_loss.clamp(max=3.0) * self.cfg.del_loss_weight
+        return self.log_clamp(del_loss, threshold=3.0) * self.cfg.del_loss_weight
+
+    def _bfactor_loss(
+        self,
+        pred: ModelPrediction,
+        batch: DataCorrupted,
+        mask: torch.Tensor,  # (B, P)
+    ) -> torch.Tensor:
+        """
+        Cross-entropy loss on b-factor histograms, adapted from cogeneration.
+        B-factor prediction is optional, and invalid when all b-factors are zero
+        (e.g. as in synthetic examples or predicted structures).
+        """
+        pred_logits = pred.pred_bfactor  # (B, P, num_bins) or None
+        if pred_logits is None or batch.res_bfactor is None:
+            return torch.tensor(0.0, device=batch.trans_t.device)
+
+        bins = pred_logits.shape[-1]
+        gt_bfactor = batch.res_bfactor  # (B, P)
+        boundaries = torch.linspace(0.0, 100.0, bins - 1, device=gt_bfactor.device)
+
+        # Discretise ground-truth b-factors
+        bin_idx = (gt_bfactor.unsqueeze(-1) > boundaries).sum(-1).long()  # (B, P)
+        target_logits = F.one_hot(bin_idx, num_classes=bins).float()
+
+        # Mask out synthetic examples (all-zero b-factors) + padding + motifs
+        valid_mask = (gt_bfactor > 1e-5) & mask & ~batch.motif_mask  # (B, P)
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=batch.trans_t.device)
+
+        # Cross-entropy
+        logp = F.log_softmax(pred_logits.float(), dim=-1)
+        ce = -(target_logits * logp).sum(-1)  # (B, P)
+        loss = (ce * valid_mask.float()).sum() / (valid_mask.sum().float() + 1e-5)
+
+        return self.log_clamp(loss, threshold=3.0) * self.cfg.bfactor_loss_weight
+
+    def _plddt_loss(
+        self,
+        pred: ModelPrediction,
+        batch: DataCorrupted,
+        target_trans: torch.Tensor,  # (B, P, 3) anchor positions
+        mask: torch.Tensor,  # (B, P)
+        dist_cutoff: float = 15.0,
+    ) -> torch.Tensor:
+        """
+        Cross-entropy on per-token lDDT bins (pLDDT).
+        Uses current predicted coords vs. anchor coords to compute lDDT.
+        """
+        plddt_logits = pred.pred_plddt  # (B, P, num_bins) or None
+        if plddt_logits is None:
+            return torch.tensor(0.0, device=batch.trans_t.device)
+
+        num_bins = plddt_logits.shape[-1]
+        pred_trans = pred.pred_trans_1  # (B, P, 3)
+
+        # Compute pairwise distances (B, P, P)
+        pred_dists = torch.cdist(pred_trans, pred_trans)
+        true_dists = torch.cdist(target_trans, target_trans)
+
+        # Mask: only consider valid residues excluding motifs, exclude self-pairs
+        loss_mask = mask & ~batch.motif_mask  # (B, P)
+        pair_mask = loss_mask.unsqueeze(2) & loss_mask.unsqueeze(1)  # (B, P, P)
+        eye = torch.eye(
+            pred_dists.size(1), device=pred_dists.device, dtype=torch.bool
+        ).unsqueeze(0)
+        pair_mask = pair_mask & ~eye
+
+        # Pairs that are "local neighbours" in the reference structure
+        neighbors = (true_dists < dist_cutoff) & pair_mask  # (B, P, P)
+
+        # Diff in distance between pred and true for every pair
+        diff = (pred_dists - true_dists).abs().unsqueeze(-1)  # (B, P, P, 1)
+
+        # Four tolerance levels, as defined by lDDT
+        cuts = torch.tensor(
+            [0.5, 1.0, 2.0, 4.0], device=diff.device, dtype=diff.dtype
+        ).view(1, 1, 1, 4)
+
+        # Pass/fail at each tolerance
+        in_proximity = (diff < cuts) & neighbors.unsqueeze(-1)  # (B, P, P, 4)
+
+        # Per-residue counts
+        in_proximity_counts = in_proximity.float().sum((2, 3))  # (B, P)
+        pair_count = neighbors.float().sum(2)  # (B, P)
+
+        target_lddt_score = in_proximity_counts / (
+            pair_count.clamp_min(1.0) * 4.0
+        )  # (B, P)
+        lddt_mask = (pair_count > 0).float()  # (B, P)
+
+        # Discretise into bins
+        target_lddt_bins = torch.clamp(
+            (target_lddt_score * num_bins).long(), max=num_bins - 1
+        )
+        target_logits = F.one_hot(target_lddt_bins, num_classes=num_bins).float()
+
+        # Cross-entropy of bin logits
+        logp = F.log_softmax(plddt_logits.float(), dim=-1)  # (B, P, num_bins)
+        ce = -(target_logits * logp).sum(-1)  # (B, P)
+        loss = (ce * loss_mask.float() * lddt_mask).sum() / (
+            (loss_mask.float() * lddt_mask).sum() + 1e-5
+        )
+        loss = torch.nan_to_num(loss, nan=0.0)
+
+        return self.log_clamp(loss, threshold=3.0) * self.cfg.plddt_loss_weight
 
     def calculate(
         self,
@@ -4263,13 +4624,22 @@ class BranchFlowLossCalculator:
             mask=valid_mask,
         )
 
-        # Base sequence loss (hard CE against sampled anchor tokens)
-        base_seq_loss = self._seq_loss(
+        # Base sequence losses:
+        # - token CE against sampled anchor tokens
+        # - soft CE against anchor probability targets
+        base_seq_token_loss = self._seq_token_loss(
             pred_aatype_logits=pred.pred_aatype_logits,
             target_anchor_tokens=aatype_anchors_pack,
             t=batch.t,
             mask=valid_mask,
         )
+        base_seq_prob_loss = self._seq_prob_loss(
+            pred_aatype_logits=pred.pred_aatype_logits,
+            target_anchor_probs=aatype_anchor_probs_pack,
+            t=batch.t,
+            mask=valid_mask,
+        )
+        base_seq_loss = base_seq_token_loss + base_seq_prob_loss
 
         # Insertion sequence loss
         # (soft CE against anchor_probs, only where future insertions exist)
@@ -4296,6 +4666,19 @@ class BranchFlowLossCalculator:
             motif_mask=batch.motif_mask,
         )
 
+        # Confidence prediction losses
+        bfactor_loss = self._bfactor_loss(
+            pred=pred,
+            batch=batch,
+            mask=valid_mask,
+        )
+        plddt_loss = self._plddt_loss(
+            pred=pred,
+            batch=batch,
+            target_trans=trans_anchors_pack,
+            mask=valid_mask,
+        )
+
         total_loss = (
             trans_loss
             + rot_vf_loss
@@ -4305,6 +4688,8 @@ class BranchFlowLossCalculator:
             + split_token_loss
             + split_pooled_loss
             + del_loss
+            + bfactor_loss
+            + plddt_loss
         )
 
         return BranchFlowLosses(
@@ -4313,10 +4698,14 @@ class BranchFlowLossCalculator:
             pairwise_loss=pairwise_loss,
             rot_vf_loss=rot_vf_loss,
             base_seq_loss=base_seq_loss,
+            base_seq_prob_loss=base_seq_prob_loss,
+            base_seq_token_loss=base_seq_token_loss,
             insertion_seq_loss=insertion_seq_loss,
             split_token_loss=split_token_loss,
             split_pooled_loss=split_pooled_loss,
             del_loss=del_loss,
+            bfactor_loss=bfactor_loss,
+            plddt_loss=plddt_loss,
         )
 
 
@@ -4912,6 +5301,55 @@ class BranchFlowModule(pl.LightningModule):
         self.loss_calculator = BranchFlowLossCalculator(cfg=self.cfg.loss)
         self.interpolant = TreeInterpolant(cfg=self.cfg.interpolant)
 
+    def load_cogeneration_weights(self, ckpt_path: str):
+        """
+        Load compatible weights from a cogeneration checkpoint.
+        Copies specified modules if shapes match. Fails on shape mismatch.
+        """
+        print(f"⚡️ Loading cogeneration weights from: {ckpt_path}")
+
+        cogen_state = torch.load(ckpt_path, map_location="cpu", weights_only=False)[
+            "state_dict"
+        ]
+        varco_state = self.state_dict()
+
+        # Modules to copy: cogen prefix -> varco prefix(es)
+        module_map = {
+            "model.esm_combiner.": "model.esm_combiner.",
+            "model.edge_feature_net.": "model.edge_feature_net.",
+            "model.trunk.": "model.trunk.",
+            "model.ipa_trunk.": "model.ipa_trunk.",
+            "model.seq_trunk.": "model.seq_trunk.",
+            "model.aa_pred_net.": "model.aatype_pred.",
+            "model.bfactor_net.": "model.bfactor_net.",
+            "model.plddt_net.": "model.plddt_net.",
+        }
+
+        mapped = {}
+        for cogen_key, value in cogen_state.items():
+            # Skip frozen ESM (loaded separately)
+            if ".esm_combiner.esm." in cogen_key:
+                continue
+            for cogen_prefix, varco_prefix in module_map.items():
+                if cogen_key.startswith(cogen_prefix):
+                    suffix = cogen_key[len(cogen_prefix) :]
+                    targets = (
+                        [varco_prefix]
+                        if isinstance(varco_prefix, str)
+                        else varco_prefix
+                    )
+                    for t in targets:
+                        varco_key = t + suffix
+                        if varco_key in varco_state:
+                            if varco_state[varco_key].shape != value.shape:
+                                raise ValueError(
+                                    f"Shape mismatch: {cogen_key} {value.shape} vs {varco_key} {varco_state[varco_key].shape}"
+                                )
+                            mapped[varco_key] = value
+                    break
+
+        self.load_state_dict(mapped, strict=False)
+
     def configure_optimizers(self) -> torch.optim.Optimizer:
         return torch.optim.AdamW(
             params=self.model.parameters(),
@@ -4950,15 +5388,34 @@ class BranchFlowModule(pl.LightningModule):
         )
         loss_time = time.perf_counter() - loss_start
 
+        # bin t value (bucketed into 0.0-0.2, 0.2-0.4, ..., 0.8-1.0)
+        mean_t = bridged.t.mean().detach().item()
+        t_bin_idx = min(
+            int(mean_t * 5), 4
+        )  # 0-4 for bins [0.0-0.2), [0.2-0.4), ..., [0.8-1.0]
+        t_bin_start = t_bin_idx * 0.2
+        t_bin_end = t_bin_start + 0.2
+        t_bin_key = f"{t_bin_start:.1f}-{t_bin_end:.1f}"
+
+        # losses
         self.log("L/train", loss.total_loss, prog_bar=True)
         self.log("L/trans", loss.trans_loss, prog_bar=True)
         self.log("L/rot", loss.rot_vf_loss, prog_bar=True)
         self.log("L/cdist", loss.pairwise_loss)
         self.log("L/seq", loss.base_seq_loss, prog_bar=True)
+        self.log("L/seq_prob", loss.base_seq_prob_loss)
+        self.log("L/seq_tok", loss.base_seq_token_loss)
         self.log("L/seq_ins", loss.insertion_seq_loss)
         self.log("L/split", loss.split_token_loss, prog_bar=True)
         self.log("L/split_pooled", loss.split_pooled_loss)
         self.log("L/del", loss.del_loss, prog_bar=True)
+        self.log("L/bfactor", loss.bfactor_loss)
+        self.log("L/plddt", loss.plddt_loss)
+
+        # t-stratified losses for primary losses
+        self.log(f"L_t/trans_t{t_bin_key}", loss.trans_loss, prog_bar=False)
+        self.log(f"L_t/rot_t{t_bin_key}", loss.rot_vf_loss, prog_bar=False)
+        self.log(f"L_t/seq_t{t_bin_key}", loss.base_seq_loss, prog_bar=False)
 
         # Timing statistics
         batch_size = corrupted.trans_t.shape[0]
@@ -4968,19 +5425,12 @@ class BranchFlowModule(pl.LightningModule):
         if batch_idx > 3:
             self.log("t/forward", forward_time * 1000)
             self.log("t/loss", loss_time * 1000)
-        # Corruption time as function of batch size
+        # Corruption time as function of batch size / t
         self.log(
             "t/corrupt_ms_per_batch", corrupt_time * 1000 / batch_size, prog_bar=False
         )
-        # Corruption time as function of t value (bucketed into 0.0-0.2, 0.2-0.4, ..., 0.8-1.0)
-        mean_t = bridged.t.mean().detach().item()
-        t_bin_idx = min(
-            int(mean_t * 5), 4
-        )  # 0-4 for bins [0.0-0.2), [0.2-0.4), ..., [0.8-1.0]
-        t_bin_start = t_bin_idx * 0.2
-        t_bin_end = t_bin_start + 0.2
         self.log(
-            f"t/corrupt_ms_t{t_bin_start:.1f}-{t_bin_end:.1f}",
+            f"t/corrupt_ms_t{t_bin_key}",
             corrupt_time * 1000,
             prog_bar=False,
         )
@@ -5056,6 +5506,11 @@ class Experiment:
         )
 
         self.module = BranchFlowModule(cfg=self.cfg)
+
+        # Load cogeneration weights if specified
+        if self.cfg.experiment.cogen_ckpt_path:
+            self.module.load_cogeneration_weights(self.cfg.experiment.cogen_ckpt_path)
+
         self.logger.info("\n" + str(ModelSummary(self.module, max_depth=2)))
 
     def debug(self, n: int = 10):
@@ -5154,7 +5609,7 @@ def main(cfg: VarcoConfig):
 
     experiment = Experiment(cfg=cfg)
     experiment.setup()
-    # experiment.debug(n=1)
+    experiment.debug(n=1)
     experiment.train()
 
 

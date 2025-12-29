@@ -16,17 +16,20 @@ from cogeneration.config.base import (
     BaseClassConfig,
     DataConfig,
     DatasetConfig,
+    DatasetContactConditioningConfig,
     ExperimentConfig,
     ExperimentWandbConfig,
     ModelAAPredConfig,
     ModelAttentionConfig,
     ModelAttentionTrunkConfig,
+    ModelBFactorConfig,
     ModelContactConditioningConfig,
     ModelEdgeFeaturesConfig,
     ModelESMCombinerConfig,
     ModelESMKey,
     ModelHyperParamsConfig,
     ModelIPAConfig,
+    ModelPLDDTConfig,
     SharedConfig,
 )
 from cogeneration.type.str_enum import StrEnum
@@ -34,12 +37,20 @@ from cogeneration.type.str_enum import StrEnum
 
 @dataclass
 class VarcoDatasetConfig(DatasetConfig):
-    # debug_head_samples: int = 1000
+    # debug_head_samples: int = 1000  # faster startup
     enable_cogeneration_pdb: bool = True
     enable_cogeneration_afdb: bool = True
     enable_cogeneration_redesigns: bool = False
     enable_multiflow_redesigned: bool = False
     enable_multiflow_synthetic: bool = False
+
+    contact_conditioning: DatasetContactConditioningConfig = field(
+        default_factory=lambda: DatasetContactConditioningConfig(
+            conditioning_prob_disabled=0.5,
+            conditioning_prob_motif_only=1.0,
+            dist_noise_ang=0.25,
+        )
+    )
 
 
 class VarcoMotifGuidanceType(StrEnum):
@@ -148,10 +159,14 @@ class VarcoLossConfig(BaseClassConfig):
     pairwise_dist_loss_weight: float = 0.2
     rot_vf_loss_weight: float = 1.0
     seq_loss_weight: float = 1.0
+    seq_prob_loss_weight: float = 1.0
+    seq_token_loss_weight: float = 0.5
     seq_ins_loss_weight: float = 0.2
     split_loss_weight: float = 0.2
     split_pooled_loss_weight: float = 0.05
     del_loss_weight: float = 0.2
+    bfactor_loss_weight: float = 0.02
+    plddt_loss_weight: float = 0.02
 
 
 @dataclass
@@ -164,8 +179,12 @@ class VarcoExperimentWandbConfig(ExperimentWandbConfig):
     project: str = "varco"
 
 
+@dataclass
 class VarcoExperimentConfig(ExperimentConfig):
     wandb: ExperimentWandbConfig = field(default_factory=VarcoExperimentWandbConfig)
+
+    # Path to cogeneration checkpoint to load compatible weights from
+    cogen_ckpt_path: Optional[str] = None
 
 
 @dataclass
@@ -177,7 +196,7 @@ class VarcoModelConfig(BaseClassConfig):
             embed_chain=True,
             embed_diffuse_mask=True,  # motif mask
             contact_conditioning=ModelContactConditioningConfig(
-                enabled=False,
+                enabled=True,
             ),
         )
     )
@@ -209,6 +228,8 @@ class VarcoModelConfig(BaseClassConfig):
     )
     # aa_pred config used for base and insertion logits
     aa_pred: ModelAAPredConfig = field(default_factory=ModelAAPredConfig)
+    bfactor: ModelBFactorConfig = field(default_factory=ModelBFactorConfig)
+    plddt: ModelPLDDTConfig = field(default_factory=ModelPLDDTConfig)
 
 
 @dataclass
