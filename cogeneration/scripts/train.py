@@ -166,7 +166,7 @@ class Experiment:
             # write locally
             ckpt_dir = self.cfg.experiment.checkpointer.dirpath
             log.info(
-                f"Checkpoints, config, validations etc. will be saved to: {ckpt_dir}"
+                f"💾 Checkpoints, config, validations etc. will be saved to: {ckpt_dir}"
             )
             os.makedirs(ckpt_dir, exist_ok=True)
             cfg_path = os.path.join(ckpt_dir, "config.yaml")

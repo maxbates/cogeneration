@@ -33,8 +33,18 @@ class ContactConditioning(nn.Module):
         edge_embed: torch.Tensor,  # (B, N, N, c_p)
         contact: Optional[torch.Tensor],  # (B, N, N)
     ) -> torch.Tensor:
-        if not self.cfg.enabled or contact is None:
+        if not self.cfg.enabled:
             return edge_embed
+        if contact is None or not torch.any(contact > 0):
+            # Keep a graph connection to this module's params so DDP doesn't treat them as unused
+            # on batches without contact constraints.
+            dummy = 0.0 * (
+                self.encoder.weight.sum()
+                + self.encoder.bias.sum()
+                + self.layer_norm.weight.sum()
+                + self.layer_norm.bias.sum()
+            )
+            return edge_embed + dummy
 
         # normalize distances to [0, 1]
         contacts_norm = (contact - self.cfg.dist_min) / (

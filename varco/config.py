@@ -60,6 +60,22 @@ class VarcoMotifGuidanceType(StrEnum):
     linear_decay = "linear_decay"
 
 
+class VarcoHazardKind(StrEnum):
+    """Time-bias hazard CDF family for counting-process events."""
+
+    uniform = "uniform"
+    late_power = "late_power"
+    early_power = "early_power"
+
+
+@dataclass
+class VarcoHazardConfig(BaseClassConfig):
+    """Hazard CDF H(t) specified as a simple closed-form family on [0, 1]."""
+
+    kind: VarcoHazardKind = VarcoHazardKind.uniform
+    power: int = 1
+
+
 @dataclass
 class VarcoInterpolantMotifGuidanceConfig(BaseClassConfig):
     """Configuration for motif position guidance during sampling."""
@@ -78,23 +94,33 @@ class VarcoInterpolantMotifGuidanceConfig(BaseClassConfig):
 
 
 @dataclass
-class VarcoInterpolantTransCouplerConfig(BaseClassConfig):
-    """Configuration for translation coupler (Brownian bridge)."""
+class VarcoInterpolantCouplerConfig(BaseClassConfig):
+    """Shared base configuration for interpolant couplers."""
 
-    # Sigma for Brownian bridge (0 for deterministic bridges)
-    sigma: float = 1.0
+    # Sigma for stochastic bridge noise (0 for deterministic)
+    noise_scale: float = 1.0
+    # Noise is forced to 0 for t >= noise_end_t in sampling steps.
+    noise_end_t: float = 0.95
 
 
 @dataclass
-class VarcoInterpolantAATypesCouplerConfig(BaseClassConfig):
+class VarcoInterpolantTransCouplerConfig(VarcoInterpolantCouplerConfig):
+    """Configuration for translation coupler (Brownian bridge)."""
+
+    # Cap per-residue translation drift step (angstroms) during sampling.
+    drift_step_cap_ang: float = 5.0
+
+
+@dataclass
+class VarcoInterpolantAATypesCouplerConfig(VarcoInterpolantCouplerConfig):
     """Configuration for amino acid types coupler (CTMC bridge)."""
 
-    # Scale for uniform noise added to step probabilities
-    noise_scale: float = 1.0
     # Total leaving rate for the CTMC
     beta: float = 3.0
     # Temperature for softmax in euler_step (lower = sharper)
     drift_temp: float = 1.0
+    # Cap for the 1/(1-t) drift gain used in sampling.
+    drift_gain_cap: float = 50.0
     # Exponent for uncertainty gating
     uncertainty_sharpness: float = 1.0
     # Maximum total off-diagonal probability per step
@@ -102,14 +128,14 @@ class VarcoInterpolantAATypesCouplerConfig(BaseClassConfig):
 
 
 @dataclass
-class VarcoInterpolantRotationCouplerConfig(BaseClassConfig):
+class VarcoInterpolantRotationCouplerConfig(VarcoInterpolantCouplerConfig):
     """Configuration for rotation coupler (SO(3) geodesic bridge with IGSO3 noise)."""
 
-    # Sigma for stochastic bridge noise (0 for deterministic geodesic interpolation)
-    sigma: float = 1.0
     # IGSO3 sigma range for sampling
     igso3_sigma_min: float = 1e-4
     igso3_sigma_max: float = 1.5
+    # Cap per-residue rotation drift step (radians) during sampling.
+    drift_step_cap_rad: float = math.pi / 3
     # Exponential schedule rate (higher = faster settling)
     exp_rate: float = 1.5
 
@@ -121,6 +147,18 @@ class VarcoInterpolantSamplingConfig(BaseClassConfig):
     # Maximum sequence length during sampling (to prevent GPU OOM)
     # If exceeded, further insertions are blocked
     max_length: int = 512
+    # Hazard distributions controlling insertion (split) and deletion time bias during sampling.
+    # Defaults match TreePlan.generate() defaults: splits early (Beta(1,2)), deletions late (Beta(2,1)).
+    split_hazard: VarcoHazardConfig = field(
+        default_factory=lambda: VarcoHazardConfig(
+            kind=VarcoHazardKind.early_power, power=2
+        )
+    )
+    delete_hazard: VarcoHazardConfig = field(
+        default_factory=lambda: VarcoHazardConfig(
+            kind=VarcoHazardKind.late_power, power=2
+        )
+    )
 
 
 @dataclass
@@ -154,6 +192,7 @@ class VarcoLossConfig(BaseClassConfig):
     t_normalize_clip: float = 0.9
     # Local pairwise distance threshold (angstroms)
     proximity_threshold_ang: float = 7.0
+
     # Loss weights
     trans_loss_weight: float = 2.0
     pairwise_dist_loss_weight: float = 0.2
@@ -169,9 +208,29 @@ class VarcoLossConfig(BaseClassConfig):
     plddt_loss_weight: float = 0.02
 
 
+class VarcoPlotColorBy(StrEnum):
+    auto = "auto"
+    position = "position"
+    sequence = "sequence"
+
+
+@dataclass
+class VarcoInferencePlotConfig(BaseClassConfig):
+    enabled: bool = True
+    max_frames: Optional[int] = 50
+    max_samples: int = 2
+    max_cols: int = 2
+    only_alpha_carbons: bool = True
+    show_residue_letters: bool = True
+    color_by: VarcoPlotColorBy = VarcoPlotColorBy.auto
+
+
 @dataclass
 class VarcoInferenceConfig(BaseClassConfig):
     predict_dir: str = "varco/outputs/${shared.id}"
+    ckpt_path: Optional[str] = None
+    inference_subdir: str = "predict"
+    plot: VarcoInferencePlotConfig = field(default_factory=VarcoInferencePlotConfig)
 
 
 @dataclass
@@ -183,8 +242,11 @@ class VarcoExperimentWandbConfig(ExperimentWandbConfig):
 class VarcoExperimentConfig(ExperimentConfig):
     wandb: ExperimentWandbConfig = field(default_factory=VarcoExperimentWandbConfig)
 
-    # Path to cogeneration checkpoint to load compatible weights from
+    # Path to warm start with cogeneration checkpoint (must be compatible shape)
     cogen_ckpt_path: Optional[str] = None
+
+    # Exponential moving average coefficient for `L/train_ema` (higher -> smoother)
+    train_loss_ema_beta: float = 0.98
 
 
 @dataclass

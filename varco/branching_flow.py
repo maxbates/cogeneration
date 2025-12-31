@@ -15,9 +15,8 @@ Then, a sampler (no tree) iterates to get base (endpoint prediction), sample spl
 
 TODOs / features:
 - break up this file
+- add folding validation? or at least run boltz and get plddt?
 - ideally we could share loss calculator with cogeneration, e.g. using static methods
-- visualize samping - show sample / model pred side by side
-- add validation loss (e.g. folding validation?)
 - support aatypes guidance potential, support particle-free ESM potential
 """
 
@@ -31,7 +30,9 @@ import tempfile
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import (
+    Any,
     Callable,
     Dict,
     Generic,
@@ -58,7 +59,7 @@ from pytorch_lightning.loggers.wandb import WandbLogger
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.utilities.model_summary import ModelSummary
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import BatchSampler, DataLoader, Dataset
 from tqdm import tqdm
 
 from cogeneration.config.base import Config, DataConfig
@@ -76,6 +77,7 @@ from cogeneration.data.noise_mask import (
     uniform_categorical,
     uniform_so3,
 )
+from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.data.residue_constants import (
     restype_order_with_x,
     restypes,
@@ -94,6 +96,7 @@ from cogeneration.models.bfactors import BFactorModule
 from cogeneration.models.confidence import PLDDTModule
 from cogeneration.models.edge_feature_net import EdgeFeatureNet
 from cogeneration.models.embed import get_index_embedding, get_time_embedding
+from cogeneration.models.esm_ckpt_loading import plan_esm_warm_start_state_dict_load
 from cogeneration.models.esm_combiner import ESMCombinerNetwork
 from cogeneration.models.utils import get_model_size_str
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
@@ -104,6 +107,8 @@ from cogeneration.util.log import rank_zero_logger
 from varco.config import (
     VarcoConfig,
     VarcoDatasetConfig,
+    VarcoHazardConfig,
+    VarcoHazardKind,
     VarcoInterpolantAATypesCouplerConfig,
     VarcoInterpolantConfig,
     VarcoInterpolantRotationCouplerConfig,
@@ -112,6 +117,8 @@ from varco.config import (
     VarcoModelConfig,
     VarcoMotifGuidanceType,
 )
+
+logger = rank_zero_logger("BranchingFlow")
 
 """ Data Flow """
 
@@ -1185,7 +1192,7 @@ class TreePlan:
         fig.savefig(path)
         plt.close(fig)
 
-        print(f"💾 Saved tree plan to {path}")
+        logger.info(f"💾 Saved tree plan to {path}")
         return path
 
 
@@ -1966,12 +1973,14 @@ class ProteinDataset(BaseDataset):
     def __init__(
         self,
         cfg: VarcoDatasetConfig,
+        eval: bool = False,
+        use_test: bool = False,
     ):
         super().__init__(
             cfg=cfg,
             task=DataTask.inpainting,
-            eval=False,
-            use_test=False,
+            eval=eval,
+            use_test=use_test,
         )
 
     def __getitem__(self, idx) -> DataSample:
@@ -2018,6 +2027,10 @@ class ProteinDataLoader(DataLoader):
         num_workers: int = max(1, os.cpu_count() - 2),
         **kwargs,
     ):
+        # force custom collate_fn
+        if "collate_fn" in kwargs:
+            del kwargs["collate_fn"]
+
         super().__init__(
             dataset,
             batch_size=batch_size,
@@ -2498,6 +2511,36 @@ class Coupler(ABC, Generic[CouplingT]):
 
         return tree.traverse_bottom_up(anchors, combine_fn)
 
+    @staticmethod
+    def _compute_sigma_t(
+        t: torch.Tensor,  # (B,)
+        scale: torch.Tensor,  # (B,) per-domain scale
+        min_sigma: float = 0.0,
+        noise_end_t: float = 0.95,
+    ) -> torch.Tensor:
+        """
+        Compute the instantaneous standard deviation of the noise at time t.
+
+        Uses a sqrt-parabolic schedule with boundary conditions sigma(0)=sigma(1)=min_sigma:
+            sigma(t) = sqrt(scale^2 * t * (1 - t) + min_sigma^2)
+
+        Additionally, to make the final sampling steps noise-free, time is warped so that
+        sigma(t) becomes 0 (up to min_sigma) for t >= noise_end_t.
+        """
+        if t.ndim != 1:
+            raise ValueError(f"Expected t to have shape (B,); got {tuple(t.shape)}")
+        if scale.shape != t.shape:
+            raise ValueError(
+                f"Expected scale to have shape (B,); got {tuple(scale.shape)} vs {tuple(t.shape)}"
+            )
+        if not (0.0 < float(noise_end_t) <= 1.0):
+            raise ValueError(f"Expected noise_end_t in (0, 1]; got {noise_end_t}")
+
+        t_eff = (t / float(noise_end_t)).clamp(0.0, 1.0)
+        return torch.sqrt(
+            scale.square() * t_eff * (1.0 - t_eff) + float(min_sigma) ** 2
+        )
+
     def bridge_step(
         self,
         coupling: CouplingT,
@@ -2733,13 +2776,13 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
         u = ((flat_s - flat_t0) / denom).clamp(0.0, 1.0)
         mean = flat_start + u.unsqueeze(-1) * (flat_end - flat_start)
 
-        if self.cfg.sigma == 0.0:
+        if self.cfg.noise_scale == 0.0:
             return mean.view(original_shape)
 
         var = (
             (flat_s - flat_t0).clamp_min(0.0) * (1.0 - flat_s).clamp_min(0.0) / denom
         ).clamp_min(0.0)
-        std = (var.sqrt() * self.cfg.sigma).to(mean.dtype)
+        std = (var.sqrt() * self.cfg.noise_scale).to(mean.dtype)
         eps = torch.randn_like(mean)
         return (mean + std.unsqueeze(-1) * eps).view(original_shape)
 
@@ -2808,11 +2851,26 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
         if potential is not None:
             v = v + potential
 
-        x_next = x_t + v * float(dt)
+        # cap drift jump
+        drift_step = v * float(dt)
+        if float(self.cfg.drift_step_cap_ang) > 0.0:
+            cap = float(self.cfg.drift_step_cap_ang)
+            step_norm = drift_step.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            drift_step = drift_step * (cap / step_norm).clamp(max=1.0)
 
-        if float(self.cfg.sigma) > 0.0 and float(dt) > 0.0:
+        x_next = x_t + drift_step
+
+        # add brownian noise
+        if float(self.cfg.noise_scale) > 0.0 and float(dt) > 0.0:
+            scale = torch.full_like(t, float(self.cfg.noise_scale))
+            sigma_t = self._compute_sigma_t(
+                t=t,
+                scale=scale,
+                min_sigma=0.0,
+                noise_end_t=float(self.cfg.noise_end_t),
+            ).to(dtype=x_next.dtype, device=x_next.device)
             x_next = x_next + torch.randn_like(x_next) * (
-                float(self.cfg.sigma) * math.sqrt(float(dt))
+                sigma_t.view(B, 1, 1) * math.sqrt(float(dt))
             )
 
         return x_next * valid_fmask + x_t * (1.0 - valid_fmask)
@@ -3168,8 +3226,10 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
 
         # Drift gain: 1 / (1 - t), clamped
         t_clamped = t.clamp(0.0, 0.99)
-        drift_gain = 1.0 / (1.0 - t_clamped + 1e-4)
-        drift_gain = drift_gain.clamp(max=100.0).view(B, 1, 1)  # (B, 1, 1)
+        drift_gain = 1.0 / (1.0 - t_clamped)
+        drift_gain = drift_gain.clamp(max=float(self.cfg.drift_gain_cap)).view(
+            B, 1, 1
+        )  # (B, 1, 1)
 
         # Compute off-diagonal drift mass
         step_probs = dt * drift_gain * probs * uncertainty.unsqueeze(-1)  # (B, P, K)
@@ -3180,9 +3240,13 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
 
         # Noise injection: add uniform mass to off-diagonal, scaled by sigma_t
         if self.cfg.noise_scale > 0:
-            # sigma_t^2 ~ t(1-t), peaks at t=0.5
-            sigma_t_sq = (t * (1.0 - t)).view(B, 1, 1)  # (B, 1, 1)
-            noise_weight = self.cfg.noise_scale * dt * sigma_t_sq  # (B, 1, 1)
+            sigma_t = self._compute_sigma_t(
+                t=t,
+                scale=torch.ones_like(t),
+                min_sigma=0.0,
+                noise_end_t=float(self.cfg.noise_end_t),
+            ).view(B, 1, 1)
+            noise_weight = float(self.cfg.noise_scale) * dt * sigma_t.square()
 
             # Uniform over non-current tokens
             uniform_noise = (1.0 - current_onehot) / max(K - 1, 1)
@@ -3370,7 +3434,7 @@ class RotationCoupler(Coupler[RotationCoupling]):
             base_mat=flat_start,
         )  # (N, 3, 3)
 
-        if self.cfg.sigma == 0.0:
+        if self.cfg.noise_scale == 0.0:
             return mean.view(original_shape)
 
         # Stochastic bridge: add IGSO3 noise scaled by bridge variance
@@ -3382,7 +3446,7 @@ class RotationCoupler(Coupler[RotationCoupling]):
         )  # (N,)
 
         # Scale variance by cfg.sigma and compute std for IGSO3
-        std = (var.sqrt() * self.cfg.sigma).clamp_min(1e-6)  # (N,)
+        std = (var.sqrt() * self.cfg.noise_scale).clamp_min(1e-6)  # (N,)
 
         # Sample IGSO3 noise and apply
         self._ensure_igso3_device(mean.device)
@@ -3431,22 +3495,6 @@ class RotationCoupler(Coupler[RotationCoupling]):
             anchors=anchors,
             creation_state=creation_state,
         )
-
-    def _compute_sigma_t(
-        self,
-        t: torch.Tensor,  # (B,)
-        scale: torch.Tensor,  # (B,)
-    ) -> torch.Tensor:
-        """Compute time-dependent noise sigma for IGSO3.
-
-        Uses exponential schedule that decays toward t=1.
-        """
-        # sigma_t = sigma_max * exp(-rate * t)
-        # Peaks near t=0, decays toward t=1
-        sigma_max = self.cfg.igso3_sigma_max
-        rate = self.cfg.exp_rate
-        sigma_t = sigma_max * torch.exp(-rate * t) * scale
-        return sigma_t.clamp(self.cfg.igso3_sigma_min, self.cfg.igso3_sigma_max)
 
     def euler_step(
         self,
@@ -3501,6 +3549,14 @@ class RotationCoupler(Coupler[RotationCoupling]):
         if potential is not None:
             rot_vf = rot_vf + potential
 
+        # Clamp per-residue rotation step.
+        drift_step_cap = float(self.cfg.drift_step_cap_rad)
+        if drift_step_cap > 0.0:
+            rot_step = rot_vf * (scaling.view(B, 1, 1) * float(dt))
+            step_norm = rot_step.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            rot_step = rot_step * (drift_step_cap / step_norm).clamp(max=1.0)
+            rot_vf = rot_step / (scaling.view(B, 1, 1) * float(dt) + 1e-8)
+
         # Geodesic step: geodesic_t(scaling * dt, x1_pred, x_t, rot_vf)
         geodesic_time = (scaling * dt)[:, None, None]  # (B, 1, 1)
         x_next = so3_utils.geodesic_t(
@@ -3511,11 +3567,16 @@ class RotationCoupler(Coupler[RotationCoupling]):
         )  # (B, P, 3, 3)
 
         # Optionally add IGSO3 noise for stochastic sampling
-        if float(self.cfg.sigma) > 0.0 and float(dt) > 0.0:
+        if float(self.cfg.noise_scale) > 0.0 and float(dt) > 0.0:
             self._ensure_igso3_device(device)
 
             # Compute sigma_t scaled by sqrt(dt)
-            sigma_t = self._compute_sigma_t(t, scale=torch.ones_like(t))
+            sigma_t = self._compute_sigma_t(
+                t=t,
+                scale=torch.full_like(t, float(self.cfg.noise_scale)),
+                min_sigma=0.0,
+                noise_end_t=float(self.cfg.noise_end_t),
+            ).clamp_max(float(self.cfg.igso3_sigma_max))
             sqrt_dt = math.sqrt(float(dt))
             sigma_t = (sigma_t * sqrt_dt).to(self.igso3.sigma_grid.device)
 
@@ -3576,6 +3637,34 @@ class TreeInterpolant:
         torch.manual_seed(int(seed))
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(int(seed))
+
+    @staticmethod
+    def _hazard_multiplier(t_val: float, hazard: VarcoHazardConfig) -> float:
+        """
+        Compute g(t) = h(t) / (1 - H(t)) for a simple closed-form hazard family.
+
+        This is the continuous-time multiplier that replaces the hard-coded 1/(1-t) when H(t)=t.
+        """
+        t = float(min(max(t_val, 0.0), 1.0 - 1e-8))
+        power = int(max(1, hazard.power))
+
+        if hazard.kind == VarcoHazardKind.uniform:
+            survival = max(1e-8, 1.0 - t)
+            return 1.0 / survival
+
+        if hazard.kind == VarcoHazardKind.early_power:
+            # H(t) = 1 - (1 - t)^p  =>  h(t) = p (1 - t)^(p-1),  S(t) = (1 - t)^p
+            survival = max(1e-8, 1.0 - t)
+            return float(power) / survival
+
+        if hazard.kind == VarcoHazardKind.late_power:
+            # H(t) = t^p  =>  h(t) = p t^(p-1),  S(t) = 1 - t^p
+            t_pow = t**power
+            survival = max(1e-8, 1.0 - t_pow)
+            h = float(power) * (t ** (power - 1))
+            return h / survival
+
+        raise ValueError(f"Unknown hazard kind: {hazard.kind!r}")
 
     def compute_motif_guidance_vf(
         self,
@@ -4089,21 +4178,25 @@ class TreeInterpolant:
         valid_mask: torch.Tensor,  # (B, P) bool
         t_val: float,  # current time
         dt: float,
+        split_hazard_mult: float,
+        delete_hazard_mult: float,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample insert/delete/substitute events for present positions in a batch.
         """
-        # Convert rates/logits to per-step probabilities via hazard-rate formulation
-        # Both split_rate and del_logits predict "eventual" quantities, so we scale by 1/(1-t)
-        denom = max(1e-4, 1.0 - t_val)
+        # Convert rates/logits to per-step probabilities using the configured hazard multipliers.
+        # - split_rate predicts remaining-event statistics (counting-process view)
+        # - del_logits predicts "destined-to-delete" probability (counting process with K in {0,1})
+        dt_split = float(dt) * float(split_hazard_mult)
+        dt_del = float(dt) * float(delete_hazard_mult)
 
-        # Insert probability from split rate
-        lam_ins = (split_rate.clamp_min(0.0) * (dt / denom)).clamp_max(20.0)
+        # Insert probability from split rate.
+        lam_ins = (split_rate.clamp_min(0.0) * dt_split).clamp_max(20.0)
         p_ins = (1.0 - torch.exp(-lam_ins)).clamp(0.0, 0.95)
 
         # Delete probability from logits
         # del_logits predicts "destined-to-delete", convert to instantaneous probability
-        lam_del = (torch.sigmoid(del_logits) * (dt / denom)).clamp_max(20.0)
+        lam_del = (torch.sigmoid(del_logits) * dt_del).clamp_max(20.0)
         p_del = (1.0 - torch.exp(-lam_del)).clamp(0.0, 0.95)
         p_del = torch.where(is_root, torch.zeros_like(p_del), p_del)
 
@@ -4137,20 +4230,11 @@ class TreeInterpolant:
 
         model.eval()
         with torch.no_grad():
-            t_grid = torch.linspace(self.min_t, 1.0, steps=num_steps, device=device)
-            pbar = tqdm(
-                enumerate(range(num_steps)),
-                total=num_steps,
-                desc="Sampling",
-                leave=False,
-            )
-            for step_num, step in pbar:
-                t_val = float(t_grid[step].item())
-                t_next = (
-                    float(t_grid[step + 1].item())
-                    if step + 1 < num_steps
-                    else (1.0 - self.min_t)
-                )
+            t_grid = torch.linspace(self.min_t, 1.0, steps=num_steps + 1, device=device)
+            pbar = tqdm(range(num_steps), total=num_steps, desc="Sampling", leave=False)
+            for step_num in pbar:
+                t_val = float(t_grid[step_num].item())
+                t_next = float(t_grid[step_num + 1].item())
                 dt = float(max(1e-6, t_next - t_val))
 
                 # Set current time and predict
@@ -4209,6 +4293,12 @@ class TreeInterpolant:
 
                 # Sample and apply insertion/deletion events, disallowed in motifs
                 is_root = batch.birth_time <= 0.0  # (B, P)
+                split_hazard_mult = self._hazard_multiplier(
+                    t_val=t_val, hazard=self.cfg.sampling.split_hazard
+                )
+                delete_hazard_mult = self._hazard_multiplier(
+                    t_val=t_val, hazard=self.cfg.sampling.delete_hazard
+                )
                 insertions, deletions, _ = self._sample_insert_delete_substitute(
                     split_rate=pred.pred_split_rate,
                     del_logits=pred.pred_del_logits,
@@ -4216,6 +4306,8 @@ class TreeInterpolant:
                     valid_mask=batch.valid_mask & ~batch.motif_mask,
                     t_val=t_val,
                     dt=dt,
+                    split_hazard_mult=split_hazard_mult,
+                    delete_hazard_mult=delete_hazard_mult,
                 )
 
                 # Enforce max_length: block insertions once we're at the limit
@@ -4565,7 +4657,9 @@ class BranchFlowLossCalculator:
         For leaves, this is effectively cross-entropy on the final aatype.
         """
         if not mask.any():
-            return torch.tensor(0.0, device=pred_insertion_logits.device)
+            # Keep a graph connection to insertion-head params so DDP doesn't treat them
+            # as unused on batches with no supervised insertion positions.
+            return pred_insertion_logits.float().sum() * 0.0
 
         # Zero out mask token and renormalize target probs
         target_probs_masked = target_anchor_probs.clone()
@@ -4618,18 +4712,33 @@ class BranchFlowLossCalculator:
             rate,
         )
 
+        # Upweight rare internal nodes (target > 0) and larger remaining counts
+        # to discourage the "predict no insertions" degenerate.
+        pos_weight = 5.0  # upweight insertion targets
+        count_weight_power = 0.5  # upweight exp for remaining counts
+        max_token_weight = 20.0  # cap weight
+
+        token_weight = torch.ones_like(target)
+        token_weight = torch.where(
+            target > 0, torch.full_like(token_weight, pos_weight), token_weight
+        )
+        token_weight = token_weight * (1.0 + target).pow(float(count_weight_power))
+        token_weight = token_weight.clamp_max(float(max_token_weight))
+
         # Scaffold loss (primary) and motif loss (small penalty)
         scaffold_mask = mask & ~motif_mask
         motif_loss_mask = mask & motif_mask
 
-        scaffold_denom = scaffold_mask.float().sum(dim=1).clamp_min(1.0)  # (B,)
+        scaffold_weight = token_weight * scaffold_mask.float()
+        scaffold_denom = scaffold_weight.sum(dim=1).clamp_min(1.0)  # (B,)
         scaffold_loss = (
-            (token_loss * scaffold_mask.float()).sum(dim=1) / scaffold_denom
+            (token_loss * scaffold_weight).sum(dim=1) / scaffold_denom
         ).mean()
 
-        motif_denom = motif_loss_mask.float().sum(dim=1).clamp_min(1.0)  # (B,)
+        motif_weight_tensor = token_weight * motif_loss_mask.float()
+        motif_denom = motif_weight_tensor.sum(dim=1).clamp_min(1.0)  # (B,)
         motif_loss = (
-            (token_loss * motif_loss_mask.float()).sum(dim=1) / motif_denom
+            (token_loss * motif_weight_tensor).sum(dim=1) / motif_denom
         ).mean()
 
         split_loss = scaffold_loss + motif_weight * motif_loss
@@ -4665,11 +4774,15 @@ class BranchFlowLossCalculator:
         (motif_weight) applied to motif positions.
         """
         if batch.deleted is None:
-            return torch.tensor(0.0, device=batch.trans_t.device)
+            # Keep a graph connection to deletion-head params so DDP doesn't treat them
+            # as unused on batches without deletion supervision.
+            return pred.pred_del_logits.float().sum() * 0.0
 
         terminal_mask = mask & (batch.remaining_insertions == 0)
         if not bool(terminal_mask.any()):
-            return torch.tensor(0.0, device=batch.trans_t.device)
+            # Keep a graph connection to deletion-head params so DDP doesn't treat them
+            # as unused on batches without any terminal tokens.
+            return pred.pred_del_logits.float().sum() * 0.0
 
         del_logits = pred.pred_del_logits  # (B, P)
         del_targets = batch.deleted.float()  # (B, P)
@@ -4703,8 +4816,12 @@ class BranchFlowLossCalculator:
         (e.g. as in synthetic examples or predicted structures).
         """
         pred_logits = pred.pred_bfactor  # (B, P, num_bins) or None
-        if pred_logits is None or batch.res_bfactor is None:
+        if pred_logits is None:
             return torch.tensor(0.0, device=batch.trans_t.device)
+        if batch.res_bfactor is None:
+            # Keep a graph connection to confidence-head params so DDP doesn't treat them
+            # as unused on batches without bfactor supervision.
+            return pred_logits.float().sum() * 0.0
 
         bins = pred_logits.shape[-1]
         gt_bfactor = batch.res_bfactor  # (B, P)
@@ -4717,7 +4834,9 @@ class BranchFlowLossCalculator:
         # Mask out synthetic examples (all-zero b-factors) + padding + motifs
         valid_mask = (gt_bfactor > 1e-5) & mask & ~batch.motif_mask  # (B, P)
         if not valid_mask.any():
-            return torch.tensor(0.0, device=batch.trans_t.device)
+            # Keep a graph connection to confidence-head params so DDP doesn't treat them
+            # as unused on batches with no valid bfactor targets.
+            return pred_logits.float().sum() * 0.0
 
         # Cross-entropy
         logp = F.log_softmax(pred_logits.float(), dim=-1)
@@ -4963,34 +5082,229 @@ class BranchFlowLossCalculator:
 """ Visualization """
 
 
-class BranchingFlowVisualizer:
-    def __init__(
-        self,
-        sigma: Optional[float] = 1.0,
-    ):
-        self.interpolant = TreeInterpolant(
-            cfg=VarcoInterpolantConfig(
-                trans_coupler=VarcoInterpolantTransCouplerConfig(sigma=sigma),
-                aatypes_coupler=VarcoInterpolantAATypesCouplerConfig(drift_temp=sigma),
+@dataclass
+class TrajectoryFrame:
+    """Visualization-ready frame data, converted to numpy.
+
+    This is a single-sample (no batch dimension) representation suitable for
+    plotting. All tensors are numpy arrays on CPU.
+    """
+
+    trans: np.ndarray  # (P, 3) CA positions
+    rotmats: np.ndarray  # (P, 3, 3) rotation matrices
+    aatypes: np.ndarray  # (P,) amino acid indices 0-20
+    motif_mask: np.ndarray  # (P,) bool
+    valid_mask: np.ndarray  # (P,) bool
+    t: float  # timestep value
+    remaining_insertions: Optional[np.ndarray] = None  # (P,) or None
+    atom37: Optional[np.ndarray] = None  # (P, 37, 3) pre-computed if needed
+
+    def get_backbone_positions(self, only_alpha_carbons: bool) -> np.ndarray:
+        """Return backbone positions for valid residues.
+
+        Args:
+            only_alpha_carbons: If True, return (n_valid, 3) CA positions.
+                If False, return (n_valid, 3, 3) N/CA/C positions.
+                Requires atom37 to have been computed at construction time.
+        """
+        valid = self.valid_mask
+        if only_alpha_carbons:
+            return self.trans[valid]  # (n_valid, 3)
+        else:
+            if self.atom37 is None:
+                raise ValueError(
+                    "atom37 not available. Set include_atom37=True when creating frame."
+                )
+            # N=0, CA=1, C=2 in atom37 ordering
+            return self.atom37[valid][:, [0, 1, 2], :]  # (n_valid, 3, 3)
+
+    @classmethod
+    def from_data_corrupted(
+        cls,
+        data: DataCorrupted,
+        batch_idx: int,
+        include_atom37: bool = False,
+    ) -> "TrajectoryFrame":
+        """Extract single batch item from DataCorrupted, convert to numpy.
+
+        Args:
+            data: The DataCorrupted containing batched samples.
+            batch_idx: Which batch item to extract.
+            include_atom37: If True, compute and store atom37 representation.
+                This is faster than computing it later since the data is still
+                on the original device (potentially GPU).
+        """
+        atom37 = None
+        if include_atom37:
+            # Compute atom37 on device before moving to CPU
+            atom37_batch = data.to_atom37()  # (B, P, 37, 3)
+            atom37 = atom37_batch[batch_idx].cpu().numpy()
+
+        return cls(
+            trans=data.trans_t[batch_idx].cpu().numpy(),
+            rotmats=data.rotmats_t[batch_idx].cpu().numpy(),
+            aatypes=data.aatypes_t[batch_idx].cpu().numpy(),
+            motif_mask=data.motif_mask[batch_idx].cpu().numpy(),
+            valid_mask=data.valid_mask[batch_idx].cpu().numpy(),
+            t=data.t[batch_idx].item(),
+            remaining_insertions=(
+                data.remaining_insertions[batch_idx].cpu().numpy()
+                if data.remaining_insertions is not None
+                else None
             ),
+            atom37=atom37,
         )
 
-    @staticmethod
-    def _get_anim_writer() -> Tuple[str, animation.AbstractMovieWriter]:
-        if animation.writers.is_available("ffmpeg"):
-            return "mp4", animation.FFMpegWriter(
-                fps=10,
-                codec="libx264",
-                extra_args=[
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-movflags",
-                    "+faststart",
-                ],
+    @classmethod
+    def from_model_prediction(
+        cls,
+        pred: ModelPrediction,
+        sample: DataCorrupted,
+        batch_idx: int,
+        include_atom37: bool = False,
+    ) -> "TrajectoryFrame":
+        """Extract single batch item from ModelPrediction, convert to numpy.
+
+        Uses the sample for motif_mask, valid_mask, and t since predictions
+        are made for a given sample state.
+
+        Args:
+            pred: The ModelPrediction containing batched predictions.
+            sample: The corresponding DataCorrupted sample (for metadata).
+            batch_idx: Which batch item to extract.
+            include_atom37: If True, compute and store atom37 representation.
+        """
+        atom37 = None
+        if include_atom37:
+            # Compute atom37 from prediction on device before moving to CPU
+            atom37_batch = all_atom.atom37_from_trans_rot(
+                trans=pred.pred_trans_1,
+                rots=pred.pred_rotmats_1,
+                torsions=None,
+                aatype=pred.pred_aatype_logits.argmax(dim=-1),
+                res_mask=sample.valid_mask.float(),
+                unknown_to_alanine=True,
             )
-        if animation.writers.is_available("imagemagick"):
-            return "gif", animation.ImageMagickWriter(fps=10)
-        return "gif", animation.PillowWriter(fps=10)
+            atom37 = atom37_batch[batch_idx].cpu().numpy()
+
+        return cls(
+            trans=pred.pred_trans_1[batch_idx].cpu().numpy(),
+            rotmats=pred.pred_rotmats_1[batch_idx].cpu().numpy(),
+            aatypes=pred.pred_aatype_logits[batch_idx].argmax(dim=-1).cpu().numpy(),
+            motif_mask=sample.motif_mask[batch_idx].cpu().numpy(),
+            valid_mask=sample.valid_mask[batch_idx].cpu().numpy(),
+            t=sample.t[batch_idx].item(),
+            remaining_insertions=pred.pred_split_rate[batch_idx].cpu().numpy(),
+            atom37=atom37,
+        )
+
+
+@dataclass
+class PlotPanel:
+    """Manages matplotlib artists for one sequence+structure visualization panel.
+
+    A panel consists of a sequence bar (2D axes) and a 3D structure view.
+    This class encapsulates the artists needed to render a TrajectoryFrame.
+    """
+
+    ax_seq: plt.Axes
+    ax_3d: Any  # Axes3D
+    seq_artists: (
+        tuple  # (rectangles, texts, motif_rects, letters, colors, positions_per_row)
+    )
+    scatter_artist: Any  # PathCollection3D
+    letter_artists: Optional[List]
+    title_prefix: str
+    max_atoms: int
+    only_alpha_carbons: bool
+    color_by: str
+
+    @classmethod
+    def create(
+        cls,
+        ax_seq: plt.Axes,
+        ax_3d: Any,
+        max_seq_len: int,
+        max_atoms: int,
+        trans_min: np.ndarray,
+        trans_max: np.ndarray,
+        only_alpha_carbons: bool,
+        color_by: str,
+        show_residue_letters: bool,
+        title_prefix: str = "",
+    ) -> "PlotPanel":
+        """Create all artists for this panel."""
+        seq_artists = cls._create_sequence_artists(ax_seq, max_seq_len)
+        scatter_artist = cls._create_3d_scatter_artist(
+            ax_3d, max_atoms, trans_min, trans_max, only_alpha_carbons, color_by
+        )
+        letter_artists = (
+            cls._create_3d_residue_letter_artists(ax_3d, max_seq_len)
+            if show_residue_letters
+            else None
+        )
+        return cls(
+            ax_seq=ax_seq,
+            ax_3d=ax_3d,
+            seq_artists=seq_artists,
+            scatter_artist=scatter_artist,
+            letter_artists=letter_artists,
+            title_prefix=title_prefix,
+            max_atoms=max_atoms,
+            only_alpha_carbons=only_alpha_carbons,
+            color_by=color_by,
+        )
+
+    def update(self, frame: TrajectoryFrame) -> None:
+        """Update all artists with new frame data."""
+        rectangles, texts, motif_rects, letters, colors, _ = self.seq_artists
+        valid = frame.valid_mask
+
+        # Update sequence bar
+        self._update_sequence_bar(
+            rectangles,
+            texts,
+            motif_rects,
+            letters,
+            colors,
+            frame.aatypes[valid],
+            frame.motif_mask[valid],
+        )
+
+        # Update 3D scatter
+        backbone_pos = frame.get_backbone_positions(self.only_alpha_carbons)
+        remaining_ins = (
+            frame.remaining_insertions[valid]
+            if frame.remaining_insertions is not None
+            else None
+        )
+        self._update_3d_scatter(
+            self.scatter_artist,
+            self.ax_3d,
+            backbone_pos,
+            frame.motif_mask[valid],
+            frame.aatypes[valid],
+            self.max_atoms,
+            frame.t,
+            self.only_alpha_carbons,
+            remaining_ins,
+            self.color_by,
+        )
+
+        # Update title with prefix
+        n_res = valid.sum()
+        title = f"{self.title_prefix}t = {frame.t:.2f} (N={n_res})"
+        self.ax_3d.set_title(title)
+
+        # Update residue letters if enabled
+        if self.letter_artists is not None:
+            ca_pos = frame.trans[valid]
+            self._update_3d_residue_letter_artists(
+                self.letter_artists,
+                self.ax_3d,
+                ca_pos,
+                frame.aatypes[valid],
+            )
 
     @staticmethod
     @functools.lru_cache(maxsize=1)
@@ -5040,41 +5354,23 @@ class BranchingFlowVisualizer:
     @functools.lru_cache(maxsize=1)
     def _aa_listed_colormap() -> ListedColormap:
         """A categorical colormap for amino acid indices (0..20)."""
-        _, colors = BranchingFlowVisualizer._aa_letters_and_colors()
+        _, colors = PlotPanel._aa_letters_and_colors()
         return ListedColormap(colors, name="aa")
 
     @staticmethod
     def _create_sequence_artists(
         ax: plt.Axes, max_len: int, positions_per_row: int = 175
     ):
-        """Pre-create all artists needed for sequence visualization with fixed-size boxes.
-
-        Uses a multi-row layout where each position has a fixed size box to ensure
-        text fits without getting squished. Sequence wraps across rows as needed.
-        Box size is consistent across all plots regardless of sequence length.
-
-        Args:
-            ax: The matplotlib axes to draw on
-            max_len: Maximum sequence length across all frames
-            positions_per_row: Fixed number of positions per row (default 175, fits 512 in 3 rows)
-
-        Returns:
-            Tuple of (rectangles, texts, motif_rects, letters, colors, positions_per_row)
-        """
-        letters, colors = BranchingFlowVisualizer._aa_letters_and_colors()
-
-        # Fixed positions per row ensures consistent box size across plots
+        """Pre-create all artists needed for sequence visualization."""
+        letters, colors = PlotPanel._aa_letters_and_colors()
         num_rows = math.ceil(max_len / positions_per_row)
 
-        # Fixed box dimensions
         box_width = 1.0
         box_height = 1.0
-        row_spacing = 0.3  # Space between rows (for motif underline + gap)
+        row_spacing = 0.3
         row_height = box_height + row_spacing
 
-        # Set axis limits for the grid layout (fixed width, variable height)
         ax.set_xlim(-0.1, positions_per_row + 0.1)
-        # Y goes from top (row 0) to bottom (last row), with motif underlines below each row
         total_height = num_rows * row_height
         ax.set_ylim(-total_height - 0.1, 0.5)
         ax.set_aspect("equal", adjustable="box")
@@ -5087,12 +5383,9 @@ class BranchingFlowVisualizer:
         for i in range(max_len):
             row = i // positions_per_row
             col = i % positions_per_row
-
-            # Y position: row 0 at top (y=0), subsequent rows below
             y_base = -row * row_height
             x_pos = col * box_width
 
-            # AA background rectangle
             rect = plt.Rectangle(
                 (x_pos, y_base - box_height),
                 box_width,
@@ -5104,7 +5397,6 @@ class BranchingFlowVisualizer:
             ax.add_patch(rect)
             rectangles.append(rect)
 
-            # AA letter text (centered in box)
             text = ax.text(
                 x_pos + box_width / 2,
                 y_base - box_height / 2,
@@ -5116,7 +5408,6 @@ class BranchingFlowVisualizer:
             )
             texts.append(text)
 
-            # Motif underline rectangle (below the box)
             motif_rect = plt.Rectangle(
                 (x_pos, y_base - box_height - 0.25),
                 box_width,
@@ -5141,10 +5432,8 @@ class BranchingFlowVisualizer:
     ):
         """Update pre-created artists with new sequence data."""
         n = len(aatypes)
-
         for i in range(len(rectangles)):
             if i < n:
-                # Update visible artists
                 aa_idx = int(aatypes[i]) if aatypes[i] < len(letters) else 20
                 rectangles[i].set_facecolor(colors[aa_idx])
                 rectangles[i].set_visible(True)
@@ -5152,7 +5441,6 @@ class BranchingFlowVisualizer:
                 texts[i].set_visible(True)
                 motif_rects[i].set_visible(bool(motif_mask[i]))
             else:
-                # Hide unused artists
                 rectangles[i].set_visible(False)
                 texts[i].set_visible(False)
                 motif_rects[i].set_visible(False)
@@ -5160,31 +5448,24 @@ class BranchingFlowVisualizer:
     @staticmethod
     def _create_3d_scatter_artist(
         ax: plt.Axes,
-        max_atoms: int,  # max residues * 3 (for N, CA, C atoms) or max residues if only_alpha_carbons
+        max_atoms: int,
         trans_min: np.ndarray,
         trans_max: np.ndarray,
         only_alpha_carbons: bool = False,
         color_by: Literal["position", "sequence"] = "position",
     ):
-        """Pre-create a 3D scatter artist with max_atoms capacity.
-
-        Returns a scatter object that can be updated via _update_3d_scatter.
-        If only_alpha_carbons=True, shows 1 point per residue (alpha carbon only).
-        Otherwise, shows 3 backbone atoms per residue: N, CA, C.
-        """
-        # Initialize with zeros - we'll update positions/colors each frame
+        """Pre-create a 3D scatter artist with max_atoms capacity."""
         dummy_pos = np.zeros((max_atoms, 3))
         dummy_colors = np.zeros(max_atoms)
         dummy_sizes = np.ones(max_atoms) * 40.0
 
-        # Create the scatter plot (initially all hidden via alpha=0 for unused)
         scat = ax.scatter(
             dummy_pos[:, 0],
             dummy_pos[:, 1],
             dummy_pos[:, 2],
             c=dummy_colors,
             cmap=(
-                BranchingFlowVisualizer._aa_listed_colormap()
+                PlotPanel._aa_listed_colormap()
                 if color_by == "sequence"
                 else "Spectral"
             ),
@@ -5195,7 +5476,6 @@ class BranchingFlowVisualizer:
             alpha=0.75,
         )
 
-        # Set axis properties once
         ax.set_xticks([])
         ax.set_yticks([])
         ax.set_zticks([])
@@ -5212,11 +5492,7 @@ class BranchingFlowVisualizer:
         max_len: int,
         fontsize: float = 8.0,
     ):
-        """Pre-create per-residue text artists (one per residue index).
-
-        Uses 2D text overlaid on a 3D axis, with positions updated via projection so
-        letters remain screen-upright (i.e. not rotated by the 3D camera).
-        """
+        """Pre-create per-residue text artists."""
         texts = []
         for _ in range(max_len):
             text = ax.text2D(
@@ -5238,11 +5514,11 @@ class BranchingFlowVisualizer:
     def _update_3d_residue_letter_artists(
         texts,
         ax: plt.Axes,
-        ca_pos: np.ndarray,  # (n_alive, 3)
-        aatypes: np.ndarray,  # (n_alive,)
+        ca_pos: np.ndarray,
+        aatypes: np.ndarray,
     ) -> None:
         """Update pre-created artists with new residue letters/positions."""
-        letters, _ = BranchingFlowVisualizer._aa_letters_and_colors()
+        letters, _ = PlotPanel._aa_letters_and_colors()
         n = len(aatypes)
 
         if n > 0:
@@ -5266,36 +5542,23 @@ class BranchingFlowVisualizer:
     def _update_3d_scatter(
         scat,
         ax: plt.Axes,
-        backbone_pos: np.ndarray,  # (n_alive, 3, 3) - N, CA, C per residue, or (n_alive, 3) if only_alpha_carbons
-        motif_alive: np.ndarray,  # (n_alive,) - per residue
-        aatypes_alive: Optional[np.ndarray],  # (n_alive,)
+        backbone_pos: np.ndarray,
+        motif_alive: np.ndarray,
+        aatypes_alive: Optional[np.ndarray],
         max_atoms: int,
         t_val: float,
         only_alpha_carbons: bool = False,
-        remaining_insertions_alive: Optional[np.ndarray] = None,  # (n_alive,)
+        remaining_insertions_alive: Optional[np.ndarray] = None,
         color_by: Literal["position", "sequence"] = "position",
     ):
-        """Update pre-created 3D scatter artist with backbone atoms.
-
-        If only_alpha_carbons=True: shows 1 point per residue (alpha carbon).
-        Otherwise: shows 3 atoms (N, CA, C) per residue with different sizes:
-        - CA: large (40)
-        - N, C: smaller (15)
-        Motif residues are shown with slightly smaller points.
-
-        During corruption (remaining_insertions_alive provided):
-        - Anchor sizes are 20 + 10 * remaining_insertions
-        - Terminal leaves (remaining_insertions == 0) get normal size (40)
-        """
+        """Update pre-created 3D scatter artist with backbone atoms."""
         n_res = backbone_pos.shape[0] if backbone_pos.size > 0 else 0
 
         if n_res > 0:
             if only_alpha_carbons:
-                # backbone_pos is (n_res, 3) - just CA positions
                 n_atoms = n_res
-                flat_pos = backbone_pos  # (n_res, 3)
+                flat_pos = backbone_pos
 
-                # Pad to max_atoms
                 padded_pos = np.zeros((max_atoms, 3))
                 padded_pos[:n_atoms] = flat_pos
 
@@ -5307,10 +5570,8 @@ class BranchingFlowVisualizer:
                         )
                     color_idx[:n_atoms] = aatypes_alive
                 else:
-                    # Color by residue index (position along chain)
                     color_idx[:n_atoms] = np.arange(n_res)
 
-                # Sizes: anchors (remaining > 0) get 30 + 10 * remaining, terminals get 20
                 if remaining_insertions_alive is not None:
                     is_anchor = remaining_insertions_alive > 0
                     base_sizes = np.where(
@@ -5324,13 +5585,9 @@ class BranchingFlowVisualizer:
                 sizes = np.zeros(max_atoms)
                 sizes[:n_atoms] = base_sizes * motif_factor
             else:
-                # backbone_pos is (n_res, 3, 3) - N, CA, C per residue
                 n_atoms = n_res * 3
-                # Flatten backbone positions: (n_res, 3, 3) -> (n_res * 3, 3)
-                # Order: N0, CA0, C0, N1, CA1, C1, ...
-                flat_pos = backbone_pos.reshape(-1, 3)  # (n_atoms, 3)
+                flat_pos = backbone_pos.reshape(-1, 3)
 
-                # Pad to max_atoms
                 padded_pos = np.zeros((max_atoms, 3))
                 padded_pos[:n_atoms] = flat_pos
 
@@ -5342,13 +5599,9 @@ class BranchingFlowVisualizer:
                         )
                     color_idx[:n_atoms] = np.repeat(aatypes_alive, 3)
                 else:
-                    # Color by residue index (all 3 atoms of same residue get same color)
-                    res_colors = np.repeat(np.arange(n_res), 3)  # [0,0,0,1,1,1,...]
+                    res_colors = np.repeat(np.arange(n_res), 3)
                     color_idx[:n_atoms] = res_colors
 
-                # Sizes: CA varies by anchor status, N/C always 10
-                # Anchors (remaining > 0): CA = 30 + 10 * remaining
-                # Terminals: CA = 20
                 if remaining_insertions_alive is not None:
                     is_anchor = remaining_insertions_alive > 0
                     ca_sizes = np.where(
@@ -5358,33 +5611,165 @@ class BranchingFlowVisualizer:
                     )
                 else:
                     ca_sizes = np.full(n_res, 20.0)
-                # Interleave: [N, CA, C] = [10, ca_size, 10] for each residue
                 base_sizes = np.zeros(n_atoms)
-                base_sizes[0::3] = 10.0  # N atoms
-                base_sizes[1::3] = ca_sizes  # CA atoms
-                base_sizes[2::3] = 10.0  # C atoms
+                base_sizes[0::3] = 10.0
+                base_sizes[1::3] = ca_sizes
+                base_sizes[2::3] = 10.0
 
                 motif_expanded = np.repeat(motif_alive, 3)
                 motif_factor = np.where(motif_expanded, 0.6, 1.0)
                 sizes = np.zeros(max_atoms)
                 sizes[:n_atoms] = base_sizes * motif_factor
 
-            # Update scatter data
             scat._offsets3d = (padded_pos[:, 0], padded_pos[:, 1], padded_pos[:, 2])
             scat.set_array(color_idx)
             if color_by == "sequence":
-                scat.set_cmap(BranchingFlowVisualizer._aa_listed_colormap())
-                _, colors = BranchingFlowVisualizer._aa_letters_and_colors()
+                scat.set_cmap(PlotPanel._aa_listed_colormap())
+                _, colors = PlotPanel._aa_letters_and_colors()
                 scat.set_clim(-0.5, float(colors.shape[0] - 1) + 0.5)
             else:
                 scat.set_cmap("Spectral")
                 scat.set_clim(0, max(n_res - 1, 1))
             scat.set_sizes(sizes)
         else:
-            # No points - hide all
             scat.set_sizes(np.zeros(max_atoms))
 
         ax.set_title(f"t = {t_val:.2f} (N={n_res})")
+
+
+class BranchingFlowVisualizer:
+    def __init__(
+        self,
+        sigma: Optional[float] = 0.0,
+    ):
+        self.interpolant = TreeInterpolant(
+            cfg=VarcoInterpolantConfig(
+                trans_coupler=VarcoInterpolantTransCouplerConfig(noise_scale=sigma),
+                aatypes_coupler=VarcoInterpolantAATypesCouplerConfig(drift_temp=sigma),
+            ),
+        )
+
+    @staticmethod
+    def _get_anim_writer() -> Tuple[str, animation.AbstractMovieWriter]:
+        if animation.writers.is_available("ffmpeg"):
+            return "mp4", animation.FFMpegWriter(
+                fps=10,
+                codec="libx264",
+                extra_args=[
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                ],
+            )
+        if animation.writers.is_available("imagemagick"):
+            return "gif", animation.ImageMagickWriter(fps=10)
+        return "gif", animation.PillowWriter(fps=10)
+
+    def _plot_trajectory_frames(
+        self,
+        frame_lists: List[List[TrajectoryFrame]],
+        panel_titles: List[str],
+        out_dir: str,
+        filename: str,
+        only_alpha_carbons: bool,
+        show_residue_letters: bool,
+        color_by: str,
+        max_cols: int = 2,
+    ) -> str:
+        """Shared implementation for plotting trajectory frames.
+
+        Args:
+            frame_lists: List of frame lists, one per panel column.
+                Each inner list contains TrajectoryFrames for that column.
+                Caller is responsible for downsampling before calling.
+            panel_titles: Title prefix for each panel column (e.g., "Sample: ", "Prediction: ").
+            out_dir: Output directory for the animation.
+            filename: Base filename (without extension).
+            only_alpha_carbons: If True, show only CA atoms.
+            show_residue_letters: If True, overlay AA letters on 3D view.
+            color_by: "position" or "sequence".
+            max_cols: Maximum columns in the grid.
+
+        Returns:
+            Path to the saved animation file.
+        """
+        num_panels = len(frame_lists)
+        num_frames = len(frame_lists[0])
+
+        # Validate frame lists have same length
+        for i, frames in enumerate(frame_lists):
+            if len(frames) != num_frames:
+                raise ValueError(
+                    f"Frame list {i} has {len(frames)} frames, expected {num_frames}"
+                )
+
+        # Compute global limits and max sequence length across all frames in all lists
+        trans_min = np.full(3, np.inf)
+        trans_max = np.full(3, -np.inf)
+        max_seq_len = 0
+        for frames in frame_lists:
+            for frame in frames:
+                valid_trans = frame.trans[frame.valid_mask]
+                if valid_trans.shape[0] > 0:
+                    trans_min = np.minimum(trans_min, valid_trans.min(axis=0))
+                    trans_max = np.maximum(trans_max, valid_trans.max(axis=0))
+                max_seq_len = max(max_seq_len, frame.valid_mask.sum())
+
+        # Setup figure layout
+        num_cols = min(num_panels, max_cols)
+        num_rows = math.ceil(num_panels / num_cols)
+
+        fig = plt.figure(figsize=(10 * num_cols, 12 * num_rows))
+        gs = fig.add_gridspec(
+            num_rows * 2,
+            num_cols,
+            height_ratios=[2, 10] * num_rows,
+            hspace=0.02,
+            wspace=0.05,
+        )
+        fig.subplots_adjust(
+            left=0.03, right=0.97, bottom=0.03, top=0.95, wspace=0.05, hspace=0.05
+        )
+
+        # Create panels
+        max_atoms = max_seq_len if only_alpha_carbons else max_seq_len * 3
+        panels: List[PlotPanel] = []
+        for i in range(num_panels):
+            row, col = divmod(i, num_cols)
+            ax_seq = fig.add_subplot(gs[row * 2, col])
+            ax_3d = fig.add_subplot(gs[row * 2 + 1, col], projection="3d")
+
+            panel = PlotPanel.create(
+                ax_seq=ax_seq,
+                ax_3d=ax_3d,
+                max_seq_len=max_seq_len,
+                max_atoms=max_atoms,
+                trans_min=trans_min,
+                trans_max=trans_max,
+                only_alpha_carbons=only_alpha_carbons,
+                color_by=color_by,
+                show_residue_letters=show_residue_letters,
+                title_prefix=panel_titles[i] if i < len(panel_titles) else "",
+            )
+            panels.append(panel)
+
+        # Save animation
+        ext, writer = self._get_anim_writer()
+        anim_path = os.path.join(out_dir, f"{filename}.{ext}")
+        logger.info(f"💾 Saving trajectory animation to {anim_path}")
+
+        with writer.saving(fig, anim_path, dpi=100):
+            for frame_idx in tqdm(
+                range(num_frames), desc="trajectory frames", leave=False
+            ):
+                for panel_idx, panel in enumerate(panels):
+                    frame = frame_lists[panel_idx][frame_idx]
+                    panel.update(frame)
+                writer.grab_frame()
+
+        plt.close(fig)
+        return anim_path
 
     def plot_trajectory(
         self,
@@ -5394,14 +5779,25 @@ class BranchingFlowVisualizer:
         max_frames: Optional[int] = 50,
         max_samples: int = 2,
         max_cols: int = 2,
-        only_alpha_carbons: bool = True,  # faster; skips to_atom37
+        only_alpha_carbons: bool = True,
         show_residue_letters: bool = True,
         color_by: Literal["auto", "position", "sequence"] = "auto",
     ) -> str:
-        """Plot a trajectory animation from any Trajectory (corruption or sampling).
+        """Plot a trajectory animation showing multiple batch samples.
 
-        If show_residue_letters=True, overlays a 1-letter AA code at each residue CA.
-        color_by controls 3D coloring: 'auto' (infer), 'position' (chain index) or 'sequence' (aatype index).
+        Args:
+            traj: Trajectory containing samples to plot.
+            out_dir: Output directory (defaults to temp directory).
+            filename: Base filename for the animation.
+            max_frames: Maximum frames to render (downsamples if exceeded).
+            max_samples: Maximum batch samples to show.
+            max_cols: Maximum columns in the grid.
+            only_alpha_carbons: If True, show only CA atoms (faster).
+            show_residue_letters: If True, overlay AA letters on 3D view.
+            color_by: 'auto' (infer), 'position' (chain index), or 'sequence' (aatype).
+
+        Returns:
+            Path to the saved animation file.
         """
         if out_dir is None:
             out_dir = tempfile.mkdtemp()
@@ -5417,198 +5813,122 @@ class BranchingFlowVisualizer:
         if color_by == "auto":
             color_by = "sequence" if show_residue_letters else "position"
 
-        ext, writer = self._get_anim_writer()
-        anim_path = os.path.join(out_dir, f"{filename}.{ext}")
-        os.makedirs(out_dir, exist_ok=True)
-        print(f"💾 Saving trajectory animation to {anim_path}")
-
         num_batch = traj.samples[0].trans_t.shape[0]
         num_plots = min(num_batch, max_samples)
-        num_cols = min(num_plots, max_cols)
-        num_rows = math.ceil(num_plots / num_cols)
+        num_total_frames = len(traj.samples)
 
-        # Compute camera limits and max sequence length (variable-length across samples)
-        trans_min = np.full(3, np.inf)
-        trans_max = np.full(3, -np.inf)
-        max_seq_len = 0
-        for sample in traj.samples:
-            valid = sample.valid_mask[:num_plots].numpy()  # (num_plots, P)
-            trans = sample.trans_t[:num_plots].numpy()  # (num_plots, P, 3)
-            valid_trans = trans[valid]  # (N_valid, 3)
-            if valid_trans.shape[0] > 0:
-                trans_min = np.minimum(trans_min, valid_trans.min(axis=0))
-                trans_max = np.maximum(trans_max, valid_trans.max(axis=0))
-            max_seq_len = max(max_seq_len, valid.sum(axis=-1).max())
-        trans_min = np.tile(trans_min, (num_batch, 1))
-        trans_max = np.tile(trans_max, (num_batch, 1))
-
-        fig = plt.figure(figsize=(10 * num_cols, 12 * num_rows))
-        # 2 rows per plot: sequence bar (height 2) + 3D structure (height 10)
-        gs = fig.add_gridspec(
-            num_rows * 2,
-            num_cols,
-            height_ratios=[2, 10] * num_rows,
-            hspace=0.02,
-            wspace=0.05,
-        )
-
-        fig.subplots_adjust(
-            left=0.03,
-            right=0.97,
-            bottom=0.03,
-            top=0.95,
-            wspace=0.05,
-            hspace=0.05,
-        )
-
-        # Create all axes and sequence artists once before the animation loop
-        axes_seq = []
-        axes_3d = []
-        # Store artists (rectangles, texts, motif_rects, letters, colors, positions_per_row)
-        seq_artists = []
-        scatter_artists = []  # Pre-created 3D scatter artists for each plot
-        residue_letter_artists = (
-            []
-        )  # Pre-created 3D text artists for each plot (optional)
-        for i in range(num_plots):
-            row, col = divmod(i, num_cols)
-            ax_seq = fig.add_subplot(gs[row * 2, col])
-            ax_3d = fig.add_subplot(gs[row * 2 + 1, col], projection="3d")
-            axes_seq.append(ax_seq)
-            axes_3d.append(ax_3d)
-
-            # Pre-create sequence artists for this plot
-            artists = BranchingFlowVisualizer._create_sequence_artists(
-                ax_seq, max_seq_len
-            )
-            seq_artists.append(artists)
-
-            # Pre-create 3D scatter artist (avoids ax.clear() each frame)
-            # max_atoms = max_seq_len * 3 for backbone atoms (N, CA, C), or just max_seq_len for CA only
-            max_atoms = max_seq_len if only_alpha_carbons else max_seq_len * 3
-            scat = BranchingFlowVisualizer._create_3d_scatter_artist(
-                ax_3d,
-                max_atoms,
-                trans_min[i],
-                trans_max[i],
-                only_alpha_carbons=only_alpha_carbons,
-                color_by=color_by,
-            )
-            scatter_artists.append(scat)
-            if show_residue_letters:
-                residue_letter_artists.append(
-                    BranchingFlowVisualizer._create_3d_residue_letter_artists(
-                        ax=ax_3d,
-                        max_len=max_seq_len,
-                        fontsize=8.0,
-                    )
-                )
-            else:
-                residue_letter_artists.append(None)
-
-        # Downsample to max_frames
-        if max_frames is not None and len(traj.samples) > max_frames:
-            sample_indices = np.linspace(
-                0, len(traj.samples) - 1, max_frames, dtype=int
-            )
+        # Compute frame indices BEFORE converting to TrajectoryFrame
+        if max_frames is not None and num_total_frames > max_frames:
+            sample_indices = np.linspace(0, num_total_frames - 1, max_frames, dtype=int)
         else:
-            sample_indices = np.arange(len(traj.samples))
+            sample_indices = np.arange(num_total_frames)
 
-        # Pre-convert all frames to numpy (data is already on CPU from detach_clone)
-        # Use lists since sequence length varies across frames
-        samples_to_plot = [traj.samples[idx] for idx in sample_indices]
-        frames_np = []
-        for s in samples_to_plot:
-            frame = {
-                "valid": s.valid_mask.numpy().astype(bool),
-                "aatypes": s.aatypes_t.numpy(),
-                "motif": s.motif_mask.numpy().astype(bool),
-                "t": s.t[0].item() if s.t.numel() > 0 else 0.0,
-                "remaining": (
-                    s.remaining_insertions.numpy()
-                    if s.remaining_insertions is not None
-                    else None
-                ),
-                "positions": (
-                    s.trans_t.numpy()
-                    if only_alpha_carbons
-                    else s.to_atom37().numpy()[:, :, :3, :]
-                ),
-            }
-            frames_np.append(frame)
+        # Convert only the needed frames to TrajectoryFrames
+        frame_lists: List[List[TrajectoryFrame]] = []
+        for batch_idx in range(num_plots):
+            frames = [
+                TrajectoryFrame.from_data_corrupted(
+                    data=traj.samples[idx],
+                    batch_idx=batch_idx,
+                    include_atom37=not only_alpha_carbons,
+                )
+                for idx in sample_indices
+            ]
+            frame_lists.append(frames)
 
-        with writer.saving(fig, anim_path, dpi=100):
-            for frame in tqdm(frames_np, desc="plot_trajectory()", leave=False):
-                valid_mask = frame["valid"]  # (B, P_max)
-                aatypes_t = frame["aatypes"]  # (B, P_max)
-                motif_mask = frame["motif"]  # (B, P_max)
-                t_val = frame["t"]
-                remaining_insertions = frame["remaining"]  # (B, P_max) or None
-                positions = frame["positions"]  # (B, P_max, 3) or (B, P_max, 3, 3)
+        return self._plot_trajectory_frames(
+            frame_lists=frame_lists,
+            panel_titles=[""] * num_plots,
+            out_dir=out_dir,
+            filename=filename,
+            only_alpha_carbons=only_alpha_carbons,
+            show_residue_letters=show_residue_letters,
+            color_by=color_by,
+            max_cols=max_cols,
+        )
 
-                for i in range(num_plots):
-                    valid_i = valid_mask[i]
-                    positions_alive = positions[i][valid_i]  # (P, 3) or (P, 3, 3)
-                    aatypes_alive = aatypes_t[i][valid_i]  # (P,)
-                    motif_alive = motif_mask[i][valid_i]  # (P,)
-                    remaining_insertions_alive = (
-                        remaining_insertions[i][valid_i]
-                        if remaining_insertions is not None
-                        else None
-                    )  # (P,) or None
-                    n_alive = positions_alive.shape[0]
+    def plot_sampling_trajectory(
+        self,
+        traj: SampleTrajectory,
+        batch_idx: int = 0,
+        out_dir: Optional[str] = None,
+        filename: str = "sampling_trajectory",
+        max_frames: Optional[int] = 50,
+        only_alpha_carbons: bool = True,
+        show_residue_letters: bool = True,
+        color_by: Literal["auto", "position", "sequence"] = "auto",
+    ) -> str:
+        """Plot sample and model prediction side-by-side for one batch item.
 
-                    # Update sequence bar using pre-created artists
-                    rectangles, texts, motif_rects, letters, colors, _ = seq_artists[i]
-                    if n_alive > 0:
-                        BranchingFlowVisualizer._update_sequence_bar(
-                            rectangles,
-                            texts,
-                            motif_rects,
-                            letters,
-                            colors,
-                            aatypes_alive,
-                            motif_alive,
-                        )
-                    else:
-                        # Hide all artists when no sequence
-                        for rect, text, motif_rect in zip(
-                            rectangles, texts, motif_rects
-                        ):
-                            rect.set_visible(False)
-                            text.set_visible(False)
-                            motif_rect.set_visible(False)
+        Args:
+            traj: SampleTrajectory containing samples and predictions.
+            batch_idx: Which batch item to visualize.
+            out_dir: Output directory (defaults to temp directory).
+            filename: Base filename for the animation.
+            max_frames: Maximum frames to render (downsamples if exceeded).
+            only_alpha_carbons: If True, show only CA atoms (faster).
+            show_residue_letters: If True, overlay AA letters on 3D view.
+            color_by: 'auto' (infer), 'position' (chain index), or 'sequence' (aatype).
 
-                    # Update 3D structure using pre-created scatter artist
-                    max_atoms = max_seq_len if only_alpha_carbons else max_seq_len * 3
-                    BranchingFlowVisualizer._update_3d_scatter(
-                        scat=scatter_artists[i],
-                        ax=axes_3d[i],
-                        backbone_pos=positions_alive,
-                        motif_alive=motif_alive,
-                        aatypes_alive=aatypes_alive,
-                        max_atoms=max_atoms,
-                        t_val=t_val,
-                        only_alpha_carbons=only_alpha_carbons,
-                        remaining_insertions_alive=remaining_insertions_alive,
-                        color_by=color_by,
-                    )
-                    if show_residue_letters:
-                        if only_alpha_carbons:
-                            ca_pos = positions_alive  # (P, 3)
-                        else:
-                            ca_pos = positions_alive[:, 1, :]  # (P, 3)
-                        BranchingFlowVisualizer._update_3d_residue_letter_artists(
-                            texts=residue_letter_artists[i],
-                            ax=axes_3d[i],
-                            ca_pos=ca_pos,
-                            aatypes=aatypes_alive,
-                        )
+        Returns:
+            Path to the saved animation file.
+        """
+        if out_dir is None:
+            out_dir = tempfile.mkdtemp()
+        os.makedirs(out_dir, exist_ok=True)
 
-                writer.grab_frame()
+        if not traj.samples:
+            raise ValueError("Trajectory has no samples to plot")
+        if not traj.pred:
+            raise ValueError("SampleTrajectory has no predictions to plot")
 
-        plt.close(fig)
-        return anim_path
+        if color_by not in {"auto", "position", "sequence"}:
+            raise ValueError(
+                f"Invalid color_by={color_by!r}; expected 'auto', 'position', or 'sequence'"
+            )
+        if color_by == "auto":
+            color_by = "sequence" if show_residue_letters else "position"
+
+        num_total_frames = len(traj.samples)
+
+        # Compute frame indices BEFORE converting to TrajectoryFrame
+        if max_frames is not None and num_total_frames > max_frames:
+            sample_indices = np.linspace(0, num_total_frames - 1, max_frames, dtype=int)
+        else:
+            sample_indices = np.arange(num_total_frames)
+
+        # Convert only the needed samples to TrajectoryFrames
+        sample_frames = [
+            TrajectoryFrame.from_data_corrupted(
+                data=traj.samples[idx],
+                batch_idx=batch_idx,
+                include_atom37=not only_alpha_carbons,
+            )
+            for idx in sample_indices
+        ]
+
+        # Convert predictions (clamping index to available predictions)
+        num_preds = len(traj.pred)
+        pred_frames = [
+            TrajectoryFrame.from_model_prediction(
+                pred=traj.pred[min(idx, num_preds - 1)],
+                sample=traj.samples[idx],
+                batch_idx=batch_idx,
+                include_atom37=not only_alpha_carbons,
+            )
+            for idx in sample_indices
+        ]
+
+        return self._plot_trajectory_frames(
+            frame_lists=[sample_frames, pred_frames],
+            panel_titles=["Sample: ", "Prediction: "],
+            out_dir=out_dir,
+            filename=filename,
+            only_alpha_carbons=only_alpha_carbons,
+            show_residue_letters=show_residue_letters,
+            color_by=color_by,
+            max_cols=2,
+        )
 
     def visualize_corruption(
         self,
@@ -5683,17 +6003,35 @@ class BranchFlowModule(pl.LightningModule):
 
         self.cfg = cfg
         self.save_hyperparameters("cfg")
+        self._log = rank_zero_logger(__name__)
 
         self.model = BranchFlowModel(cfg=self.cfg.model)
         self.loss_calculator = BranchFlowLossCalculator(cfg=self.cfg.loss)
         self.interpolant = TreeInterpolant(cfg=self.cfg.interpolant)
+
+        # track EMA of training loss, hacky init at 10 to avoid nan handling
+        self.register_buffer("_train_loss_ema", torch.tensor(10.0), persistent=False)
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        if strict:
+            plan = plan_esm_warm_start_state_dict_load(
+                checkpoint_state_dict=state_dict,
+                current_state_dict=self.state_dict(),
+                strict=True,
+                allow_missing_esm_combiner_pair=True,
+            )
+            for note in plan.notes:
+                self._log.info(note)
+            strict = plan.strict
+
+        return super().load_state_dict(state_dict, strict=strict)
 
     def load_cogeneration_weights(self, ckpt_path: str):
         """
         Load compatible weights from a cogeneration checkpoint.
         Copies specified modules if shapes match. Fails on shape mismatch.
         """
-        print(f"⚡️ Loading cogeneration weights from: {ckpt_path}")
+        logger.info(f"⚡️ Loading cogeneration weights from: {ckpt_path}")
 
         cogen_state = torch.load(ckpt_path, map_location="cpu", weights_only=False)[
             "state_dict"
@@ -5784,25 +6122,31 @@ class BranchFlowModule(pl.LightningModule):
         t_bin_end = t_bin_start + 0.2
         t_bin_key = f"{t_bin_start:.1f}-{t_bin_end:.1f}"
 
-        # losses
+        # primary losses
         self.log("L/train", loss.total_loss, prog_bar=True)
-        self.log("L/trans", loss.trans_loss, prog_bar=True)
-        self.log("L/rot", loss.rot_vf_loss, prog_bar=True)
+        self.log("L/trans", loss.trans_loss)
+        self.log("L/rot", loss.rot_vf_loss)
         self.log("L/cdist", loss.pairwise_loss)
-        self.log("L/seq", loss.base_seq_loss, prog_bar=True)
+        self.log("L/seq", loss.base_seq_loss)
         self.log("L/seq_prob", loss.base_seq_prob_loss)
         self.log("L/seq_tok", loss.base_seq_token_loss)
         self.log("L/seq_ins", loss.insertion_seq_loss)
-        self.log("L/split", loss.split_token_loss, prog_bar=True)
+        self.log("L/split", loss.split_token_loss)
         self.log("L/split_pooled", loss.split_pooled_loss)
-        self.log("L/del", loss.del_loss, prog_bar=True)
+        self.log("L/del", loss.del_loss)
         self.log("L/bfactor", loss.bfactor_loss)
         self.log("L/plddt", loss.plddt_loss)
 
+        # EMA of training loss
+        train_loss = loss.total_loss.detach().item()
+        beta = float(self.cfg.experiment.train_loss_ema_beta)
+        self._train_loss_ema = beta * self._train_loss_ema + (1.0 - beta) * train_loss
+        self.log("L/train_ema", self._train_loss_ema, prog_bar=True)
+
         # t-stratified losses for primary losses
-        self.log(f"L_t/trans_t{t_bin_key}", loss.trans_loss, prog_bar=False)
-        self.log(f"L_t/rot_t{t_bin_key}", loss.rot_vf_loss, prog_bar=False)
-        self.log(f"L_t/seq_t{t_bin_key}", loss.base_seq_loss, prog_bar=False)
+        self.log(f"L_t/trans_t{t_bin_key}", loss.trans_loss)
+        self.log(f"L_t/rot_t{t_bin_key}", loss.rot_vf_loss)
+        self.log(f"L_t/seq_t{t_bin_key}", loss.base_seq_loss)
 
         # Timing statistics
         batch_size = corrupted.trans_t.shape[0]
@@ -5813,20 +6157,14 @@ class BranchFlowModule(pl.LightningModule):
             self.log("t/forward", forward_time * 1000)
             self.log("t/loss", loss_time * 1000)
         # Corruption time as function of batch size / t
-        self.log(
-            "t/corrupt_ms_per_batch", corrupt_time * 1000 / batch_size, prog_bar=False
-        )
-        self.log(
-            f"t/corrupt_ms_t{t_bin_key}",
-            corrupt_time * 1000,
-            prog_bar=False,
-        )
+        self.log("t/corrupt_ms_per_batch", corrupt_time * 1000 / batch_size)
+        self.log(f"t/corrupt_ms_t{t_bin_key}", corrupt_time * 1000)
 
         # MPS clean up
         if batch_idx % 100 == 0 and torch.backends.mps.is_available():
             alloc = torch.mps.current_allocated_memory() / 1e9
             drv = torch.mps.driver_allocated_memory() / 1e9
-            print(f"step {batch_idx} mps alloc={alloc:.2f}GB driver={drv:.2f}GB")
+            logger.debug(f"step {batch_idx} mps alloc={alloc:.2f}GB driver={drv:.2f}GB")
             gc.collect()
             torch.mps.empty_cache()
 
@@ -5844,13 +6182,52 @@ class BranchFlowModule(pl.LightningModule):
         val_dir = os.path.join(
             self.cfg.inference.predict_dir, "val", f"epoch{self.current_epoch:03d}"
         )
-        viz.plot_trajectory(
-            sample_traj,
+        viz.plot_sampling_trajectory(
+            traj=sample_traj,
             out_dir=val_dir,
             filename=f"val_sample_{batch_idx}",
         )
 
         # TODO compute a loss (e.g. folding validation) use for model checkpointer
+
+    def predict_step(self, batch: DataBatch, batch_idx: int, dataloader_idx: int = 0):
+        self.interpolant.set_device(self.device)
+
+        sample_traj = self.interpolant.sample(
+            model=self.model,
+            data=batch,
+        )
+
+        rank = DDPInfo.from_env().rank
+        out_dir = os.path.join(
+            self.cfg.inference.predict_dir,
+            "predict",
+            f"rank{rank:03d}",
+        )
+        os.makedirs(out_dir, exist_ok=True)
+
+        # write PDB
+        final_sample = sample_traj.samples[-1]
+        write_prot_to_pdb(
+            prot_pos=final_sample.to_atom37()[0].detach().cpu().numpy(),
+            file_path=os.path.join(out_dir, f"sample_{batch_idx:05d}.pdb"),
+            aatype=final_sample.aatypes_t[0].detach().cpu().numpy(),
+            chain_idx=final_sample.chain_idx[0].detach().cpu().numpy(),
+        )
+
+        if self.cfg.inference.plot.enabled:
+            viz = BranchingFlowVisualizer()
+            viz.plot_sampling_trajectory(
+                traj=sample_traj,
+                out_dir=out_dir,
+                filename=f"sample_{batch_idx:05d}",
+                max_frames=self.cfg.inference.plot.max_frames,
+                max_samples=self.cfg.inference.plot.max_samples,
+                max_cols=self.cfg.inference.plot.max_cols,
+                only_alpha_carbons=self.cfg.inference.plot.only_alpha_carbons,
+                show_residue_letters=self.cfg.inference.plot.show_residue_letters,
+                color_by=self.cfg.inference.plot.color_by,
+            )
 
 
 """ Training """
@@ -5869,9 +6246,26 @@ class Experiment:
     def __init__(self, cfg: VarcoConfig):
         self.cfg = cfg
         self.logger = rank_zero_logger(__name__)
+        self._warm_start_ckpt_path: Optional[str] = None
 
     def setup(self):
         pl.seed_everything(self.cfg.shared.seed, workers=True)
+
+        # Support warm starts / resume from a varco Lightning checkpoint.
+        if self.cfg.experiment.warm_start_ckpt is not None:
+            ckpt_path = str(self.cfg.experiment.warm_start_ckpt)
+            if not os.path.isabs(ckpt_path):
+                ckpt_path = str(Path(self.cfg.shared.project_root) / ckpt_path)
+            if not ckpt_path.endswith(".ckpt"):
+                raise ValueError(
+                    f"Invalid warm start checkpoint path {ckpt_path!r}; expected .ckpt"
+                )
+            if not os.path.exists(ckpt_path):
+                raise FileNotFoundError(
+                    f"Warm start checkpoint {ckpt_path!r} does not exist."
+                )
+            self._warm_start_ckpt_path = ckpt_path
+            self.logger.info(f"🚩 Warm starting from {ckpt_path}")
 
         # Handle DDP set up in case pytorch lightning doesn't handle it
         # (e.g. on mac laptop)
@@ -5885,7 +6279,7 @@ class Experiment:
         # Create output directory for this run
         predict_dir = self.cfg.inference.predict_dir
         os.makedirs(predict_dir, exist_ok=True)
-        print(f"📁 Output directory: {predict_dir}")
+        logger.info(f"📁 Output directory: {predict_dir}")
 
         self.data_module = ProteinDataModule(
             dataset=ProteinDataset(cfg=self.cfg.dataset),
@@ -5896,6 +6290,11 @@ class Experiment:
 
         # Load cogeneration weights if specified
         if self.cfg.experiment.cogen_ckpt_path:
+            if self._warm_start_ckpt_path is not None:
+                raise ValueError(
+                    "`cfg.experiment.cogen_ckpt_path` cannot be used together with "
+                    "`cfg.experiment.warm_start_ckpt`."
+                )
             self.module.load_cogeneration_weights(self.cfg.experiment.cogen_ckpt_path)
 
         self.logger.info("\n" + str(ModelSummary(self.module, max_depth=2)))
@@ -5932,7 +6331,7 @@ class Experiment:
             # write locally
             ckpt_dir = self.cfg.experiment.checkpointer.dirpath
             self.logger.info(
-                f"Checkpoints, config, validations etc. will be saved to: {ckpt_dir}"
+                f"💾 Checkpoints, config, validations etc. will be saved to: {ckpt_dir}"
             )
             os.makedirs(ckpt_dir, exist_ok=True)
             cfg_path = os.path.join(ckpt_dir, "config.yaml")
@@ -5953,8 +6352,9 @@ class Experiment:
         # callbacks.append(TQDMProgressBar(refresh_rate=1))
 
         # Model checkpoints
+        monitor = "L/train_ema"
         checkpoint_cfg = self.cfg.experiment.checkpointer.asdict()
-        checkpoint_cfg["monitor"] = "L/train"
+        checkpoint_cfg["monitor"] = monitor
         callbacks.append(ModelCheckpoint(**checkpoint_cfg))
 
         # Save every n training steps
@@ -5962,7 +6362,7 @@ class Experiment:
         n_step_cfg = copy.deepcopy(checkpoint_cfg)
         del n_step_cfg["every_n_epochs"]
         n_step_cfg["every_n_train_steps"] = 2000
-        n_step_cfg["monitor"] = "L/train"
+        n_step_cfg["monitor"] = monitor
         callbacks.append(ModelCheckpoint(**n_step_cfg))
 
         self.save_config(wandb_logger=wandb_logger)
@@ -5978,13 +6378,15 @@ class Experiment:
             enable_progress_bar=True,
         )
 
-        trainer.fit(self.module, datamodule=self.data_module)
+        trainer.fit(
+            self.module,
+            datamodule=self.data_module,
+            ckpt_path=self._warm_start_ckpt_path,
+        )
 
         self.logger.info(f"Training complete")
         self.logger.info(f"💾 ckpt saved to {self.cfg.experiment.checkpointer.dirpath}")
-        self.logger.info(
-            f"🏆 Best validation loss: {self.cfg.experiment.checkpointer.monitor}"
-        )
+        self.logger.info(f"🏆 Best checkpoint monitor: {monitor}")
 
         return self.module
 

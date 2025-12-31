@@ -417,9 +417,7 @@ class TestPadMask:
 
     def test_variable_length_batch_with_pad_mask(self):
         """Test pad_mask with variable-length sequences."""
-        model = FrozenEsmModel(
-            ModelESMKey.DUMMY, use_esm_attn_map=False, caching=False
-        )
+        model = FrozenEsmModel(ModelESMKey.DUMMY, use_esm_attn_map=False, caching=False)
 
         B, max_len = 3, 15
         aatypes = torch.randint(0, 21, (B, max_len))

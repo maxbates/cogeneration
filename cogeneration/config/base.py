@@ -1426,9 +1426,8 @@ class ExperimentTrainerConfig(BaseClassConfig):
     # `accelerator` is argument name to Trainer()
     accelerator: str = "${ternary:${equals: ${shared.local}, True}, 'mps', 'cuda'}"
     # `strategy` is argument name to Trainer(), ddp = distributed data parallel
-    # use `ddp_find_unused_parameters_true` if using frozen ESM
     strategy: Optional[str] = (
-        "${ternary:${equals: ${shared.local}, True}, 'auto', 'ddp_find_unused_parameters_true'}"
+        "${ternary:${equals: ${shared.local}, True}, 'auto', 'ddp'}"
     )
     min_epochs: int = 1  # prevents early stopping
     max_epochs: int = 200

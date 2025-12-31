@@ -50,7 +50,6 @@ from cogeneration.type.task import DataTask, InferenceTask
 class BaseDataset(Dataset):
     def __init__(
         self,
-        *,
         cfg: DatasetConfig,
         task: DataTask,
         eval: bool,  # process for evaluation
@@ -319,11 +318,11 @@ class BaseDataset(Dataset):
         eval_lengths = all_lengths[length_indices]
         eval_csv = metadata[metadata[length_column].isin(eval_lengths)]
 
-        # Pick subset per length
+        # Pick subset per length, sort shorter first
         eval_csv = eval_csv.groupby(length_column).sample(
             cfg.samples_per_eval_length, replace=True, random_state=fixed_seed
         )
-        eval_csv = eval_csv.sort_values(length_column, ascending=False)
+        eval_csv = eval_csv.sort_values(length_column, ascending=True)
 
         return eval_csv
 

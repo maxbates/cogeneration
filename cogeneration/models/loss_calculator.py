@@ -265,6 +265,12 @@ class BatchLossCalculator:
 
         return n_bb_atoms
 
+    def _connected_zeros(self, ref: torch.Tensor) -> torch.Tensor:
+        """Return per-batch zeros connected to `ref`'s graph (DDP-safe for optional supervision)."""
+        # Sum over all non-batch dims to produce (B,) and multiply by 0 to keep output unchanged.
+        reduce_dims = tuple(range(1, ref.ndim))
+        return ref.float().sum(dim=reduce_dims) * 0.0
+
     @cached_property
     def pred_bb_atoms(self) -> torch.Tensor:
         """Predicted backbone atoms (B, N, 37, 3)"""
@@ -539,11 +545,15 @@ class BatchLossCalculator:
         (e.g. as in synthetic examples).
         """
         pred_logits = self.pred.get(pbp.pred_bfactor, None)  # (B, N, num_bins)
-        if pred_logits is None or bp.res_bfactor not in self.batch:
+        if pred_logits is None:
             return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+        if bp.res_bfactor not in self.batch:
+            return self._connected_zeros(pred_logits)
 
         bins = pred_logits.shape[-1]
         gt_bfactor = self.batch[bp.res_bfactor]  # (B, N)
+        if gt_bfactor is None:
+            return self._connected_zeros(pred_logits)
         boundaries = torch.linspace(0.0, 100.0, bins - 1, device=gt_bfactor.device)
 
         # discretise ground-truth b-factors
@@ -553,7 +563,7 @@ class BatchLossCalculator:
         # mask out synthetic examples (all-zero b-factors) + padding
         valid_mask = (gt_bfactor > 1e-5) & self.loss_mask  # (B, N)
         if not valid_mask.any():
-            return torch.zeros(self.num_batch, device=self.batch[bp.res_mask].device)
+            return self._connected_zeros(pred_logits)
 
         # cross-entropy
         logp = torch.nn.functional.log_softmax(pred_logits.float(), dim=-1)
