@@ -98,7 +98,7 @@ class VarcoInterpolantAATypesCouplerConfig(BaseClassConfig):
     # Exponent for uncertainty gating
     uncertainty_sharpness: float = 1.0
     # Maximum total off-diagonal probability per step
-    leave_mass_cap: float = 0.25
+    leave_mass_cap: float = 0.2
 
 
 @dataclass

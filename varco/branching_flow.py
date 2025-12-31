@@ -31,7 +31,17 @@ import tempfile
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Generic, List, Optional, Tuple, TypeVar, Union
+from typing import (
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import hydra
 import matplotlib.animation as animation
@@ -40,6 +50,8 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+from matplotlib.colors import ListedColormap
+from mpl_toolkits.mplot3d import proj3d
 from omegaconf import OmegaConf
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 from pytorch_lightning.loggers.wandb import WandbLogger
@@ -2348,8 +2360,15 @@ class BranchFlowModel(nn.Module):
 """ Tree Coupling """
 
 
+@dataclass
 class Coupling(ABC):
-    """Coupling struct tracks domain-specific anchors, and the corruption tree plan."""
+    """
+    Coupling struct captures domain-specific creation / anchor values for corruption tree plan.
+    """
+
+    tree: BatchedTreePlan
+    anchors: torch.Tensor  # (B, A, ...)
+    creation_state: torch.Tensor  # (B, A, ...)
 
     def validate(self) -> None:
         return
@@ -2479,6 +2498,77 @@ class Coupler(ABC, Generic[CouplingT]):
 
         return tree.traverse_bottom_up(anchors, combine_fn)
 
+    def bridge_step(
+        self,
+        coupling: CouplingT,
+        x_prev: torch.Tensor,  # (B, A, ...)
+        t_prev: float,
+        t_next: float,
+    ) -> torch.Tensor:
+        """Advance a single coupled bridge path from t_prev -> t_next.
+
+        This is intended for time-coupled visualization / debugging: it reuses a fixed
+        sampled coupling (anchors + creation_state) and produces a single stochastic
+        trajectory instead of independent marginal samples at each timepoint.
+
+        Notes:
+        - Per-position start time is clamped as t0 = max(t_prev, birth_time).
+        - For positions not yet born at t_prev, we start from coupling.creation_state.
+        - post_process() is applied at t_next (masking, motif fixing, etc.).
+        """
+        if float(t_next) < float(t_prev):
+            raise ValueError(f"Expected t_next >= t_prev; got {t_next} < {t_prev}")
+
+        tree = coupling.tree
+        birth_time = tree.birth_time  # (B, A)
+
+        # validate x_prev is in aligned space, matches coupling states
+        if (
+            x_prev.shape != coupling.creation_state.shape
+            or x_prev.shape != coupling.anchors.shape
+        ):
+            raise ValueError(
+                "x_prev, coupling.creation_state, and coupling.anchors must have the same shape; "
+                f"got x_prev={tuple(x_prev.shape)}, creation_state={tuple(coupling.creation_state.shape)}, "
+                f"anchors={tuple(coupling.anchors.shape)}"
+            )
+
+        t_prev_full = torch.full_like(birth_time, float(t_prev))  # (B, A)
+        t_next_full = torch.full_like(birth_time, float(t_next))  # (B, A)
+
+        # start time is min_clamped by birth_time
+        t0 = torch.maximum(t_prev_full, birth_time)
+
+        # start state is creation state if t_prev < birth_time, otherwise provided x_prev
+        use_prev = birth_time <= float(t_prev)  # (B, A)
+        use_prev_expanded = use_prev
+        while use_prev_expanded.ndim < x_prev.ndim:
+            use_prev_expanded = use_prev_expanded.unsqueeze(-1)
+        x_start = torch.where(use_prev_expanded, x_prev, coupling.creation_state)
+
+        # sample bridge from x_prev (x_start) -> t_next (anchors)
+        x_next = self.sample_bridge(
+            x_start=x_start,  # (B, A, ...)
+            x_end=coupling.anchors,  # (B, A, ...)
+            s=t_next_full,
+            t0=t0,
+        )
+
+        # Apply domain-specific masking / constraints at t_next
+        present_mask = tree.present_mask(
+            t=torch.full(
+                (birth_time.shape[0],), float(t_next), device=birth_time.device
+            )
+        )
+        x_next = self.post_process(
+            x_t=x_next,
+            present_mask=present_mask,
+            motif_mask=tree.motif_mask,
+            anchors=coupling.anchors,
+        )
+
+        return x_next
+
     def corrupt(
         self,
         tree: BatchedTreePlan,
@@ -2501,6 +2591,7 @@ class Coupler(ABC, Generic[CouplingT]):
         device = x1.device
         B = x1.shape[0]
         A = tree.parent_idx.shape[1]
+        t_expanded = t.unsqueeze(1).expand(B, A)
 
         if x0 is None:
             # Broadcast x1 to aligned space (copies leaves, fills internal nodes)
@@ -2512,10 +2603,10 @@ class Coupler(ABC, Generic[CouplingT]):
                 device=device,
             )
 
+        # traverse bottom up to get anchors (which aggregate leaves).
+        # for trans and rots, anchors are deterministic "centers" of leaves
+        # for aatypes, anchor probs are deterministic but we *sample* an anchor token
         anchors = self.build_anchors(x1=x1, tree=tree)
-
-        creation_state = x0.clone()
-        t_expanded = t.unsqueeze(1).expand(B, A)
 
         def split_fn(node_creation, node_target, node_t0, node_st):
             return self.sample_bridge(
@@ -2525,6 +2616,9 @@ class Coupler(ABC, Generic[CouplingT]):
                 t0=node_t0,
             )
 
+        # traverse top-down from roots -> anchors -> leaves to get creation states
+        # motifs + roots will use t=0 state. anchors states determined by bridges.
+        creation_state = x0.clone()
         creation_state = tree.traverse_top_down(
             creation_state=creation_state,
             target_state=anchors,
@@ -2532,6 +2626,12 @@ class Coupler(ABC, Generic[CouplingT]):
             max_split_time=t_expanded,
         )
 
+        # track domain's coupling: creation state + anchors (target states)
+        coupling = self._make_coupling(
+            tree=tree, anchors=anchors, creation_state=creation_state
+        )
+
+        # sample bridge from creation state -> anchor/terminal state to get state at t
         x_t = self.sample_bridge(
             x_start=creation_state,
             x_end=anchors,
@@ -2545,6 +2645,7 @@ class Coupler(ABC, Generic[CouplingT]):
                 "Domain couplers must clamp time deltas for unborn nodes."
             )
 
+        # domain specific post-processing, mostly null out non-present nodes
         x_t = self.post_process(
             x_t=x_t,
             present_mask=tree.present_mask(t=t),
@@ -2552,13 +2653,14 @@ class Coupler(ABC, Generic[CouplingT]):
             anchors=anchors,
         )
 
-        return x_t, self._make_coupling(anchors=anchors, tree=tree)
+        return x_t, coupling
 
     @abstractmethod
     def _make_coupling(
         self,
-        anchors: torch.Tensor,
         tree: BatchedTreePlan,
+        anchors: torch.Tensor,  # (B, A, ...)
+        creation_state: torch.Tensor,  # (B, A, ...)
     ) -> Coupling:
         """Create domain-specific coupling object."""
         raise NotImplementedError
@@ -2584,8 +2686,9 @@ class Coupler(ABC, Generic[CouplingT]):
 
 @dataclass
 class TranslationCoupling(Coupling):
-    tree: BatchedTreePlan
-    anchors: torch.Tensor  # (B, A, 3)
+    """Coupling for translations using Brownian bridge."""
+
+    pass
 
 
 class TranslationCoupler(Coupler[TranslationCoupling]):
@@ -2656,10 +2759,15 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
 
     def _make_coupling(
         self,
-        anchors: torch.Tensor,
+        anchors: torch.Tensor,  # (B, A, 3)
         tree: BatchedTreePlan,
+        creation_state: torch.Tensor,  # (B, A, 3)
     ) -> TranslationCoupling:
-        return TranslationCoupling(anchors=anchors, tree=tree)
+        return TranslationCoupling(
+            tree=tree,
+            anchors=anchors,
+            creation_state=creation_state,
+        )
 
     def euler_step(
         self,
@@ -2714,8 +2822,6 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
 class AATypesCoupling(Coupling):
     """Coupling for amino acid types using CTMC bridge."""
 
-    tree: BatchedTreePlan
-    anchors: torch.Tensor  # (B, A) long
     # Anchor probability distributions (before sampling)
     anchor_probs: torch.Tensor  # (B, A, K)
 
@@ -2919,9 +3025,9 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
 
         anchor_probs = tree.traverse_bottom_up(anchor_probs, combine_fn)
 
+        # uniform fallback where no mass for multinomial()
         row_sums = anchor_probs.sum(dim=-1, keepdim=True)
         has_mass = row_sums > 1e-12
-
         uniform_fallback = torch.ones(B, A, K, device=device) / K
         anchor_probs = torch.where(
             has_mass,
@@ -2936,6 +3042,8 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
             noisy_anchor_probs = (
                 1.0 - noise_weight
             ) * noisy_anchor_probs + noise_weight * uniform_fallback
+            # disallow mask token for anchor tokens
+            noisy_anchor_probs[:, :, MASK_TOKEN_INDEX] = 0.0
             noisy_anchor_probs = noisy_anchor_probs / noisy_anchor_probs.sum(
                 dim=-1, keepdim=True
             ).clamp_min(1e-12)
@@ -3005,13 +3113,15 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
 
     def _make_coupling(
         self,
-        anchors: torch.Tensor,
         tree: BatchedTreePlan,
+        anchors: torch.Tensor,  # (B, A)
+        creation_state: torch.Tensor,  # (B, A)
     ) -> AATypesCoupling:
         return AATypesCoupling(
-            anchors=anchors,
-            anchor_probs=self._last_anchor_probs,
             tree=tree,
+            anchors=anchors,
+            creation_state=creation_state,
+            anchor_probs=self._last_anchor_probs,  # (B, A, K)
         )
 
     def _uncertainty_gate(
@@ -3150,8 +3260,7 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
 class RotationCoupling(Coupling):
     """Coupling for SO(3) rotations using geodesic bridge with IGSO3 noise."""
 
-    tree: BatchedTreePlan
-    anchors: torch.Tensor  # (B, A, 3, 3)
+    pass
 
 
 class RotationCoupler(Coupler[RotationCoupling]):
@@ -3313,10 +3422,15 @@ class RotationCoupler(Coupler[RotationCoupling]):
 
     def _make_coupling(
         self,
-        anchors: torch.Tensor,
         tree: BatchedTreePlan,
+        anchors: torch.Tensor,  # (B, A, 3, 3)
+        creation_state: torch.Tensor,  # (B, A, 3, 3)
     ) -> RotationCoupling:
-        return RotationCoupling(anchors=anchors, tree=tree)
+        return RotationCoupling(
+            tree=tree,
+            anchors=anchors,
+            creation_state=creation_state,
+        )
 
     def _compute_sigma_t(
         self,
@@ -3456,6 +3570,13 @@ class TreeInterpolant:
         self.device = device
         self.rotation_coupler.set_device(device)  # for IGSO3 device
 
+    def seed_all(self, seed: int):
+        if seed is None:
+            return
+        torch.manual_seed(int(seed))
+        if self.device.type == "cuda":
+            torch.cuda.manual_seed_all(int(seed))
+
     def compute_motif_guidance_vf(
         self,
         t: torch.Tensor,  # (B,)
@@ -3524,84 +3645,50 @@ class TreeInterpolant:
 
         return trans_guidance_vf, rotmats_guidance_vf
 
-    def corrupt_to(
+    def pack_bridged_states(
         self,
         batch: DataBatch,
         t: torch.Tensor,  # (B,)
-        trans_0: Optional[torch.Tensor] = None,
-        aatypes_0: Optional[torch.Tensor] = None,
-        rotmats_0: Optional[torch.Tensor] = None,
-    ) -> Tuple[DataBridged, TreeCouplings]:
+        trans_t: torch.Tensor,  # (B, A, 3)
+        rotmats_t: torch.Tensor,  # (B, A, 3, 3)
+        aatypes_t: torch.Tensor,  # (B, A)
+    ) -> DataBridged:
+        """
+        Pack static batch fields + per-domain tree-aligned states into a DataBridged.
+        """
         tree = batch.tree.to(self.device)
         trans_1 = batch.trans_1.to(self.device)
         rotmats_1 = batch.rotmats_1.to(self.device)
-        aatypes_1 = batch.aatypes_1.to(self.device)
-        t = t.to(self.device)
-        trans_0 = to_device(trans_0, self.device)
-        aatypes_0 = to_device(aatypes_0, self.device)
-        rotmats_0 = to_device(rotmats_0, self.device)
+        present_mask = tree.present_mask(t=t)
 
-        res_mask = batch.tree.broadcast_to_leaves(
+        res_mask = tree.broadcast_to_leaves(
             x=batch.res_mask.to(self.device), fill_value=0
         )
-        chain_idx = batch.tree.broadcast_to_leaves(
+        chain_idx = tree.broadcast_to_leaves(
             x=batch.chain_idx.to(self.device), fill_value=0
         )
-        res_bfactor = batch.tree.broadcast_to_leaves(
+        res_bfactor = tree.broadcast_to_leaves(
             x=batch.res_bfactor.to(self.device), fill_value=0.0
         )
-        res_plddt = batch.tree.broadcast_to_leaves(
+        res_plddt = tree.broadcast_to_leaves(
             x=batch.res_plddt.to(self.device), fill_value=0.0
         )
-        # contact_conditioning: (B, N, N) -> (B, A, A); inserted positions inherit parent's value (always 0 for scaffolds)
-        contact_conditioning = batch.tree.broadcast_to_leaves(
+        contact_conditioning = tree.broadcast_to_leaves(
             x=batch.contact_conditioning.to(self.device), fill_value=0.0, is_2d=True
         )
 
-        # Broadcast trans_1 in motifs to aligned space for motif guidance
         trans_1_motifs = tree.broadcast_to_leaves(x=trans_1, fill_value=0.0)
         trans_1_motifs = trans_1_motifs * tree.motif_mask.unsqueeze(-1).float()
 
-        # Broadcast rotmats_1 in motifs to aligned space for motif guidance
         identity = torch.eye(3, device=self.device, dtype=rotmats_1.dtype)
-        rotmats_1_motifs = tree.broadcast_to_leaves(
-            x=rotmats_1,
-            fill_value=identity,
-        )
+        rotmats_1_motifs = tree.broadcast_to_leaves(x=rotmats_1, fill_value=identity)
         rotmats_1_motifs = torch.where(
             tree.motif_mask.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3, 3),
             rotmats_1_motifs,
             identity.unsqueeze(0).unsqueeze(0).expand_as(rotmats_1_motifs),
         )
 
-        # Corrupt domains
-
-        trans_t, trans_coupling = self.translation_coupler.corrupt(
-            tree=tree,
-            t=t,
-            x1=trans_1,
-            x0=trans_0,
-        )
-        trans_coupling.validate()
-
-        rotmats_t, rotation_coupling = self.rotation_coupler.corrupt(
-            tree=tree,
-            t=t,
-            x1=rotmats_1,
-            x0=rotmats_0,
-        )
-        rotation_coupling.validate()
-
-        aatypes_t, aatypes_coupling = self.aatypes_coupler.corrupt(
-            tree=tree,
-            t=t,
-            x1=aatypes_1,
-            x0=aatypes_0,
-        )
-        aatypes_coupling.validate()
-
         # Recenter translations to maintain translation invariance
-        present_mask = tree.present_mask(t=t)
         trans_t = trans_t - batch_center_of_mass(trans_t, mask=present_mask)[:, None]
 
         bridged = DataBridged(
@@ -3624,23 +3711,190 @@ class TreeInterpolant:
             contact_conditioning=contact_conditioning,
         )
         bridged.validate()
+        return bridged
+
+    def corrupt_to(
+        self,
+        batch: DataBatch,
+        t: torch.Tensor,  # (B,)
+        trans_0: Optional[torch.Tensor] = None,
+        aatypes_0: Optional[torch.Tensor] = None,
+        rotmats_0: Optional[torch.Tensor] = None,
+    ) -> Tuple[DataBridged, TreeCouplings]:
+        """Corrupt a batch to time t."""
+        tree = batch.tree.to(self.device)
+        t = t.to(self.device)
+
+        # Corrupt domains to time t
+
+        trans_t, trans_coupling = self.translation_coupler.corrupt(
+            tree=tree,
+            t=t,
+            x1=batch.trans_1.to(self.device),
+            x0=to_device(trans_0, self.device),
+        )
+        trans_coupling.validate()
+
+        rotmats_t, rotation_coupling = self.rotation_coupler.corrupt(
+            tree=tree,
+            t=t,
+            x1=batch.rotmats_1.to(self.device),
+            x0=to_device(rotmats_0, self.device),
+        )
+        rotation_coupling.validate()
+
+        aatypes_t, aatypes_coupling = self.aatypes_coupler.corrupt(
+            tree=tree,
+            t=t,
+            x1=batch.aatypes_1.to(self.device),
+            x0=to_device(aatypes_0, self.device),
+        )
+        aatypes_coupling.validate()
 
         couplings = TreeCouplings(
             translation=trans_coupling,
             aatypes=aatypes_coupling,
             rotation=rotation_coupling,
         )
+
+        bridged = self.pack_bridged_states(
+            batch=batch,
+            t=t,
+            trans_t=trans_t,
+            rotmats_t=rotmats_t,
+            aatypes_t=aatypes_t,
+        )
+
         return bridged, couplings
 
     def corrupt_batch(self, batch: DataBatch) -> Tuple[DataBridged, TreeCouplings]:
-        # pick a single time to share across the batch, biased slightly toward later times,
-        # simply so they have a similar number of insertion/deletions to simulate
-        # since corruption is run across the batch
+        """
+        Corrupt a batch to a shared time.
+        Pick a single time to share across the batch, biased slightly toward later times,
+        simply so they have a similar number of insertion/deletions to simulate
+        since corruption is run across the batch
+        """
         shared_t = torch.rand(1, device=self.device) ** 0.8
         shared_t = shared_t.clamp(min=self.min_t, max=1.0 - self.min_t)
         t = torch.ones(batch.trans_1.shape[0], device=self.device) * shared_t  # (B,)
-
         return self.corrupt_to(batch=batch, t=t)
+
+    def corrupt_trajectory(
+        self,
+        batch: DataBatch,
+        times: Optional[List[float]] = None,
+        seed: Optional[int] = None,
+        trans_0: Optional[torch.Tensor] = None,
+        aatypes_0: Optional[torch.Tensor] = None,
+        rotmats_0: Optional[torch.Tensor] = None,
+    ) -> Tuple[Trajectory, TreeCouplings]:
+        """Generate a time-coupled corruption trajectory"""
+        self.set_device(batch.trans_1.device)
+        self.seed_all(seed)
+
+        B = batch.trans_1.shape[0]
+        tree = batch.tree.to(self.device)
+        trans_1 = batch.trans_1.to(self.device)
+        rotmats_1 = batch.rotmats_1.to(self.device)
+        aatypes_1 = batch.aatypes_1.to(self.device)
+
+        if times is None:
+            times = list(np.linspace(0.0, 1.0, 50))
+        if len(times) == 0:
+            raise ValueError("times must be non-empty")
+        times = [float(np.clip(t, self.min_t, 1.0 - self.min_t)) for t in times]
+
+        # corrupt to t_build to get couplings for trajectory
+        t_build = float(times[-1])
+        t_build_tensor = torch.ones(B, device=self.device) * t_build
+
+        # Define consistent base samples for the whole trajectory (in aligned space)
+        if trans_0 is None:
+            trans_0 = self.translation_coupler.sample_base(
+                motif_mask=tree.motif_mask,
+                x1=tree.broadcast_to_leaves(trans_1, fill_value=0),
+                device=self.device,
+            )
+        if rotmats_0 is None:
+            rotmats_0 = self.rotation_coupler.sample_base(
+                motif_mask=tree.motif_mask,
+                x1=tree.broadcast_to_leaves(
+                    rotmats_1, fill_value=torch.eye(3, device=self.device)
+                ),
+                device=self.device,
+            )
+        if aatypes_0 is None:
+            aatypes_0 = self.aatypes_coupler.sample_base(
+                motif_mask=tree.motif_mask,
+                x1=tree.broadcast_to_leaves(aatypes_1, fill_value=MASK_TOKEN_INDEX),
+                device=self.device,
+            )
+
+        # Build couplings once (anchors + creation states)
+        _, trans_coupling = self.translation_coupler.corrupt(
+            tree=tree,
+            t=t_build_tensor,
+            x1=trans_1,
+            x0=to_device(trans_0, self.device),
+        )
+        _, rotmats_coupling = self.rotation_coupler.corrupt(
+            tree=tree,
+            t=t_build_tensor,
+            x1=rotmats_1,
+            x0=to_device(rotmats_0, self.device),
+        )
+        _, aatypes_coupling = self.aatypes_coupler.corrupt(
+            tree=tree,
+            t=t_build_tensor,
+            x1=aatypes_1,
+            x0=to_device(aatypes_0, self.device),
+        )
+        couplings = TreeCouplings(
+            translation=trans_coupling,
+            aatypes=aatypes_coupling,
+            rotation=rotmats_coupling,
+        )
+
+        # Start from creation states (defined at birth_time for each node), and step forward.
+        trans_cur = trans_coupling.creation_state
+        rotmats_cur = rotmats_coupling.creation_state
+        aatypes_cur = aatypes_coupling.creation_state
+        t_prev = 0.0
+
+        # Iterate through time, bridging current state to next timepoint
+        samples: List[DataCorrupted] = []
+        for t_val in tqdm(times, desc="corrupt_trajectory()", leave=False):
+            trans_cur = self.translation_coupler.bridge_step(
+                coupling=trans_coupling,
+                x_prev=trans_cur,
+                t_prev=t_prev,
+                t_next=t_val,
+            )
+            rotmats_cur = self.rotation_coupler.bridge_step(
+                coupling=rotmats_coupling,
+                x_prev=rotmats_cur,
+                t_prev=t_prev,
+                t_next=t_val,
+            )
+            aatypes_cur = self.aatypes_coupler.bridge_step(
+                coupling=aatypes_coupling,
+                x_prev=aatypes_cur,
+                t_prev=t_prev,
+                t_next=t_val,
+            )
+
+            t_tensor = torch.ones(B, device=self.device) * float(t_val)
+            bridged = self.pack_bridged_states(
+                batch=batch,
+                t=t_tensor,
+                trans_t=trans_cur,
+                rotmats_t=rotmats_cur,
+                aatypes_t=aatypes_cur,
+            )
+            samples.append(bridged.pack_present())
+            t_prev = float(t_val)
+
+        return Trajectory(samples=samples), couplings
 
     @staticmethod
     def _sample_initial_positions(
@@ -4040,12 +4294,9 @@ class TreeInterpolant:
                     )
 
                 # Recenter translations to maintain translation invariance
-                batch.trans_t = (
-                    batch.trans_t
-                    - batch_center_of_mass(batch.trans_t, mask=batch.valid_mask)[
-                        :, None
-                    ]
-                )
+                # Everything is "present" in sampling,so use valid_mask
+                com = batch_center_of_mass(batch.trans_t, mask=batch.valid_mask)
+                batch.trans_t = batch.trans_t - com[:, None, :]
 
                 # Save
                 if traj_frames is None or step_num % traj_frames == 0:
@@ -4786,6 +5037,13 @@ class BranchingFlowVisualizer:
         return tuple(letters), colors
 
     @staticmethod
+    @functools.lru_cache(maxsize=1)
+    def _aa_listed_colormap() -> ListedColormap:
+        """A categorical colormap for amino acid indices (0..20)."""
+        _, colors = BranchingFlowVisualizer._aa_letters_and_colors()
+        return ListedColormap(colors, name="aa")
+
+    @staticmethod
     def _create_sequence_artists(
         ax: plt.Axes, max_len: int, positions_per_row: int = 175
     ):
@@ -4906,6 +5164,7 @@ class BranchingFlowVisualizer:
         trans_min: np.ndarray,
         trans_max: np.ndarray,
         only_alpha_carbons: bool = False,
+        color_by: Literal["position", "sequence"] = "position",
     ):
         """Pre-create a 3D scatter artist with max_atoms capacity.
 
@@ -4924,7 +5183,11 @@ class BranchingFlowVisualizer:
             dummy_pos[:, 1],
             dummy_pos[:, 2],
             c=dummy_colors,
-            cmap="Spectral",
+            cmap=(
+                BranchingFlowVisualizer._aa_listed_colormap()
+                if color_by == "sequence"
+                else "Spectral"
+            ),
             vmin=0,
             vmax=1,
             s=dummy_sizes,
@@ -4944,15 +5207,73 @@ class BranchingFlowVisualizer:
         return scat
 
     @staticmethod
+    def _create_3d_residue_letter_artists(
+        ax: plt.Axes,
+        max_len: int,
+        fontsize: float = 8.0,
+    ):
+        """Pre-create per-residue text artists (one per residue index).
+
+        Uses 2D text overlaid on a 3D axis, with positions updated via projection so
+        letters remain screen-upright (i.e. not rotated by the 3D camera).
+        """
+        texts = []
+        for _ in range(max_len):
+            text = ax.text2D(
+                0.0,
+                0.0,
+                "",
+                transform=ax.transData,
+                ha="center",
+                va="center",
+                fontsize=fontsize,
+                color="k",
+                alpha=0.9,
+            )
+            text.set_visible(False)
+            texts.append(text)
+        return texts
+
+    @staticmethod
+    def _update_3d_residue_letter_artists(
+        texts,
+        ax: plt.Axes,
+        ca_pos: np.ndarray,  # (n_alive, 3)
+        aatypes: np.ndarray,  # (n_alive,)
+    ) -> None:
+        """Update pre-created artists with new residue letters/positions."""
+        letters, _ = BranchingFlowVisualizer._aa_letters_and_colors()
+        n = len(aatypes)
+
+        if n > 0:
+            x2, y2, _ = proj3d.proj_transform(
+                ca_pos[:, 0],
+                ca_pos[:, 1],
+                ca_pos[:, 2],
+                ax.get_proj(),
+            )
+
+        for i in range(len(texts)):
+            if i < n:
+                aa_idx = int(aatypes[i]) if aatypes[i] < len(letters) else 20
+                texts[i].set_text(letters[aa_idx])
+                texts[i].set_position((float(x2[i]), float(y2[i])))
+                texts[i].set_visible(True)
+            else:
+                texts[i].set_visible(False)
+
+    @staticmethod
     def _update_3d_scatter(
         scat,
         ax: plt.Axes,
         backbone_pos: np.ndarray,  # (n_alive, 3, 3) - N, CA, C per residue, or (n_alive, 3) if only_alpha_carbons
         motif_alive: np.ndarray,  # (n_alive,) - per residue
+        aatypes_alive: Optional[np.ndarray],  # (n_alive,)
         max_atoms: int,
         t_val: float,
         only_alpha_carbons: bool = False,
         remaining_insertions_alive: Optional[np.ndarray] = None,  # (n_alive,)
+        color_by: Literal["position", "sequence"] = "position",
     ):
         """Update pre-created 3D scatter artist with backbone atoms.
 
@@ -4978,9 +5299,16 @@ class BranchingFlowVisualizer:
                 padded_pos = np.zeros((max_atoms, 3))
                 padded_pos[:n_atoms] = flat_pos
 
-                # Color by residue index (Spectral colormap)
                 color_idx = np.zeros(max_atoms)
-                color_idx[:n_atoms] = np.arange(n_res)
+                if color_by == "sequence":
+                    if aatypes_alive is None:
+                        raise ValueError(
+                            "aatypes_alive is required for color_by='sequence'"
+                        )
+                    color_idx[:n_atoms] = aatypes_alive
+                else:
+                    # Color by residue index (position along chain)
+                    color_idx[:n_atoms] = np.arange(n_res)
 
                 # Sizes: anchors (remaining > 0) get 30 + 10 * remaining, terminals get 20
                 if remaining_insertions_alive is not None:
@@ -5006,10 +5334,17 @@ class BranchingFlowVisualizer:
                 padded_pos = np.zeros((max_atoms, 3))
                 padded_pos[:n_atoms] = flat_pos
 
-                # Color by residue index (all 3 atoms of same residue get same color)
                 color_idx = np.zeros(max_atoms)
-                res_colors = np.repeat(np.arange(n_res), 3)  # [0,0,0,1,1,1,...]
-                color_idx[:n_atoms] = res_colors
+                if color_by == "sequence":
+                    if aatypes_alive is None:
+                        raise ValueError(
+                            "aatypes_alive is required for color_by='sequence'"
+                        )
+                    color_idx[:n_atoms] = np.repeat(aatypes_alive, 3)
+                else:
+                    # Color by residue index (all 3 atoms of same residue get same color)
+                    res_colors = np.repeat(np.arange(n_res), 3)  # [0,0,0,1,1,1,...]
+                    color_idx[:n_atoms] = res_colors
 
                 # Sizes: CA varies by anchor status, N/C always 10
                 # Anchors (remaining > 0): CA = 30 + 10 * remaining
@@ -5037,7 +5372,13 @@ class BranchingFlowVisualizer:
             # Update scatter data
             scat._offsets3d = (padded_pos[:, 0], padded_pos[:, 1], padded_pos[:, 2])
             scat.set_array(color_idx)
-            scat.set_clim(0, max(n_res - 1, 1))
+            if color_by == "sequence":
+                scat.set_cmap(BranchingFlowVisualizer._aa_listed_colormap())
+                _, colors = BranchingFlowVisualizer._aa_letters_and_colors()
+                scat.set_clim(-0.5, float(colors.shape[0] - 1) + 0.5)
+            else:
+                scat.set_cmap("Spectral")
+                scat.set_clim(0, max(n_res - 1, 1))
             scat.set_sizes(sizes)
         else:
             # No points - hide all
@@ -5051,9 +5392,17 @@ class BranchingFlowVisualizer:
         out_dir: Optional[str] = None,
         filename: str = "trajectory",
         max_frames: Optional[int] = 50,
+        max_samples: int = 2,
+        max_cols: int = 2,
         only_alpha_carbons: bool = True,  # faster; skips to_atom37
+        show_residue_letters: bool = True,
+        color_by: Literal["auto", "position", "sequence"] = "auto",
     ) -> str:
-        """Plot a trajectory animation from any Trajectory (corruption or sampling)."""
+        """Plot a trajectory animation from any Trajectory (corruption or sampling).
+
+        If show_residue_letters=True, overlays a 1-letter AA code at each residue CA.
+        color_by controls 3D coloring: 'auto' (infer), 'position' (chain index) or 'sequence' (aatype index).
+        """
         if out_dir is None:
             out_dir = tempfile.mkdtemp()
         os.makedirs(out_dir, exist_ok=True)
@@ -5061,13 +5410,22 @@ class BranchingFlowVisualizer:
         if not traj.samples:
             raise ValueError("Trajectory has no samples to plot")
 
+        if color_by not in {"auto", "position", "sequence"}:
+            raise ValueError(
+                f"Invalid color_by={color_by!r}; expected 'auto', 'position', or 'sequence'"
+            )
+        if color_by == "auto":
+            color_by = "sequence" if show_residue_letters else "position"
+
         ext, writer = self._get_anim_writer()
         anim_path = os.path.join(out_dir, f"{filename}.{ext}")
         os.makedirs(out_dir, exist_ok=True)
         print(f"💾 Saving trajectory animation to {anim_path}")
 
         num_batch = traj.samples[0].trans_t.shape[0]
-        num_plots = min(num_batch, 4)
+        num_plots = min(num_batch, max_samples)
+        num_cols = min(num_plots, max_cols)
+        num_rows = math.ceil(num_plots / num_cols)
 
         # Compute camera limits and max sequence length (variable-length across samples)
         trans_min = np.full(3, np.inf)
@@ -5084,8 +5442,6 @@ class BranchingFlowVisualizer:
         trans_min = np.tile(trans_min, (num_batch, 1))
         trans_max = np.tile(trans_max, (num_batch, 1))
 
-        num_cols = min(num_plots, 2)
-        num_rows = math.ceil(num_plots / num_cols)
         fig = plt.figure(figsize=(10 * num_cols, 12 * num_rows))
         # 2 rows per plot: sequence bar (height 2) + 3D structure (height 10)
         gs = fig.add_gridspec(
@@ -5111,6 +5467,9 @@ class BranchingFlowVisualizer:
         # Store artists (rectangles, texts, motif_rects, letters, colors, positions_per_row)
         seq_artists = []
         scatter_artists = []  # Pre-created 3D scatter artists for each plot
+        residue_letter_artists = (
+            []
+        )  # Pre-created 3D text artists for each plot (optional)
         for i in range(num_plots):
             row, col = divmod(i, num_cols)
             ax_seq = fig.add_subplot(gs[row * 2, col])
@@ -5133,8 +5492,19 @@ class BranchingFlowVisualizer:
                 trans_min[i],
                 trans_max[i],
                 only_alpha_carbons=only_alpha_carbons,
+                color_by=color_by,
             )
             scatter_artists.append(scat)
+            if show_residue_letters:
+                residue_letter_artists.append(
+                    BranchingFlowVisualizer._create_3d_residue_letter_artists(
+                        ax=ax_3d,
+                        max_len=max_seq_len,
+                        fontsize=8.0,
+                    )
+                )
+            else:
+                residue_letter_artists.append(None)
 
         # Downsample to max_frames
         if max_frames is not None and len(traj.samples) > max_frames:
@@ -5216,11 +5586,24 @@ class BranchingFlowVisualizer:
                         ax=axes_3d[i],
                         backbone_pos=positions_alive,
                         motif_alive=motif_alive,
+                        aatypes_alive=aatypes_alive,
                         max_atoms=max_atoms,
                         t_val=t_val,
                         only_alpha_carbons=only_alpha_carbons,
                         remaining_insertions_alive=remaining_insertions_alive,
+                        color_by=color_by,
                     )
+                    if show_residue_letters:
+                        if only_alpha_carbons:
+                            ca_pos = positions_alive  # (P, 3)
+                        else:
+                            ca_pos = positions_alive[:, 1, :]  # (P, 3)
+                        BranchingFlowVisualizer._update_3d_residue_letter_artists(
+                            texts=residue_letter_artists[i],
+                            ax=axes_3d[i],
+                            ca_pos=ca_pos,
+                            aatypes=aatypes_alive,
+                        )
 
                 writer.grab_frame()
 
@@ -5232,11 +5615,19 @@ class BranchingFlowVisualizer:
         batch: DataBatch,
         out_dir: Optional[str] = None,
         times: Optional[List[float]] = None,
-        only_alpha_carbons: bool = True,  # faster; skips to_atom37
+        only_alpha_carbons: bool = False,  # faster; skips to_atom37
         filename: str = "corruption",
+        coupled: bool = True,
+        seed: Optional[int] = None,
     ) -> str:
-        """Create a corruption trajectory and plot it."""
+        """Create a corruption trajectory and plot it.
+
+        If coupled=True, generates a time-coupled trajectory from a single sampled set of
+        domain couplings (anchors + creation states), rather than sampling each timepoint
+        marginal independently.
+        """
         self.interpolant.set_device(batch.trans_1.device)
+        self.interpolant.seed_all(seed)
         if times is None:
             times = list(np.linspace(0.0, 1.0, 50))
         times = sorted(times)
@@ -5244,6 +5635,8 @@ class BranchingFlowVisualizer:
         num_batch = batch.trans_1.shape[0]
         device = batch.trans_1.device
         tree = batch.tree.to(device)
+        min_t = float(self.interpolant.min_t)
+        times = [float(np.clip(t, min_t, 1.0 - min_t)) for t in times]
 
         # Define consistent base samples for the whole trajectory (in aligned space)
         trans_0 = self.interpolant.translation_coupler.sample_base(
@@ -5266,19 +5659,13 @@ class BranchingFlowVisualizer:
             device=device,
         )
 
-        # Build the trajectory
-        samples: List[DataCorrupted] = []
-        for time in tqdm(times, desc="visualize_corruption() corrupt", leave=False):
-            bridged, _ = self.interpolant.corrupt_to(
-                batch=batch,
-                t=torch.ones(num_batch, device=device) * time,
-                trans_0=trans_0,
-                rotmats_0=rotmats_0,
-                aatypes_0=aatypes_0,
-            )
-            samples.append(bridged.pack_present())
-
-        traj = Trajectory(samples=samples)
+        traj, _ = self.interpolant.corrupt_trajectory(
+            batch=batch,
+            times=times,
+            trans_0=trans_0,
+            rotmats_0=rotmats_0,
+            aatypes_0=aatypes_0,
+        )
         return self.plot_trajectory(
             traj=traj,
             out_dir=out_dir,
@@ -5361,7 +5748,7 @@ class BranchFlowModule(pl.LightningModule):
         backward_start = time.perf_counter()
         optimizer.step(closure=optimizer_closure)
         backward_time = time.perf_counter() - backward_start
-        self.log("time/backward_ms", backward_time * 1000)
+        self.log("t/backward_ms", backward_time * 1000)
 
     def forward(self, batch: DataCorrupted) -> ModelPrediction:
         return self.model(batch)
