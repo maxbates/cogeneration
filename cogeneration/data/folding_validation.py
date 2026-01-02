@@ -107,6 +107,7 @@ class FoldingValidator:
         res_idx: npt.NDArray,  # (N)
         true_bb_positions: Optional[npt.NDArray],  # (N, 37, 3), motifs for inpainting
         true_aa: Optional[npt.NDArray],  # (N)
+        inverse_fold: bool = True,  # whether to run inverse folding (ProteinMPNN)
         also_fold_pmpnn_seq: bool = True,  # also fold inverse-folded sequences
         n_inverse_folds: Optional[int] = None,
     ) -> Tuple[Dict[str, Any], SavedFoldingValidation]:
@@ -256,13 +257,23 @@ class FoldingValidator:
         #    since some of the metrics check for sequence conservation of motifs.
         inverse_fold_diffuse_mask = np.ones_like(diffuse_mask)
 
-        # Run inverse folding
-        inverse_folded_fasta_path = self.inverse_fold_pdb(
-            pdb_path=pred_pdb_path,
-            diffuse_mask=inverse_fold_diffuse_mask,
-            output_dir=inverse_folding_dir,
-            num_sequences=n_inverse_folds,
-        )
+        if also_fold_pmpnn_seq and not inverse_fold:
+            raise ValueError("`also_fold_pmpnn_seq=True` requires `inverse_fold=True`")
+        if not is_codesign and not inverse_fold:
+            raise ValueError(
+                f"`inverse_fold=False` is not supported for task={task}; "
+                "forward/inverse folding require inverse folding for top-sample selection."
+            )
+
+        inverse_folded_fasta_path = None
+        if inverse_fold:
+            # Run inverse folding
+            inverse_folded_fasta_path = self.inverse_fold_pdb(
+                pdb_path=pred_pdb_path,
+                diffuse_mask=inverse_fold_diffuse_mask,
+                output_dir=inverse_folding_dir,
+                num_sequences=n_inverse_folds,
+            )
 
         # Run folding on the generated sequence
         codesign_df = self.fold_fasta(
@@ -280,7 +291,9 @@ class FoldingValidator:
 
         # Run folding on the inverse folded sequences
         designability_df = None
-        if also_fold_pmpnn_seq or not is_codesign:
+        if inverse_folded_fasta_path is not None and (
+            also_fold_pmpnn_seq or not is_codesign
+        ):
             designability_df = self.fold_fasta(
                 fasta_path=inverse_folded_fasta_path,
                 output_dir=designability_folding_dir,
@@ -464,7 +477,9 @@ class FoldingValidator:
             true_pdb=true_pdb_path,
             true_fasta=true_fasta_path,
             sample_fasta=str(sample_fasta_path),
-            inverse_folded_fasta=str(inverse_folded_fasta_path),
+            inverse_folded_fasta=(
+                str(inverse_folded_fasta_path) if inverse_folded_fasta_path else None
+            ),
             codesign_df=codesign_df_path,
             designability_df=designability_df_path,
             top_sample_json=top_sample_path,

@@ -19,6 +19,7 @@ from cogeneration.config.base import (
     DatasetContactConditioningConfig,
     ExperimentConfig,
     ExperimentWandbConfig,
+    FoldingConfig,
     ModelAAPredConfig,
     ModelAttentionConfig,
     ModelAttentionTrunkConfig,
@@ -226,11 +227,23 @@ class VarcoInferencePlotConfig(BaseClassConfig):
 
 
 @dataclass
+class VarcoFoldingValidationConfig(BaseClassConfig):
+    enabled: bool = False
+    # Fold predicted sequence with Boltz, or designability with ProteinMPNN -> Boltz
+    assess_designability: bool = False
+    # max validation batches per epoch (should be reduced by eval dataset)
+    max_batches: int = 50
+
+
+@dataclass
 class VarcoInferenceConfig(BaseClassConfig):
     predict_dir: str = "varco/outputs/${shared.id}"
     ckpt_path: Optional[str] = None
     inference_subdir: str = "predict"
     plot: VarcoInferencePlotConfig = field(default_factory=VarcoInferencePlotConfig)
+    folding_validation: VarcoFoldingValidationConfig = field(
+        default_factory=VarcoFoldingValidationConfig
+    )
 
 
 @dataclass
@@ -304,6 +317,7 @@ class VarcoConfig(BaseClassConfig):
     interpolant: VarcoInterpolantConfig = field(default_factory=VarcoInterpolantConfig)
     loss: VarcoLossConfig = field(default_factory=VarcoLossConfig)
     model: VarcoModelConfig = field(default_factory=VarcoModelConfig)
+    folding: FoldingConfig = field(default_factory=FoldingConfig)
 
 
 # Register the config class with Hydra

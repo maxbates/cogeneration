@@ -15,7 +15,6 @@ Then, a sampler (no tree) iterates to get base (endpoint prediction), sample spl
 
 TODOs / features:
 - break up this file
-- add folding validation? or at least run boltz and get plddt?
 - ideally we could share loss calculator with cogeneration, e.g. using static methods
 - support aatypes guidance potential, support particle-free ESM potential
 """
@@ -48,8 +47,10 @@ import hydra
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import pytorch_lightning as pl
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from matplotlib.colors import ListedColormap
 from mpl_toolkits.mplot3d import proj3d
@@ -72,6 +73,7 @@ from cogeneration.data.const import (
     rigids_ang_to_nm,
     rigids_nm_to_ang,
 )
+from cogeneration.data.folding_validation import FoldingValidator
 from cogeneration.data.noise_mask import (
     centered_gaussian,
     uniform_categorical,
@@ -102,7 +104,8 @@ from cogeneration.models.utils import get_model_size_str
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.embed import PositionalEmbeddingMethod
-from cogeneration.type.task import DataTask
+from cogeneration.type.metrics import MetricName, OutputFileName
+from cogeneration.type.task import DataTask, InferenceTask
 from cogeneration.util.log import rank_zero_logger
 from varco.config import (
     VarcoConfig,
@@ -6012,6 +6015,48 @@ class BranchFlowModule(pl.LightningModule):
         # track EMA of training loss, hacky init at 10 to avoid nan handling
         self.register_buffer("_train_loss_ema", torch.tensor(10.0), persistent=False)
 
+        self._folding_validator: Optional[FoldingValidator] = None
+        self._val_top_samples: List[Dict[str, Any]] = []
+        self._predict_top_samples: List[Dict[str, Any]] = []
+
+    def _get_folding_validator(self) -> FoldingValidator:
+        if self._folding_validator is None:
+            self._folding_validator = FoldingValidator(
+                cfg=self.cfg.folding, device="cpu"
+            )
+        return self._folding_validator
+
+    def _gather_top_samples(
+        self, local_top_samples: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        if not dist.is_available() or not dist.is_initialized():
+            return local_top_samples
+
+        gathered: List[Optional[List[Dict[str, Any]]]] = [
+            None for _ in range(dist.get_world_size())
+        ]
+        dist.all_gather_object(gathered, local_top_samples)
+
+        merged: List[Dict[str, Any]] = []
+        for part in gathered:
+            if part:
+                merged.extend(part)
+        return merged
+
+    def on_validation_start(self) -> None:
+        if self.cfg.inference.folding_validation.enabled:
+            self._get_folding_validator().set_device_id(str(self.device))
+
+    def on_predict_start(self) -> None:
+        if self.cfg.inference.folding_validation.enabled:
+            self._get_folding_validator().set_device_id(str(self.device))
+
+    def on_validation_epoch_start(self) -> None:
+        self._val_top_samples = []
+
+    def on_predict_epoch_start(self) -> None:
+        self._predict_top_samples = []
+
     def load_state_dict(self, state_dict, strict: bool = True):
         if strict:
             plan = plan_esm_warm_start_state_dict_load(
@@ -6172,6 +6217,7 @@ class BranchFlowModule(pl.LightningModule):
 
     def validation_step(self, batch: DataBatch, batch_idx: int) -> None:
         self.interpolant.set_device(self.device)
+        sample_name = f"val_sample_{batch_idx}"
 
         sample_traj = self.interpolant.sample(
             model=self.model,
@@ -6185,10 +6231,60 @@ class BranchFlowModule(pl.LightningModule):
         viz.plot_sampling_trajectory(
             traj=sample_traj,
             out_dir=val_dir,
-            filename=f"val_sample_{batch_idx}",
+            filename=sample_name,
         )
 
-        # TODO compute a loss (e.g. folding validation) use for model checkpointer
+        # run folding validation (refold/designability)for max_batches samples
+        fold_val_cfg = self.cfg.inference.folding_validation
+        if (
+            fold_val_cfg.enabled
+            and batch_idx < fold_val_cfg.max_batches
+            and DDPInfo.from_env().local_rank == 0
+        ):
+            sample_dir = os.path.join(val_dir, sample_name)
+            os.makedirs(sample_dir, exist_ok=True)
+
+            final_sample = sample_traj.samples[-1]
+            pred_atom37 = final_sample.to_atom37()[0].detach().cpu().numpy()
+            pred_aa = final_sample.aatypes_t[0].detach().cpu().numpy()
+            chain_idx = final_sample.chain_idx[0].detach().cpu().numpy()
+            res_idx = np.arange(pred_aa.shape[0], dtype=np.int32)
+
+            pred_pdb_path = os.path.join(sample_dir, OutputFileName.sample_pdb)
+            write_prot_to_pdb(
+                prot_pos=pred_atom37,
+                file_path=pred_pdb_path,
+                aatype=pred_aa,
+                chain_idx=chain_idx,
+                res_idx=res_idx,
+                no_indexing=True,
+                overwrite=True,
+            )
+
+            top_sample_metrics, _ = self._get_folding_validator().assess_sample(
+                task=InferenceTask.unconditional,
+                sample_name=sample_name,
+                sample_dir=sample_dir,
+                pred_pdb_path=pred_pdb_path,
+                pred_bb_positions=pred_atom37,
+                pred_aa=pred_aa,
+                sample_aa_traj=np.expand_dims(pred_aa, axis=0),
+                diffuse_mask=np.ones_like(pred_aa, dtype=np.int8),
+                motif_mask=None,
+                chain_idx=chain_idx,
+                res_idx=res_idx,
+                true_bb_positions=None,
+                true_aa=None,
+                inverse_fold=fold_val_cfg.assess_designability,
+                also_fold_pmpnn_seq=fold_val_cfg.assess_designability,
+                n_inverse_folds=self.cfg.folding.protein_mpnn.seq_per_sample,
+            )
+
+            self._val_top_samples.append(top_sample_metrics)
+            if MetricName.plddt_mean in top_sample_metrics:
+                self.log("val/plddt_mean", top_sample_metrics[MetricName.plddt_mean])
+            if MetricName.bb_rmsd_folded in top_sample_metrics:
+                self.log("val/bb_rmsd", top_sample_metrics[MetricName.bb_rmsd_folded])
 
     def predict_step(self, batch: DataBatch, batch_idx: int, dataloader_idx: int = 0):
         self.interpolant.set_device(self.device)
@@ -6199,28 +6295,41 @@ class BranchFlowModule(pl.LightningModule):
         )
 
         rank = DDPInfo.from_env().rank
-        out_dir = os.path.join(
+        sample_name = f"predict_rank{rank:03d}_idx{batch_idx:05d}"
+
+        sample_dir = os.path.join(
             self.cfg.inference.predict_dir,
-            "predict",
-            f"rank{rank:03d}",
+            self.cfg.inference.inference_subdir,
+            sample_name,
         )
-        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(sample_dir, exist_ok=True)
 
         # write PDB
         final_sample = sample_traj.samples[-1]
+        pred_atom37 = final_sample.to_atom37()[0].detach().cpu().numpy()
+        pred_aa = final_sample.aatypes_t[0].detach().cpu().numpy()
+        chain_idx = final_sample.chain_idx[0].detach().cpu().numpy()
+        res_idx = np.arange(pred_aa.shape[0], dtype=np.int32)
+
+        # write predicted PDB file
+        pred_pdb_path = os.path.join(sample_dir, OutputFileName.sample_pdb)
         write_prot_to_pdb(
-            prot_pos=final_sample.to_atom37()[0].detach().cpu().numpy(),
-            file_path=os.path.join(out_dir, f"sample_{batch_idx:05d}.pdb"),
-            aatype=final_sample.aatypes_t[0].detach().cpu().numpy(),
-            chain_idx=final_sample.chain_idx[0].detach().cpu().numpy(),
+            prot_pos=pred_atom37,
+            file_path=pred_pdb_path,
+            aatype=pred_aa,
+            chain_idx=chain_idx,
+            res_idx=res_idx,
+            no_indexing=True,
+            overwrite=True,
         )
 
+        # plot trajectory
         if self.cfg.inference.plot.enabled:
             viz = BranchingFlowVisualizer()
             viz.plot_sampling_trajectory(
                 traj=sample_traj,
-                out_dir=out_dir,
-                filename=f"sample_{batch_idx:05d}",
+                out_dir=sample_dir,
+                filename="sampling_trajectory",
                 max_frames=self.cfg.inference.plot.max_frames,
                 max_samples=self.cfg.inference.plot.max_samples,
                 max_cols=self.cfg.inference.plot.max_cols,
@@ -6228,6 +6337,63 @@ class BranchFlowModule(pl.LightningModule):
                 show_residue_letters=self.cfg.inference.plot.show_residue_letters,
                 color_by=self.cfg.inference.plot.color_by,
             )
+
+        # folding validation - either refolding, or designability
+        fold_val_cfg = self.cfg.inference.folding_validation
+        if fold_val_cfg.enabled and batch_idx < fold_val_cfg.max_batches:
+            top_sample_metrics, _ = self._get_folding_validator().assess_sample(
+                task=InferenceTask.unconditional,
+                sample_name=sample_name,
+                sample_dir=sample_dir,
+                pred_pdb_path=pred_pdb_path,
+                pred_bb_positions=pred_atom37,
+                pred_aa=pred_aa,
+                sample_aa_traj=np.expand_dims(pred_aa, axis=0),
+                diffuse_mask=np.ones_like(pred_aa, dtype=np.int8),
+                motif_mask=None,
+                chain_idx=chain_idx,
+                res_idx=res_idx,
+                true_bb_positions=None,
+                true_aa=None,
+                inverse_fold=fold_val_cfg.assess_designability,
+                also_fold_pmpnn_seq=fold_val_cfg.assess_designability,
+                n_inverse_folds=self.cfg.folding.protein_mpnn.seq_per_sample,
+            )
+            self._predict_top_samples.append(top_sample_metrics)
+
+    def on_validation_epoch_end(self) -> None:
+        if not self.cfg.inference.folding_validation.enabled:
+            return
+        if DDPInfo.from_env().local_rank != 0:
+            return
+
+        all_top_samples = self._gather_top_samples(self._val_top_samples)
+        if len(all_top_samples) == 0:
+            return
+
+        val_dir = os.path.join(
+            self.cfg.inference.predict_dir, "val", f"epoch{self.current_epoch:03d}"
+        )
+        os.makedirs(val_dir, exist_ok=True)
+        pd.DataFrame(all_top_samples).to_csv(
+            os.path.join(val_dir, OutputFileName.all_top_samples_df), index=False
+        )
+
+    def on_predict_epoch_end(self) -> None:
+        if not self.cfg.inference.folding_validation.enabled:
+            return
+        if DDPInfo.from_env().local_rank != 0:
+            return
+
+        all_top_samples = self._gather_top_samples(self._predict_top_samples)
+        if len(all_top_samples) == 0:
+            return
+
+        predict_dir = os.path.join(self.cfg.inference.predict_dir, "predict")
+        os.makedirs(predict_dir, exist_ok=True)
+        pd.DataFrame(all_top_samples).to_csv(
+            os.path.join(predict_dir, OutputFileName.all_top_samples_df), index=False
+        )
 
 
 """ Training """
