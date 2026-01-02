@@ -14,6 +14,7 @@ A simple model predicts base (endpoint prediction), split (remaining children co
 Then, a sampler (no tree) iterates to get base (endpoint prediction), sample split events, sample deletion events
 
 TODOs / features:
+- add a README
 - break up this file
 - ideally we could share loss calculator with cogeneration, e.g. using static methods
 - support aatypes guidance potential, support particle-free ESM potential
@@ -529,9 +530,22 @@ class TreePlan:
         leaf_del_t = dup_mask  # duplicates are the deletion-leaves
         num_deletions = int(leaf_del_t.sum().item())
 
+        # Break planar_position ties for deletion-duplicate leaves so they don't deterministically
+        # sort after the original when packed via planar_position (stable argsort).
+        # Keep jitter small enough to avoid reordering across neighboring residues.
+        leaf_pos_jitter_cpu = torch.zeros(
+            (num_leaves,), dtype=torch.float32, device="cpu"
+        )
+        if num_deletions > 0:
+            u = torch.rand(
+                (num_deletions,), generator=rng.rng, device="cpu", dtype=torch.float32
+            )
+            leaf_pos_jitter_cpu[dup_mask] = (u - 0.5) * 0.4  # [-0.2, 0.2]
+
         # Move leaf-level bookkeeping to the target device
         leaf_map_leaves = leaf_ref_t_cpu.to(device=device)  # (num_leaves,)
         leaf_del_t = leaf_del_t.to(device=device)  # (num_leaves,)
+        leaf_pos_jitter = leaf_pos_jitter_cpu.to(device=device)  # (num_leaves,)
 
         # --- Group ID assignment
         # Group ids computed in *leaf order* (includes deletion duplicates), fully vectorized.
@@ -818,7 +832,7 @@ class TreePlan:
         # This handles both originals and duplicates correctly - duplicates share position
         for i in range(num_leaves_original):
             data_idx = int(leaf_map_leaves[i].item())
-            planar_pos[i] = data_idx_to_pos[data_idx]
+            planar_pos[i] = data_idx_to_pos[data_idx] + leaf_pos_jitter[i]
 
         # Extra deleted roots: sample random position within their span's leaf range
         # span_start and span_end are node IDs of the first/last leaves in the span,
@@ -4434,6 +4448,35 @@ class BranchFlowLosses:
 
 
 @dataclass
+class BranchFlowMetrics:
+    base_seq_ce: torch.Tensor  # unweighted token CE (nats)
+    insertion_seq_ce: torch.Tensor  # unweighted soft CE on insertion logits (nats)
+    insertion_target_entropy: (
+        torch.Tensor
+    )  # unweighted entropy of insertion targets (nats)
+    insertion_ce_over_entropy: torch.Tensor  # mean over positions of CE/H(target)
+    insertion_ce_minus_entropy: (
+        torch.Tensor
+    )  # mean over positions of CE - H(target) (nats)
+    split_event_ce: torch.Tensor  # Bernoulli CE on split event (>0)
+    split_event_precision: torch.Tensor
+    split_event_recall: torch.Tensor
+    split_event_f1: torch.Tensor
+    split_rate_mae: torch.Tensor  # MAE on pred split vs target count
+    split_rate_mae_pos: torch.Tensor  # MAE conditioned on target>0
+    del_event_ce: (
+        torch.Tensor
+    )  # Bernoulli CE on delete event (terminal scaffold tokens)
+    del_event_precision: torch.Tensor
+    del_event_recall: torch.Tensor
+    del_event_f1: torch.Tensor
+    plddt_ce: torch.Tensor  # unweighted, unclamped CE (nats)
+    plddt_bin_acc: torch.Tensor  # top-1 accuracy on bins
+    plddt_bin_acc_pm1: torch.Tensor  # accuracy within ±1 bin
+    plddt_bin_mae: torch.Tensor  # mean abs bin error
+
+
+@dataclass
 class BranchFlowLossCalculator:
     cfg: VarcoLossConfig
 
@@ -4453,6 +4496,53 @@ class BranchFlowLossCalculator:
         Preserves gradients above threshold but at diminishing scale: threshold + log(1 + excess)
         """
         return torch.where(x > threshold, threshold + torch.log1p(x - threshold), x)
+
+    def _soft_ce_from_probs(
+        self,
+        pred_logits: torch.Tensor,  # (B, P, K)
+        target_probs: torch.Tensor,  # (B, P, K)
+        mask: torch.Tensor,  # (B, P)
+        t: Optional[torch.Tensor] = None,  # (B,)
+        apply_time_norm: bool = False,
+        time_norm_divisor: float = 2.0,
+        per_example: bool = True,
+        mostly_mask_threshold: float = 0.75,
+        require_mass: bool = True,
+    ) -> torch.Tensor:
+        """Soft cross-entropy on logits vs per-token target probabilities."""
+        B, P, K = pred_logits.shape
+        if apply_time_norm:
+            if t is None:
+                raise ValueError("t is required when apply_time_norm=True")
+            t_norm = self._time_norm_scale(t=t).view(B, 1)  # (B, 1)
+
+        # Zero out mask token and renormalize target probs
+        target_probs_masked = target_probs.clone()
+        target_probs_masked[:, :, MASK_TOKEN_INDEX] = 0.0
+        row_sums = target_probs_masked.sum(dim=-1, keepdim=True)
+        has_mass = row_sums.squeeze(-1) > 1e-8  # (B, P)
+        target_probs_masked = target_probs_masked / row_sums.clamp_min(1e-8)
+
+        log_probs = F.log_softmax(pred_logits, dim=-1)  # (B, P, K)
+        ce_per_token = -(target_probs_masked * log_probs).sum(dim=-1)  # (B, P)
+
+        if apply_time_norm:
+            ce_per_token = ce_per_token / (float(time_norm_divisor) * t_norm)  # (B, P)
+
+        is_mostly_mask = target_probs[:, :, MASK_TOKEN_INDEX] >= float(
+            mostly_mask_threshold
+        )  # (B, P)
+        mask_f = mask.float() * (~is_mostly_mask).float()
+        if require_mass:
+            mask_f = mask_f * has_mass.float()
+
+        if per_example:
+            denom = mask_f.sum(dim=1).clamp_min(1.0)  # (B,)
+            loss_per_batch = (ce_per_token * mask_f).sum(dim=1) / denom  # (B,)
+            return loss_per_batch.mean()
+
+        denom = mask_f.sum().clamp_min(1.0)
+        return (ce_per_token * mask_f).sum() / denom
 
     def _base_trans_loss(
         self,
@@ -4615,38 +4705,41 @@ class BranchFlowLossCalculator:
         mask: torch.Tensor,  # (B, P)
     ) -> torch.Tensor:
         """Sequence loss: soft cross-entropy on amino acid logits vs anchor probability targets."""
-        B, P, K = pred_aatype_logits.shape
-
-        # Time-based normalization for likelihood weighting (higher weight as t -> 1)
-        t_norm = self._time_norm_scale(t=t).view(B, 1)  # (B, 1)
-
-        # Zero out mask token and renormalize target probs
-        target_probs_masked = target_anchor_probs.clone()
-        target_probs_masked[:, :, MASK_TOKEN_INDEX] = 0.0
-        row_sums = target_probs_masked.sum(dim=-1, keepdim=True)
-        has_mass = row_sums.squeeze(-1) > 1e-8  # (B, P)
-        target_probs_masked = target_probs_masked / row_sums.clamp_min(1e-8)
-
-        # Soft cross-entropy: -sum(target_probs * log_softmax(logits))
-        log_probs = F.log_softmax(pred_aatype_logits, dim=-1)  # (B, P, K)
-        ce_per_token = -(target_probs_masked * log_probs).sum(dim=-1)  # (B, P)
-
-        # Apply softened time normalization (likelihood weighting, half strength)
-        ce_per_token = ce_per_token / (2.0 * t_norm)  # (B, P)
-
-        # Mask out positions where target was mostly the mask token
-        is_mostly_mask = target_anchor_probs[:, :, MASK_TOKEN_INDEX] >= 0.75  # (B, P)
-        mask_f = mask.float() * (~is_mostly_mask).float() * has_mass.float()
-
-        denom = mask_f.sum(dim=1).clamp_min(1.0)  # (B,)
-        loss_per_batch = (ce_per_token * mask_f).sum(dim=1) / denom  # (B,)
-        seq_loss = loss_per_batch.mean()
+        seq_loss = self._soft_ce_from_probs(
+            pred_logits=pred_aatype_logits,
+            target_probs=target_anchor_probs,
+            mask=mask,
+            t=t,
+            apply_time_norm=True,
+            time_norm_divisor=2.0,
+            per_example=True,
+            mostly_mask_threshold=0.75,
+            require_mass=True,
+        )
 
         return (
             self.log_clamp(seq_loss, threshold=5.0)
             * self.cfg.seq_loss_weight
             * self.cfg.seq_prob_loss_weight
         )
+
+    def _seq_ce_metric(
+        self,
+        pred_aatype_logits: torch.Tensor,  # (B, P, K)
+        target_anchor_tokens: torch.Tensor,  # (B, P) long
+        mask: torch.Tensor,  # (B, P)
+    ) -> torch.Tensor:
+        """Aux metric: unweighted per-token CE on amino acids (nats)."""
+        with torch.no_grad():
+            B, P, K = pred_aatype_logits.shape
+            ce = F.cross_entropy(
+                pred_aatype_logits.view(-1, K),
+                target_anchor_tokens.view(-1),
+                reduction="none",
+            ).view(B, P)
+            valid = mask & (target_anchor_tokens != MASK_TOKEN_INDEX)
+            valid_f = valid.float()
+            return (ce * valid_f).sum() / valid_f.sum().clamp_min(1.0)
 
     def _insertion_seq_loss(
         self,
@@ -4684,6 +4777,66 @@ class BranchFlowLossCalculator:
         return (
             self.log_clamp(insertion_loss, threshold=5.0) * self.cfg.seq_ins_loss_weight
         )
+
+    @staticmethod
+    def _insertion_ce_entropy_metrics(
+        pred_logits: torch.Tensor,  # (B, P, K)
+        target_probs: torch.Tensor,  # (B, P, K)
+        mask: torch.Tensor,  # (B, P)
+        mostly_mask_threshold: float = 0.75,
+        eps: float = 1e-8,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute insertion CE vs target entropy metrics on the same mask convention as insertion_seq_ce:
+        - mask out positions where target is mostly MASK_TOKEN_INDEX
+        - remove MASK token mass and renormalize
+
+        Returns:
+            target_entropy_mean: mean H(target) over valid positions (nats)
+            ce_over_entropy_mean: mean CE(pred,target)/H(target) over valid positions
+            ce_minus_entropy_mean: mean CE(pred,target)-H(target) over valid positions (nats)
+        """
+        B, P, K = pred_logits.shape
+        if target_probs.shape != (B, P, K):
+            raise ValueError(
+                f"target_probs must have shape (B, P, K); got {tuple(target_probs.shape)}"
+            )
+        if mask.shape != (B, P):
+            raise ValueError(f"mask must have shape (B, P); got {tuple(mask.shape)}")
+
+        # Drop mask token from the target distribution and renormalize.
+        target_probs_masked = target_probs.clone()
+        target_probs_masked[:, :, MASK_TOKEN_INDEX] = 0.0
+        row_sums = target_probs_masked.sum(dim=-1, keepdim=True)
+        has_mass = row_sums.squeeze(-1) > float(eps)  # (B, P)
+        target_probs_masked = target_probs_masked / row_sums.clamp_min(float(eps))
+
+        # Match insertion_seq_ce behavior: drop positions that were mostly mask-token supervision.
+        is_mostly_mask = target_probs[:, :, MASK_TOKEN_INDEX] >= float(
+            mostly_mask_threshold
+        )
+        valid = mask & (~is_mostly_mask) & has_mass  # (B, P)
+        valid_f = valid.float()
+        denom = valid_f.sum().clamp_min(1.0)
+
+        log_q = F.log_softmax(pred_logits, dim=-1)  # (B, P, K)
+        ce_per_token = -(target_probs_masked * log_q).sum(dim=-1)  # (B, P)
+
+        # Entropy H(p) = -sum p log p
+        log_p = torch.log(target_probs_masked.clamp_min(float(eps)))
+        entropy_per_token = -(target_probs_masked * log_p).sum(dim=-1)  # (B, P)
+
+        # CE - H = KL(p || q) >= 0 (when p has mass)
+        ce_minus_entropy = ce_per_token - entropy_per_token
+
+        # Ratio is only meaningful when entropy > 0; clamp to avoid infs for near-delta targets.
+        ratio = ce_per_token / entropy_per_token.clamp_min(float(eps))
+
+        target_entropy_mean = (entropy_per_token * valid_f).sum() / denom
+        ce_minus_entropy_mean = (ce_minus_entropy * valid_f).sum() / denom
+        ce_over_entropy_mean = (ratio * valid_f).sum() / denom
+
+        return target_entropy_mean, ce_over_entropy_mean, ce_minus_entropy_mean
 
     def _split_token_loss(
         self,
@@ -4745,7 +4898,59 @@ class BranchFlowLossCalculator:
         ).mean()
 
         split_loss = scaffold_loss + motif_weight * motif_loss
-        return self.log_clamp(split_loss, threshold=3.0) * self.cfg.split_loss_weight
+        return self.log_clamp(split_loss, threshold=5.0) * self.cfg.split_loss_weight
+
+    def _split_metrics(
+        self,
+        pred: ModelPrediction,
+        batch: DataCorrupted,
+        mask: torch.Tensor,  # (B, P)
+        motif_mask: torch.Tensor,  # (B, P)
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Aux metrics for split prediction (scaffold only)."""
+        device = batch.trans_t.device
+        if batch.remaining_insertions is None:
+            zero = torch.tensor(0.0, device=device)
+            return zero, zero, zero, zero, zero, zero
+
+        with torch.no_grad():
+            target = batch.remaining_insertions.to(torch.float32)  # (B, P)
+            rate = pred.pred_split_rate.clamp_min(0.0)  # (B, P)
+
+            split_mask = mask & ~motif_mask
+            split_mask_f = split_mask.float()
+            denom = split_mask_f.sum().clamp_min(1.0)
+
+            # Event metrics: event is whether any insertions remain at this token.
+            y = (target > 0).float()
+            p = (1.0 - torch.exp(-rate)).clamp(min=1e-6, max=1.0 - 1e-6)
+            bce = -(y * torch.log(p) + (1.0 - y) * torch.log1p(-p))
+            split_event_ce = (bce * split_mask_f).sum() / denom
+
+            pred_pos = p > 0.5
+            true_pos = target > 0
+            tp = (pred_pos & true_pos & split_mask).sum().to(torch.float32)
+            fp = (pred_pos & ~true_pos & split_mask).sum().to(torch.float32)
+            fn = ((~pred_pos) & true_pos & split_mask).sum().to(torch.float32)
+            precision = tp / (tp + fp).clamp_min(1.0)
+            recall = tp / (tp + fn).clamp_min(1.0)
+            f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-8)
+
+            mae = ((rate - target).abs() * split_mask_f).sum() / denom
+            pos_mask = split_mask & (target > 0)
+            pos_mask_f = pos_mask.float()
+            mae_pos = (
+                (rate - target).abs() * pos_mask_f
+            ).sum() / pos_mask_f.sum().clamp_min(1.0)
+
+        return split_event_ce, precision, recall, f1, mae, mae_pos
 
     def _split_pooled_loss(
         self,
@@ -4759,9 +4964,44 @@ class BranchFlowLossCalculator:
         )  # (B,) model predicts in log1p space
         pooled_loss = F.mse_loss(pred_log1p, target_log)
         return (
-            self.log_clamp(pooled_loss, threshold=3.0)
+            self.log_clamp(pooled_loss, threshold=10.0)
             * self.cfg.split_pooled_loss_weight
         )
+
+    def _deletion_metrics(
+        self,
+        pred: ModelPrediction,
+        batch: DataCorrupted,
+        mask: torch.Tensor,  # (B, P)
+        motif_mask: torch.Tensor,  # (B, P)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Aux metrics for deletion prediction (terminal scaffold tokens only)."""
+        device = batch.trans_t.device
+        if batch.deleted is None:
+            zero = torch.tensor(0.0, device=device)
+            return zero, zero, zero, zero
+
+        with torch.no_grad():
+            terminal_mask = mask & (batch.remaining_insertions == 0) & ~motif_mask
+            terminal_f = terminal_mask.float()
+            denom = terminal_f.sum().clamp_min(1.0)
+
+            logits = pred.pred_del_logits
+            targets = batch.deleted.float()
+            bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+            del_event_ce = (bce * terminal_f).sum() / denom
+
+            probs = torch.sigmoid(logits)
+            pred_pos = probs > 0.5
+            true_pos = targets > 0.5
+            tp = (pred_pos & true_pos & terminal_mask).sum().to(torch.float32)
+            fp = (pred_pos & ~true_pos & terminal_mask).sum().to(torch.float32)
+            fn = ((~pred_pos) & true_pos & terminal_mask).sum().to(torch.float32)
+            precision = tp / (tp + fp).clamp_min(1.0)
+            recall = tp / (tp + fn).clamp_min(1.0)
+            f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-8)
+
+        return del_event_ce, precision, recall, f1
 
     def _deletion_loss(
         self,
@@ -4769,7 +5009,6 @@ class BranchFlowLossCalculator:
         batch: DataCorrupted,
         mask: torch.Tensor,
         motif_mask: torch.Tensor,  # (B, P)
-        motif_weight: float = 0.1,
     ) -> torch.Tensor:
         """Deletion loss, supervised only on terminal tokens.
 
@@ -4790,22 +5029,36 @@ class BranchFlowLossCalculator:
         del_logits = pred.pred_del_logits  # (B, P)
         del_targets = batch.deleted.float()  # (B, P)
         bce = F.binary_cross_entropy_with_logits(
-            del_logits, del_targets, reduction="none"
+            del_logits,
+            del_targets,
+            reduction="none",
+        )
+
+        # upweight deleted targets
+        del_pos_weight = 5.0
+        token_weight = torch.ones_like(del_targets)
+        token_weight = torch.where(
+            del_targets > 0.5,
+            torch.full_like(token_weight, float(del_pos_weight)),
+            token_weight,
         )
 
         # Scaffold loss (primary) and motif loss (small penalty)
+        motif_weight = 0.1
         scaffold_mask = terminal_mask & ~motif_mask
         motif_loss_mask = terminal_mask & motif_mask
 
-        scaffold_denom = scaffold_mask.float().sum().clamp_min(1.0)
-        scaffold_loss = (bce * scaffold_mask.float()).sum() / scaffold_denom
+        scaffold_weight = token_weight * scaffold_mask.float()
+        scaffold_denom = scaffold_weight.sum().clamp_min(1.0)
+        scaffold_loss = (bce * scaffold_weight).sum() / scaffold_denom
 
-        motif_denom = motif_loss_mask.float().sum().clamp_min(1.0)
-        motif_loss = (bce * motif_loss_mask.float()).sum() / motif_denom
+        motif_weight_tensor = token_weight * motif_loss_mask.float()
+        motif_denom = motif_weight_tensor.sum().clamp_min(1.0)
+        motif_loss = (bce * motif_weight_tensor).sum() / motif_denom
 
         del_loss = scaffold_loss + motif_weight * motif_loss
 
-        return self.log_clamp(del_loss, threshold=3.0) * self.cfg.del_loss_weight
+        return self.log_clamp(del_loss, threshold=8.0) * self.cfg.del_loss_weight
 
     def _bfactor_loss(
         self,
@@ -4846,7 +5099,7 @@ class BranchFlowLossCalculator:
         ce = -(target_logits * logp).sum(-1)  # (B, P)
         loss = (ce * valid_mask.float()).sum() / (valid_mask.sum().float() + 1e-5)
 
-        return self.log_clamp(loss, threshold=3.0) * self.cfg.bfactor_loss_weight
+        return self.log_clamp(loss, threshold=5.0) * self.cfg.bfactor_loss_weight
 
     def _plddt_loss(
         self,
@@ -4855,14 +5108,15 @@ class BranchFlowLossCalculator:
         target_trans: torch.Tensor,  # (B, P, 3) anchor positions
         mask: torch.Tensor,  # (B, P)
         dist_cutoff: float = 15.0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Cross-entropy on per-token lDDT bins (pLDDT).
         Uses current predicted coords vs. anchor coords to compute lDDT.
         """
         plddt_logits = pred.pred_plddt  # (B, P, num_bins) or None
         if plddt_logits is None:
-            return torch.tensor(0.0, device=batch.trans_t.device)
+            zero = torch.tensor(0.0, device=batch.trans_t.device)
+            return zero, zero, zero, zero, zero
 
         num_bins = plddt_logits.shape[-1]
         pred_trans = pred.pred_trans_1  # (B, P, 3)
@@ -4911,12 +5165,23 @@ class BranchFlowLossCalculator:
         # Cross-entropy of bin logits
         logp = F.log_softmax(plddt_logits.float(), dim=-1)  # (B, P, num_bins)
         ce = -(target_logits * logp).sum(-1)  # (B, P)
-        loss = (ce * loss_mask.float() * lddt_mask).sum() / (
-            (loss_mask.float() * lddt_mask).sum() + 1e-5
-        )
-        loss = torch.nan_to_num(loss, nan=0.0)
+        denom = (loss_mask.float() * lddt_mask).sum() + 1e-5
+        loss_ce = (ce * loss_mask.float() * lddt_mask).sum() / denom
+        loss_ce = torch.nan_to_num(loss_ce, nan=0.0)
 
-        return self.log_clamp(loss, threshold=3.0) * self.cfg.plddt_loss_weight
+        # Accuracy metrics: top-1 accuracy, ±1 bin accuracy, mean absolute error
+        with torch.no_grad():
+            valid = loss_mask & (lddt_mask > 0.5)  # (B, P)
+            valid_f = valid.float()
+            denom_valid = valid_f.sum().clamp_min(1.0)
+            pred_bins = plddt_logits.argmax(dim=-1)  # (B, P)
+            err = (pred_bins - target_lddt_bins).abs()
+            acc = ((err == 0).float() * valid_f).sum() / denom_valid
+            acc_pm1 = ((err <= 1).float() * valid_f).sum() / denom_valid
+            mae_bins = (err.float() * valid_f).sum() / denom_valid
+
+        loss = self.log_clamp(loss_ce, threshold=10.0) * self.cfg.plddt_loss_weight
+        return loss, loss_ce.detach(), acc, acc_pm1, mae_bins
 
     def calculate(
         self,
@@ -4924,7 +5189,7 @@ class BranchFlowLossCalculator:
         pred: ModelPrediction,
         couplings: TreeCouplings,
         bridged: DataBridged,
-    ) -> BranchFlowLosses:
+    ) -> tuple[BranchFlowLosses, BranchFlowMetrics]:
         B, P, D = batch.trans_t.shape
         assert pred.pred_trans_1.shape == (B, P, D)
 
@@ -5013,6 +5278,11 @@ class BranchFlowLossCalculator:
             mask=valid_mask,
         )
         base_seq_loss = base_seq_token_loss + base_seq_prob_loss
+        base_seq_ce = self._seq_ce_metric(
+            pred_aatype_logits=pred.pred_aatype_logits,
+            target_anchor_tokens=aatype_anchors_pack,
+            mask=valid_mask,
+        )
 
         # Insertion sequence loss
         # (soft CE against anchor_probs, only where future insertions exist)
@@ -5020,6 +5290,25 @@ class BranchFlowLossCalculator:
             pred_insertion_logits=pred.pred_insertion_logits,
             target_anchor_probs=aatype_anchor_probs_pack,
             mask=valid_mask & (batch.remaining_insertions > 0),
+        )
+        insertion_seq_ce = self._soft_ce_from_probs(
+            pred_logits=pred.pred_insertion_logits,
+            target_probs=aatype_anchor_probs_pack,
+            mask=valid_mask & (batch.remaining_insertions > 0),
+            apply_time_norm=False,
+            per_example=False,
+            mostly_mask_threshold=0.75,
+            require_mass=False,
+        )
+        (
+            insertion_target_entropy,
+            insertion_ce_over_entropy,
+            insertion_ce_minus_entropy,
+        ) = self._insertion_ce_entropy_metrics(
+            pred_logits=pred.pred_insertion_logits,
+            target_probs=aatype_anchor_probs_pack,
+            mask=valid_mask & (batch.remaining_insertions > 0),
+            mostly_mask_threshold=0.75,
         )
 
         # Insertion / split losses
@@ -5030,6 +5319,19 @@ class BranchFlowLossCalculator:
             motif_mask=batch.motif_mask,
         )
         split_pooled_loss = self._split_pooled_loss(pred=pred, batch=batch)
+        (
+            split_event_ce,
+            split_event_precision,
+            split_event_recall,
+            split_event_f1,
+            split_rate_mae,
+            split_rate_mae_pos,
+        ) = self._split_metrics(
+            pred=pred,
+            batch=batch,
+            mask=valid_mask,
+            motif_mask=batch.motif_mask,
+        )
 
         # Deletion loss
         del_loss = self._deletion_loss(
@@ -5038,6 +5340,14 @@ class BranchFlowLossCalculator:
             mask=valid_mask,
             motif_mask=batch.motif_mask,
         )
+        del_event_ce, del_event_precision, del_event_recall, del_event_f1 = (
+            self._deletion_metrics(
+                pred=pred,
+                batch=batch,
+                mask=valid_mask,
+                motif_mask=batch.motif_mask,
+            )
+        )
 
         # Confidence prediction losses
         bfactor_loss = self._bfactor_loss(
@@ -5045,11 +5355,13 @@ class BranchFlowLossCalculator:
             batch=batch,
             mask=valid_mask,
         )
-        plddt_loss = self._plddt_loss(
-            pred=pred,
-            batch=batch,
-            target_trans=trans_anchors_pack,
-            mask=valid_mask,
+        plddt_loss, plddt_ce, plddt_bin_acc, plddt_bin_acc_pm1, plddt_bin_mae = (
+            self._plddt_loss(
+                pred=pred,
+                batch=batch,
+                target_trans=trans_anchors_pack,
+                mask=valid_mask,
+            )
         )
 
         total_loss = (
@@ -5065,7 +5377,7 @@ class BranchFlowLossCalculator:
             + plddt_loss
         )
 
-        return BranchFlowLosses(
+        losses = BranchFlowLosses(
             total_loss=total_loss,
             trans_loss=trans_loss,
             pairwise_loss=pairwise_loss,
@@ -5080,6 +5392,28 @@ class BranchFlowLossCalculator:
             bfactor_loss=bfactor_loss,
             plddt_loss=plddt_loss,
         )
+        metrics = BranchFlowMetrics(
+            base_seq_ce=base_seq_ce,
+            insertion_seq_ce=insertion_seq_ce,
+            insertion_target_entropy=insertion_target_entropy,
+            insertion_ce_over_entropy=insertion_ce_over_entropy,
+            insertion_ce_minus_entropy=insertion_ce_minus_entropy,
+            split_event_ce=split_event_ce,
+            split_event_precision=split_event_precision,
+            split_event_recall=split_event_recall,
+            split_event_f1=split_event_f1,
+            split_rate_mae=split_rate_mae,
+            split_rate_mae_pos=split_rate_mae_pos,
+            del_event_ce=del_event_ce,
+            del_event_precision=del_event_precision,
+            del_event_recall=del_event_recall,
+            del_event_f1=del_event_f1,
+            plddt_ce=plddt_ce,
+            plddt_bin_acc=plddt_bin_acc,
+            plddt_bin_acc_pm1=plddt_bin_acc_pm1,
+            plddt_bin_mae=plddt_bin_mae,
+        )
+        return losses, metrics
 
 
 """ Visualization """
@@ -6153,7 +6487,7 @@ class BranchFlowModule(pl.LightningModule):
 
         # Time loss calculation (part of forward)
         loss_start = time.perf_counter()
-        loss = self.loss_calculator.calculate(
+        losses, metrics = self.loss_calculator.calculate(
             batch=corrupted, pred=pred, couplings=couplings, bridged=bridged
         )
         loss_time = time.perf_counter() - loss_start
@@ -6168,30 +6502,51 @@ class BranchFlowModule(pl.LightningModule):
         t_bin_key = f"{t_bin_start:.1f}-{t_bin_end:.1f}"
 
         # primary losses
-        self.log("L/train", loss.total_loss, prog_bar=True)
-        self.log("L/trans", loss.trans_loss)
-        self.log("L/rot", loss.rot_vf_loss)
-        self.log("L/cdist", loss.pairwise_loss)
-        self.log("L/seq", loss.base_seq_loss)
-        self.log("L/seq_prob", loss.base_seq_prob_loss)
-        self.log("L/seq_tok", loss.base_seq_token_loss)
-        self.log("L/seq_ins", loss.insertion_seq_loss)
-        self.log("L/split", loss.split_token_loss)
-        self.log("L/split_pooled", loss.split_pooled_loss)
-        self.log("L/del", loss.del_loss)
-        self.log("L/bfactor", loss.bfactor_loss)
-        self.log("L/plddt", loss.plddt_loss)
+        self.log("L/train", losses.total_loss, prog_bar=True)
+        self.log("L/trans", losses.trans_loss)
+        self.log("L/rot", losses.rot_vf_loss)
+        self.log("L/cdist", losses.pairwise_loss)
+        self.log("L/seq", losses.base_seq_loss)
+        self.log("L/seq_prob", losses.base_seq_prob_loss)
+        self.log("L/seq_tok", losses.base_seq_token_loss)
+        self.log("L/seq_ins", losses.insertion_seq_loss)
+        self.log("L/split", losses.split_token_loss)
+        self.log("L/split_pooled", losses.split_pooled_loss)
+        self.log("L/del", losses.del_loss)
+        self.log("L/bfactor", losses.bfactor_loss)
+        self.log("L/plddt", losses.plddt_loss)
 
         # EMA of training loss
-        train_loss = loss.total_loss.detach().item()
+        train_loss = losses.total_loss.detach().item()
         beta = float(self.cfg.experiment.train_loss_ema_beta)
         self._train_loss_ema = beta * self._train_loss_ema + (1.0 - beta) * train_loss
         self.log("L/train_ema", self._train_loss_ema, prog_bar=True)
 
+        # aux metrics
+        self.log("A/base_seq_ce", metrics.base_seq_ce)
+        self.log("A/insertion_seq_ce", metrics.insertion_seq_ce)
+        self.log("A/insertion_target_entropy", metrics.insertion_target_entropy)
+        self.log("A/insertion_ce_over_entropy", metrics.insertion_ce_over_entropy)
+        self.log("A/insertion_ce_minus_entropy", metrics.insertion_ce_minus_entropy)
+        self.log("A/split_event_ce", metrics.split_event_ce)
+        self.log("A/split_event_precision", metrics.split_event_precision)
+        self.log("A/split_event_recall", metrics.split_event_recall)
+        self.log("A/split_event_f1", metrics.split_event_f1)
+        self.log("A/split_rate_mae", metrics.split_rate_mae)
+        self.log("A/split_rate_mae_pos", metrics.split_rate_mae_pos)
+        self.log("A/del_event_ce", metrics.del_event_ce)
+        self.log("A/del_event_precision", metrics.del_event_precision)
+        self.log("A/del_event_recall", metrics.del_event_recall)
+        self.log("A/del_event_f1", metrics.del_event_f1)
+        self.log("A/plddt_ce", metrics.plddt_ce)
+        self.log("A/plddt_bin_acc", metrics.plddt_bin_acc)
+        self.log("A/plddt_bin_acc_pm1", metrics.plddt_bin_acc_pm1)
+        self.log("A/plddt_bin_mae", metrics.plddt_bin_mae)
+
         # t-stratified losses for primary losses
-        self.log(f"L_t/trans_t{t_bin_key}", loss.trans_loss)
-        self.log(f"L_t/rot_t{t_bin_key}", loss.rot_vf_loss)
-        self.log(f"L_t/seq_t{t_bin_key}", loss.base_seq_loss)
+        self.log(f"L_t/trans_t{t_bin_key}", losses.trans_loss)
+        self.log(f"L_t/rot_t{t_bin_key}", losses.rot_vf_loss)
+        self.log(f"L_t/seq_t{t_bin_key}", losses.base_seq_loss)
 
         # Timing statistics
         batch_size = corrupted.trans_t.shape[0]
@@ -6213,7 +6568,7 @@ class BranchFlowModule(pl.LightningModule):
             gc.collect()
             torch.mps.empty_cache()
 
-        return loss.total_loss
+        return losses.total_loss
 
     def validation_step(self, batch: DataBatch, batch_idx: int) -> None:
         self.interpolant.set_device(self.device)

@@ -41,9 +41,9 @@ class VarcoDatasetConfig(DatasetConfig):
     # debug_head_samples: int = 1000  # faster startup
     enable_cogeneration_pdb: bool = True
     enable_cogeneration_afdb: bool = True
-    enable_cogeneration_redesigns: bool = False
-    enable_multiflow_redesigned: bool = False
-    enable_multiflow_synthetic: bool = False
+    enable_cogeneration_redesigns: bool = True
+    enable_multiflow_redesigned: bool = True
+    enable_multiflow_synthetic: bool = True
 
     contact_conditioning: DatasetContactConditioningConfig = field(
         default_factory=lambda: DatasetContactConditioningConfig(
@@ -199,14 +199,14 @@ class VarcoLossConfig(BaseClassConfig):
     pairwise_dist_loss_weight: float = 0.2
     rot_vf_loss_weight: float = 1.0
     seq_loss_weight: float = 1.0
-    seq_prob_loss_weight: float = 1.0
-    seq_token_loss_weight: float = 0.5
+    seq_prob_loss_weight: float = 1.0  # anchor probs
+    seq_token_loss_weight: float = 0.5  # sampled anchor token
     seq_ins_loss_weight: float = 0.2
     split_loss_weight: float = 0.2
     split_pooled_loss_weight: float = 0.05
-    del_loss_weight: float = 0.2
+    del_loss_weight: float = 0.35
     bfactor_loss_weight: float = 0.02
-    plddt_loss_weight: float = 0.02
+    plddt_loss_weight: float = 0.2
 
 
 class VarcoPlotColorBy(StrEnum):
