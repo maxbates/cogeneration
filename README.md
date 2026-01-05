@@ -5,7 +5,13 @@ Cogeneration is a protein generative model that simultaneously generates protein
 It uses the AlphaFold2 style frame representation, and applies flow matching across several domains:
 Translations + torsions are interpolated in Euclidean space, rotations are interpolated in SO(3), and the sequence with discrete flow matching.
 
-This project is a work in progress; a new model enabling all these features has not yet been trained, though many features can be exercised while using the public Multiflow weights.
+Only a small model has been trained. Many features can be also exercised while using the public Multiflow weights (a config is available to recreate its model architecture).
+
+## Variable length Cogeneration (varco)
+
+Note: see `/varco` which extends cogeneration (with a reduced feature set) to variable length motif scaffolding
+
+## Features
 
 This project collects several ideas from other work and includes several extensions over MultiFlow:
 - **Inpainting (conditional generation)** given partial sequences / structures using guidance
@@ -45,16 +51,14 @@ See an [example trajectory](media/example_uncond_172_traj_panel.mp4).
 
 ## Future Work
 
+Latent representation like La-proteina for torsions and sequence forthcoming shortly...
+
 Some outstanding improvements and features:
 
 - support non-residue atoms (small molecules, nucleic polymers, metals), and implicitly small molecule drug binding generation
-- discrete flow matching alternatives, e.g. simplex or gumbel-softmax, or latent flow matching like La-proteina
 - support another model for enriching single/pair encodings - ESM a poor fit for multimers
-- sequence confidence metric, like pLDDT 
 - additional data augmentation strategies esp for multimers, e.g. dynamic cropping, chain-pair selection
-- improve conformation sampling (e.g. train on ensembles)
 - improve sequence sampling diversity (e.g. train using MSAs)
-- improve torsion flow matching representation
 - enable fixed-motif style inpintaing, rather than guided motifs
 - benchmark: forward folding, inverse folding, unconditional designability
 - benchmark: inpainting performance, e.g. on RFDiffusion scaffold set

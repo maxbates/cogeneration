@@ -13,8 +13,9 @@ from torch.utils.data import Subset
 
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
 from cogeneration.util.log import rank_zero_logger
-from varco.branching_flow import BranchFlowModule, ProteinDataLoader, ProteinDataset
 from varco.config import VarcoConfig
+from varco.dataset import ProteinDataLoader, ProteinDataset
+from varco.module import BranchFlowModule
 
 log = rank_zero_logger(__name__)
 
