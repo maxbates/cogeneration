@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from matplotlib import pyplot as plt
 
-from varco.module import logger
+from cogeneration.util.log import rank_zero_logger
 from varco.tensor_utils import SeededRNG, gather_and_pad, pad_and_stack, to_device
 
 # Trees define the corruption process, which in a nutshell looks like:
@@ -19,6 +19,8 @@ from varco.tensor_utils import SeededRNG, gather_and_pad, pad_and_stack, to_devi
 # Data Flow:
 # TreePlan - t=0 -> t=1 per-sample tree topology (length A) with birth/split/delete times
 # BatchedTreePlan - collated TreePlans with (B, A_max) tensors
+
+logger = rank_zero_logger(__name__)
 
 
 @dataclass

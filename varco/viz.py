@@ -592,7 +592,7 @@ class PlotPanel:
 class BranchingFlowVisualizer:
     def __init__(
         self,
-        sigma: Optional[float] = 0.0,
+        sigma: Optional[float] = 1.0,
     ):
         self.interpolant = TreeInterpolant(
             cfg=VarcoInterpolantConfig(

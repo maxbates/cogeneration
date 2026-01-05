@@ -20,12 +20,26 @@ Corruption requires some amount of sampling. However, we can construct a brownia
 
 Sampling is still performed over N timesteps, with the addition that we sample a split and deletion hazard and nodes may be added / removed over the process.
 
+### Examples
+
+<p align="center">
+  <img src="media/example_treeplan.png" alt="Example TreePlan" width="1200"/>
+</p>
+
+<p align="center">
+  <video width="1200" controls>
+    <source src="media/example_corruption.mp4" type="video/mp4">
+    Your browser does not support the video tag.
+  </video>
+</p>
+
+
 ## Running
 
 Varco uses Hydra structured configs registered in `varco/config.py`.
 
-- **Training** (runs the training entrypoint in `varco/branching_flow.py`):
-  - `python -m varco.branching_flow`
+- **Training** (runs the training entrypoint in `varco/train.py`):
+  - `python -m varco.train`
 
 - **Prediction** (loads a checkpoint and runs `Trainer.predict`):
   - `python -m varco.predict inference.ckpt_path=varco/ckpt/epoch0_len512_step74000.ckpt`
