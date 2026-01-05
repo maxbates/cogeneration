@@ -22,17 +22,17 @@ Sampling is still performed over N timesteps, with the addition that we sample a
 
 ### Examples
 
+This graphic illustrates a TreePlan for a single scaffold.
+
+t=0 on top, t=1 on bottom. Motifs are in grey; they do not split or delete, and the sequence is fixed, but they are interpolated in space. 
+
+1 root appears at t=0. "anchors" are split at intermediate time points. Deleted nodes are marked by a red square.
+
 <p align="center">
   <img src="media/example_treeplan.png" alt="Example TreePlan" width="1200"/>
 </p>
 
-<p align="center">
-  <video width="1200" controls>
-    <source src="media/example_corruption.mp4" type="video/mp4">
-    Your browser does not support the video tag.
-  </video>
-</p>
-
+See the [corruption animation](media/example_corruption.mp4), which shows a trajectory from t=0 to t=1 for translations, rotations, and sequence.
 
 ## Running
 
