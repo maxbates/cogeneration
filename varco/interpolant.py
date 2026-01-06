@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -7,7 +8,7 @@ from torch.nn import functional as F
 from tqdm import tqdm
 
 from cogeneration.data import so3_utils
-from cogeneration.data.const import MASK_TOKEN_INDEX
+from cogeneration.data.const import MASK_TOKEN_INDEX, NM_TO_ANG_SCALE
 from cogeneration.data.rigid import batch_center_of_mass
 from varco.config import (
     VarcoHazardConfig,
@@ -43,7 +44,7 @@ class TreeCouplings:
 class TreeInterpolant:
     cfg: VarcoInterpolantConfig
     device: torch.device = torch.device("cpu")
-    min_t: float = 0.005
+    min_t: float = 0.01
     translation_coupler: Coupler[TranslationCoupling] = field(init=False)
     aatypes_coupler: Coupler[AATypesCoupling] = field(init=False)
     rotation_coupler: RotationCoupler = field(init=False)
@@ -63,34 +64,6 @@ class TreeInterpolant:
         torch.manual_seed(int(seed))
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(int(seed))
-
-    @staticmethod
-    def _hazard_multiplier(t_val: float, hazard: VarcoHazardConfig) -> float:
-        """
-        Compute g(t) = h(t) / (1 - H(t)) for a simple closed-form hazard family.
-
-        This is the continuous-time multiplier that replaces the hard-coded 1/(1-t) when H(t)=t.
-        """
-        t = float(min(max(t_val, 0.0), 1.0 - 1e-8))
-        power = int(max(1, hazard.power))
-
-        if hazard.kind == VarcoHazardKind.uniform:
-            survival = max(1e-8, 1.0 - t)
-            return 1.0 / survival
-
-        if hazard.kind == VarcoHazardKind.early_power:
-            # H(t) = 1 - (1 - t)^p  =>  h(t) = p (1 - t)^(p-1),  S(t) = (1 - t)^p
-            survival = max(1e-8, 1.0 - t)
-            return float(power) / survival
-
-        if hazard.kind == VarcoHazardKind.late_power:
-            # H(t) = t^p  =>  h(t) = p t^(p-1),  S(t) = 1 - t^p
-            t_pow = t**power
-            survival = max(1e-8, 1.0 - t_pow)
-            h = float(power) * (t ** (power - 1))
-            return h / survival
-
-        raise ValueError(f"Unknown hazard kind: {hazard.kind!r}")
 
     def compute_motif_guidance_vf(
         self,
@@ -124,6 +97,11 @@ class TreeInterpolant:
             omega2 = kappa**2 / (t_clamped**2 + kappa**2)
             scale = 0.5 * g * g / omega2
             scale = scale.clamp(min=0.0, max=guidance_cfg.var_scale_cap)
+
+            if guidance_cfg.var_decay:
+                # Decay to 0 as t approaches guidance_end_t
+                decay = (1.0 - t_clamped / guidance_cfg.guidance_end_t).clamp(min=0.0)
+                scale = scale * decay
         elif guidance_cfg.scale_type == VarcoMotifGuidanceType.linear_decay:
             scale = guidance_cfg.linear_decay_strength * (1.0 - t_clamped)
         else:
@@ -284,12 +262,12 @@ class TreeInterpolant:
 
     def corrupt_batch(self, batch: DataBatch) -> Tuple[DataBridged, TreeCouplings]:
         """
-        Corrupt a batch to a shared time.
-        Pick a single time to share across the batch, biased slightly toward later times,
+        Corrupt a batch to a shared time. Bias later using `t_corrupt_exp < 1.0`.
+        Pick a single time to share across the batch,
         simply so they have a similar number of insertion/deletions to simulate
-        since corruption is run across the batch
+        since corruption is run across the batch.
         """
-        shared_t = torch.rand(1, device=self.device) ** 0.8
+        shared_t = torch.rand(1, device=self.device) ** self.cfg.t_corrupt_exp
         shared_t = shared_t.clamp(min=self.min_t, max=1.0 - self.min_t)
         t = torch.ones(batch.trans_1.shape[0], device=self.device) * shared_t  # (B,)
         return self.corrupt_to(batch=batch, t=t)
@@ -577,8 +555,8 @@ class TreeInterpolant:
             motif_mask=is_motif, x1=aatypes_1_gathered, device=device
         )
 
-        # init batch at min_t
-        t = torch.full((B,), self.min_t, dtype=torch.float32, device=device)
+        # init batch at t=0
+        t = torch.zeros((B,), dtype=torch.float32, device=device)
 
         return DataCorrupted(
             t=t,
@@ -604,27 +582,97 @@ class TreeInterpolant:
         valid_mask: torch.Tensor,  # (B, P) bool
         t_val: float,  # current time
         dt: float,
-        split_hazard_mult: float,
-        delete_hazard_mult: float,
+        split_hazard: VarcoHazardConfig,
+        delete_hazard: VarcoHazardConfig,
+        pred_split_pooled_log1p_rate: Optional[torch.Tensor] = None,  # (B,)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample insert/delete/substitute events for present positions in a batch.
+
+        Uses exact CTMC interval probabilities instead of g(t)*dt approximation:
+        - Insertions: p = 1 - exp(-R * I) where I = integral_t^{t+dt} g(u) du
+        - Deletions: p = 1 - (1 - p_final*H(t+dt)) / (1 - p_final*H(t))
+
+        For insertions (counting process with K remaining events):
+        - split_rate predicts E[remaining insertions]
+        - optionally calibrated using the pooled prediction
+        - exact integral I of g(t) = h(t)/S(t) over [t, t+dt]
+
+        For deletions (binary event: will/won't be deleted by t=1):
+        - del_logits predicts P(deleted by t=1) via sigmoid
+        - exact conditional interval probability from CTMC theory
+        - this ensures the cumulative deletion probability by t=1 equals p_final
         """
-        # Convert rates/logits to per-step probabilities using the configured hazard multipliers.
-        # - split_rate predicts remaining-event statistics (counting-process view)
-        # - del_logits predicts "destined-to-delete" probability (counting process with K in {0,1})
-        dt_split = float(dt) * float(split_hazard_mult)
-        dt_del = float(dt) * float(delete_hazard_mult)
+        eps = 1e-6
+        t = max(eps, min(1.0 - eps, float(t_val)))
+        t_next = min(1.0 - eps, t + float(dt))
 
-        # Insert probability from split rate.
-        lam_ins = (split_rate.clamp_min(0.0) * dt_split).clamp_max(20.0)
-        p_ins = (1.0 - torch.exp(-lam_ins)).clamp(0.0, 0.95)
+        # Calibrate per-token split_rate using the pooled prediction
+        split_rate = split_rate.clamp_min(0.0)  # (B, P)
+        if pred_split_pooled_log1p_rate is not None:
+            token_sum = (split_rate * valid_mask.float()).sum(dim=1)  # (B,)
+            # pooled prediction is in log1p space: log(1 + total_remaining)
+            pooled_total = torch.expm1(pred_split_pooled_log1p_rate).clamp_min(
+                0.0
+            )  # (B,)
+            # if per-token sum exceeds pooled, scale down
+            scale = pooled_total / token_sum.clamp_min(0.1)  # (B,)
+            # allow up to 10% over-prediction before scaling kicks in
+            # and cap at 10x scale down
+            scale = scale.clamp(min=0.1, max=1.1)
+            split_rate = split_rate * scale.unsqueeze(1)  # (B, P)
 
-        # Delete probability from logits
-        # del_logits predicts "destined-to-delete", convert to instantaneous probability
-        lam_del = (torch.sigmoid(del_logits) * dt_del).clamp_max(20.0)
-        p_del = (1.0 - torch.exp(-lam_del)).clamp(0.0, 0.95)
-        p_del = torch.where(is_root, torch.zeros_like(p_del), p_del)
+        # I_split = integral_t^{t_next} g(u) du, closed form for each hazard
+        p_split = float(max(1, split_hazard.power))
+
+        if split_hazard.kind == VarcoHazardKind.uniform:
+            # g(u) = 1/(1-u), integral = -log(1-u)
+            I_split = math.log((1.0 - t) / max(1e-12, 1.0 - t_next))
+        elif split_hazard.kind == VarcoHazardKind.early_power:
+            # g(u) = p/(1-u), integral = -p*log(1-u)
+            I_split = p_split * math.log((1.0 - t) / max(1e-12, 1.0 - t_next))
+        elif split_hazard.kind == VarcoHazardKind.late_power:
+            # H(u) = u^p, g(u) = p*u^(p-1)/(1-u^p), integral = -log(1-u^p)
+            tp = t**p_split
+            tnp = t_next**p_split
+            I_split = math.log((1.0 - tp) / max(1e-12, 1.0 - tnp))
+        else:
+            raise ValueError(f"Unknown split hazard kind: {split_hazard.kind!r}")
+
+        # CTMC-matching per-step event probability: 1 - exp(-R * I_split)
+        # technically there could be multiple events, we check for 1.
+        lam_ins = split_rate * float(I_split)
+        p_ins = (1.0 - torch.exp(-lam_ins.clamp_max(10.0))).clamp(0.0, 0.95)
+
+        # --- Deletions (binary eventual event) ---
+        # p_final = sigmoid(del_logits) is P(deleted by t=1)
+        #
+        # For a binary deletion modulated by hazard H(t):
+        #   lambda(t) = p_final * h(t) / (1 - p_final * H(t))
+        #
+        # Exact conditional interval probability:
+        #   p_del(t -> t+dt) = 1 - (1 - p_final*H(t_next)) / (1 - p_final*H(t))
+
+        p_del_final = torch.sigmoid(del_logits).clamp(eps, 1.0 - eps)
+        p_del_pow = float(max(1, delete_hazard.power))
+
+        # H(t) for the chosen hazard family
+        if delete_hazard.kind == VarcoHazardKind.uniform:
+            H_t = t
+            H_tn = t_next
+        elif delete_hazard.kind == VarcoHazardKind.early_power:
+            H_t = 1.0 - (1.0 - t) ** p_del_pow
+            H_tn = 1.0 - (1.0 - t_next) ** p_del_pow
+        elif delete_hazard.kind == VarcoHazardKind.late_power:
+            H_t = t**p_del_pow
+            H_tn = t_next**p_del_pow
+        else:
+            raise ValueError(f"Unknown delete hazard kind: {delete_hazard.kind!r}")
+
+        # Exact conditional interval probability
+        denom = (1.0 - p_del_final * H_t).clamp_min(eps)
+        numer = (1.0 - p_del_final * H_tn).clamp_min(0.0)
+        p_del = (1.0 - (numer / denom)).clamp(0.0, 0.95)
 
         insertions = torch.rand_like(p_ins) < p_ins
         deletions = torch.rand_like(p_del) < p_del
@@ -654,9 +702,11 @@ class TreeInterpolant:
         traj = SampleTrajectory()
         traj.samples.append(batch.detach_clone(device=torch.device("cpu")))
 
+        t_end = float(1.0 - self.min_t)
         model.eval()
         with torch.no_grad():
-            t_grid = torch.linspace(self.min_t, 1.0, steps=num_steps + 1, device=device)
+            t_grid = torch.linspace(0.0, t_end, steps=num_steps + 1, device=device)
+
             pbar = tqdm(range(num_steps), total=num_steps, desc="Sampling", leave=False)
             for step_num in pbar:
                 t_val = float(t_grid[step_num].item())
@@ -717,23 +767,21 @@ class TreeInterpolant:
                 )
                 batch.aatypes_t = aatypes_next
 
-                # Sample and apply insertion/deletion events, disallowed in motifs
+                # Disallowed in motifs
+                scaffold_mask = batch.valid_mask & ~batch.motif_mask  # (B, P)
                 is_root = batch.birth_time <= 0.0  # (B, P)
-                split_hazard_mult = self._hazard_multiplier(
-                    t_val=t_val, hazard=self.cfg.sampling.split_hazard
-                )
-                delete_hazard_mult = self._hazard_multiplier(
-                    t_val=t_val, hazard=self.cfg.sampling.delete_hazard
-                )
+
+                # sample indels
                 insertions, deletions, _ = self._sample_insert_delete_substitute(
                     split_rate=pred.pred_split_rate,
                     del_logits=pred.pred_del_logits,
                     is_root=is_root,
-                    valid_mask=batch.valid_mask & ~batch.motif_mask,
+                    valid_mask=scaffold_mask,
                     t_val=t_val,
                     dt=dt,
-                    split_hazard_mult=split_hazard_mult,
-                    delete_hazard_mult=delete_hazard_mult,
+                    split_hazard=self.cfg.sampling.split_hazard,
+                    delete_hazard=self.cfg.sampling.delete_hazard,
+                    pred_split_pooled_log1p_rate=pred.pred_split_pooled_log1p_rate,
                 )
 
                 # Enforce max_length: block insertions once we're at the limit
@@ -752,8 +800,10 @@ class TreeInterpolant:
                 # Domain-specific initialization for newly inserted tokens.
                 # TODO - use couplings for domain-specific corruptions
                 if insert_mask.any():
-                    # Add isotropic perturbation to inserted translations
-                    trans_noise = torch.randn_like(batch.trans_t) * 0.5
+                    # Add small isotropic perturbation to inserted translations
+                    trans_noise = torch.randn_like(batch.trans_t) * (
+                        0.1 * NM_TO_ANG_SCALE
+                    )
                     batch.trans_t = (
                         batch.trans_t + insert_mask.unsqueeze(-1).float() * trans_noise
                     )
@@ -766,7 +816,7 @@ class TreeInterpolant:
                     # Use small sigma for perturbation
                     sigma_insert = torch.full(
                         (B_new,),
-                        self.cfg.rotation_coupler.igso3_sigma_min * 10,
+                        0.1,
                         device=self.rotation_coupler.igso3.sigma_grid.device,
                     )
                     insert_noise = self.rotation_coupler.igso3.sample(
@@ -830,5 +880,46 @@ class TreeInterpolant:
                         torch.mps.empty_cache()
 
             pbar.close()
+
+            # Final endpoint step: take the model's endpoint prediction after integrating to t=1-min_t.
+            # No motif guidance or insertions/deletions are applied in this step.
+            t_val = float(t_grid[-1].item())
+            batch.t = torch.full(
+                (num_batch,), t_val, dtype=torch.float32, device=device
+            )
+            pred = model.forward(batch)
+            traj.pred.append(pred.detach_clone(device=torch.device("cpu")))
+
+            # take predicted translations and rotations, without motif guidance
+            batch.trans_t = pred.pred_trans_1
+            batch.rotmats_t = pred.pred_rotmats_1
+
+            # Sample final-interval (t_end -> 1.0) deletions, not insertions.
+            _, final_deletions, _ = self._sample_insert_delete_substitute(
+                split_rate=torch.zeros_like(pred.pred_split_rate),
+                del_logits=pred.pred_del_logits,
+                is_root=batch.birth_time <= 0.0,
+                valid_mask=batch.valid_mask & ~batch.motif_mask,
+                t_val=t_val,
+                dt=1.0 - t_val,
+                split_hazard=self.cfg.sampling.split_hazard,
+                delete_hazard=self.cfg.sampling.delete_hazard,
+                pred_split_pooled_log1p_rate=None,
+            )
+            if final_deletions.any():
+                zeros = torch.zeros_like(final_deletions)
+                batch, _, _ = batch.apply_insertions_deletions(
+                    insertions=zeros,
+                    deletions=final_deletions,
+                    t_birth=t_end,
+                )
+
+            # recenter
+            batch.t = torch.ones((num_batch,), dtype=torch.float32, device=device)
+            com = batch_center_of_mass(batch.trans_t, mask=batch.valid_mask)
+            batch.trans_t = batch.trans_t - com[:, None, :]
+
+            # save final sample
+            traj.samples.append(batch.detach_clone(device=torch.device("cpu")))
 
         return traj

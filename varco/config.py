@@ -1,15 +1,8 @@
-import datetime
 import math
-import os
-import re
-from collections import OrderedDict
-from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
+from dataclasses import dataclass, field
+from typing import Optional
 
-import torch
 from hydra.core.config_store import ConfigStore
-from omegaconf import DictConfig, OmegaConf, SCMode
 
 from cogeneration.config.base import (
     AttentionType,
@@ -40,7 +33,7 @@ from cogeneration.type.str_enum import StrEnum
 class VarcoDatasetConfig(DatasetConfig):
     # debug_head_samples: int = 1000  # faster startup
     enable_cogeneration_pdb: bool = True
-    enable_cogeneration_afdb: bool = True
+    enable_cogeneration_afdb: bool = False
     enable_cogeneration_redesigns: bool = True
     enable_multiflow_redesigned: bool = True
     enable_multiflow_synthetic: bool = True
@@ -61,22 +54,6 @@ class VarcoMotifGuidanceType(StrEnum):
     linear_decay = "linear_decay"
 
 
-class VarcoHazardKind(StrEnum):
-    """Time-bias hazard CDF family for counting-process events."""
-
-    uniform = "uniform"
-    late_power = "late_power"
-    early_power = "early_power"
-
-
-@dataclass
-class VarcoHazardConfig(BaseClassConfig):
-    """Hazard CDF H(t) specified as a simple closed-form family on [0, 1]."""
-
-    kind: VarcoHazardKind = VarcoHazardKind.uniform
-    power: int = 1
-
-
 @dataclass
 class VarcoInterpolantMotifGuidanceConfig(BaseClassConfig):
     """Configuration for motif position guidance during sampling."""
@@ -84,14 +61,18 @@ class VarcoInterpolantMotifGuidanceConfig(BaseClassConfig):
     enabled: bool = True
     # Scale function
     scale_type: VarcoMotifGuidanceType = VarcoMotifGuidanceType.posterior_variance
+    # decay posterior variance to 0 by t=1
+    var_decay: bool = True
+    # For posterior_variance decay scale: t value at which guidance decays to 0
+    guidance_end_t: float = 0.9
     # For posterior_variance scale: max clamp value (for close to t=0)
     var_scale_cap: float = 10.0
     # For linear_decay scale: strength multiplier
     linear_decay_strength: float = 1.0
     # Per-step translation force cap (angstroms) - prevents huge single-step jumps
-    max_step_force_ang: float = 5.0
+    max_step_force_ang: float = 10.0
     # Per-step rotation force cap (radians) - prevents huge single-step rotations
-    max_rot_step_force_rad: float = math.pi / 2
+    max_rot_step_force_rad: float = math.pi
 
 
 @dataclass
@@ -101,7 +82,7 @@ class VarcoInterpolantCouplerConfig(BaseClassConfig):
     # Sigma for stochastic bridge noise (0 for deterministic)
     noise_scale: float = 1.0
     # Noise is forced to 0 for t >= noise_end_t in sampling steps.
-    noise_end_t: float = 0.95
+    noise_end_t: float = 0.90
 
 
 @dataclass
@@ -117,7 +98,7 @@ class VarcoInterpolantAATypesCouplerConfig(VarcoInterpolantCouplerConfig):
     """Configuration for amino acid types coupler (CTMC bridge)."""
 
     # Total leaving rate for the CTMC
-    beta: float = 3.0
+    beta: float = 2.0
     # Temperature for softmax in euler_step (lower = sharper)
     drift_temp: float = 1.0
     # Cap for the 1/(1-t) drift gain used in sampling.
@@ -141,6 +122,22 @@ class VarcoInterpolantRotationCouplerConfig(VarcoInterpolantCouplerConfig):
     exp_rate: float = 1.5
 
 
+class VarcoHazardKind(StrEnum):
+    """Time-bias hazard CDF family for counting-process events."""
+
+    uniform = "uniform"
+    late_power = "late_power"
+    early_power = "early_power"
+
+
+@dataclass
+class VarcoHazardConfig(BaseClassConfig):
+    """Hazard CDF H(t) specified as a simple closed-form family on [0, 1]."""
+
+    kind: VarcoHazardKind = VarcoHazardKind.uniform
+    power: float = 1
+
+
 @dataclass
 class VarcoInterpolantSamplingConfig(BaseClassConfig):
     """Configuration for Varco sampling behavior."""
@@ -149,15 +146,15 @@ class VarcoInterpolantSamplingConfig(BaseClassConfig):
     # If exceeded, further insertions are blocked
     max_length: int = 512
     # Hazard distributions controlling insertion (split) and deletion time bias during sampling.
-    # Defaults match TreePlan.generate() defaults: splits early (Beta(1,2)), deletions late (Beta(2,1)).
+    # TreePlan.generate() defaults: splits early (Beta(1,2)), deletions late (Beta(2,1))
     split_hazard: VarcoHazardConfig = field(
         default_factory=lambda: VarcoHazardConfig(
-            kind=VarcoHazardKind.early_power, power=2
+            kind=VarcoHazardKind.early_power, power=1.75
         )
     )
     delete_hazard: VarcoHazardConfig = field(
         default_factory=lambda: VarcoHazardConfig(
-            kind=VarcoHazardKind.late_power, power=2
+            kind=VarcoHazardKind.late_power, power=2.0
         )
     )
 
@@ -167,6 +164,7 @@ class VarcoInterpolantConfig(BaseClassConfig):
     """Configuration for Varco interpolant / sampling behavior."""
 
     sigma: float = 1.0  # 0 for deterministic bridges (legacy, prefer coupler configs)
+    t_corrupt_exp: float = 1.0  # < 1.0 -> bias later times in corrupt_batch()
 
     trans_coupler: VarcoInterpolantTransCouplerConfig = field(
         default_factory=VarcoInterpolantTransCouplerConfig
@@ -190,7 +188,10 @@ class VarcoLossConfig(BaseClassConfig):
     """Configuration for Varco loss weights and parameters."""
 
     # Time normalization clip (higher weight as t -> 1)
-    t_normalize_clip: float = 0.9
+    t_normalize_clip: float = 0.8
+    # Exponent to smooth time norm `(1 - t_clip) ** exp`
+    # (<1 -> flatter, >1 -> t->1 weight stronger)
+    t_normalize_exponent: float = 0.25
     # Local pairwise distance threshold (angstroms)
     proximity_threshold_ang: float = 7.0
 
@@ -202,11 +203,13 @@ class VarcoLossConfig(BaseClassConfig):
     seq_prob_loss_weight: float = 1.0  # anchor probs
     seq_token_loss_weight: float = 0.5  # sampled anchor token
     seq_ins_loss_weight: float = 0.2
-    split_loss_weight: float = 0.2
-    split_pooled_loss_weight: float = 0.05
-    del_loss_weight: float = 0.35
+    split_loss_weight: float = 0.35
+    split_rate_entropy_weight = 0.1
+    split_rate_l2_weight: float = 0.1
+    split_pooled_loss_weight: float = 0.2
+    del_loss_weight: float = 0.5
     bfactor_loss_weight: float = 0.02
-    plddt_loss_weight: float = 0.2
+    plddt_loss_weight: float = 0.5
 
 
 class VarcoPlotColorBy(StrEnum):

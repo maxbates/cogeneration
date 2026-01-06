@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -35,6 +36,7 @@ class BranchFlowLosses:
 @dataclass
 class BranchFlowMetrics:
     base_seq_ce: torch.Tensor  # unweighted token CE (nats)
+    base_seq_acc: torch.Tensor  # unweighted top-1 accuracy on anchor tokens
     insertion_seq_ce: torch.Tensor  # unweighted soft CE on insertion logits (nats)
     insertion_target_entropy: (
         torch.Tensor
@@ -43,18 +45,32 @@ class BranchFlowMetrics:
     insertion_ce_minus_entropy: (
         torch.Tensor
     )  # mean over positions of CE - H(target) (nats)
+    insertion_seq_kl: torch.Tensor  # alias for CE - H(target) (nats)
+    trans_rmse_ang: torch.Tensor  # RMS translation error (angstroms)
+    trans_mae_ang: torch.Tensor  # MAE translation error (angstroms)
+    rot_mae_deg: torch.Tensor  # mean abs geodesic angle error (degrees)
+    rot_rmse_deg: torch.Tensor  # RMS geodesic angle error (degrees)
     split_event_ce: torch.Tensor  # Bernoulli CE on split event (>0)
     split_event_precision: torch.Tensor
     split_event_recall: torch.Tensor
     split_event_f1: torch.Tensor
+    split_event_auprc: torch.Tensor  # average precision (PR-AUC) for split event
+    split_event_pos_rate: torch.Tensor  # fraction of positives for split event
     split_rate_mae: torch.Tensor  # MAE on pred split vs target count
     split_rate_mae_pos: torch.Tensor  # MAE conditioned on target>0
+    split_rate_corr: torch.Tensor  # Pearson correlation of rate vs target count
     del_event_ce: (
         torch.Tensor
     )  # Bernoulli CE on delete event (terminal scaffold tokens)
     del_event_precision: torch.Tensor
     del_event_recall: torch.Tensor
     del_event_f1: torch.Tensor
+    del_event_auprc: torch.Tensor  # average precision (PR-AUC) for delete event
+    del_event_pos_rate: torch.Tensor  # fraction of positives for delete event
+    del_prob_mean: torch.Tensor  # mean predicted P(delete) on supervised tokens
+    del_true_rate: torch.Tensor  # empirical delete rate on supervised tokens
+    del_brier: torch.Tensor  # mean (p - y)^2 on supervised tokens
+    lddt_mean: torch.Tensor  # mean lDDT (0-1) computed from coords vs anchors
     plddt_ce: torch.Tensor  # unweighted, unclamped CE (nats)
     plddt_bin_acc: torch.Tensor  # top-1 accuracy on bins
     plddt_bin_acc_pm1: torch.Tensor  # accuracy within ±1 bin
@@ -65,14 +81,54 @@ class BranchFlowMetrics:
 class BranchFlowLossCalculator:
     cfg: VarcoLossConfig
 
+    @staticmethod
+    def _average_precision(scores: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Average precision / PR-AUC for binary labels, computed over a flat vector."""
+        if scores.ndim != 1 or labels.ndim != 1:
+            raise ValueError("scores and labels must be 1D")
+        if scores.numel() != labels.numel():
+            raise ValueError("scores and labels must have the same length")
+        if scores.numel() == 0:
+            return torch.tensor(0.0, device=scores.device)
+
+        labels_f = labels.to(dtype=torch.float32)
+        pos = labels_f.sum()
+        if float(pos.item()) <= 0.0:
+            return torch.tensor(0.0, device=scores.device)
+
+        order = torch.argsort(scores, descending=True)
+        y = labels_f[order]
+        cum_tp = torch.cumsum(y, dim=0)
+        ranks = torch.arange(1, y.numel() + 1, device=scores.device, dtype=y.dtype)
+        precision = cum_tp / ranks
+        return (precision * y).sum() / pos
+
+    @staticmethod
+    def _pearson_corr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Pearson correlation over flat vectors; returns 0 if undefined."""
+        if x.ndim != 1 or y.ndim != 1:
+            raise ValueError("x and y must be 1D")
+        if x.numel() != y.numel():
+            raise ValueError("x and y must have the same length")
+        if x.numel() < 2:
+            return torch.tensor(0.0, device=x.device)
+
+        x = x.to(dtype=torch.float32)
+        y = y.to(dtype=torch.float32)
+        x = x - x.mean()
+        y = y - y.mean()
+        denom = (x.square().sum().sqrt() * y.square().sum().sqrt()).clamp_min(1e-8)
+        return (x * y).sum() / denom
+
     def _time_norm_scale(self, t: torch.Tensor) -> torch.Tensor:
         """
         Compute time-based normalization scale: 1 - min(t, clip).
         Higher weight (smaller divisor) as t -> 1.
         """
-        return 1 - torch.min(
-            t, torch.tensor(self.cfg.t_normalize_clip, device=t.device)
-        )
+        t_clip = t.clamp(max=self.cfg.t_normalize_clip)
+        t_norm = 1 - t_clip
+        t_norm = t**self.cfg.t_normalize_exponent
+        return t_norm
 
     @staticmethod
     def log_clamp(x: torch.Tensor, threshold: float = 5.0) -> torch.Tensor:
@@ -96,10 +152,6 @@ class BranchFlowLossCalculator:
     ) -> torch.Tensor:
         """Soft cross-entropy on logits vs per-token target probabilities."""
         B, P, K = pred_logits.shape
-        if apply_time_norm:
-            if t is None:
-                raise ValueError("t is required when apply_time_norm=True")
-            t_norm = self._time_norm_scale(t=t).view(B, 1)  # (B, 1)
 
         # Zero out mask token and renormalize target probs
         target_probs_masked = target_probs.clone()
@@ -112,6 +164,9 @@ class BranchFlowLossCalculator:
         ce_per_token = -(target_probs_masked * log_probs).sum(dim=-1)  # (B, P)
 
         if apply_time_norm:
+            if t is None:
+                raise ValueError("t is required when apply_time_norm=True")
+            t_norm = self._time_norm_scale(t=t).view(B, 1)  # (B, 1)
             ce_per_token = ce_per_token / (float(time_norm_divisor) * t_norm)  # (B, P)
 
         is_mostly_mask = target_probs[:, :, MASK_TOKEN_INDEX] >= float(
@@ -200,6 +255,22 @@ class BranchFlowLossCalculator:
             * self.cfg.pairwise_dist_loss_weight
         )
 
+    @staticmethod
+    def _trans_error_metrics_ang(
+        pred_trans: torch.Tensor,  # (B, P, 3) angstroms
+        target_trans: torch.Tensor,  # (B, P, 3) angstroms
+        mask: torch.Tensor,  # (B, P)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Translation error metrics in angstroms: (RMSE, MAE) over per-token norms."""
+        with torch.no_grad():
+            diff = pred_trans - target_trans  # (B, P, 3)
+            err = diff.norm(dim=-1)  # (B, P)
+            mask_f = mask.float()
+            denom = mask_f.sum().clamp_min(1.0)
+            mae = (err * mask_f).sum() / denom
+            rmse = torch.sqrt(((err.square()) * mask_f).sum() / denom)
+            return rmse, mae
+
     def _rot_vf_loss(
         self,
         pred_rotmats: torch.Tensor,  # (B, P, 3, 3)
@@ -242,6 +313,25 @@ class BranchFlowLossCalculator:
             self.log_clamp(loss_per_batch.mean(), threshold=5.0)
             * self.cfg.rot_vf_loss_weight
         )
+
+    @staticmethod
+    def _rot_geodesic_error_metrics_deg(
+        pred_rotmats: torch.Tensor,  # (B, P, 3, 3)
+        target_rotmats: torch.Tensor,  # (B, P, 3, 3)
+        mask: torch.Tensor,  # (B, P)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotation error metrics: (MAE, RMSE) of geodesic angle error in degrees."""
+        with torch.no_grad():
+            rel = so3_utils.rot_mult(
+                so3_utils.rot_transpose(pred_rotmats), target_rotmats
+            )  # (B, P, 3, 3)
+            angles_rad, _, _ = so3_utils.angle_from_rotmat(rel)  # (B, P)
+            mask_f = mask.float()
+            denom = mask_f.sum().clamp_min(1.0)
+            mae_rad = (angles_rad.abs() * mask_f).sum() / denom
+            rmse_rad = torch.sqrt((angles_rad.square() * mask_f).sum() / denom)
+            rad2deg = 180.0 / math.pi
+            return mae_rad * rad2deg, rmse_rad * rad2deg
 
     def _seq_token_loss(
         self,
@@ -325,6 +415,20 @@ class BranchFlowLossCalculator:
             valid = mask & (target_anchor_tokens != MASK_TOKEN_INDEX)
             valid_f = valid.float()
             return (ce * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+
+    @staticmethod
+    def _seq_acc_metric(
+        pred_aatype_logits: torch.Tensor,  # (B, P, K)
+        target_anchor_tokens: torch.Tensor,  # (B, P) long
+        mask: torch.Tensor,  # (B, P)
+    ) -> torch.Tensor:
+        """Aux metric: unweighted per-token top-1 accuracy on amino acids."""
+        with torch.no_grad():
+            pred_tokens = pred_aatype_logits.argmax(dim=-1)  # (B, P)
+            valid = mask & (target_anchor_tokens != MASK_TOKEN_INDEX)
+            denom = valid.float().sum().clamp_min(1.0)
+            correct = (pred_tokens == target_anchor_tokens) & valid
+            return correct.float().sum() / denom
 
     def _insertion_seq_loss(
         self,
@@ -453,37 +557,47 @@ class BranchFlowLossCalculator:
             rate,
         )
 
-        # Upweight rare internal nodes (target > 0) and larger remaining counts
-        # to discourage the "predict no insertions" degenerate.
-        pos_weight = 5.0  # upweight insertion targets
-        count_weight_power = 0.5  # upweight exp for remaining counts
-        max_token_weight = 20.0  # cap weight
-
-        token_weight = torch.ones_like(target)
-        token_weight = torch.where(
-            target > 0, torch.full_like(token_weight, pos_weight), token_weight
-        )
-        token_weight = token_weight * (1.0 + target).pow(float(count_weight_power))
-        token_weight = token_weight.clamp_max(float(max_token_weight))
-
         # Scaffold loss (primary) and motif loss (small penalty)
         scaffold_mask = mask & ~motif_mask
         motif_loss_mask = mask & motif_mask
 
-        scaffold_weight = token_weight * scaffold_mask.float()
+        scaffold_weight = scaffold_mask.float()
         scaffold_denom = scaffold_weight.sum(dim=1).clamp_min(1.0)  # (B,)
         scaffold_loss = (
             (token_loss * scaffold_weight).sum(dim=1) / scaffold_denom
         ).mean()
 
-        motif_weight_tensor = token_weight * motif_loss_mask.float()
+        motif_weight_tensor = motif_loss_mask.float()
         motif_denom = motif_weight_tensor.sum(dim=1).clamp_min(1.0)  # (B,)
         motif_loss = (
             (token_loss * motif_weight_tensor).sum(dim=1) / motif_denom
         ).mean()
 
         split_loss = scaffold_loss + motif_weight * motif_loss
-        return self.log_clamp(split_loss, threshold=5.0) * self.cfg.split_loss_weight
+
+        # Regularize diffuse per-token split rates to encourage sparsity.
+        entropy_weight = self.cfg.split_rate_entropy_weight
+        l2_weight = self.cfg.split_rate_l2_weight
+        if (entropy_weight > 0.0) or (l2_weight > 0.0):
+            rate_scaffold = rate * scaffold_mask.float()  # (B, P)
+            sum_rate = rate_scaffold.sum(dim=1, keepdim=True).clamp_min(eps)  # (B, 1)
+            w = rate_scaffold / sum_rate  # (B, P), sums to 1 over scaffold positions
+
+            # Normalized entropy in [~0, 1] (0=one-hot; 1=uniform over N)
+            n = scaffold_mask.float().sum(dim=1).clamp_min(2.0)  # (B,)
+            entropy = -(w * torch.log(w.clamp_min(eps))).sum(dim=1)  # (B,)
+            entropy_norm = entropy / torch.log(n)  # (B,)
+
+            # Encourage concentration via L2 (max=1 for one-hot; min~1/N for uniform)
+            l2 = w.square().sum(dim=1)  # (B,)
+            l2_penalty = (1.0 - l2).clamp_min(0.0)  # (B,)
+
+            regularize_loss = (
+                entropy_weight * entropy_norm.mean() + l2_weight * l2_penalty.mean()
+            )
+            split_loss = split_loss + regularize_loss
+
+        return self.log_clamp(split_loss, threshold=8.0) * self.cfg.split_loss_weight
 
     def _split_metrics(
         self,
@@ -498,12 +612,15 @@ class BranchFlowLossCalculator:
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
         """Aux metrics for split prediction (scaffold only)."""
         device = batch.trans_t.device
         if batch.remaining_insertions is None:
             zero = torch.tensor(0.0, device=device)
-            return zero, zero, zero, zero, zero, zero
+            return zero, zero, zero, zero, zero, zero, zero, zero, zero
 
         with torch.no_grad():
             target = batch.remaining_insertions.to(torch.float32)  # (B, P)
@@ -535,7 +652,29 @@ class BranchFlowLossCalculator:
                 (rate - target).abs() * pos_mask_f
             ).sum() / pos_mask_f.sum().clamp_min(1.0)
 
-        return split_event_ce, precision, recall, f1, mae, mae_pos
+            split_rate_corr = self._pearson_corr(rate[split_mask], target[split_mask])
+            split_event_labels = (target > 0)[split_mask].flatten()
+            split_event_scores = p[split_mask].flatten()
+            if split_event_labels.numel() == 0:
+                split_event_pos_rate = torch.tensor(0.0, device=device)
+                split_event_auprc = torch.tensor(0.0, device=device)
+            else:
+                split_event_pos_rate = split_event_labels.to(torch.float32).mean()
+                split_event_auprc = self._average_precision(
+                    split_event_scores, split_event_labels
+                )
+
+        return (
+            split_event_ce,
+            precision,
+            recall,
+            f1,
+            mae,
+            mae_pos,
+            split_event_auprc,
+            split_event_pos_rate,
+            split_rate_corr,
+        )
 
     def _split_pooled_loss(
         self,
@@ -559,12 +698,22 @@ class BranchFlowLossCalculator:
         batch: DataCorrupted,
         mask: torch.Tensor,  # (B, P)
         motif_mask: torch.Tensor,  # (B, P)
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Aux metrics for deletion prediction (terminal scaffold tokens only)."""
         device = batch.trans_t.device
-        if batch.deleted is None:
+        if batch.deleted is None or batch.remaining_insertions is None:
             zero = torch.tensor(0.0, device=device)
-            return zero, zero, zero, zero
+            return zero, zero, zero, zero, zero, zero, zero, zero, zero
 
         with torch.no_grad():
             terminal_mask = mask & (batch.remaining_insertions == 0) & ~motif_mask
@@ -586,7 +735,34 @@ class BranchFlowLossCalculator:
             recall = tp / (tp + fn).clamp_min(1.0)
             f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-8)
 
-        return del_event_ce, precision, recall, f1
+            del_scores = probs[terminal_mask].flatten()
+            del_labels = (targets > 0.5)[terminal_mask].flatten()
+            if del_labels.numel() == 0:
+                del_event_pos_rate = torch.tensor(0.0, device=device)
+                del_event_auprc = torch.tensor(0.0, device=device)
+                del_prob_mean = torch.tensor(0.0, device=device)
+                del_true_rate = torch.tensor(0.0, device=device)
+                del_brier = torch.tensor(0.0, device=device)
+            else:
+                del_event_pos_rate = del_labels.to(torch.float32).mean()
+                del_event_auprc = self._average_precision(del_scores, del_labels)
+                del_prob_mean = del_scores.mean()
+                del_true_rate = del_event_pos_rate
+                del_brier = (
+                    (del_scores - del_labels.to(del_scores.dtype)).square().mean()
+                )
+
+        return (
+            del_event_ce,
+            precision,
+            recall,
+            f1,
+            del_event_auprc,
+            del_event_pos_rate,
+            del_prob_mean,
+            del_true_rate,
+            del_brier,
+        )
 
     def _deletion_loss(
         self,
@@ -594,6 +770,7 @@ class BranchFlowLossCalculator:
         batch: DataCorrupted,
         mask: torch.Tensor,
         motif_mask: torch.Tensor,  # (B, P)
+        pos_weight: float = 1.00,  # upweight deleted targets, note may bias toward deletion
     ) -> torch.Tensor:
         """Deletion loss, supervised only on terminal tokens.
 
@@ -620,11 +797,10 @@ class BranchFlowLossCalculator:
         )
 
         # upweight deleted targets
-        del_pos_weight = 5.0
         token_weight = torch.ones_like(del_targets)
         token_weight = torch.where(
             del_targets > 0.5,
-            torch.full_like(token_weight, float(del_pos_weight)),
+            torch.full_like(token_weight, float(pos_weight)),
             token_weight,
         )
 
@@ -693,7 +869,14 @@ class BranchFlowLossCalculator:
         target_trans: torch.Tensor,  # (B, P, 3) anchor positions
         mask: torch.Tensor,  # (B, P)
         dist_cutoff: float = 15.0,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """
         Cross-entropy on per-token lDDT bins (pLDDT).
         Uses current predicted coords vs. anchor coords to compute lDDT.
@@ -701,7 +884,7 @@ class BranchFlowLossCalculator:
         plddt_logits = pred.pred_plddt  # (B, P, num_bins) or None
         if plddt_logits is None:
             zero = torch.tensor(0.0, device=batch.trans_t.device)
-            return zero, zero, zero, zero, zero
+            return zero, zero, zero, zero, zero, zero
 
         num_bins = plddt_logits.shape[-1]
         pred_trans = pred.pred_trans_1  # (B, P, 3)
@@ -740,6 +923,10 @@ class BranchFlowLossCalculator:
             pair_count.clamp_min(1.0) * 4.0
         )  # (B, P)
         lddt_mask = (pair_count > 0).float()  # (B, P)
+        with torch.no_grad():
+            valid_lddt = loss_mask.float() * lddt_mask
+            denom_lddt = valid_lddt.sum().clamp_min(1.0)
+            lddt_mean = (target_lddt_score * valid_lddt).sum() / denom_lddt
 
         # Discretise into bins
         target_lddt_bins = torch.clamp(
@@ -766,7 +953,7 @@ class BranchFlowLossCalculator:
             mae_bins = (err.float() * valid_f).sum() / denom_valid
 
         loss = self.log_clamp(loss_ce, threshold=10.0) * self.cfg.plddt_loss_weight
-        return loss, loss_ce.detach(), acc, acc_pm1, mae_bins
+        return loss, loss_ce.detach(), acc, acc_pm1, mae_bins, lddt_mean.detach()
 
     def calculate(
         self,
@@ -837,6 +1024,11 @@ class BranchFlowLossCalculator:
             t=batch.t,
             mask=valid_mask,
         )
+        trans_rmse_ang, trans_mae_ang = self._trans_error_metrics_ang(
+            pred_trans=pred.pred_trans_1,
+            target_trans=trans_anchors_pack,
+            mask=valid_mask,
+        )
 
         # Rotation VF loss
         rot_vf_loss = self._rot_vf_loss(
@@ -844,6 +1036,11 @@ class BranchFlowLossCalculator:
             target_rotmats=rot_anchors_pack,
             rotmats_t=batch.rotmats_t,
             t=batch.t,
+            mask=valid_mask,
+        )
+        rot_mae_deg, rot_rmse_deg = self._rot_geodesic_error_metrics_deg(
+            pred_rotmats=pred.pred_rotmats_1,
+            target_rotmats=rot_anchors_pack,
             mask=valid_mask,
         )
 
@@ -864,6 +1061,11 @@ class BranchFlowLossCalculator:
         )
         base_seq_loss = base_seq_token_loss + base_seq_prob_loss
         base_seq_ce = self._seq_ce_metric(
+            pred_aatype_logits=pred.pred_aatype_logits,
+            target_anchor_tokens=aatype_anchors_pack,
+            mask=valid_mask,
+        )
+        base_seq_acc = self._seq_acc_metric(
             pred_aatype_logits=pred.pred_aatype_logits,
             target_anchor_tokens=aatype_anchors_pack,
             mask=valid_mask,
@@ -895,6 +1097,7 @@ class BranchFlowLossCalculator:
             mask=valid_mask & (batch.remaining_insertions > 0),
             mostly_mask_threshold=0.75,
         )
+        insertion_seq_kl = insertion_ce_minus_entropy
 
         # Insertion / split losses
         split_token_loss = self._split_token_loss(
@@ -911,6 +1114,9 @@ class BranchFlowLossCalculator:
             split_event_f1,
             split_rate_mae,
             split_rate_mae_pos,
+            split_event_auprc,
+            split_event_pos_rate,
+            split_rate_corr,
         ) = self._split_metrics(
             pred=pred,
             batch=batch,
@@ -925,13 +1131,21 @@ class BranchFlowLossCalculator:
             mask=valid_mask,
             motif_mask=batch.motif_mask,
         )
-        del_event_ce, del_event_precision, del_event_recall, del_event_f1 = (
-            self._deletion_metrics(
-                pred=pred,
-                batch=batch,
-                mask=valid_mask,
-                motif_mask=batch.motif_mask,
-            )
+        (
+            del_event_ce,
+            del_event_precision,
+            del_event_recall,
+            del_event_f1,
+            del_event_auprc,
+            del_event_pos_rate,
+            del_prob_mean,
+            del_true_rate,
+            del_brier,
+        ) = self._deletion_metrics(
+            pred=pred,
+            batch=batch,
+            mask=valid_mask,
+            motif_mask=batch.motif_mask,
         )
 
         # Confidence prediction losses
@@ -940,13 +1154,18 @@ class BranchFlowLossCalculator:
             batch=batch,
             mask=valid_mask,
         )
-        plddt_loss, plddt_ce, plddt_bin_acc, plddt_bin_acc_pm1, plddt_bin_mae = (
-            self._plddt_loss(
-                pred=pred,
-                batch=batch,
-                target_trans=trans_anchors_pack,
-                mask=valid_mask,
-            )
+        (
+            plddt_loss,
+            plddt_ce,
+            plddt_bin_acc,
+            plddt_bin_acc_pm1,
+            plddt_bin_mae,
+            lddt_mean,
+        ) = self._plddt_loss(
+            pred=pred,
+            batch=batch,
+            target_trans=trans_anchors_pack,
+            mask=valid_mask,
         )
 
         total_loss = (
@@ -979,20 +1198,35 @@ class BranchFlowLossCalculator:
         )
         metrics = BranchFlowMetrics(
             base_seq_ce=base_seq_ce,
+            base_seq_acc=base_seq_acc,
             insertion_seq_ce=insertion_seq_ce,
             insertion_target_entropy=insertion_target_entropy,
             insertion_ce_over_entropy=insertion_ce_over_entropy,
             insertion_ce_minus_entropy=insertion_ce_minus_entropy,
+            insertion_seq_kl=insertion_seq_kl,
+            trans_rmse_ang=trans_rmse_ang,
+            trans_mae_ang=trans_mae_ang,
+            rot_mae_deg=rot_mae_deg,
+            rot_rmse_deg=rot_rmse_deg,
             split_event_ce=split_event_ce,
             split_event_precision=split_event_precision,
             split_event_recall=split_event_recall,
             split_event_f1=split_event_f1,
+            split_event_auprc=split_event_auprc,
+            split_event_pos_rate=split_event_pos_rate,
             split_rate_mae=split_rate_mae,
             split_rate_mae_pos=split_rate_mae_pos,
+            split_rate_corr=split_rate_corr,
             del_event_ce=del_event_ce,
             del_event_precision=del_event_precision,
             del_event_recall=del_event_recall,
             del_event_f1=del_event_f1,
+            del_event_auprc=del_event_auprc,
+            del_event_pos_rate=del_event_pos_rate,
+            del_prob_mean=del_prob_mean,
+            del_true_rate=del_true_rate,
+            del_brier=del_brier,
+            lddt_mean=lddt_mean,
             plddt_ce=plddt_ce,
             plddt_bin_acc=plddt_bin_acc,
             plddt_bin_acc_pm1=plddt_bin_acc_pm1,

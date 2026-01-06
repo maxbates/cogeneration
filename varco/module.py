@@ -165,19 +165,18 @@ class BranchFlowModule(pl.LightningModule):
     def training_step(self, batch: DataBatch, batch_idx: int) -> torch.Tensor:
         self.interpolant.set_device(self.device)
 
-        # Time corruption (CPU time, no synchronization needed)
+        # Corruption (timed) runs on GPU, not in dataloader (CPU)
         corrupt_start = time.perf_counter()
         bridged, couplings = self.interpolant.corrupt_batch(batch=batch)
+        corrupted = bridged.pack_present()
         corrupt_time = time.perf_counter() - corrupt_start
 
-        corrupted = bridged.pack_present()
-
-        # Time forward pass
+        # Forward pass
         forward_start = time.perf_counter()
         pred = self.forward(corrupted)
         forward_time = time.perf_counter() - forward_start
 
-        # Time loss calculation (part of forward)
+        # Loss and metrics
         loss_start = time.perf_counter()
         losses, metrics = self.loss_calculator.calculate(
             batch=corrupted, pred=pred, couplings=couplings, bridged=bridged
@@ -216,20 +215,36 @@ class BranchFlowModule(pl.LightningModule):
 
         # aux metrics
         self.log("A/base_seq_ce", metrics.base_seq_ce)
+        self.log("A/base_seq_acc", metrics.base_seq_acc)
+        self.log("A/base_seq_ppl", torch.exp(metrics.base_seq_ce))
         self.log("A/insertion_seq_ce", metrics.insertion_seq_ce)
         self.log("A/insertion_target_entropy", metrics.insertion_target_entropy)
         self.log("A/insertion_ce_over_entropy", metrics.insertion_ce_over_entropy)
         self.log("A/insertion_ce_minus_entropy", metrics.insertion_ce_minus_entropy)
+        self.log("A/insertion_seq_kl", metrics.insertion_seq_kl)
+        self.log("A/trans_rmse_ang", metrics.trans_rmse_ang)
+        self.log("A/trans_mae_ang", metrics.trans_mae_ang)
+        self.log("A/rot_mae_deg", metrics.rot_mae_deg)
+        self.log("A/rot_rmse_deg", metrics.rot_rmse_deg)
         self.log("A/split_event_ce", metrics.split_event_ce)
         self.log("A/split_event_precision", metrics.split_event_precision)
         self.log("A/split_event_recall", metrics.split_event_recall)
         self.log("A/split_event_f1", metrics.split_event_f1)
+        self.log("A/split_event_auprc", metrics.split_event_auprc)
+        self.log("A/split_event_pos_rate", metrics.split_event_pos_rate)
         self.log("A/split_rate_mae", metrics.split_rate_mae)
         self.log("A/split_rate_mae_pos", metrics.split_rate_mae_pos)
+        self.log("A/split_rate_corr", metrics.split_rate_corr)
         self.log("A/del_event_ce", metrics.del_event_ce)
         self.log("A/del_event_precision", metrics.del_event_precision)
         self.log("A/del_event_recall", metrics.del_event_recall)
         self.log("A/del_event_f1", metrics.del_event_f1)
+        self.log("A/del_event_auprc", metrics.del_event_auprc)
+        self.log("A/del_event_pos_rate", metrics.del_event_pos_rate)
+        self.log("A/del_prob_mean", metrics.del_prob_mean)
+        self.log("A/del_true_rate", metrics.del_true_rate)
+        self.log("A/del_brier", metrics.del_brier)
+        self.log("A/lddt_mean", metrics.lddt_mean)
         self.log("A/plddt_ce", metrics.plddt_ce)
         self.log("A/plddt_bin_acc", metrics.plddt_bin_acc)
         self.log("A/plddt_bin_acc_pm1", metrics.plddt_bin_acc_pm1)
@@ -239,6 +254,16 @@ class BranchFlowModule(pl.LightningModule):
         self.log(f"L_t/trans_t{t_bin_key}", losses.trans_loss)
         self.log(f"L_t/rot_t{t_bin_key}", losses.rot_vf_loss)
         self.log(f"L_t/seq_t{t_bin_key}", losses.base_seq_loss)
+
+        # t-stratified metrics
+        self.log(f"A_t/trans_rmse_ang_t{t_bin_key}", metrics.trans_rmse_ang)
+        self.log(f"A_t/rot_rmse_deg_t{t_bin_key}", metrics.rot_rmse_deg)
+        self.log(f"A_t/base_seq_acc_t{t_bin_key}", metrics.base_seq_acc)
+        self.log(f"A_t/insertion_seq_kl_t{t_bin_key}", metrics.insertion_seq_kl)
+        self.log(f"A_t/split_rate_mae_t{t_bin_key}", metrics.split_rate_mae)
+        self.log(f"A_t/split_event_auprc_t{t_bin_key}", metrics.split_event_auprc)
+        self.log(f"A_t/del_event_auprc_t{t_bin_key}", metrics.del_event_auprc)
+        self.log(f"A_t/lddt_mean_t{t_bin_key}", metrics.lddt_mean)
 
         # Timing statistics
         batch_size = corrupted.trans_t.shape[0]
@@ -378,8 +403,6 @@ class BranchFlowModule(pl.LightningModule):
                 out_dir=sample_dir,
                 filename="sampling_trajectory",
                 max_frames=self.cfg.inference.plot.max_frames,
-                max_samples=self.cfg.inference.plot.max_samples,
-                max_cols=self.cfg.inference.plot.max_cols,
                 only_alpha_carbons=self.cfg.inference.plot.only_alpha_carbons,
                 show_residue_letters=self.cfg.inference.plot.show_residue_letters,
                 color_by=self.cfg.inference.plot.color_by,

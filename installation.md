@@ -8,11 +8,11 @@ set up ssh
 
 **Option 1: Using rsync (recommended):**
 
-Run from local machine:
+Run from local machine, assuming ssh target is `lambda_labs_tester`:
 
 ```bash
 # Sync from local `./` (cogeneration directory) to remote ~/cogeneration
-rsync -avz --filter=':- .gitignore' --exclude='.git' --exclude '*.tar' ./ username@remote_host:~/cogeneration/
+rsync -avz --filter=':- .gitignore' --exclude='.git' --exclude '*.tar' ./ lambda_labs_tester:~/cogeneration/
 ```
 
 **Option 2: Using PyCharm:**

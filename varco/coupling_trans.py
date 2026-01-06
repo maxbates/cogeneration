@@ -66,7 +66,9 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
         var = (
             (flat_s - flat_t0).clamp_min(0.0) * (1.0 - flat_s).clamp_min(0.0) / denom
         ).clamp_min(0.0)
-        std = (var.sqrt() * self.cfg.noise_scale).to(mean.dtype)
+        # Match cogeneration: translation noise source is in nm then converted to Å via NM_TO_ANG_SCALE.
+        # Treat noise_scale as dimensionless amplitude on top of that.
+        std = (var.sqrt() * self.cfg.noise_scale * NM_TO_ANG_SCALE).to(mean.dtype)
         eps = torch.randn_like(mean)
         return (mean + std.unsqueeze(-1) * eps).view(original_shape)
 
@@ -153,8 +155,13 @@ class TranslationCoupler(Coupler[TranslationCoupling]):
                 min_sigma=0.0,
                 noise_end_t=float(self.cfg.noise_end_t),
             ).to(dtype=x_next.dtype, device=x_next.device)
-            x_next = x_next + torch.randn_like(x_next) * (
-                sigma_t.view(B, 1, 1) * math.sqrt(float(dt))
+            # sample incremental noise using sample_base()
+            noise = self.sample_base(
+                motif_mask=motif_mask,
+                x1=None,  # not needed
+                device=x_next.device,
             )
+            noise *= sigma_t.view(B, 1, 1) * math.sqrt(float(dt))
+            x_next = x_next + noise
 
         return x_next * valid_fmask + x_t * (1.0 - valid_fmask)

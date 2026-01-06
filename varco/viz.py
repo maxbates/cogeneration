@@ -473,6 +473,7 @@ class PlotPanel:
         letters, _ = PlotPanel._aa_letters_and_colors()
         n = len(aatypes)
 
+        x2, y2 = None, None
         if n > 0:
             x2, y2, _ = proj3d.proj_transform(
                 ca_pos[:, 0],
@@ -860,11 +861,13 @@ class BranchingFlowVisualizer:
         ]
 
         # Convert predictions (clamping index to available predictions)
+        # Use the sample corresponding to the prediction index, not the frame index,
+        # since sequence lengths can change during sampling (insertions/deletions)
         num_preds = len(traj.pred)
         pred_frames = [
             TrajectoryFrame.from_model_prediction(
                 pred=traj.pred[min(idx, num_preds - 1)],
-                sample=traj.samples[idx],
+                sample=traj.samples[min(idx, num_preds - 1)],
                 batch_idx=batch_idx,
                 include_atom37=not only_alpha_carbons,
             )

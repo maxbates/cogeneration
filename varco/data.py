@@ -211,16 +211,22 @@ class DataCorrupted:
         is_insertion = torch.zeros((B, P_new), dtype=torch.bool, device=device)
         is_insertion[:, 1:] = gather_idx[:, 1:] == gather_idx[:, :-1]
 
+        # When an insertion happens, one source position becomes two child positions.
+        # Track `is_split_child` and set birth_time for each.
+        is_split_child = is_insertion.clone()
+        is_split_child[:, :-1] = is_split_child[:, :-1] | is_insertion[:, 1:]
+
         # Valid mask for new batch
         new_valid = out_pos < out_lens.unsqueeze(1)
         is_insertion = is_insertion & new_valid
+        is_split_child = is_split_child & new_valid
 
-        # Update birth_time for inserted positions to current time t, set padding to inf
+        # Update birth_time for split children to current time t, set padding to inf
         new_birth = gather_and_pad(
             self.birth_time, gather_idx, new_valid, fill_value=float("inf")
         )
         new_birth = torch.where(
-            is_insertion, torch.full_like(new_birth, t_birth), new_birth
+            is_split_child, torch.full_like(new_birth, t_birth), new_birth
         )
 
         # Skip mapping optional supervised fields, make sure not defined (not used while sampling)

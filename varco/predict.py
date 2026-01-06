@@ -9,7 +9,6 @@ import torch
 from omegaconf import OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning.utilities.model_summary import ModelSummary
-from torch.utils.data import Subset
 
 from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
 from cogeneration.util.log import rank_zero_logger
@@ -17,7 +16,7 @@ from varco.config import VarcoConfig
 from varco.dataset import ProteinDataLoader, ProteinDataset
 from varco.module import BranchFlowModule
 
-log = rank_zero_logger(__name__)
+logger = rank_zero_logger(__name__)
 
 torch.set_float32_matmul_precision("high")
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -66,7 +65,7 @@ class VarcoEvaluator:
             config_path = os.path.join(inference_dir, "config.yaml")
             with open(config_path, "w") as f:
                 OmegaConf.save(config=self.cfg, f=f)
-            log.info(f"💾 Saving inference config to {config_path}")
+            logger.info(f"💾 Saving inference config to {config_path}")
 
         # Read checkpoint and initialize module
         try:
@@ -75,11 +74,11 @@ class VarcoEvaluator:
                 cfg=self.cfg,
             )
         except Exception as e:
-            log.error(f"Failed to load checkpoint {ckpt_path}: {e}")
+            logger.error(f"Failed to load checkpoint {ckpt_path}: {e}")
             raise
 
         self._module.eval()
-        log.info("\n" + str(ModelSummary(self._module, max_depth=2)))
+        logger.info("\n" + str(ModelSummary(self._module, max_depth=2)))
 
     def _setup_inference_dir(self, ckpt_path: str) -> str:
         ckpt_name = "/".join(Path(ckpt_path).with_suffix("").parts[-3:])
@@ -131,6 +130,7 @@ class VarcoEvaluator:
             model=self._module,
             dataloaders=self.dataloader,
         )
+        logger.info("Prediction complete")
 
 
 @hydra.main(config_path=".", config_name="varco", version_base=None)

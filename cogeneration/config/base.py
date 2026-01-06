@@ -1437,7 +1437,7 @@ class ExperimentTrainerConfig(BaseClassConfig):
     overfit_batches: Union[float, int] = 0
     deterministic: bool = False
     # Perform validation every `n` epochs.
-    check_val_every_n_epoch: int = 5
+    check_val_every_n_epoch: int = 1
     # Enable gradient accumulation
     accumulate_grad_batches: int = 1
     # weights / tensor precision

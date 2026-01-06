@@ -348,7 +348,8 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
         valid_mask: torch.Tensor,  # (B, P) positions that are valid (born)
     ) -> torch.Tensor:
         """
-        Compute regularized step probabilities for discrete Euler sampling.
+        Compute regularized step probabilities using the legacy heuristic drift sampler (not CTMC).
+        This treats the model logits as a drift target with a hand-designed 1/(1-t) schedule.
         Applies temperature, uncertainty gate, noise, leave mass cap, and regularization.
         """
         B, P = x_t.shape
@@ -409,6 +410,91 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
 
         return step_probs
 
+    def _ctmc_step_probs(
+        self,
+        logits: torch.Tensor,  # (B, P, K) predicted logits for endpoint distribution
+        x_t: torch.Tensor,  # (B, P) current tokens
+        t: torch.Tensor,  # (B,) current time
+        dt: float,
+        valid_mask: torch.Tensor,  # (B, P) positions that are valid (born)
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """
+        Compute step probabilities using a CTMC(beta) Doob h-transform (matches the CTMC corruption model).
+        This conditions a uniform-substitution CTMC on the model's predicted endpoint distribution; we also
+        apply an uncertainty gate to reduce substitutions when the model is confident about the current token.
+        """
+        B, P = x_t.shape
+        K = self.K
+
+        # Endpoint distribution q_end from logits (optionally tempered).
+        q_end = F.softmax(logits / float(self.cfg.drift_temp), dim=-1)  # (B, P, K)
+
+        # Disallow MASK token as an endpoint target, matching the loss convention.
+        q_end_masked = q_end.clone()
+        q_end_masked[:, :, MASK_TOKEN_INDEX] = 0.0
+        q_end = q_end_masked / q_end_masked.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+        # Uncertainty gating: suppress substitutions when q_end is confident about the current token.
+        # This is heuristic (not part of the base CTMC model), but tends to stabilize sampling.
+        uncertainty = self._uncertainty_gate(x_t=x_t, probs=q_end)  # (B, P)
+
+        # Optional exploration noise: mix q_end with uniform mass early/mid-trajectory.
+        if float(self.cfg.noise_scale) > 0.0 and float(dt) > 0.0:
+            sigma_t = self._compute_sigma_t(
+                t=t,
+                scale=torch.ones_like(t),
+                min_sigma=0.0,
+                noise_end_t=float(self.cfg.noise_end_t),
+            )  # (B,)
+            mix = (
+                float(self.cfg.noise_scale)
+                * float(dt)
+                * sigma_t.square().clamp_min(0.0)
+            ).clamp(
+                0.0, 0.25
+            )  # (B,)
+            uniform = torch.ones_like(q_end) / K
+            q_end = (1.0 - mix.view(B, 1, 1)) * q_end + mix.view(B, 1, 1) * uniform
+            q_end = q_end / q_end.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+        # h_t(x) = sum_y P_{x,y}(1-t) q_end(y), computed in closed form for uniform substitution.
+        delta_end = (1.0 - t).clamp_min(0.0).view(B, 1, 1)  # (B, 1, 1)
+        p_stay_end = self._transition_prob(delta_end, same=True)  # (B, 1, 1)
+        p_jump_end = self._transition_prob(delta_end, same=False)  # (B, 1, 1)
+        h_all = p_jump_end + q_end * (p_stay_end - p_jump_end)  # (B, P, K)
+
+        # h_t(i) for current token i.
+        h_i = h_all.gather(-1, x_t.long().clamp(0, K - 1).unsqueeze(-1)).squeeze(-1)
+        h_i = h_i.clamp_min(eps)  # (B, P)
+
+        # Uniform substitution generator: Q(i->j)=beta/(K-1) for j!=i.
+        q_rate = float(self.cfg.beta) / max(K - 1, 1)
+        ratios = (h_all / h_i.unsqueeze(-1)).clamp_min(0.0).clamp_max(1e6)  # (B, P, K)
+
+        current_onehot = F.one_hot(x_t.long().clamp(0, K - 1), num_classes=K).float()
+        off_rates = (
+            q_rate * ratios * (1.0 - current_onehot) * uncertainty.unsqueeze(-1)
+        )  # (B, P, K)
+
+        # First-order interval probabilities p(i->j) ~= rate * dt.
+        step_off = (off_rates * float(dt)).clamp_min(0.0)  # (B, P, K)
+
+        # Cap total leave mass for numerical stability.
+        if self.cfg.leave_mass_cap is not None and float(self.cfg.leave_mass_cap) > 0.0:
+            row_sum = step_off.sum(dim=-1, keepdim=True).clamp_min(eps)
+            shrink = (float(self.cfg.leave_mass_cap) / row_sum).clamp_max(1.0)
+            step_off = step_off * shrink
+
+        row_sum = step_off.sum(dim=-1, keepdim=True).clamp_min(0.0)
+        step_probs = step_off + current_onehot * (1.0 - row_sum)  # (B, P, K)
+        step_probs = step_probs / step_probs.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+        # For invalid positions: stay put.
+        stay_dist = current_onehot
+        step_probs = torch.where(valid_mask.unsqueeze(-1), step_probs, stay_dist)
+        return step_probs
+
     def euler_step(
         self,
         x_t: torch.Tensor,  # (B, P) current tokens
@@ -419,10 +505,17 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
         motif_mask: torch.Tensor,  # (B, P)
         potential: Optional[torch.Tensor] = None,  # (B, P, K) guidance logits
     ) -> torch.Tensor:
-        """Single Euler step for discrete amino acid sampling.
+        """
+        Single sampling step for discrete amino acids using a CTMC (uniform substitution).
 
-        Uses discrete jump process with uncertainty gating and noise injection.
-        See _compute_step_probs for details on the probability computation.
+        Training corruption for aatypes uses a CTMC bridge (see sample_bridge / _bridge_marginal). For inference,
+        we don't have the true endpoint token X_1, so we form a "soft" bridge using the model's predicted endpoint
+        distribution q_end (from logits), and sample the time-inhomogeneous conditioned CTMC:
+
+            rate(i -> j | t) = Q(i -> j) * h_t(j) / h_t(i),
+            h_t(x) = P(X_1 ~ q_end | X_t = x) = sum_y P_{x,y}(1-t) q_end(y),
+
+        where Q is the uniform substitution generator with leaving rate beta.
         """
         B, P = x_t.shape
         K = self.K
@@ -432,11 +525,9 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
 
         assert potential is None, "potential not yet supported"
 
-        # Valid positions are those born before current time
+        # Valid positions are those born before (or at) current time.
         valid_mask = birth_time <= t[:, None]  # (B, P)
-
-        # Compute step probabilities with uncertainty gating, noise, and regularization
-        step_probs = self._compute_step_probs(
+        step_probs = self._ctmc_step_probs(
             logits=x1_pred,
             x_t=x_t,
             t=t,
@@ -444,14 +535,9 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
             valid_mask=valid_mask,
         )
 
-        # Sample new tokens
         x_next = torch.multinomial(step_probs.view(-1, K), num_samples=1).squeeze(-1)
         x_next = x_next.view(B, P)
 
-        # Keep invalid positions unchanged
-        x_next = torch.where(valid_mask, x_next, x_t)
-
-        # Keep motif positions fixed
+        # Keep motif positions fixed.
         x_next = torch.where(motif_mask, x_t, x_next)
-
         return x_next

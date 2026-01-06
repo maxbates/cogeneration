@@ -141,9 +141,7 @@ class RotationCoupler(Coupler[RotationCoupling]):
 
         # Sample IGSO3 noise and apply
         self._ensure_igso3_device(mean.device)
-        sigma_for_igso3 = std.clamp(
-            self.cfg.igso3_sigma_min, self.cfg.igso3_sigma_max
-        ).to(self.igso3.sigma_grid.device)
+        sigma_for_igso3 = std.clamp(self.cfg.igso3_sigma_min, self.cfg.igso3_sigma_max)
 
         # Only sample noise where std > min threshold
         apply_mask = std > self.cfg.igso3_sigma_min
@@ -152,6 +150,7 @@ class RotationCoupler(Coupler[RotationCoupling]):
                 torch.eye(3, device=mean.device).unsqueeze(0).expand(N, -1, -1)
             )
             sigma_sel = sigma_for_igso3[apply_mask]
+            sigma_sel = sigma_sel.to(self.igso3.sigma_grid.device)
             noise_sel = self.igso3.sample(sigma_sel, 1).to(mean.device)
             noise_sel = noise_sel.squeeze(1)  # (N_apply, 3, 3)
             intermediate_noise = identity_noise.clone()
