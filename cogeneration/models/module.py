@@ -561,26 +561,28 @@ class FlowModule(LightningModule):
         #     inference_task = InferenceTask.unconditional
 
         # Validation can run either unconditional generation, or inpainting
+        # Motif guidance uses autograd during sampling (inference tensors break backward).
         self.interpolant.set_device(res_mask.device)
-        sample_traj, model_traj, fk_traj = self.interpolant.sample(
-            num_batch,
-            num_res,
-            self.model,
-            task=inference_task,
-            diffuse_mask=batch[bp.diffuse_mask],
-            motif_mask=batch.get(bp.motif_mask, None),
-            chain_idx=batch[bp.chain_idx],
-            res_idx=batch[bp.res_idx],
-            # t=0 values will be noise
-            trans_1=batch[bp.trans_1],
-            rotmats_1=batch[bp.rotmats_1],
-            aatypes_1=batch[bp.aatypes_1],
-            torsions_1=batch[bp.torsions_1],
-            hot_spots=batch.get(bp.hot_spots, None),
-            contact_conditioning=batch.get(bp.contact_conditioning, None),
-            # Disable FK steering during validation
-            num_particles=0,
-        )
+        with torch.inference_mode(False):
+            sample_traj, model_traj, fk_traj = self.interpolant.sample(
+                num_batch,
+                num_res,
+                self.model,
+                task=inference_task,
+                diffuse_mask=batch[bp.diffuse_mask],
+                motif_mask=batch.get(bp.motif_mask, None),
+                chain_idx=batch[bp.chain_idx],
+                res_idx=batch[bp.res_idx],
+                # t=0 values will be noise
+                trans_1=batch[bp.trans_1],
+                rotmats_1=batch[bp.rotmats_1],
+                aatypes_1=batch[bp.aatypes_1],
+                torsions_1=batch[bp.torsions_1],
+                hot_spots=batch.get(bp.hot_spots, None),
+                contact_conditioning=batch.get(bp.contact_conditioning, None),
+                # Disable FK steering during validation
+                num_particles=0,
+            )
 
         bb_trajs = to_numpy(sample_traj.structure)
         aa_trajs = to_numpy(sample_traj.amino_acids)
@@ -806,23 +808,25 @@ class FlowModule(LightningModule):
             raise ValueError(f"Unknown task {task}")
 
         # Sample batch
-        sample_traj, model_traj, fk_traj = interpolant.sample(
-            num_batch=num_batch,
-            num_res=sample_length,
-            model=self.model,
-            task=task,
-            diffuse_mask=diffuse_mask,
-            motif_mask=motif_mask,
-            chain_idx=batch[bp.chain_idx],
-            res_idx=batch[bp.res_idx],
-            trans_1=trans_1,
-            rotmats_1=rotmats_1,
-            torsions_1=torsions_1,
-            aatypes_1=aatypes_1,
-            hot_spots=batch.get(bp.hot_spots, None),
-            contact_conditioning=batch.get(bp.contact_conditioning, None),
-            show_progress=show_progress,
-        )
+        # Motif guidance uses autograd during sampling (inference tensors break backward).
+        with torch.inference_mode(False):
+            sample_traj, model_traj, fk_traj = interpolant.sample(
+                num_batch=num_batch,
+                num_res=sample_length,
+                model=self.model,
+                task=task,
+                diffuse_mask=diffuse_mask,
+                motif_mask=motif_mask,
+                chain_idx=batch[bp.chain_idx],
+                res_idx=batch[bp.res_idx],
+                trans_1=trans_1,
+                rotmats_1=rotmats_1,
+                torsions_1=torsions_1,
+                aatypes_1=aatypes_1,
+                hot_spots=batch.get(bp.hot_spots, None),
+                contact_conditioning=batch.get(bp.contact_conditioning, None),
+                show_progress=show_progress,
+            )
 
         model_bb_trajs = to_numpy(model_traj.structure)
         model_aa_trajs = to_numpy(model_traj.amino_acids)

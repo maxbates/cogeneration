@@ -44,14 +44,19 @@ def batch_align_structures(
     pos_1: torch.Tensor, pos_2: torch.Tensor, mask=None, center=False
 ):
     """
-    Center and align structures to reference structures
+    Center and align structures to reference structures, i.e. align pos_1 to pos_2.
     If no mask is provided, structures are centered at origin, otherwise pass `center=True` to center
+
+    Returns aligned pos_1. Centers pos_2 in place! returns align_rots (B, 3, 3).
+
     TODO(dataset) set `center=True` by default so get similar behavior as when no mask is provided
     """
     if pos_1.shape != pos_2.shape:
-        raise ValueError("pos_1 and pos_2 must have the same shape.")
+        raise ValueError(
+            f"pos_1 and pos_2 must have the same shape: {pos_1.shape} != {pos_2.shape}"
+        )
     if pos_1.ndim != 3:
-        raise ValueError(f"Expected inputs to have shape [B, N, 3]")
+        raise ValueError(f"Expected inputs to have shape [B, N, 3]: {pos_1.shape}")
     num_batch = pos_1.shape[0]
     device = pos_1.device
     batch_indices = (

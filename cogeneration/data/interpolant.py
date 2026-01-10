@@ -29,6 +29,10 @@ from cogeneration.data.fm.rotations import FlowMatcherRotations
 from cogeneration.data.fm.torsions import FlowMatcherTorsions
 from cogeneration.data.fm.translations import FlowMatcherTrans
 from cogeneration.data.logits import combine_logits
+from cogeneration.data.motif_guidance import (
+    compute_motif_potential,
+    motif_potential_window,
+)
 from cogeneration.data.noise_mask import (
     mask_blend_1d,
     mask_blend_2d,
@@ -100,6 +104,21 @@ class BatchTrueFeatures:
             torsions=torsions,
             aatypes=aatypes,
             logits=logits_1,
+        )
+
+    def expand_particles(self, num_particles: int) -> "BatchTrueFeatures":
+        """
+        Expand batch by repeating each sample K times for FK steering particles.
+        Returns a new BatchTrueFeatures with shape (B * K, ...) instead of (B, ...).
+        """
+        if num_particles <= 1:
+            return self
+        return BatchTrueFeatures(
+            trans=self.trans.repeat_interleave(num_particles, dim=0),
+            rotmats=self.rotmats.repeat_interleave(num_particles, dim=0),
+            torsions=self.torsions.repeat_interleave(num_particles, dim=0),
+            aatypes=self.aatypes.repeat_interleave(num_particles, dim=0),
+            logits=self.logits.repeat_interleave(num_particles, dim=0),
         )
 
 
@@ -511,111 +530,37 @@ class Interpolant:
     def motif_potentials(
         self,
         t: torch.Tensor,  # (B,)
-        noisy_batch: NoisyFeatures,
-        model_pred: SamplingStep,
+        trans_t: torch.Tensor,  # (B, N, 3) - must have requires_grad=True if gradient-based
+        rotmats_t: torch.Tensor,  # (B, N, 3, 3) - must have requires_grad=True if gradient-based
+        pred_trans_1: torch.Tensor,  # (B, N, 3)
+        pred_rotmats_1: torch.Tensor,  # (B, N, 3, 3)
         true_feats: BatchTrueFeatures,
         motif_mask: Optional[torch.Tensor],  # (B, N) bool
+        res_mask: torch.Tensor,  # (B, N)
     ) -> PotentialField:
         """
-        Generate potentials for motif guidance, returning translation and rotation vector fields.
-        `aatypes` are fixed in motifs, so no guidance for them.
+        Generate potentials for motif guidance using gradient-based approach.
+        Delegates to centralized compute_motif_potential function which computes:
 
-        Model predicts an unconditional drift, and this VF (masked to motifs) is passed to
-        euler steps and modifies those unconditional velocities.
-
-        This is similar to how FrameFlow does it, or twisted SMC,
-        but only considering a single trajectory and without gradients.
-
-        Cf. substituting the motifs into the prediction and interpolating towards them,
-        prefer using an additional velocity because:
-        - keep ODE smooth
-        - reduce scaffold jitter
-        - softens as t-> 1 (but > 0) so motifs are not completely locked in
-        - preserves equivariance
-
-        See FrameFlow paper for details about motif guidance (sec 3.2):
-        https://arxiv.org/pdf/2401.04082
+        This requires trans_t and rotmats_t to have requires_grad=True when
+        gradient-based guidance is enabled.
         """
-        if motif_mask is None or not motif_mask.any():
-            return PotentialField()
-
-        trans_t = noisy_batch[nbp.trans_t]
-        rotmats_t = noisy_batch[nbp.rotmats_t]
-        pred_trans_1 = model_pred.trans
-        pred_rotmats_1 = model_pred.rotmats
-        motif_sel = motif_mask.bool()
-
-        eps = 1e-3
-        t = torch.clamp(t, min=eps, max=1.0 - eps)
-
-        # derive scale = 1/2 g(t)² / ω², starting with g(t) (guidance scale) and ω² (posterior scale)
-        # ω² values from FrameFlow eq 14, 15 assume linear interpolation
-        # ω²(t) for linear path κ(t)=1−t is (1−t)² / (t² + (1−t)²)
-        # generalized form: ω²(t) = κ(t)² / (t² + κ(t)²)
-        # similarly, g(t) in FrameFlow is (1-t)/t because linear and so because it matches
-        # diffusion coefficient for diffusion SDE that matches marginals of flow SDE.
-        # g(t) can be generalized to κ(t) / t
-        # However, we support non-linear schedules for interpolation.
-        # Additionally, translations and rotations may have different schedules.
-        # Note on signs -- the scale is positive, and the drift is (true - pred).
-
-        # translations
-        if self.cfg.trans.sample_schedule == InterpolantTranslationsScheduleEnum.linear:
-            kappa_trans = 1.0 - t
-        elif (
-            self.cfg.trans.sample_schedule == InterpolantTranslationsScheduleEnum.vpsde
-        ):
-            bmin, bmax = self.cfg.trans.vpsde_bmin, self.cfg.trans.vpsde_bmax
-            # ᾱ(t) = exp(-∫₀ᵗ β(s)ds), β(s)=bmax-(bmax-bmin)s  ⇒ ∫= bmax t - 0.5(bmax-bmin)t²
-            alphabar_t = torch.exp(-(bmax * t - 0.5 * (bmax - bmin) * t * t))
-            # κ_T(t) = sqrt(ᾱ(t)) makes κ(0)=1, κ(1)≈0 (noise→data)
-            kappa_trans = torch.sqrt(alphabar_t)
-        else:
-            raise ValueError("Unknown translation schedule")
-        g_trans = kappa_trans / t
-        omega2_trans = kappa_trans**2 / (t**2 + kappa_trans**2)
-        scale_trans = 0.5 * g_trans * g_trans / omega2_trans  # (B,)
-
-        # rotations
-        if self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.linear:
-            kappa_rotmats = 1.0 - t
-        elif self.cfg.rots.sample_schedule == InterpolantRotationsScheduleEnum.exp:
-            # exp(-c•t) for c>0 => fast early rotation "lock-in" and vanishing near t->1
-            kappa_rotmats = torch.exp(-self.cfg.rots.exp_rate * t)
-        else:
-            raise ValueError("Unknown rotation schedule")
-        g_rotmats = kappa_rotmats / t
-        omega2_rotmats = kappa_rotmats**2 / (t**2 + kappa_rotmats**2)
-        scale_rotmats = 0.5 * g_rotmats * g_rotmats / omega2_rotmats  # (B,)
-
-        # clamp the scales, which can be very large (>100) near t=0 and lead to overshooting.
-        # TODO make configurable, scale depending on noise strength, maybe proportional to uncond VF
-        scale_trans = torch.clamp(scale_trans, min=0.0, max=50.0).to(
-            pred_trans_1.device
+        potential, metrics = compute_motif_potential(
+            t=t,
+            trans_t=trans_t,
+            rotmats_t=rotmats_t,
+            pred_trans_1=pred_trans_1,
+            pred_rotmats_1=pred_rotmats_1,
+            trans_1_motifs=true_feats.trans,
+            rotmats_1_motifs=true_feats.rotmats,
+            motif_mask=motif_mask,
+            valid_mask=res_mask,
+            cfg=self.cfg.motif_guidance,
+            min_t=self.cfg.min_t,
+            align=True,
+            allow_none=True,  # Return empty field on failure rather than raising
         )
-        scale_rotmats = torch.clamp(scale_rotmats, min=0.0, max=50.0).to(
-            pred_rotmats_1.device
-        )
-
-        # trans_vf = 1/2 g(t)² ∇x / ω²(t) = scale_trans • ∇x
-        # diff = (true - pred) so push towards target.
-        trans_vf = torch.zeros_like(pred_trans_1)  # (B, N, 3)
-        trans_vf[motif_sel] = (true_feats.trans - pred_trans_1)[motif_sel]
-        trans_vf *= scale_trans.view(-1, 1, 1)
-
-        # rotmats_vf = 1/2 g(t)² ∇r / ω²(t) = scale_rotmats • ∇r
-        # compute tangent from current -> true and current -> pred
-        # and their difference is ~ the gradient (all in tangent space of current)
-        rotmats_t_to_true = so3_utils.calc_rot_vf(
-            mat_t=rotmats_t,
-            mat_1=true_feats.rotmats,
-        )
-        rotmats_t_to_pred = so3_utils.calc_rot_vf(mat_t=rotmats_t, mat_1=pred_rotmats_1)
-        rotmats_vf = torch.zeros_like(rotmats_t_to_true)
-        rotmats_vf[motif_sel] = (rotmats_t_to_true - rotmats_t_to_pred)[motif_sel]
-        rotmats_vf *= scale_rotmats.view(-1, 1, 1)
-
-        return PotentialField(trans=trans_vf, rotmats=rotmats_vf)
+        return potential
 
     def _rot_sample_kappa(self, t: torch.Tensor):
         """kappa to scale rotation `so3_t` times, so that rotations can settle more quickly"""
@@ -669,9 +614,29 @@ class Interpolant:
             batch=noisy_batch,
         )
 
+        # Determine if gradient-based motif guidance is active for this step
+        guidance_cfg = self.cfg.motif_guidance
+        guidance_active = (
+            guidance_cfg.enabled
+            and motif_mask is not None
+            and motif_mask.any()
+            and t_1.min().item() >= guidance_cfg.guidance_start_t
+            and t_1.max().item() <= guidance_cfg.guidance_end_t
+        )
+
         # Get model output given batch at time `t`
-        with torch.no_grad():
+        # If gradient-based guidance is active, we need gradients through the model
+        ctx = torch.enable_grad() if guidance_active else torch.no_grad()
+        with ctx:
+            # If guidance active, enable gradient tracking on trans_t and rotmats_t
+            if guidance_active:
+                trans_t_req = noisy_batch[nbp.trans_t].detach().requires_grad_(True)
+                rotmats_t_req = noisy_batch[nbp.rotmats_t].detach().requires_grad_(True)
+                noisy_batch[nbp.trans_t] = trans_t_req
+                noisy_batch[nbp.rotmats_t] = rotmats_t_req
+
             model_out = model(noisy_batch)
+
         pred_trans_1 = model_out[pbp.pred_trans]
         pred_rotmats_1 = model_out[pbp.pred_rotmats]
         pred_torsions_1 = model_out[pbp.pred_torsions]  # may be None
@@ -756,13 +721,30 @@ class Interpolant:
         # For inpainting, compute a potential (scaled by `t=t_1`) to pull the motifs
         # (trans + rotmats) towards their known positions.
         # If not inpainting, motif_mask is None, and no guidance.
-        motif_guidance = self.motif_potentials(
-            t=t_1,
-            noisy_batch=noisy_batch,
-            model_pred=model_pred,
-            true_feats=true_feats,
-            motif_mask=motif_mask,
-        )
+        if guidance_active:
+            # Compute gradient-based motif guidance
+            motif_guidance = self.motif_potentials(
+                t=t_1,
+                trans_t=noisy_batch[nbp.trans_t],
+                rotmats_t=noisy_batch[nbp.rotmats_t],
+                pred_trans_1=pred_trans_1,
+                pred_rotmats_1=pred_rotmats_1,
+                true_feats=true_feats,
+                motif_mask=motif_mask,
+                res_mask=res_mask,
+            )
+            # Detach tensors after gradient computation
+            noisy_batch[nbp.trans_t] = noisy_batch[nbp.trans_t].detach()
+            noisy_batch[nbp.rotmats_t] = noisy_batch[nbp.rotmats_t].detach()
+            # Also detach model predictions
+            pred_trans_1 = pred_trans_1.detach()
+            pred_rotmats_1 = pred_rotmats_1.detach()
+            pred_logits_1 = pred_logits_1.detach()
+            pred_aatypes_1 = pred_aatypes_1.detach()
+            if pred_torsions_1 is not None:
+                pred_torsions_1 = pred_torsions_1.detach()
+        else:
+            motif_guidance = PotentialField()
 
         # add motif and potential guidance vector fields
         guidance = motif_guidance + potential_guidance
@@ -1104,7 +1086,9 @@ class Interpolant:
         batch = resampler.init_particles(batch=batch)  # (B, ...) -> (B * K, ...)
         # Update num_batch to reflect potential particle expansion (handles K=1 and disabled gracefully)
         num_batch = batch[bp.res_mask].shape[0]
-        # TODO - expand true_feats; implicitly assumes B=1 for broadcasting across particles
+        # Expand true_feats to match particle-expanded batch
+        if resampler.enabled and resampler.num_particles > 1:
+            true_feats = true_feats.expand_particles(resampler.num_particles)
 
         # model_trajectory tracks model outputs
         model_trajectory = SamplingTrajectory(

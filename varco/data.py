@@ -482,10 +482,10 @@ class ModelPrediction:
     pred_insertion_logits: (
         torch.Tensor
     )  # (B, P, 21) amino acid logits for inserted children
-    pred_split_rate: torch.Tensor  # (B, P) non-negative remaining splits per token
-    pred_split_pooled_log1p_rate: (
-        torch.Tensor
-    )  # (B,) log1p-space total remaining splits
+    # Time-independent insertion mass M per token. Remaining insertions R_t = M * S(t)
+    # where S(t) = 1 - H(t) is the hazard survival function.
+    pred_split_mass: torch.Tensor  # (B, P) non-negative insertion mass per token
+    pred_split_pooled_log1p_mass: torch.Tensor  # (B,) log1p-space total insertion mass
     pred_del_logits: torch.Tensor  # (B, P) deletion logit per token
     pred_bfactor: Optional[torch.Tensor] = None  # (B, P, num_bins) bfactor logits
     pred_plddt: Optional[torch.Tensor] = None  # (B, P, num_bins) pLDDT logits
@@ -497,9 +497,9 @@ class ModelPrediction:
             pred_rotmats_1=to_device(self.pred_rotmats_1, device),
             pred_aatype_logits=to_device(self.pred_aatype_logits, device),
             pred_insertion_logits=to_device(self.pred_insertion_logits, device),
-            pred_split_rate=to_device(self.pred_split_rate, device),
-            pred_split_pooled_log1p_rate=to_device(
-                self.pred_split_pooled_log1p_rate, device
+            pred_split_mass=to_device(self.pred_split_mass, device),
+            pred_split_pooled_log1p_mass=to_device(
+                self.pred_split_pooled_log1p_mass, device
             ),
             pred_del_logits=to_device(self.pred_del_logits, device),
             pred_bfactor=to_device(self.pred_bfactor, device),
@@ -517,9 +517,9 @@ class ModelPrediction:
             pred_rotmats_1=clone_detach(self.pred_rotmats_1),
             pred_aatype_logits=clone_detach(self.pred_aatype_logits),
             pred_insertion_logits=clone_detach(self.pred_insertion_logits),
-            pred_split_rate=clone_detach(self.pred_split_rate),
-            pred_split_pooled_log1p_rate=clone_detach(
-                self.pred_split_pooled_log1p_rate
+            pred_split_mass=clone_detach(self.pred_split_mass),
+            pred_split_pooled_log1p_mass=clone_detach(
+                self.pred_split_pooled_log1p_mass
             ),
             pred_del_logits=clone_detach(self.pred_del_logits),
             pred_bfactor=clone_detach(self.pred_bfactor),

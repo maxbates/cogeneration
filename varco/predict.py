@@ -120,6 +120,8 @@ class VarcoEvaluator:
                 "enable_progress_bar": True,
                 "use_distributed_sampler": True,
                 "devices": self.cfg.experiment.num_devices,
+                # enable grad for motif guidance
+                "inference_mode": False,
             }
         )
         self._trainer = Trainer(**trainer_kwargs)

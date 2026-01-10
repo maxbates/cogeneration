@@ -68,7 +68,7 @@ class MetricsCfg:
 
 
 def _expected_indel_step_metrics(
-    split_rate: torch.Tensor,  # (B, P)
+    split_mass: torch.Tensor,  # (B, P) time-independent insertion mass
     del_logits: torch.Tensor,  # (B, P)
     is_root: torch.Tensor,  # (B, P) bool
     valid_mask: torch.Tensor,  # (B, P) bool (scaffold-only in sampling)
@@ -76,7 +76,7 @@ def _expected_indel_step_metrics(
     dt: float,
     split_hazard: VarcoHazardConfig,
     delete_hazard: VarcoHazardConfig,
-    pred_split_pooled_log1p_rate: Optional[torch.Tensor] = None,  # (B,)
+    pred_split_pooled_log1p_mass: Optional[torch.Tensor] = None,  # (B,)
 ) -> Dict[str, float]:
     """
     Expected intensity diagnostics for per-token Bernoulli event sampling.
@@ -88,11 +88,26 @@ def _expected_indel_step_metrics(
     t = max(eps, min(1.0 - eps, float(t_val)))
     t_next = min(1.0 - eps, t + float(dt))
 
-    # --- Insertions ---
-    split_rate = split_rate.clamp_min(0.0)
-    if pred_split_pooled_log1p_rate is not None:
+    # Compute survival function S(t) for the split hazard
+    p_split = float(max(1, split_hazard.power))
+    if split_hazard.kind == VarcoHazardKind.uniform:
+        S_t = 1.0 - t
+    elif split_hazard.kind == VarcoHazardKind.early_power:
+        S_t = (1.0 - t) ** p_split
+    elif split_hazard.kind == VarcoHazardKind.late_power:
+        S_t = 1.0 - (t**p_split)
+    else:
+        raise ValueError(f"Unknown split hazard kind: {split_hazard.kind!r}")
+
+    # Convert mass to rate: R_t = M * S(t)
+    split_mass = split_mass.clamp_min(0.0)
+    split_rate = split_mass * S_t  # (B, P)
+
+    # Calibrate using pooled prediction
+    if pred_split_pooled_log1p_mass is not None:
         token_sum = (split_rate * valid_mask.float()).sum(dim=1)  # (B,)
-        pooled_total = torch.expm1(pred_split_pooled_log1p_rate).clamp_min(0.0)  # (B,)
+        pooled_mass = torch.expm1(pred_split_pooled_log1p_mass).clamp_min(0.0)
+        pooled_total = pooled_mass * S_t  # (B,)
         scale = pooled_total / token_sum.clamp_min(0.1)
         scale = scale.clamp(min=0.1, max=1.2)
         split_rate = split_rate * scale.unsqueeze(1)
@@ -1107,16 +1122,14 @@ def analyze_sampling_trajectory(
             )
 
             # Compute guidance
-            trans_guidance_vf, rotmats_guidance_vf = (
-                interpolant.compute_motif_guidance_vf(
-                    t=batch.t,
-                    pred_trans_1=pred.pred_trans_1,
-                    trans_1_motifs=batch.trans_1_motifs,
-                    pred_rotmats_1=pred.pred_rotmats_1,
-                    rotmats_t=batch.rotmats_t,
-                    rotmats_1_motifs=batch.rotmats_1_motifs,
-                    motif_mask=batch.motif_mask,
-                )
+            trans_guidance_vf, rotmats_guidance_vf = interpolant.compute_motif_pull_vf(
+                t=batch.t,
+                pred_trans_1=pred.pred_trans_1,
+                trans_1_motifs=batch.trans_1_motifs,
+                pred_rotmats_1=pred.pred_rotmats_1,
+                rotmats_t=batch.rotmats_t,
+                rotmats_1_motifs=batch.rotmats_1_motifs,
+                motif_mask=batch.motif_mask,
             )
 
             # ------------------------------------------------------------
@@ -1336,7 +1349,7 @@ def analyze_sampling_trajectory(
             is_root = batch.birth_time <= 0.0
 
             expected_indel = _expected_indel_step_metrics(
-                split_rate=pred.pred_split_rate,
+                split_mass=pred.pred_split_mass,
                 del_logits=pred.pred_del_logits,
                 is_root=is_root,
                 valid_mask=scaffold_mask,
@@ -1344,11 +1357,11 @@ def analyze_sampling_trajectory(
                 dt=dt,
                 split_hazard=cfg.interpolant.sampling.split_hazard,
                 delete_hazard=cfg.interpolant.sampling.delete_hazard,
-                pred_split_pooled_log1p_rate=pred.pred_split_pooled_log1p_rate,
+                pred_split_pooled_log1p_mass=pred.pred_split_pooled_log1p_mass,
             )
 
             insertions, deletions, _ = interpolant._sample_insert_delete_substitute(
-                split_rate=pred.pred_split_rate,
+                split_mass=pred.pred_split_mass,
                 del_logits=pred.pred_del_logits,
                 is_root=is_root,
                 valid_mask=scaffold_mask,
@@ -1356,7 +1369,7 @@ def analyze_sampling_trajectory(
                 dt=dt,
                 split_hazard=cfg.interpolant.sampling.split_hazard,
                 delete_hazard=cfg.interpolant.sampling.delete_hazard,
-                pred_split_pooled_log1p_rate=pred.pred_split_pooled_log1p_rate,
+                pred_split_pooled_log1p_mass=pred.pred_split_pooled_log1p_mass,
             )
 
             # Enforce max length

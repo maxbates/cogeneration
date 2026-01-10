@@ -24,6 +24,8 @@ from cogeneration.config.base import (
     ModelHyperParamsConfig,
     ModelIPAConfig,
     ModelPLDDTConfig,
+    MotifGuidanceConfig,
+    MotifGuidanceVarScale,
     SharedConfig,
 )
 from cogeneration.type.str_enum import StrEnum
@@ -47,31 +49,32 @@ class VarcoDatasetConfig(DatasetConfig):
     )
 
 
+# alias for ckpt
+VarcoMotifVarScale = MotifGuidanceVarScale
+
+
 class VarcoMotifGuidanceType(StrEnum):
-    """scale function for motif guidance"""
+    """Scale function for motif guidance (deprecated, use MotifGuidanceVarScale)."""
 
     posterior_variance = "posterior_variance"
     linear_decay = "linear_decay"
 
 
 @dataclass
-class VarcoInterpolantMotifGuidanceConfig(BaseClassConfig):
-    """Configuration for motif position guidance during sampling."""
+class VarcoInterpolantMotifGuidanceConfig(MotifGuidanceConfig):
+    """Varco-specific motif guidance config (extends shared MotifGuidanceConfig).
 
-    enabled: bool = True
-    # Scale function
-    scale_type: VarcoMotifGuidanceType = VarcoMotifGuidanceType.posterior_variance
-    # decay posterior variance to 0 by t=1
-    var_decay: bool = True
-    # For posterior_variance decay scale: t value at which guidance decays to 0
-    guidance_end_t: float = 0.9
-    # For posterior_variance scale: max clamp value (for close to t=0)
-    var_scale_cap: float = 10.0
+    Includes deprecated fields for backward compatibility with existing configs.
+    """
+
+    # Deprecated fields - kept for config loading compatibility
     # For linear_decay scale: strength multiplier
     linear_decay_strength: float = 1.0
-    # Per-step translation force cap (angstroms) - prevents huge single-step jumps
+    # Scale function (deprecated, use var_scale_type from MotifGuidanceConfig)
+    scale_type: VarcoMotifGuidanceType = VarcoMotifGuidanceType.posterior_variance
+    # Per-step translation force cap (angstroms) - deprecated
     max_step_force_ang: float = 10.0
-    # Per-step rotation force cap (radians) - prevents huge single-step rotations
+    # Per-step rotation force cap (radians) - deprecated
     max_rot_step_force_rad: float = math.pi
 
 
@@ -149,14 +152,17 @@ class VarcoInterpolantSamplingConfig(BaseClassConfig):
     # TreePlan.generate() defaults: splits early (Beta(1,2)), deletions late (Beta(2,1))
     split_hazard: VarcoHazardConfig = field(
         default_factory=lambda: VarcoHazardConfig(
-            kind=VarcoHazardKind.early_power, power=1.75
+            kind=VarcoHazardKind.early_power, power=2.5
         )
     )
     delete_hazard: VarcoHazardConfig = field(
         default_factory=lambda: VarcoHazardConfig(
-            kind=VarcoHazardKind.late_power, power=2.0
+            kind=VarcoHazardKind.late_power, power=1.5
         )
     )
+    # Sharpening exponent for indel probabilities. Applied as p^gamma before sampling.
+    # 1.0 uses model directly. Higher values suppress low-confidence predictions.
+    indel_sharpness: float = 1.5
 
 
 @dataclass
@@ -195,6 +201,15 @@ class VarcoLossConfig(BaseClassConfig):
     # Local pairwise distance threshold (angstroms)
     proximity_threshold_ang: float = 7.0
 
+    # Model predicts time-independent mass M; target is remaining_insertions / S(t).
+    # This should match the split_hazard used in sampling.
+    split_hazard: VarcoHazardConfig = field(
+        default_factory=lambda: VarcoHazardConfig(
+            kind="${interpolant.sampling.split_hazard.kind}",
+            power="${interpolant.sampling.split_hazard.power}",
+        )
+    )
+
     # Loss weights
     trans_loss_weight: float = 2.0
     pairwise_dist_loss_weight: float = 0.2
@@ -203,13 +218,13 @@ class VarcoLossConfig(BaseClassConfig):
     seq_prob_loss_weight: float = 1.0  # anchor probs
     seq_token_loss_weight: float = 0.5  # sampled anchor token
     seq_ins_loss_weight: float = 0.2
-    split_loss_weight: float = 0.35
-    split_rate_entropy_weight = 0.1
-    split_rate_l2_weight: float = 0.1
+    split_loss_weight: float = 0.3
+    split_mass_entropy_weight: float = 0.1
+    split_mass_l2_weight: float = 0.1
     split_pooled_loss_weight: float = 0.2
     del_loss_weight: float = 0.5
     bfactor_loss_weight: float = 0.02
-    plddt_loss_weight: float = 0.5
+    plddt_loss_weight: float = 0.25
 
 
 class VarcoPlotColorBy(StrEnum):

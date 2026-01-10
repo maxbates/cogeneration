@@ -240,15 +240,16 @@ class BranchFlowModel(nn.Module):
         )  # (B, P, K)
         pred_insertion_logits = pred_insertion_logits * valid.unsqueeze(-1).float()
 
-        # Predict nonnegative remaining-splits rates (Poisson-like regression)
-        split_rate = F.softplus(self.split_rate_pred(node_embed)).squeeze(-1)  # (B, P)
+        # Predict nonnegative time-independent insertion mass M per token.
+        # At sampling time, remaining insertions R_t = M * S(t) where S(t) = 1 - H(t).
+        split_mass = F.softplus(self.split_rate_pred(node_embed)).squeeze(-1)  # (B, P)
 
-        # Masked mean pool over alive tokens to predict total remaining insertions per example
+        # Masked mean pool over alive tokens to predict total insertion mass per example
         valid_count = valid.sum(dim=1, keepdim=True).float().clamp(min=1)  # (B, 1)
         pooled = (node_embed * valid.unsqueeze(-1)).sum(
             dim=1
         ) / valid_count  # (B, model_dim)
-        split_pooled_log1p_rate = self.split_pooled_log1p_rate_pred(pooled).squeeze(
+        split_pooled_log1p_mass = self.split_pooled_log1p_rate_pred(pooled).squeeze(
             -1
         )  # (B,)
 
@@ -269,8 +270,8 @@ class BranchFlowModel(nn.Module):
             pred_rotmats_1=pred_rotmats_1,
             pred_aatype_logits=pred_aatype_logits,
             pred_insertion_logits=pred_insertion_logits,
-            pred_split_rate=split_rate,
-            pred_split_pooled_log1p_rate=split_pooled_log1p_rate,
+            pred_split_mass=split_mass,
+            pred_split_pooled_log1p_mass=split_pooled_log1p_mass,
             pred_del_logits=del_logits,
             pred_bfactor=pred_bfactor,
             pred_plddt=pred_plddt,

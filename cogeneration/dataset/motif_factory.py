@@ -558,7 +558,7 @@ class MotifFactory:
         leftover_space = max(num_res - (total_motif_length + total_padding), 0)
         # Pick num_motifs random positions within [0, leftover_space] to use as starts
         if leftover_space > 0:
-            offset_options = [0] * (num_motifs-1) + list(range(leftover_space + 1))
+            offset_options = [0] * (num_motifs - 1) + list(range(leftover_space + 1))
             offsets = self.rng.choice(offset_options, size=num_motifs, replace=False)
         else:
             offsets = [0] * num_motifs

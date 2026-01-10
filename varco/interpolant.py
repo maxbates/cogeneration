@@ -1,3 +1,4 @@
+import copy
 import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -7,15 +8,15 @@ import torch
 from torch.nn import functional as F
 from tqdm import tqdm
 
-from cogeneration.data import so3_utils
 from cogeneration.data.const import MASK_TOKEN_INDEX, NM_TO_ANG_SCALE
-from cogeneration.data.rigid import batch_center_of_mass
-from varco.config import (
-    VarcoHazardConfig,
-    VarcoHazardKind,
-    VarcoInterpolantConfig,
-    VarcoMotifGuidanceType,
+from cogeneration.data.motif_guidance import MotifGuidanceMetrics
+from cogeneration.data.motif_guidance import (
+    compute_motif_potential as _compute_motif_potential_shared,
 )
+from cogeneration.data.motif_guidance import motif_potential_window
+from cogeneration.data.potentials import PotentialField
+from cogeneration.data.rigid import batch_center_of_mass
+from varco.config import VarcoHazardConfig, VarcoHazardKind, VarcoInterpolantConfig
 from varco.coupling import Coupler
 from varco.coupling_aatypes import AATypesCoupler, AATypesCoupling
 from varco.coupling_rots import RotationCoupler, RotationCoupling
@@ -64,79 +65,6 @@ class TreeInterpolant:
         torch.manual_seed(int(seed))
         if self.device.type == "cuda":
             torch.cuda.manual_seed_all(int(seed))
-
-    def compute_motif_guidance_vf(
-        self,
-        t: torch.Tensor,  # (B,)
-        pred_trans_1: torch.Tensor,  # (B, P, 3)
-        trans_1_motifs: torch.Tensor,  # (B, P, 3) true motif positions
-        pred_rotmats_1: torch.Tensor,  # (B, P, 3, 3)
-        rotmats_t: torch.Tensor,  # (B, P, 3, 3)
-        rotmats_1_motifs: torch.Tensor,  # (B, P, 3, 3) true motif rotations
-        motif_mask: torch.Tensor,  # (B, P)
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Compute guidance velocity fields pulling motif positions toward their targets.
-
-        Returns (trans_guidance_vf, rotmats_guidance_vf), each (B, P, 3) or None.
-        Returns (None, None) if guidance is disabled or no motifs present.
-        """
-        guidance_cfg = self.cfg.motif_guidance
-        if not guidance_cfg.enabled or not motif_mask.any():
-            return None, None
-
-        B, P = motif_mask.shape
-        t_clamped = t.clamp(min=1e-3, max=1.0 - 1e-3)
-
-        # Compute scale based on config
-        if guidance_cfg.scale_type == VarcoMotifGuidanceType.posterior_variance:
-            # scale = 0.5 * g² / ω² where g = κ/t, ω² = κ²/(t² + κ²), κ = 1-t
-            # see cogeneration interpolant for details
-            kappa = 1.0 - t_clamped
-            g = kappa / t_clamped
-            omega2 = kappa**2 / (t_clamped**2 + kappa**2)
-            scale = 0.5 * g * g / omega2
-            scale = scale.clamp(min=0.0, max=guidance_cfg.var_scale_cap)
-
-            if guidance_cfg.var_decay:
-                # Decay to 0 as t approaches guidance_end_t
-                decay = (1.0 - t_clamped / guidance_cfg.guidance_end_t).clamp(min=0.0)
-                scale = scale * decay
-        elif guidance_cfg.scale_type == VarcoMotifGuidanceType.linear_decay:
-            scale = guidance_cfg.linear_decay_strength * (1.0 - t_clamped)
-        else:
-            raise ValueError(f"Unknown scale_type: {guidance_cfg.scale_type}")
-
-        # --- Translation guidance ---
-        trans_guidance_vf = (trans_1_motifs - pred_trans_1) * scale.view(B, 1, 1)
-        trans_guidance_vf = trans_guidance_vf * motif_mask.unsqueeze(-1).float()
-
-        # Cap per-residue magnitude
-        if guidance_cfg.max_step_force_ang > 0:
-            norm = trans_guidance_vf.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-            trans_guidance_vf = trans_guidance_vf * (
-                guidance_cfg.max_step_force_ang / norm
-            ).clamp(max=1.0)
-
-        # --- Rotation guidance ---
-        # Compute rotation vector fields in tangent space
-        rot_vf_to_target = so3_utils.calc_rot_vf(
-            mat_t=rotmats_t, mat_1=rotmats_1_motifs
-        )
-        rot_vf_to_pred = so3_utils.calc_rot_vf(mat_t=rotmats_t, mat_1=pred_rotmats_1)
-
-        # Guidance = scale * (target_vf - pred_vf)
-        rotmats_guidance_vf = (rot_vf_to_target - rot_vf_to_pred) * scale.view(B, 1, 1)
-        rotmats_guidance_vf = rotmats_guidance_vf * motif_mask.unsqueeze(-1).float()
-
-        # Cap per-residue rotation magnitude (in radians)
-        if guidance_cfg.max_rot_step_force_rad > 0:
-            norm = rotmats_guidance_vf.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-            rotmats_guidance_vf = rotmats_guidance_vf * (
-                guidance_cfg.max_rot_step_force_rad / norm
-            ).clamp(max=1.0)
-
-        return trans_guidance_vf, rotmats_guidance_vf
 
     def pack_bridged_states(
         self,
@@ -268,7 +196,7 @@ class TreeInterpolant:
         since corruption is run across the batch.
         """
         shared_t = torch.rand(1, device=self.device) ** self.cfg.t_corrupt_exp
-        shared_t = shared_t.clamp(min=self.min_t, max=1.0 - self.min_t)
+        shared_t = shared_t.clamp(min=0, max=1.0 - self.min_t)
         t = torch.ones(batch.trans_1.shape[0], device=self.device) * shared_t  # (B,)
         return self.corrupt_to(batch=batch, t=t)
 
@@ -388,6 +316,46 @@ class TreeInterpolant:
             t_prev = float(t_val)
 
         return Trajectory(samples=samples), couplings
+
+    def compute_motif_potential(
+        self,
+        t: torch.Tensor,  # (B,)
+        trans_t: torch.Tensor,  # (B, P, 3) requires_grad=True
+        rotmats_t: torch.Tensor,  # (B, P, 3, 3) requires_grad=True
+        pred_trans_1: torch.Tensor,  # (B, P, 3)
+        pred_rotmats_1: torch.Tensor,  # (B, P, 3, 3)
+        trans_1_motifs: torch.Tensor,  # (B, P, 3)
+        rotmats_1_motifs: torch.Tensor,  # (B, P, 3, 3)
+        motif_mask: torch.Tensor,  # (B, P) bool
+        align: bool = True,
+        allow_none: bool = False,
+        # Debug parameters - only used when cfg.motif_guidance.debug=True
+        valid_mask: Optional[torch.Tensor] = None,
+        step: int = 0,
+        prev_metrics: Optional[MotifGuidanceMetrics] = None,
+    ) -> Tuple[PotentialField, Optional[MotifGuidanceMetrics]]:
+        """
+        Twisted diffusion/FrameFlow-style motif guidance using autograd.
+        Delegates to shared implementation in cogeneration.data.motif_guidance.
+        Metrics are computed when cfg.motif_guidance.debug=True
+        """
+        return _compute_motif_potential_shared(
+            t=t,
+            trans_t=trans_t,
+            rotmats_t=rotmats_t,
+            pred_trans_1=pred_trans_1,
+            pred_rotmats_1=pred_rotmats_1,
+            trans_1_motifs=trans_1_motifs,
+            rotmats_1_motifs=rotmats_1_motifs,
+            motif_mask=motif_mask,
+            valid_mask=valid_mask,
+            cfg=self.cfg.motif_guidance,
+            min_t=self.min_t,
+            align=align,
+            allow_none=allow_none,
+            step=step,
+            prev_metrics=prev_metrics,
+        )
 
     @staticmethod
     def _sample_initial_positions(
@@ -575,8 +543,32 @@ class TreeInterpolant:
         )
 
     @staticmethod
+    def compute_hazard_survival(t: float, hazard: VarcoHazardConfig) -> float:
+        """
+        Compute survival function S(t) = 1 - H(t) for a hazard config.
+
+        S(t) represents the fraction of events that have NOT yet occurred by time t.
+        - At t=0: S(0) = 1 (no events have occurred)
+        - At t=1: S(1) = 0 (all events have occurred)
+        """
+        t = max(0.0, min(1.0, t))
+        p = float(max(1, hazard.power))
+
+        if hazard.kind == VarcoHazardKind.uniform:
+            # H(t) = t, S(t) = 1 - t
+            return 1.0 - t
+        elif hazard.kind == VarcoHazardKind.early_power:
+            # H(t) = 1 - (1-t)^p, S(t) = (1-t)^p
+            return (1.0 - t) ** p
+        elif hazard.kind == VarcoHazardKind.late_power:
+            # H(t) = t^p, S(t) = 1 - t^p
+            return 1.0 - (t**p)
+        else:
+            raise ValueError(f"Unknown hazard kind: {hazard.kind!r}")
+
+    @staticmethod
     def _sample_insert_delete_substitute(
-        split_rate: torch.Tensor,  # (B, P)
+        split_mass: torch.Tensor,  # (B, P) time-independent insertion mass M
         del_logits: torch.Tensor,  # (B, P)
         is_root: torch.Tensor,  # (B, P) bool
         valid_mask: torch.Tensor,  # (B, P) bool
@@ -584,18 +576,20 @@ class TreeInterpolant:
         dt: float,
         split_hazard: VarcoHazardConfig,
         delete_hazard: VarcoHazardConfig,
-        pred_split_pooled_log1p_rate: Optional[torch.Tensor] = None,  # (B,)
+        pred_split_pooled_log1p_mass: Optional[torch.Tensor] = None,  # (B,)
+        indel_sharpness: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample insert/delete/substitute events for present positions in a batch.
 
         Uses exact CTMC interval probabilities instead of g(t)*dt approximation:
-        - Insertions: p = 1 - exp(-R * I) where I = integral_t^{t+dt} g(u) du
+        - Insertions: p = 1 - exp(-R_t * I) where I = integral_t^{t+dt} g(u) du
         - Deletions: p = 1 - (1 - p_final*H(t+dt)) / (1 - p_final*H(t))
 
-        For insertions (counting process with K remaining events):
-        - split_rate predicts E[remaining insertions]
-        - optionally calibrated using the pooled prediction
+        For insertions (counting process with time-independent mass):
+        - split_mass M predicts total insertion mass per token (time-independent)
+        - R_t = M * S(t) gives remaining insertions at time t, where S(t) = 1 - H(t)
+        - This structural parameterization ensures R_t -> 0 as t -> 1
         - exact integral I of g(t) = h(t)/S(t) over [t, t+dt]
 
         For deletions (binary event: will/won't be deleted by t=1):
@@ -607,14 +601,21 @@ class TreeInterpolant:
         t = max(eps, min(1.0 - eps, float(t_val)))
         t_next = min(1.0 - eps, t + float(dt))
 
+        # Compute survival function S(t) = 1 - H(t) for the split hazard
+        S_t = TreeInterpolant.compute_hazard_survival(t, split_hazard)
+
+        # Convert time-independent mass M to time-dependent rate R_t = M * S(t)
+        # This ensures R_t -> 0 as t -> 1, structurally preventing late insertions
+        split_mass = split_mass.clamp_min(0.0)  # (B, P)
+        split_rate = split_mass * S_t  # (B, P)
+
         # Calibrate per-token split_rate using the pooled prediction
-        split_rate = split_rate.clamp_min(0.0)  # (B, P)
-        if pred_split_pooled_log1p_rate is not None:
+        if pred_split_pooled_log1p_mass is not None:
             token_sum = (split_rate * valid_mask.float()).sum(dim=1)  # (B,)
-            # pooled prediction is in log1p space: log(1 + total_remaining)
-            pooled_total = torch.expm1(pred_split_pooled_log1p_rate).clamp_min(
-                0.0
-            )  # (B,)
+            # pooled prediction is in log1p space: log(1 + total_mass)
+            # Convert to rate: total_rate = expm1(log1p_mass) * S(t)
+            pooled_mass = torch.expm1(pred_split_pooled_log1p_mass).clamp_min(0.0)
+            pooled_total = pooled_mass * S_t  # (B,)
             # if per-token sum exceeds pooled, scale down
             scale = pooled_total / token_sum.clamp_min(0.1)  # (B,)
             # allow up to 10% over-prediction before scaling kicks in
@@ -674,6 +675,11 @@ class TreeInterpolant:
         numer = (1.0 - p_del_final * H_tn).clamp_min(0.0)
         p_del = (1.0 - (numer / denom)).clamp(0.0, 0.95)
 
+        # Apply sharpening: p^gamma suppresses low-confidence predictions.
+        if indel_sharpness != 1.0:
+            p_ins = p_ins.pow(indel_sharpness)
+            p_del = p_del.pow(indel_sharpness)
+
         insertions = torch.rand_like(p_ins) < p_ins
         deletions = torch.rand_like(p_del) < p_del
         insertions = insertions & valid_mask
@@ -694,6 +700,7 @@ class TreeInterpolant:
         traj_frames: Optional[int] = None,
     ) -> SampleTrajectory:
         device = self.device
+        model.eval()
 
         # Create initial batch, which we edit in-place through the trajectory
         num_batch, _ = data.motif_mask.shape
@@ -703,223 +710,261 @@ class TreeInterpolant:
         traj.samples.append(batch.detach_clone(device=torch.device("cpu")))
 
         t_end = float(1.0 - self.min_t)
-        model.eval()
-        with torch.no_grad():
-            t_grid = torch.linspace(0.0, t_end, steps=num_steps + 1, device=device)
+        t_grid = torch.linspace(0.0, t_end, steps=num_steps + 1, device=device)
 
-            pbar = tqdm(range(num_steps), total=num_steps, desc="Sampling", leave=False)
-            for step_num in pbar:
-                t_val = float(t_grid[step_num].item())
-                t_next = float(t_grid[step_num + 1].item())
-                dt = float(max(1e-6, t_next - t_val))
+        # Track metrics for computing delta_theta between steps (when debug enabled)
+        prev_metrics: Optional[MotifGuidanceMetrics] = None
 
-                # Set current time and predict
-                batch.t = torch.full(
-                    (num_batch,), t_val, dtype=torch.float32, device=device
-                )
-                pred = model.forward(batch)
+        pbar = tqdm(range(num_steps), total=num_steps, desc="Sampling", leave=False)
+        for step_num in pbar:
+            t_val = float(t_grid[step_num].item())
+            t_next = float(t_grid[step_num + 1].item())
+            dt = float(max(1e-6, t_next - t_val))
 
-                if traj_frames is None or step_num % traj_frames == 0:
-                    traj.pred.append(pred.detach_clone(device=torch.device("cpu")))
-
-                # Compute motif guidance VFs
-                trans_guidance_vf, rotmats_guidance_vf = self.compute_motif_guidance_vf(
-                    t=batch.t,
-                    pred_trans_1=pred.pred_trans_1,
-                    trans_1_motifs=batch.trans_1_motifs,
-                    pred_rotmats_1=pred.pred_rotmats_1,
-                    rotmats_t=batch.rotmats_t,
-                    rotmats_1_motifs=batch.rotmats_1_motifs,
-                    motif_mask=batch.motif_mask,
-                )
-
-                # Euler steps for domains
-
-                trans_next = self.translation_coupler.euler_step(
-                    x_t=batch.trans_t,
-                    x1_pred=pred.pred_trans_1,
-                    t=batch.t,
-                    dt=dt,
-                    birth_time=batch.birth_time,
-                    motif_mask=batch.motif_mask,
-                    potential=trans_guidance_vf,
-                )
-                batch.trans_t = trans_next
-
-                rotmats_next = self.rotation_coupler.euler_step(
-                    x_t=batch.rotmats_t,
-                    x1_pred=pred.pred_rotmats_1,
-                    t=batch.t,
-                    dt=dt,
-                    birth_time=batch.birth_time,
-                    motif_mask=batch.motif_mask,
-                    potential=rotmats_guidance_vf,
-                )
-                batch.rotmats_t = rotmats_next
-
-                aatypes_next = self.aatypes_coupler.euler_step(
-                    x_t=batch.aatypes_t,
-                    x1_pred=pred.pred_aatype_logits,
-                    t=batch.t,
-                    dt=dt,
-                    birth_time=batch.birth_time,
-                    motif_mask=batch.motif_mask,
-                )
-                batch.aatypes_t = aatypes_next
-
-                # Disallowed in motifs
-                scaffold_mask = batch.valid_mask & ~batch.motif_mask  # (B, P)
-                is_root = batch.birth_time <= 0.0  # (B, P)
-
-                # sample indels
-                insertions, deletions, _ = self._sample_insert_delete_substitute(
-                    split_rate=pred.pred_split_rate,
-                    del_logits=pred.pred_del_logits,
-                    is_root=is_root,
-                    valid_mask=scaffold_mask,
-                    t_val=t_val,
-                    dt=dt,
-                    split_hazard=self.cfg.sampling.split_hazard,
-                    delete_hazard=self.cfg.sampling.delete_hazard,
-                    pred_split_pooled_log1p_rate=pred.pred_split_pooled_log1p_rate,
-                )
-
-                # Enforce max_length: block insertions once we're at the limit
-                max_len = self.cfg.sampling.max_length
-                cur_lens = batch.valid_mask.sum(dim=1)  # (B,)
-                at_limit = cur_lens >= max_len  # (B,)
-                if at_limit.any():
-                    insertions = insertions & ~at_limit.unsqueeze(1)
-
-                batch, insert_mask, gather_idx = batch.apply_insertions_deletions(
-                    insertions=insertions,
-                    deletions=deletions,
-                    t_birth=t_next,  # born at t_next since after euler step
-                )
-
-                # Domain-specific initialization for newly inserted tokens.
-                # TODO - use couplings for domain-specific corruptions
-                if insert_mask.any():
-                    # Add small isotropic perturbation to inserted translations
-                    trans_noise = torch.randn_like(batch.trans_t) * (
-                        0.1 * NM_TO_ANG_SCALE
-                    )
-                    batch.trans_t = (
-                        batch.trans_t + insert_mask.unsqueeze(-1).float() * trans_noise
-                    )
-
-                    # Add small IGSO3 perturbation to inserted rotations
-                    # Inserted positions inherit parent's rotation from apply_insertions_deletions
-                    # Add noise to break symmetry
-                    B_new, P_new = batch.rotmats_t.shape[:2]
-                    self.rotation_coupler._ensure_igso3_device(device)
-                    # Use small sigma for perturbation
-                    sigma_insert = torch.full(
-                        (B_new,),
-                        0.1,
-                        device=self.rotation_coupler.igso3.sigma_grid.device,
-                    )
-                    insert_noise = self.rotation_coupler.igso3.sample(
-                        sigma_insert, P_new
-                    ).to(
-                        device
-                    )  # (B, P, 3, 3)
-                    # Apply noise to inserted positions only
-                    rotmats_with_noise = torch.einsum(
-                        "...ij,...jk->...ik", batch.rotmats_t, insert_noise
-                    )
-                    batch.rotmats_t = torch.where(
-                        insert_mask.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3, 3),
-                        rotmats_with_noise,
-                        batch.rotmats_t,
-                    )
-
-                    # Sample amino acids for inserted positions from parent's insertion logits
-                    K = pred.pred_insertion_logits.shape[-1]
-                    P_old = pred.pred_insertion_logits.shape[1]
-
-                    # Gather parent's insertion logits for new positions
-                    insertion_logits_gathered = pred.pred_insertion_logits.gather(
-                        1,
-                        gather_idx.unsqueeze(-1).expand(-1, -1, K).clamp(0, P_old - 1),
-                    )  # (B, P_new, K)
-
-                    # Convert to probs and mix in uniform noise (like _compute_step_probs)
-                    probs = F.softmax(
-                        insertion_logits_gathered, dim=-1
-                    )  # (B, P_new, K)
-                    uniform_dist = torch.ones_like(probs) / K
-                    probs = (
-                        1.0 - self.cfg.aatypes_coupler.noise_scale
-                    ) * probs + self.cfg.aatypes_coupler.noise_scale * uniform_dist
-
-                    # Sample from noisy distribution
-                    sampled_tokens = torch.multinomial(
-                        probs.view(-1, K), num_samples=1
-                    ).view(B_new, P_new)
-                    batch.aatypes_t = torch.where(
-                        insert_mask, sampled_tokens, batch.aatypes_t
-                    )
-
-                # Recenter translations to maintain translation invariance
-                # Everything is "present" in sampling,so use valid_mask
-                com = batch_center_of_mass(batch.trans_t, mask=batch.valid_mask)
-                batch.trans_t = batch.trans_t - com[:, None, :]
-
-                # Save
-                if traj_frames is None or step_num % traj_frames == 0:
-                    traj.samples.append(batch.detach_clone(device=torch.device("cpu")))
-
-                # Update progress bar with batch dimensions
-                B, P = batch.trans_t.shape[:2]
-                pbar.set_postfix_str(f"B={B} P={P}")
-
-                # Cleanup
-                if step_num % 10 == 0:
-                    if torch.backends.mps.is_available():
-                        torch.mps.empty_cache()
-
-            pbar.close()
-
-            # Final endpoint step: take the model's endpoint prediction after integrating to t=1-min_t.
-            # No motif guidance or insertions/deletions are applied in this step.
-            t_val = float(t_grid[-1].item())
+            # Set current time
             batch.t = torch.full(
                 (num_batch,), t_val, dtype=torch.float32, device=device
             )
-            pred = model.forward(batch)
-            traj.pred.append(pred.detach_clone(device=torch.device("cpu")))
 
-            # take predicted translations and rotations, without motif guidance
-            batch.trans_t = pred.pred_trans_1
-            batch.rotmats_t = pred.pred_rotmats_1
+            # determine if motif guidance is on this step
+            motif_guidance_window = motif_potential_window(
+                t=batch.t,
+                motif_mask=batch.motif_mask,
+                cfg=self.cfg.motif_guidance,
+            )
+            guidance_on = (motif_guidance_window > 0).any()
 
-            # Sample final-interval (t_end -> 1.0) deletions, not insertions.
-            _, final_deletions, _ = self._sample_insert_delete_substitute(
-                split_rate=torch.zeros_like(pred.pred_split_rate),
+            ctx = torch.enable_grad() if guidance_on else torch.no_grad()
+            with ctx:
+                if guidance_on:
+                    assert not batch.trans_t.is_inference()  # sanity check
+                    # Make motif tensors so autograd.grad can target them through the model graph
+                    trans_t_req = batch.trans_t.detach().requires_grad_(True)
+                    rotmats_t_req = batch.rotmats_t.detach().requires_grad_(True)
+                    batch.trans_t = trans_t_req
+                    batch.rotmats_t = rotmats_t_req
+
+                pred = model.forward(batch)
+
+                # Compute motif potential VFs (and metrics if debug enabled)
+                potential_field, metrics = self.compute_motif_potential(
+                    t=batch.t,
+                    trans_t=batch.trans_t,
+                    rotmats_t=batch.rotmats_t,
+                    pred_trans_1=pred.pred_trans_1,
+                    pred_rotmats_1=pred.pred_rotmats_1,
+                    trans_1_motifs=batch.trans_1_motifs,
+                    rotmats_1_motifs=batch.rotmats_1_motifs,
+                    motif_mask=batch.motif_mask,
+                    valid_mask=batch.valid_mask,
+                    step=step_num,
+                    prev_metrics=prev_metrics,
+                )
+                if metrics is not None:
+                    prev_metrics = metrics
+
+                if guidance_on:
+                    # Detach tensors we tracked gradients for (no backprop through sampling)
+                    batch.trans_t = trans_t_req.detach()
+                    batch.rotmats_t = rotmats_t_req.detach()
+                    assert not batch.motif_mask.requires_grad  # sanity check
+
+                # Detach prediction regardless of whether has gradients for guidance
+                pred = pred.detach_clone(device=batch.trans_t.device)
+
+                # Save prediction
+                if traj_frames is None or step_num % traj_frames == 0:
+                    traj.pred.append(pred.to(device=torch.device("cpu")))
+
+                # Log motif guidance metrics if debug enabled
+                if metrics is not None:
+                    pbar.write(metrics.to_str())
+                    pbar.set_postfix_str(metrics.to_postfix())
+
+            # Euler steps for domains
+
+            trans_next = self.translation_coupler.euler_step(
+                x_t=batch.trans_t,
+                x1_pred=pred.pred_trans_1,
+                t=batch.t,
+                dt=dt,
+                birth_time=batch.birth_time,
+                motif_mask=batch.motif_mask,
+                potential=potential_field.trans,
+            )
+            batch.trans_t = trans_next
+
+            rotmats_next = self.rotation_coupler.euler_step(
+                x_t=batch.rotmats_t,
+                x1_pred=pred.pred_rotmats_1,
+                t=batch.t,
+                dt=dt,
+                birth_time=batch.birth_time,
+                motif_mask=batch.motif_mask,
+                potential=potential_field.rotmats,
+            )
+            batch.rotmats_t = rotmats_next
+
+            aatypes_next = self.aatypes_coupler.euler_step(
+                x_t=batch.aatypes_t,
+                x1_pred=pred.pred_aatype_logits,
+                t=batch.t,
+                dt=dt,
+                birth_time=batch.birth_time,
+                motif_mask=batch.motif_mask,
+            )
+            batch.aatypes_t = aatypes_next
+
+            # Disallowed in motifs
+            scaffold_mask = batch.valid_mask & ~batch.motif_mask  # (B, P)
+            is_root = batch.birth_time <= 0.0  # (B, P)
+
+            # sample indels (model predicts time-independent mass M, we compute R_t = M * S(t))
+            insertions, deletions, _ = self._sample_insert_delete_substitute(
+                split_mass=pred.pred_split_mass,
                 del_logits=pred.pred_del_logits,
-                is_root=batch.birth_time <= 0.0,
-                valid_mask=batch.valid_mask & ~batch.motif_mask,
+                is_root=is_root,
+                valid_mask=scaffold_mask,
                 t_val=t_val,
-                dt=1.0 - t_val,
+                dt=dt,
                 split_hazard=self.cfg.sampling.split_hazard,
                 delete_hazard=self.cfg.sampling.delete_hazard,
-                pred_split_pooled_log1p_rate=None,
+                pred_split_pooled_log1p_mass=pred.pred_split_pooled_log1p_mass,
+                indel_sharpness=self.cfg.sampling.indel_sharpness,
             )
-            if final_deletions.any():
-                zeros = torch.zeros_like(final_deletions)
-                batch, _, _ = batch.apply_insertions_deletions(
-                    insertions=zeros,
-                    deletions=final_deletions,
-                    t_birth=t_end,
+
+            # Enforce max_length: block insertions once we're at the limit
+            max_len = self.cfg.sampling.max_length
+            cur_lens = batch.valid_mask.sum(dim=1)  # (B,)
+            at_limit = cur_lens >= max_len  # (B,)
+            if at_limit.any():
+                insertions = insertions & ~at_limit.unsqueeze(1)
+
+            batch, insert_mask, gather_idx = batch.apply_insertions_deletions(
+                insertions=insertions,
+                deletions=deletions,
+                t_birth=t_next,  # born at t_next since after euler step
+            )
+
+            # Domain-specific initialization for newly inserted tokens.
+            # TODO - use couplings for domain-specific corruptions
+            if insert_mask.any():
+                # Add small isotropic perturbation to inserted translations
+                trans_noise = torch.randn_like(batch.trans_t) * (0.1 * NM_TO_ANG_SCALE)
+                batch.trans_t = (
+                    batch.trans_t + insert_mask.unsqueeze(-1).float() * trans_noise
                 )
 
-            # recenter
-            batch.t = torch.ones((num_batch,), dtype=torch.float32, device=device)
+                # Add small IGSO3 perturbation to inserted rotations
+                # Inserted positions inherit parent's rotation from apply_insertions_deletions
+                # Add noise to break symmetry
+                B_new, P_new = batch.rotmats_t.shape[:2]
+                self.rotation_coupler._ensure_igso3_device(device)
+                # Use small sigma for perturbation
+                sigma_insert = torch.full(
+                    (B_new,),
+                    0.1,
+                    device=self.rotation_coupler.igso3.sigma_grid.device,
+                )
+                insert_noise = self.rotation_coupler.igso3.sample(
+                    sigma_insert, P_new
+                ).to(
+                    device
+                )  # (B, P, 3, 3)
+                # Apply noise to inserted positions only
+                rotmats_with_noise = torch.einsum(
+                    "...ij,...jk->...ik", batch.rotmats_t, insert_noise
+                )
+                batch.rotmats_t = torch.where(
+                    insert_mask.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3, 3),
+                    rotmats_with_noise,
+                    batch.rotmats_t,
+                )
+
+                # Sample amino acids for inserted positions from parent's insertion logits
+                K = pred.pred_insertion_logits.shape[-1]
+                P_old = pred.pred_insertion_logits.shape[1]
+
+                # Gather parent's insertion logits for new positions
+                insertion_logits_gathered = pred.pred_insertion_logits.gather(
+                    1,
+                    gather_idx.unsqueeze(-1).expand(-1, -1, K).clamp(0, P_old - 1),
+                )  # (B, P_new, K)
+
+                # Convert to probs and mix in uniform noise (like _compute_step_probs)
+                probs = F.softmax(insertion_logits_gathered, dim=-1)  # (B, P_new, K)
+                uniform_dist = torch.ones_like(probs) / K
+                probs = (
+                    1.0 - self.cfg.aatypes_coupler.noise_scale
+                ) * probs + self.cfg.aatypes_coupler.noise_scale * uniform_dist
+
+                # Sample from noisy distribution
+                sampled_tokens = torch.multinomial(
+                    probs.view(-1, K), num_samples=1
+                ).view(B_new, P_new)
+                batch.aatypes_t = torch.where(
+                    insert_mask, sampled_tokens, batch.aatypes_t
+                )
+
+            # Recenter translations to maintain translation invariance
+            # Everything is "present" in sampling,so use valid_mask
             com = batch_center_of_mass(batch.trans_t, mask=batch.valid_mask)
             batch.trans_t = batch.trans_t - com[:, None, :]
 
-            # save final sample
-            traj.samples.append(batch.detach_clone(device=torch.device("cpu")))
+            # Save
+            if traj_frames is None or step_num % traj_frames == 0:
+                traj.samples.append(batch.detach_clone(device=torch.device("cpu")))
+
+            # Update progress bar with batch dimensions
+            B, P = batch.trans_t.shape[:2]
+            pbar.set_postfix_str(f"B={B} P={P}")
+
+            # Cleanup
+            if step_num % 10 == 0:
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+
+        pbar.close()
+
+        # Final endpoint step: take the model's endpoint prediction after integrating to t=1-min_t.
+        # No motif guidance or insertions/deletions are applied in this step.
+        t_val = float(t_grid[-1].item())
+        batch.t = torch.full((num_batch,), t_val, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            pred = model.forward(batch)
+            traj.pred.append(pred.detach_clone(device=torch.device("cpu")))
+
+        # take predicted translations and rotations, without motif guidance
+        batch.trans_t = pred.pred_trans_1
+        batch.rotmats_t = pred.pred_rotmats_1
+
+        # Sample final-interval (t_end -> 1.0) deletions, not insertions.
+        _, final_deletions, _ = self._sample_insert_delete_substitute(
+            split_mass=torch.zeros_like(pred.pred_split_mass),
+            del_logits=pred.pred_del_logits,
+            is_root=batch.birth_time <= 0.0,
+            valid_mask=batch.valid_mask & ~batch.motif_mask,
+            t_val=t_val,
+            dt=1.0 - t_val,
+            split_hazard=self.cfg.sampling.split_hazard,
+            delete_hazard=self.cfg.sampling.delete_hazard,
+            pred_split_pooled_log1p_mass=None,
+            indel_sharpness=self.cfg.sampling.indel_sharpness,
+        )
+        if final_deletions.any():
+            zeros = torch.zeros_like(final_deletions)
+            batch, _, _ = batch.apply_insertions_deletions(
+                insertions=zeros,
+                deletions=final_deletions,
+                t_birth=t_end,
+            )
+
+        # recenter
+        batch.t = torch.ones((num_batch,), dtype=torch.float32, device=device)
+        com = batch_center_of_mass(batch.trans_t, mask=batch.valid_mask)
+        batch.trans_t = batch.trans_t - com[:, None, :]
+
+        # save final sample
+        traj.samples.append(batch.detach_clone(device=torch.device("cpu")))
 
         return traj

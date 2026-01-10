@@ -146,7 +146,7 @@ class TrajectoryFrame:
             motif_mask=sample.motif_mask[batch_idx].cpu().numpy(),
             valid_mask=sample.valid_mask[batch_idx].cpu().numpy(),
             t=sample.t[batch_idx].item(),
-            remaining_insertions=pred.pred_split_rate[batch_idx].cpu().numpy(),
+            remaining_insertions=pred.pred_split_mass[batch_idx].cpu().numpy(),
             atom37=atom37,
         )
 

@@ -925,6 +925,46 @@ class InterpolantTrainTimeSamplingEnum(StrEnum):
     late_biased = "late_biased"
 
 
+class MotifGuidanceVarScale(StrEnum):
+    """Variance scale function for motif guidance."""
+
+    ot = "ot"  # OT-like scaling: (1-t)/t - matches FrameFlow
+    linear = "linear"  # Linear decay: (1-t)
+    constant = "constant"  # Constant: 1.0
+
+
+@dataclass
+class MotifGuidanceConfig(BaseClassConfig):
+    """
+    Configuration for gradient-based motif position guidance during sampling.
+    Follows the twisted diffusion / FrameFlow approach where:
+    - potential = 0.5 * g(t)^2 * nabla_{T_t} [dist^2]
+    - Scale is 0.5 * g^2 / omega^2 * window_factor
+    """
+
+    # Whether motif guidance is enabled
+    enabled: bool = True
+    # Overall scale factor multiplier for guidance strength
+    scale_factor: float = 1.0
+    # Variance scale type determining time-dependent scaling
+    var_scale_type: MotifGuidanceVarScale = MotifGuidanceVarScale.ot
+    # Time window: guidance only active on [guidance_start_t, guidance_end_t]
+    # Don't make too small - guidance is strong early
+    guidance_start_t: float = 0.15
+    guidance_end_t: float = 1.0
+    # Optional linear fade-out: decay to 0 as t -> guidance_end_t
+    var_decay: bool = False
+    # Cap for variance-based scale (prevents blow-ups near t=0)
+    var_scale_cap: float = 50.0
+    # Observation noise floors to prevent blow-up as variance -> 0
+    # Translation: ~0.5 Angstrom, slightly above typical atomic uncertainty
+    obs_noise_trans_ang: float = 0.5
+    # Rotation: ~6 degrees (0.1 rad), typical backbone dihedral uncertainty
+    obs_noise_rot_rad: float = 0.1
+    # Debug mode: compute and return MotifGuidanceMetrics during sampling
+    debug: bool = False
+
+
 @dataclass
 class InterpolantSamplingConfig(BaseClassConfig):
     # training takes a random t. Sampling runs over t timestemps.
@@ -1054,6 +1094,8 @@ class InterpolantConfig(BaseClassConfig):
     steering: InterpolantSteeringConfig = field(
         default_factory=InterpolantSteeringConfig
     )
+    # motif guidance (gradient-based, for inpainting)
+    motif_guidance: MotifGuidanceConfig = field(default_factory=MotifGuidanceConfig)
 
 
 ##### Data and Dataset #####
@@ -1436,6 +1478,8 @@ class ExperimentTrainerConfig(BaseClassConfig):
     # force overfiting by using a fraction/number of batches. Don't shuffle dataloader.
     overfit_batches: Union[float, int] = 0
     deterministic: bool = False
+    # Limit number of validation batches
+    limit_val_batches: Union[float, int] = 100
     # Perform validation every `n` epochs.
     check_val_every_n_epoch: int = 1
     # Enable gradient accumulation

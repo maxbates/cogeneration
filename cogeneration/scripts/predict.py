@@ -137,6 +137,7 @@ class EvalRunner:
         self._trainer = Trainer(
             **self.cfg.experiment.trainer.asdict(),
             devices=devices,
+            inference_mode=False,  # for motif guidance
         )
         return self._trainer
 

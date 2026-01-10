@@ -291,10 +291,12 @@ class BranchFlowModule(pl.LightningModule):
         self.interpolant.set_device(self.device)
         sample_name = f"val_sample_{batch_idx}"
 
-        sample_traj = self.interpolant.sample(
-            model=self.model,
-            data=batch,
-        )
+        # Motif guidance uses autograd during sampling (inference tensors break backward).
+        with torch.inference_mode(False):
+            sample_traj = self.interpolant.sample(
+                model=self.model,
+                data=batch,
+            )
 
         viz = BranchingFlowVisualizer(sigma=1.0)
         val_dir = os.path.join(
@@ -361,10 +363,12 @@ class BranchFlowModule(pl.LightningModule):
     def predict_step(self, batch: DataBatch, batch_idx: int, dataloader_idx: int = 0):
         self.interpolant.set_device(self.device)
 
-        sample_traj = self.interpolant.sample(
-            model=self.model,
-            data=batch,
-        )
+        # Motif guidance uses autograd during sampling (inference tensors break backward).
+        with torch.inference_mode(False):
+            sample_traj = self.interpolant.sample(
+                model=self.model,
+                data=batch,
+            )
 
         rank = DDPInfo.from_env().rank
         sample_name = f"predict_rank{rank:03d}_idx{batch_idx:05d}"

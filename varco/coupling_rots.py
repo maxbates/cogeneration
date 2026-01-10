@@ -194,7 +194,9 @@ class RotationCoupler(Coupler[RotationCoupling]):
         dt: float,
         birth_time: torch.Tensor,  # (B, P)
         motif_mask: torch.Tensor,  # (B, P)
-        potential: Optional[torch.Tensor] = None,  # (B, P, 3) rotation vector field
+        potential: Optional[
+            torch.Tensor
+        ] = None,  # (B, P, 3) rotation tangent vector field
     ) -> torch.Tensor:
         """
         Single Euler step for rotation sampling using geodesic flow.

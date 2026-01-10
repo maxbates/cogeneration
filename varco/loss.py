@@ -9,7 +9,7 @@ from cogeneration.data import so3_utils
 from cogeneration.data.const import ANG_TO_NM_SCALE, MASK_TOKEN_INDEX
 from varco.config import VarcoLossConfig
 from varco.data import DataBridged, DataCorrupted, ModelPrediction
-from varco.interpolant import TreeCouplings
+from varco.interpolant import TreeCouplings, TreeInterpolant
 
 # TODO - ideally we could share loss calculator with cogeneration, e.g. using static methods
 
@@ -127,7 +127,7 @@ class BranchFlowLossCalculator:
         """
         t_clip = t.clamp(max=self.cfg.t_normalize_clip)
         t_norm = 1 - t_clip
-        t_norm = t**self.cfg.t_normalize_exponent
+        t_norm = t_norm**self.cfg.t_normalize_exponent
         return t_norm
 
     @staticmethod
@@ -537,9 +537,12 @@ class BranchFlowLossCalculator:
         eps: float = 1e-8,
     ) -> torch.Tensor:
         """
-        Per-token Poisson Bregman divergence:
-        D(k || r) = r - k + k * log(k/r)  for k > 0
-        D(0 || r) = r                     for k = 0
+        Per-token Poisson Bregman divergence on insertion mass M:
+        D(M_target || M_pred) = M_pred - M_target + M_target * log(M_target/M_pred)
+
+        The model predicts time-independent mass M; the target is:
+            M_target = remaining_insertions / S(t)
+        where S(t) = 1 - H(t) is the hazard survival function.
 
         Primary loss is on scaffolds (mask & ~motif_mask), with a smaller penalty
         (motif_weight) applied to motif positions.
@@ -547,14 +550,25 @@ class BranchFlowLossCalculator:
         if batch.remaining_insertions is None:
             raise ValueError("batch.remaining_insertions is required for split loss")
 
-        target = batch.remaining_insertions.to(torch.float32)  # (B, P)
-        rate = pred.pred_split_rate.clamp_min(eps)  # (B, P)
+        # Compute survival function S(t) for each batch element
+        # batch.t is (B,), we use mean t for the batch (they should be same in corrupt_batch)
+        t_mean = float(batch.t.mean().item())
+        S_t = TreeInterpolant.compute_hazard_survival(t_mean, self.cfg.split_hazard)
+        S_t = max(eps, S_t)  # avoid division by zero near t=1
 
-        target_safe = target.clamp_min(eps)
+        # Target mass: M = R_t / S(t)
+        remaining = batch.remaining_insertions.to(torch.float32)  # (B, P)
+        target_mass = remaining / S_t  # (B, P)
+
+        # Predicted mass
+        mass = pred.pred_split_mass.clamp_min(eps)  # (B, P)
+
+        # Poisson Bregman divergence on mass
+        target_safe = target_mass.clamp_min(eps)
         token_loss = torch.where(
-            target > 0,
-            rate - target + target * torch.log(target_safe / rate),
-            rate,
+            target_mass > 0,
+            mass - target_mass + target_mass * torch.log(target_safe / mass),
+            mass,
         )
 
         # Scaffold loss (primary) and motif loss (small penalty)
@@ -575,13 +589,13 @@ class BranchFlowLossCalculator:
 
         split_loss = scaffold_loss + motif_weight * motif_loss
 
-        # Regularize diffuse per-token split rates to encourage sparsity.
-        entropy_weight = self.cfg.split_rate_entropy_weight
-        l2_weight = self.cfg.split_rate_l2_weight
+        # Regularize diffuse per-token split mass to encourage sparsity.
+        entropy_weight = self.cfg.split_mass_entropy_weight
+        l2_weight = self.cfg.split_mass_l2_weight
         if (entropy_weight > 0.0) or (l2_weight > 0.0):
-            rate_scaffold = rate * scaffold_mask.float()  # (B, P)
-            sum_rate = rate_scaffold.sum(dim=1, keepdim=True).clamp_min(eps)  # (B, 1)
-            w = rate_scaffold / sum_rate  # (B, P), sums to 1 over scaffold positions
+            mass_scaffold = mass * scaffold_mask.float()  # (B, P)
+            sum_mass = mass_scaffold.sum(dim=1, keepdim=True).clamp_min(eps)  # (B, 1)
+            w = mass_scaffold / sum_mass  # (B, P), sums to 1 over scaffold positions
 
             # Normalized entropy in [~0, 1] (0=one-hot; 1=uniform over N)
             n = scaffold_mask.float().sum(dim=1).clamp_min(2.0)  # (B,)
@@ -616,15 +630,26 @@ class BranchFlowLossCalculator:
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Aux metrics for split prediction (scaffold only)."""
+        """Aux metrics for split prediction (scaffold only).
+
+        Metrics are computed in rate space (R_t = M * S(t)) for interpretability,
+        since remaining_insertions is the natural target at time t.
+        """
         device = batch.trans_t.device
+        eps = 1e-8
         if batch.remaining_insertions is None:
             zero = torch.tensor(0.0, device=device)
             return zero, zero, zero, zero, zero, zero, zero, zero, zero
 
         with torch.no_grad():
+            # Compute S(t) to convert mass -> rate for metrics
+            t_mean = float(batch.t.mean().item())
+            S_t = TreeInterpolant.compute_hazard_survival(t_mean, self.cfg.split_hazard)
+            S_t = max(eps, S_t)
+
             target = batch.remaining_insertions.to(torch.float32)  # (B, P)
-            rate = pred.pred_split_rate.clamp_min(0.0)  # (B, P)
+            # Convert predicted mass to rate for comparison
+            rate = pred.pred_split_mass.clamp_min(0.0) * S_t  # (B, P)
 
             split_mask = mask & ~motif_mask
             split_mask_f = split_mask.float()
@@ -681,11 +706,20 @@ class BranchFlowLossCalculator:
         pred: ModelPrediction,
         batch: DataCorrupted,
     ) -> torch.Tensor:
-        """Pooled MSE loss, in log1p space to reduce dynamic range"""
-        target_log = torch.log1p(batch.remaining_total.to(torch.float32))  # (B,)
-        pred_log1p = (
-            pred.pred_split_pooled_log1p_rate
-        )  # (B,) model predicts in log1p space
+        """Pooled MSE loss on total insertion mass, in log1p space.
+
+        Target mass = remaining_total / S(t), model predicts log1p(total_mass).
+        """
+        eps = 1e-8
+        t_mean = float(batch.t.mean().item())
+        S_t = TreeInterpolant.compute_hazard_survival(t_mean, self.cfg.split_hazard)
+        S_t = max(eps, S_t)
+
+        # Target mass in log1p space
+        target_mass = batch.remaining_total.to(torch.float32) / S_t  # (B,)
+        target_log = torch.log1p(target_mass)  # (B,)
+
+        pred_log1p = pred.pred_split_pooled_log1p_mass  # (B,)
         pooled_loss = F.mse_loss(pred_log1p, target_log)
         return (
             self.log_clamp(pooled_loss, threshold=10.0)
