@@ -1,10 +1,12 @@
-from dataclasses import dataclass, field
+import csv
+from dataclasses import asdict, dataclass, field
 from typing import List, Optional, Tuple
 
 import torch
 
 from cogeneration.data import all_atom
 from cogeneration.data.const import MASK_TOKEN_INDEX
+from cogeneration.data.motif_guidance import MotifGuidanceMetrics
 from varco.tensor_utils import clone_detach, gather_and_pad, to_device
 from varco.tree_plan import BatchedTreePlan, TreePlan
 
@@ -542,6 +544,31 @@ class Trajectory:
 
 @dataclass
 class SampleTrajectory(Trajectory):
-    """Trajectory from sampling, includes model predictions."""
+    """Trajectory from sampling, includes model predictions and optional metrics."""
 
     pred: List[ModelPrediction] = field(default_factory=list)
+    # Motif guidance metrics (if cfg.motif_guidance.debug=True)
+    metrics: List[MotifGuidanceMetrics] = field(default_factory=list)
+
+    def write_metrics_csv(self, path: str) -> None:
+        """Write motif guidance metrics to a CSV file.
+
+        Args:
+            path: Path to the output CSV file
+        """
+        if not self.metrics or len(self.metrics) == 0:
+            return
+
+        # Get field names from the first metric (excluding align_rot which is a tensor)
+        fieldnames = list(asdict(self.metrics[0]).keys())
+        if "align_rot" in fieldnames:
+            fieldnames.remove("align_rot")
+
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for m in self.metrics:
+                m_dict = asdict(m)
+                if "align_rot" in m_dict:
+                    del m_dict["align_rot"]
+                writer.writerow(m_dict)

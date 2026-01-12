@@ -939,7 +939,7 @@ class MotifGuidanceConfig(BaseClassConfig):
     Configuration for gradient-based motif position guidance during sampling.
     Follows the twisted diffusion / FrameFlow approach where:
     - potential = 0.5 * g(t)^2 * nabla_{T_t} [dist^2]
-    - Scale is 0.5 * g^2 / omega^2 * window_factor
+    - prefactor scale is 0.5 * g^2 / omega^2 * window_factor
     """
 
     # Whether motif guidance is enabled
@@ -947,9 +947,10 @@ class MotifGuidanceConfig(BaseClassConfig):
     # Overall scale factor multiplier for guidance strength
     scale_factor: float = 1.0
     # Variance scale type determining time-dependent scaling
+    # variance down -> grad up, increases strength at end esp with OT schedule
     var_scale_type: MotifGuidanceVarScale = MotifGuidanceVarScale.ot
     # Time window: guidance only active on [guidance_start_t, guidance_end_t]
-    # Don't make too small - guidance is strong early
+    # Don't make start time too small - guidance is strong early
     guidance_start_t: float = 0.15
     guidance_end_t: float = 1.0
     # Optional linear fade-out: decay to 0 as t -> guidance_end_t
@@ -957,8 +958,9 @@ class MotifGuidanceConfig(BaseClassConfig):
     # Cap for variance-based scale (prevents blow-ups near t=0)
     var_scale_cap: float = 50.0
     # Observation noise floors to prevent blow-up as variance -> 0
+    # Increase floor to reduce late time guidance, or enable var decay
     # Translation: ~0.5 Angstrom, slightly above typical atomic uncertainty
-    obs_noise_trans_ang: float = 0.5
+    obs_noise_trans_ang: float = 0.3
     # Rotation: ~6 degrees (0.1 rad), typical backbone dihedral uncertainty
     obs_noise_rot_rad: float = 0.1
     # Debug mode: compute and return MotifGuidanceMetrics during sampling

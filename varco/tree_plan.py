@@ -67,13 +67,17 @@ class TreePlan:
         p_deletion: float = 0.20,
         # Beta distribution parameters for biasing split/insertion times.
         # With alpha < beta, splits are biased to occur earlier (closer to t=0).
-        # Default (1.0, 2.0) gives mean ~0.33, moving mass toward earlier times.
+        # For early_power(p) hazard, the PDF is Beta(1, p), so (1.0, 2.5) matches
+        # the default sampling hazard early_power(2.5).
         # Use (1.0, 1.0) for uniform sampling (no bias).
-        split_time_beta: tuple[float, float] = (1.0, 2.0),
+        split_time_beta: tuple[float, float] = (1.0, 2.5),
         # Beta distribution parameters for biasing deletion times.
-        # With alpha > beta, deletions are biased to occur later (closer to t=1).
-        # Default (2.0, 1.0) gives mean ~0.67, moving mass toward later times.
-        delete_time_beta: tuple[float, float] = (2.0, 1.0),
+        # Default (1.0, 1.0) is uniform, matching uniform delete_hazard in sampling.
+        delete_time_beta: tuple[float, float] = (1.0, 1.0),
+        # Maximum time for indel events. Events are clamped to this value.
+        # Set to < 1.0 to match sampling behavior where late indels are suppressed
+        # via indel sharpening. Default 0.85 matches effective sampling cutoff.
+        max_indel_time: float = 0.85,
     ) -> "TreePlan":
         """
         Generate a simple planar coalescent tree plan with sampled split/birth/delete times.
@@ -396,16 +400,15 @@ class TreePlan:
                 t0_valid = t0_vec[valid]
                 W_valid = W_vec[valid]
 
-                # Exponential sampling for all valid nodes at this depth
-                # st = 1 - (1 - t0) * exp(-E / (W - 1)), where E ~ Exp(1)
-                # Use beta distribution to bias the base uniform toward earlier times
+                # Sample split times using Beta distribution scaled to [t0, T].
+                # u ~ Beta(alpha, beta) gives values in [0, 1] biased toward 0 when alpha < beta.
+                # Then st = t0 + (T - t0) * u maps to [t0, T].
+                # With Beta(1, p), this matches the early_power(p) hazard CDF.
                 alpha, beta = split_time_beta
                 u = rng.sample_beta(len(valid_nodes), alpha, beta, device=device)
-                E = -torch.log(u.clamp_min(1e-12))
-                st = 1.0 - (1.0 - t0_valid) * torch.exp(
-                    -E / (W_valid - 1).clamp_min(1.0)
-                )
-                st = torch.clamp(st, min=min_t, max=1.0 - 2 * min_t)
+                T = max_indel_time - 2 * min_t  # buffer for deletions
+                st = t0_valid + (T - t0_valid).clamp_min(min_t) * u
+                st = torch.clamp(st, min=min_t, max=T)
 
                 # Write split times
                 split_time[valid_nodes] = st
@@ -432,8 +435,11 @@ class TreePlan:
         #
         # We enforce strict inequalities with tiny epsilons to avoid dt == birth or dt == 1
         # due to floating point edge cases.
+        #
+        # We also clamp to max_indel_time to match sampling behavior where late deletions
+        # are suppressed via indel sharpening.
         min_delete_eps = min_t
-        max_delete_time = 1.0 - min_t
+        max_delete_time = min(max_indel_time, 1.0 - min_t)
 
         # Set deletion times for nodes:
         # - Marked as deleted (leaf_deleted)
@@ -447,15 +453,14 @@ class TreePlan:
             b = birth_time[valid_deleted]
 
             # Sample beta-distributed random values for all deleted leaves at once
-            # With alpha > beta, deletions are biased toward later times
             alpha, beta = delete_time_beta
             u = rng.sample_beta(int(num_deleted), alpha, beta, device=device)
 
-            # Compute deletion times: dt = birth + (1 - birth) * u
-            dt = b + (1.0 - b) * u
+            # Compute deletion times: dt = birth + (max_delete_time - birth) * u
+            # This samples in [birth, max_delete_time] instead of [birth, 1]
+            dt = b + (max_delete_time - b).clamp_min(min_delete_eps) * u
 
             # Clamp to valid range [birth + min_delete_eps, max_delete_time]
-            # For births very close to 1, this ensures we have a valid deletion time
             dt = torch.clamp_min(dt, min=b + min_delete_eps)
             dt = torch.clamp_max(dt, max=max_delete_time)
 

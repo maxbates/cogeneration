@@ -150,7 +150,7 @@ class Coupler(ABC, Generic[CouplingT]):
         t: torch.Tensor,  # (B,)
         scale: torch.Tensor,  # (B,) per-domain scale
         min_sigma: float = 0.0,
-        noise_end_t: float = 0.95,
+        noise_end_t: float = 1.0,
     ) -> torch.Tensor:
         """
         Compute the instantaneous standard deviation of the noise at time t.

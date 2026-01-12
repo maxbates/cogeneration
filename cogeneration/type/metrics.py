@@ -129,7 +129,8 @@ class OutputFileName(StrEnum):
     traj_panel_gif = "traj_panel.gif"
     traj_panel_mp4 = "traj_panel.mp4"
 
-    # FK steering
+    # FK steering / potentials
+    motif_guidance_metrics_csv = "motif_guidance_metrics.csv"
     fk_steering_energy_traj_png = "fk_steering_traj.png"
     fk_steering_potential_logits_gif = "fk_steering_potential_logits.gif"
     fk_steering_potential_logits_mp4 = "fk_steering_potential_logits.mp4"

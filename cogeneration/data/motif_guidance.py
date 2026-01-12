@@ -44,7 +44,7 @@ class MotifGuidanceMetrics:
             f"M={self.num_motif} | "
             f"rmsd_r={self.rmsd_raw:6.3f} | "
             f"rmsd_a={self.rmsd_aligned:6.3f} | "
-            f"sv_min={self.sv_min:6.3f} | "
+            f"sv_min={self.sv_min:7.3f} | "
             f"cond={self.condition_number:8.1f} | "
             f"dθ={self.delta_theta:6.3f} | "
             f"∇trans={self.trans_guidance_norm:6.3f} | "

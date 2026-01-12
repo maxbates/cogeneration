@@ -10,6 +10,8 @@ from cogeneration.config.base import (
     DataConfig,
     DatasetConfig,
     DatasetContactConditioningConfig,
+    DatasetInpaintingConfig,
+    DatasetInpaintingMotifStrategy,
     ExperimentConfig,
     ExperimentWandbConfig,
     FoldingConfig,
@@ -32,14 +34,35 @@ from cogeneration.type.str_enum import StrEnum
 
 
 @dataclass
+class VarcoTreePlanConfig(BaseClassConfig):
+    """
+    Configuration for TreePlan generation during training.
+    These parameters control when indel events occur in training trajectories.
+    """
+
+    # Beta distribution for split times (alpha < beta = early bias).
+    split_time_beta_alpha: float = 1.0
+    split_time_beta_beta: float = "${interpolant.sampling.split_hazard.power}"
+    # Beta distribution for delete times
+    delete_time_beta_alpha: float = 1.0
+    delete_time_beta_beta: float = 1.0
+    # Maximum time for indel events
+    max_indel_time: float = 0.85
+    # Scaffold nuclei sampling range per span
+    min_scaffold_nuclei: int = 1
+    max_scaffold_nuclei: int = 10
+    # Probability of deleting scaffold positions (Poisson rate multiplier)
+    p_deletion: float = 0.20
+
+
+@dataclass
 class VarcoDatasetConfig(DatasetConfig):
     # debug_head_samples: int = 1000  # faster startup
     enable_cogeneration_pdb: bool = True
-    enable_cogeneration_afdb: bool = False
+    enable_cogeneration_afdb: bool = True
     enable_cogeneration_redesigns: bool = True
     enable_multiflow_redesigned: bool = True
     enable_multiflow_synthetic: bool = True
-
     contact_conditioning: DatasetContactConditioningConfig = field(
         default_factory=lambda: DatasetContactConditioningConfig(
             conditioning_prob_disabled=0.5,
@@ -47,12 +70,19 @@ class VarcoDatasetConfig(DatasetConfig):
             dist_noise_ang=0.25,
         )
     )
+    inpainting: DatasetInpaintingConfig = field(default_factory=lambda: DatasetInpaintingConfig(
+        strategy=DatasetInpaintingMotifStrategy.single_motif,
+        min_percent_motifs=0.40,
+        max_percent_motifs=0.80,
+    ))
+    tree_plan: VarcoTreePlanConfig = field(default_factory=VarcoTreePlanConfig)
 
 
-# alias for ckpt
+# alias for ckpt, deprecated
 VarcoMotifVarScale = MotifGuidanceVarScale
 
 
+# deprecated. use InterpolantMotifGuidanceConfig instead
 class VarcoMotifGuidanceType(StrEnum):
     """Scale function for motif guidance (deprecated, use MotifGuidanceVarScale)."""
 
@@ -60,6 +90,7 @@ class VarcoMotifGuidanceType(StrEnum):
     linear_decay = "linear_decay"
 
 
+# deprecated. use InterpolantMotifGuidanceConfig instead
 @dataclass
 class VarcoInterpolantMotifGuidanceConfig(MotifGuidanceConfig):
     """Varco-specific motif guidance config (extends shared MotifGuidanceConfig).
@@ -67,7 +98,6 @@ class VarcoInterpolantMotifGuidanceConfig(MotifGuidanceConfig):
     Includes deprecated fields for backward compatibility with existing configs.
     """
 
-    # Deprecated fields - kept for config loading compatibility
     # For linear_decay scale: strength multiplier
     linear_decay_strength: float = 1.0
     # Scale function (deprecated, use var_scale_type from MotifGuidanceConfig)
@@ -84,8 +114,8 @@ class VarcoInterpolantCouplerConfig(BaseClassConfig):
 
     # Sigma for stochastic bridge noise (0 for deterministic)
     noise_scale: float = 1.0
-    # Noise is forced to 0 for t >= noise_end_t in sampling steps.
-    noise_end_t: float = 0.90
+    # Noise is forced to 0 for t >= noise_end_t
+    noise_end_t: float = 1.0
 
 
 @dataclass
@@ -122,7 +152,7 @@ class VarcoInterpolantRotationCouplerConfig(VarcoInterpolantCouplerConfig):
     # Cap per-residue rotation drift step (radians) during sampling.
     drift_step_cap_rad: float = math.pi / 3
     # Exponential schedule rate (higher = faster settling)
-    exp_rate: float = 1.5
+    exp_rate: float = 3
 
 
 class VarcoHazardKind(StrEnum):
@@ -157,12 +187,19 @@ class VarcoInterpolantSamplingConfig(BaseClassConfig):
     )
     delete_hazard: VarcoHazardConfig = field(
         default_factory=lambda: VarcoHazardConfig(
-            kind=VarcoHazardKind.late_power, power=1.5
+            kind=VarcoHazardKind.uniform, power=1.0
         )
     )
     # Sharpening exponent for indel probabilities. Applied as p^gamma before sampling.
     # 1.0 uses model directly. Higher values suppress low-confidence predictions.
-    indel_sharpness: float = 1.5
+    indel_sharpness: float = 1.0
+    # Optional time-dependent sharpening schedule
+    # Use this to smoothly suppress late indels.  Note that this will not shift them earlier!
+    # gamma(t) = indel_sharpness + indel_sharpness_late_delta * ramp(t)^power
+    # where ramp(t) = clip((t - indel_sharpness_late_start_t) / (1 - start), 0, 1).
+    indel_sharpness_late_start_t: float = 0.75  # 1.0 disables schedule
+    indel_sharpness_late_delta: float = 2.0  # extra sharpness by t=1
+    indel_sharpness_late_power: float = 2.0  # curvature of the ramp, > 1.0
 
 
 @dataclass
@@ -197,7 +234,7 @@ class VarcoLossConfig(BaseClassConfig):
     t_normalize_clip: float = 0.8
     # Exponent to smooth time norm `(1 - t_clip) ** exp`
     # (<1 -> flatter, >1 -> t->1 weight stronger)
-    t_normalize_exponent: float = 0.25
+    t_normalize_exponent: float = 1.0
     # Local pairwise distance threshold (angstroms)
     proximity_threshold_ang: float = 7.0
 

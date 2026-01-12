@@ -18,6 +18,7 @@ from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.residue_constants import restypes_with_x
 from cogeneration.util.log import rank_zero_logger
 from varco.config import (
+    VarcoHazardConfig,
     VarcoInterpolantAATypesCouplerConfig,
     VarcoInterpolantConfig,
     VarcoInterpolantTransCouplerConfig,
@@ -113,6 +114,7 @@ class TrajectoryFrame:
         pred: ModelPrediction,
         sample: DataCorrupted,
         batch_idx: int,
+        split_hazard: VarcoHazardConfig,
         include_atom37: bool = False,
     ) -> "TrajectoryFrame":
         """Extract single batch item from ModelPrediction, convert to numpy.
@@ -124,6 +126,8 @@ class TrajectoryFrame:
             pred: The ModelPrediction containing batched predictions.
             sample: The corresponding DataCorrupted sample (for metadata).
             batch_idx: Which batch item to extract.
+            split_hazard: Hazard config used to convert time-independent split mass
+                to expected remaining insertions at time t.
             include_atom37: If True, compute and store atom37 representation.
         """
         atom37 = None
@@ -139,14 +143,22 @@ class TrajectoryFrame:
             )
             atom37 = atom37_batch[batch_idx].cpu().numpy()
 
+        # Model predicts time-independent insertion mass M, but visualization expects
+        # remaining insertions R_t at the current time t: R_t = M * S(t).
+        t_val = float(sample.t[batch_idx].item())
+        S_t = float(TreeInterpolant.compute_hazard_survival(t_val, split_hazard))
+        remaining_insertions = (
+            (pred.pred_split_mass[batch_idx].clamp_min(0.0) * S_t).cpu().numpy()
+        )
+
         return cls(
             trans=pred.pred_trans_1[batch_idx].cpu().numpy(),
             rotmats=pred.pred_rotmats_1[batch_idx].cpu().numpy(),
             aatypes=pred.pred_aatype_logits[batch_idx].argmax(dim=-1).cpu().numpy(),
             motif_mask=sample.motif_mask[batch_idx].cpu().numpy(),
             valid_mask=sample.valid_mask[batch_idx].cpu().numpy(),
-            t=sample.t[batch_idx].item(),
-            remaining_insertions=pred.pred_split_mass[batch_idx].cpu().numpy(),
+            t=t_val,
+            remaining_insertions=remaining_insertions,
             atom37=atom37,
         )
 
@@ -869,6 +881,7 @@ class BranchingFlowVisualizer:
                 pred=traj.pred[min(idx, num_preds - 1)],
                 sample=traj.samples[min(idx, num_preds - 1)],
                 batch_idx=batch_idx,
+                split_hazard=self.interpolant.cfg.sampling.split_hazard,
                 include_atom37=not only_alpha_carbons,
             )
             for idx in sample_indices

@@ -290,6 +290,9 @@ class BranchFlowModule(pl.LightningModule):
     def validation_step(self, batch: DataBatch, batch_idx: int) -> None:
         self.interpolant.set_device(self.device)
         sample_name = f"val_sample_{batch_idx}"
+        val_dir = os.path.join(
+            self.cfg.inference.predict_dir, "val", f"epoch{self.current_epoch:03d}"
+        )
 
         # Motif guidance uses autograd during sampling (inference tensors break backward).
         with torch.inference_mode(False):
@@ -298,14 +301,36 @@ class BranchFlowModule(pl.LightningModule):
                 data=batch,
             )
 
-        viz = BranchingFlowVisualizer(sigma=1.0)
-        val_dir = os.path.join(
-            self.cfg.inference.predict_dir, "val", f"epoch{self.current_epoch:03d}"
+        # Generate atom37 rep
+        final_sample = sample_traj.samples[-1]
+        pred_atom37 = final_sample.to_atom37()[0].detach().cpu().numpy()
+        pred_aa = final_sample.aatypes_t[0].detach().cpu().numpy()
+        chain_idx = final_sample.chain_idx[0].detach().cpu().numpy()
+        res_idx = np.arange(pred_aa.shape[0], dtype=np.int32)
+
+        # Save PDB
+        pred_pdb_path = os.path.join(val_dir, OutputFileName.sample_pdb)
+        write_prot_to_pdb(
+            prot_pos=pred_atom37,
+            file_path=pred_pdb_path,
+            aatype=pred_aa,
+            chain_idx=chain_idx,
+            res_idx=res_idx,
+            no_indexing=True,
+            overwrite=True,
         )
+
+        # Plot trajectory
+        viz = BranchingFlowVisualizer()
         viz.plot_sampling_trajectory(
             traj=sample_traj,
             out_dir=val_dir,
             filename=sample_name,
+        )
+
+        # Write motif guidance metrics, if generated
+        sample_traj.write_metrics_csv(
+            path=os.path.join(val_dir, OutputFileName.motif_guidance_metrics_csv)
         )
 
         # run folding validation (refold/designability)for max_batches samples
@@ -317,23 +342,6 @@ class BranchFlowModule(pl.LightningModule):
         ):
             sample_dir = os.path.join(val_dir, sample_name)
             os.makedirs(sample_dir, exist_ok=True)
-
-            final_sample = sample_traj.samples[-1]
-            pred_atom37 = final_sample.to_atom37()[0].detach().cpu().numpy()
-            pred_aa = final_sample.aatypes_t[0].detach().cpu().numpy()
-            chain_idx = final_sample.chain_idx[0].detach().cpu().numpy()
-            res_idx = np.arange(pred_aa.shape[0], dtype=np.int32)
-
-            pred_pdb_path = os.path.join(sample_dir, OutputFileName.sample_pdb)
-            write_prot_to_pdb(
-                prot_pos=pred_atom37,
-                file_path=pred_pdb_path,
-                aatype=pred_aa,
-                chain_idx=chain_idx,
-                res_idx=res_idx,
-                no_indexing=True,
-                overwrite=True,
-            )
 
             top_sample_metrics, _ = self._get_folding_validator().assess_sample(
                 task=InferenceTask.unconditional,
@@ -363,13 +371,6 @@ class BranchFlowModule(pl.LightningModule):
     def predict_step(self, batch: DataBatch, batch_idx: int, dataloader_idx: int = 0):
         self.interpolant.set_device(self.device)
 
-        # Motif guidance uses autograd during sampling (inference tensors break backward).
-        with torch.inference_mode(False):
-            sample_traj = self.interpolant.sample(
-                model=self.model,
-                data=batch,
-            )
-
         rank = DDPInfo.from_env().rank
         sample_name = f"predict_rank{rank:03d}_idx{batch_idx:05d}"
 
@@ -380,14 +381,21 @@ class BranchFlowModule(pl.LightningModule):
         )
         os.makedirs(sample_dir, exist_ok=True)
 
-        # write PDB
+        # Motif guidance uses autograd during sampling (inference tensors break backward).
+        with torch.inference_mode(False):
+            sample_traj = self.interpolant.sample(
+                model=self.model,
+                data=batch,
+            )
+
+        # Generate atom37 rep
         final_sample = sample_traj.samples[-1]
         pred_atom37 = final_sample.to_atom37()[0].detach().cpu().numpy()
         pred_aa = final_sample.aatypes_t[0].detach().cpu().numpy()
         chain_idx = final_sample.chain_idx[0].detach().cpu().numpy()
         res_idx = np.arange(pred_aa.shape[0], dtype=np.int32)
 
-        # write predicted PDB file
+        # Save PDB
         pred_pdb_path = os.path.join(sample_dir, OutputFileName.sample_pdb)
         write_prot_to_pdb(
             prot_pos=pred_atom37,
@@ -411,6 +419,11 @@ class BranchFlowModule(pl.LightningModule):
                 show_residue_letters=self.cfg.inference.plot.show_residue_letters,
                 color_by=self.cfg.inference.plot.color_by,
             )
+
+        # Write motif guidance metrics, if generated
+        sample_traj.write_metrics_csv(
+            path=os.path.join(sample_dir, OutputFileName.motif_guidance_metrics_csv)
+        )
 
         # folding validation - either refolding, or designability
         fold_val_cfg = self.cfg.inference.folding_validation
@@ -465,6 +478,6 @@ class BranchFlowModule(pl.LightningModule):
 
         predict_dir = os.path.join(self.cfg.inference.predict_dir, "predict")
         os.makedirs(predict_dir, exist_ok=True)
-        pd.DataFrame(all_top_samples).to_csv(
-            os.path.join(predict_dir, OutputFileName.all_top_samples_df), index=False
-        )
+        top_samples_path = os.path.join(predict_dir, OutputFileName.all_top_samples_df)
+        pd.DataFrame(all_top_samples).to_csv(top_samples_path, index=False)
+        logger.info(f"Saved {len(all_top_samples)} top samples to {top_samples_path}")

@@ -532,6 +532,10 @@ def create_synthetic_databatch(
     device: torch.device,
     motif_fraction: float = 0.25,
     seed: Optional[int] = None,
+    # TreePlan timing params (use None to use TreePlan.generate defaults)
+    split_time_beta: Optional[tuple[float, float]] = None,
+    delete_time_beta: Optional[tuple[float, float]] = None,
+    max_indel_time: Optional[float] = None,
 ) -> DataBatch:
     """
     Create synthetic DataBatch for corruption analysis.
@@ -560,11 +564,21 @@ def create_synthetic_databatch(
     res_bfactor = torch.zeros(B, N, device=device)
     res_plddt = torch.full((B, N), 90.0, device=device)
 
-    # Generate tree plans
+    # Generate tree plans with optional timing overrides
+    tree_kwargs = {}
+    if split_time_beta is not None:
+        tree_kwargs["split_time_beta"] = split_time_beta
+    if delete_time_beta is not None:
+        tree_kwargs["delete_time_beta"] = delete_time_beta
+    if max_indel_time is not None:
+        tree_kwargs["max_indel_time"] = max_indel_time
+
     tree_plans = []
     for b in range(B):
         plan_seed = None if seed is None else int(seed) + int(b)
-        plan = TreePlan.generate(motif_mask=motif_mask[b].cpu(), seed=plan_seed)
+        plan = TreePlan.generate(
+            motif_mask=motif_mask[b].cpu(), seed=plan_seed, **tree_kwargs
+        )
         tree_plans.append(plan)
 
     tree = BatchedTreePlan.collate(tree_plans).to(device)

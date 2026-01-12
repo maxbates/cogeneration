@@ -16,7 +16,12 @@ from cogeneration.data.motif_guidance import (
 from cogeneration.data.motif_guidance import motif_potential_window
 from cogeneration.data.potentials import PotentialField
 from cogeneration.data.rigid import batch_center_of_mass
-from varco.config import VarcoHazardConfig, VarcoHazardKind, VarcoInterpolantConfig
+from varco.config import (
+    VarcoHazardConfig,
+    VarcoHazardKind,
+    VarcoInterpolantConfig,
+    VarcoInterpolantSamplingConfig,
+)
 from varco.coupling import Coupler
 from varco.coupling_aatypes import AATypesCoupler, AATypesCoupling
 from varco.coupling_rots import RotationCoupler, RotationCoupling
@@ -574,10 +579,8 @@ class TreeInterpolant:
         valid_mask: torch.Tensor,  # (B, P) bool
         t_val: float,  # current time
         dt: float,
-        split_hazard: VarcoHazardConfig,
-        delete_hazard: VarcoHazardConfig,
+        cfg: VarcoInterpolantSamplingConfig,
         pred_split_pooled_log1p_mass: Optional[torch.Tensor] = None,  # (B,)
-        indel_sharpness: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample insert/delete/substitute events for present positions in a batch.
@@ -601,6 +604,9 @@ class TreeInterpolant:
         t = max(eps, min(1.0 - eps, float(t_val)))
         t_next = min(1.0 - eps, t + float(dt))
 
+        split_hazard = cfg.split_hazard
+        delete_hazard = cfg.delete_hazard
+
         # Compute survival function S(t) = 1 - H(t) for the split hazard
         S_t = TreeInterpolant.compute_hazard_survival(t, split_hazard)
 
@@ -618,9 +624,9 @@ class TreeInterpolant:
             pooled_total = pooled_mass * S_t  # (B,)
             # if per-token sum exceeds pooled, scale down
             scale = pooled_total / token_sum.clamp_min(0.1)  # (B,)
-            # allow up to 10% over-prediction before scaling kicks in
+            # allow up to 20% over-prediction before scaling kicks in
             # and cap at 10x scale down
-            scale = scale.clamp(min=0.1, max=1.1)
+            scale = scale.clamp(min=0.1, max=1.2)
             split_rate = split_rate * scale.unsqueeze(1)  # (B, P)
 
         # I_split = integral_t^{t_next} g(u) du, closed form for each hazard
@@ -676,6 +682,21 @@ class TreeInterpolant:
         p_del = (1.0 - (numer / denom)).clamp(0.0, 0.95)
 
         # Apply sharpening: p^gamma suppresses low-confidence predictions.
+        # Optional late-time schedule:
+        #   gamma(t) = base + late_delta * ramp(t_next)^late_power
+        #   ramp(u) = clip((u - start) / (1 - start), 0, 1)
+        indel_sharpness = cfg.indel_sharpness
+        if (
+            cfg.indel_sharpness_late_delta != 0.0
+            and cfg.indel_sharpness_late_start_t < 1.0
+        ):
+            start_t = cfg.indel_sharpness_late_start_t
+            denom = max(eps, 1.0 - start_t)
+            ramp = (float(t_next) - start_t) / denom
+            ramp = float(max(0.0, min(1.0, ramp)))
+            ramp = ramp ** float(max(1.0, cfg.indel_sharpness_late_power))
+            indel_sharpness += cfg.indel_sharpness_late_delta * ramp
+
         if indel_sharpness != 1.0:
             p_ins = p_ins.pow(indel_sharpness)
             p_del = p_del.pow(indel_sharpness)
@@ -776,10 +797,10 @@ class TreeInterpolant:
                 if traj_frames is None or step_num % traj_frames == 0:
                     traj.pred.append(pred.to(device=torch.device("cpu")))
 
-                # Log motif guidance metrics if debug enabled
+                # Log and save motif guidance metrics if debug enabled
                 if metrics is not None:
+                    traj.metrics.append(metrics)
                     pbar.write(metrics.to_str())
-                    pbar.set_postfix_str(metrics.to_postfix())
 
             # Euler steps for domains
 
@@ -827,10 +848,8 @@ class TreeInterpolant:
                 valid_mask=scaffold_mask,
                 t_val=t_val,
                 dt=dt,
-                split_hazard=self.cfg.sampling.split_hazard,
-                delete_hazard=self.cfg.sampling.delete_hazard,
+                cfg=self.cfg.sampling,
                 pred_split_pooled_log1p_mass=pred.pred_split_pooled_log1p_mass,
-                indel_sharpness=self.cfg.sampling.indel_sharpness,
             )
 
             # Enforce max_length: block insertions once we're at the limit
@@ -897,6 +916,9 @@ class TreeInterpolant:
                 probs = (
                     1.0 - self.cfg.aatypes_coupler.noise_scale
                 ) * probs + self.cfg.aatypes_coupler.noise_scale * uniform_dist
+                if K > MASK_TOKEN_INDEX:
+                    probs[..., MASK_TOKEN_INDEX] = 0.0
+                    probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
                 # Sample from noisy distribution
                 sampled_tokens = torch.multinomial(
@@ -946,10 +968,8 @@ class TreeInterpolant:
             valid_mask=batch.valid_mask & ~batch.motif_mask,
             t_val=t_val,
             dt=1.0 - t_val,
-            split_hazard=self.cfg.sampling.split_hazard,
-            delete_hazard=self.cfg.sampling.delete_hazard,
+            cfg=self.cfg.sampling,
             pred_split_pooled_log1p_mass=None,
-            indel_sharpness=self.cfg.sampling.indel_sharpness,
         )
         if final_deletions.any():
             zeros = torch.zeros_like(final_deletions)

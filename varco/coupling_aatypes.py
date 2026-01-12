@@ -37,6 +37,34 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
     ):
         self.cfg = cfg
 
+    def _aa_only_renormalize(
+        self,
+        probs: torch.Tensor,  # (..., K)
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """
+        Renormalize probabilities over amino-acid tokens only (exclude MASK_TOKEN_INDEX).
+
+        If a row has (near-)zero AA mass, falls back to uniform over AA tokens.
+        """
+        if probs.shape[-1] != self.K:
+            raise ValueError(
+                f"Expected probs last dim K={self.K}; got shape {tuple(probs.shape)}"
+            )
+
+        out = probs.clone()
+        out[..., MASK_TOKEN_INDEX] = 0.0
+
+        row_sum = out.sum(dim=-1, keepdim=True)
+        has_mass = row_sum > eps
+
+        uniform_aa = torch.ones_like(out)
+        uniform_aa[..., MASK_TOKEN_INDEX] = 0.0
+        uniform_aa = uniform_aa / uniform_aa.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+        out = torch.where(has_mass, out / row_sum.clamp_min(eps), uniform_aa)
+        return out
+
     def sample_base(
         self,
         motif_mask: torch.Tensor,  # (B, N) bool
@@ -48,8 +76,8 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
         Preserves motif sequences and samples random sequences for scaffolds.
         """
         B, N = motif_mask.shape
-        # Sample uniform random amino acids for all positions
-        x0 = uniform_categorical(B, N, num_tokens=self.K, device=device)
+        # Sample uniform random amino acids for all positions (exclude MASK token).
+        x0 = uniform_categorical(B, N, num_tokens=NUM_TOKENS, device=device)
         # Preserve motif sequences from x1
         x0 = torch.where(motif_mask, x1, x0)
         return x0
@@ -358,6 +386,7 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
 
         # Softmax with temperature
         probs = F.softmax(logits / self.cfg.drift_temp, dim=-1)  # (B, P, K)
+        probs = self._aa_only_renormalize(probs)
 
         # Uncertainty gating
         uncertainty = self._uncertainty_gate(x_t, probs)  # (B, P)
@@ -386,8 +415,12 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
             ).view(B, 1, 1)
             noise_weight = float(self.cfg.noise_scale) * dt * sigma_t.square()
 
-            # Uniform over non-current tokens
+            # Uniform over non-current AA tokens (exclude MASK).
             uniform_noise = (1.0 - current_onehot) / max(K - 1, 1)
+            uniform_noise[..., MASK_TOKEN_INDEX] = 0.0
+            uniform_noise = uniform_noise / uniform_noise.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-12)
             step_probs = step_probs + noise_weight * uniform_noise
 
         # Cap leave mass
@@ -408,6 +441,12 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
         stay_dist = current_onehot  # (B, P, K)
         step_probs = torch.where(valid_mask.unsqueeze(-1), step_probs, stay_dist)
 
+        # For valid positions, MASK is not a valid residue state.
+        step_probs = torch.where(
+            valid_mask.unsqueeze(-1),
+            self._aa_only_renormalize(step_probs),
+            step_probs,
+        )
         return step_probs
 
     def _ctmc_step_probs(
@@ -429,11 +468,7 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
 
         # Endpoint distribution q_end from logits (optionally tempered).
         q_end = F.softmax(logits / float(self.cfg.drift_temp), dim=-1)  # (B, P, K)
-
-        # Disallow MASK token as an endpoint target, matching the loss convention.
-        q_end_masked = q_end.clone()
-        q_end_masked[:, :, MASK_TOKEN_INDEX] = 0.0
-        q_end = q_end_masked / q_end_masked.sum(dim=-1, keepdim=True).clamp_min(eps)
+        q_end = self._aa_only_renormalize(q_end, eps=eps)
 
         # Uncertainty gating: suppress substitutions when q_end is confident about the current token.
         # This is heuristic (not part of the base CTMC model), but tends to stabilize sampling.
@@ -455,8 +490,9 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
                 0.0, 0.25
             )  # (B,)
             uniform = torch.ones_like(q_end) / K
+            uniform = self._aa_only_renormalize(uniform, eps=eps)
             q_end = (1.0 - mix.view(B, 1, 1)) * q_end + mix.view(B, 1, 1) * uniform
-            q_end = q_end / q_end.sum(dim=-1, keepdim=True).clamp_min(eps)
+            q_end = self._aa_only_renormalize(q_end, eps=eps)
 
         # h_t(x) = sum_y P_{x,y}(1-t) q_end(y), computed in closed form for uniform substitution.
         delta_end = (1.0 - t).clamp_min(0.0).view(B, 1, 1)  # (B, 1, 1)
@@ -493,6 +529,24 @@ class AATypesCoupler(Coupler[AATypesCoupling]):
         # For invalid positions: stay put.
         stay_dist = current_onehot
         step_probs = torch.where(valid_mask.unsqueeze(-1), step_probs, stay_dist)
+
+        # For valid positions, MASK is not a valid residue state (prevents "all-mask" degeneration).
+        step_probs = torch.where(
+            valid_mask.unsqueeze(-1),
+            self._aa_only_renormalize(step_probs, eps=eps),
+            step_probs,
+        )
+
+        # If a position is valid but currently MASK, force an immediate unmask to AA-only.
+        is_mask = x_t == MASK_TOKEN_INDEX  # (B, P)
+        force_unmask = valid_mask & is_mask  # (B, P)
+        if force_unmask.any():
+            q_end_aa = q_end  # already AA-only
+            step_probs = torch.where(
+                force_unmask.unsqueeze(-1),
+                q_end_aa,
+                step_probs,
+            )
         return step_probs
 
     def euler_step(

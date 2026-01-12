@@ -48,7 +48,23 @@ class ProteinDataset(BaseDataset):
         res_bfactor = feats[bp.res_bfactor]
         res_plddt = feats[bp.res_plddt]
 
-        tree_plan = TreePlan.generate(motif_mask=motif_mask)
+        # Generate tree plan with timing parameters from config
+        tree_cfg = self.cfg.tree_plan
+        tree_plan = TreePlan.generate(
+            motif_mask=motif_mask,
+            split_time_beta=(
+                tree_cfg.split_time_beta_alpha,
+                tree_cfg.split_time_beta_beta,
+            ),
+            delete_time_beta=(
+                tree_cfg.delete_time_beta_alpha,
+                tree_cfg.delete_time_beta_beta,
+            ),
+            max_indel_time=tree_cfg.max_indel_time,
+            min_scaffold_nuclei=tree_cfg.min_scaffold_nuclei,
+            max_scaffold_nuclei=tree_cfg.max_scaffold_nuclei,
+            p_deletion=tree_cfg.p_deletion,
+        )
         tree_plan.validate()
 
         return DataSample(
