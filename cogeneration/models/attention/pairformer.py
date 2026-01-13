@@ -1,5 +1,6 @@
 # Adapted from Boltz-2
 
+import warnings
 from typing import Optional, Tuple
 
 import torch
@@ -17,6 +18,15 @@ from cogeneration.models.attention.triangular_attention import (
 from cogeneration.models.attention.triangular_mult import (
     TriangleMultiplicationIncoming,
     TriangleMultiplicationOutgoing,
+)
+
+# Suppress cuequivariance float32 cast warning
+# still faster to use bf16 and cast as needed
+warnings.filterwarnings(
+    "ignore",
+    message=".*Non-SM100f kernel expects bias to be float32.*",
+    category=UserWarning,
+    module="cuequivariance_ops_torch",
 )
 
 # chunking constant

@@ -89,7 +89,7 @@ def motif_potential_window(
     window = (t >= start_t).float() * (t <= end_t).float()  # (B,)
 
     # Optional linear fade-out: decay to 0 as t -> end_t
-    if cfg.var_decay:
+    if cfg.guidance_decay:
         fade = (1.0 - t / max(end_t, 1e-6)).clamp(min=0.0)
         window = window * fade
 

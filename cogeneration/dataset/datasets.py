@@ -291,8 +291,6 @@ class BaseDataset(Dataset):
         """
         # length (post trim) is specified by the modeled length column
         length_column = cfg.modeled_trim_method.to_dataset_column()
-        # Fix a random seed to get the same split each time.
-        fixed_seed = 123
 
         assert (
             length_column in metadata.columns
@@ -320,7 +318,7 @@ class BaseDataset(Dataset):
 
         # Pick subset per length, sort shorter first
         eval_csv = eval_csv.groupby(length_column).sample(
-            cfg.samples_per_eval_length, replace=True, random_state=fixed_seed
+            cfg.samples_per_eval_length, replace=True, random_state=cfg.seed
         )
         eval_csv = eval_csv.sort_values(length_column, ascending=True)
 

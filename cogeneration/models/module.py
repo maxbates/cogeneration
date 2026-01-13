@@ -678,7 +678,7 @@ class FlowModule(LightningModule):
         return batch_metrics_df
 
     def predict_step(
-        self, batch: InferenceFeatures, batch_idx: Any, show_progress: bool = False
+        self, batch: InferenceFeatures, batch_idx: Any, show_progress: bool = True
     ) -> Optional[pd.DataFrame]:
         task = self.cfg.inference.task
         res_mask = batch[bp.res_mask]
@@ -719,18 +719,16 @@ class FlowModule(LightningModule):
             sample_dirs = [
                 os.path.join(
                     self.inference_dir,
-                    f"length_{sample_length}",
-                    f"sample_{str(sample_id)}",
+                    f"{sample_length}_{str(sample_id)}_{batch_idx}",
                 )
                 for sample_id in sample_ids
             ]
         elif task == InferenceTask.inpainting:
-            # For inpainting, we take a known PDB, but may alter its scaffold lengths
+            # For inpainting, we take a known PDB, but *may* alter its scaffold lengths
             sample_dirs = [
                 os.path.join(
                     self.inference_dir,
-                    sample_pdb_name,
-                    f"{sample_length}_{str(sample_id)}",
+                    f"{sample_length}_{sample_pdb_name}_{str(sample_id)}_{batch_idx}",
                 )
                 for sample_id in sample_ids
             ]
@@ -738,14 +736,14 @@ class FlowModule(LightningModule):
             sample_dirs = [
                 os.path.join(
                     self.inference_dir,
-                    f"length_{sample_length}",
-                    sample_pdb_name,
+                    f"{sample_length}_{sample_pdb_name}_{batch_idx}",
                 )
             ]
         elif task == InferenceTask.inverse_folding:
             sample_dirs = [
                 os.path.join(
-                    self.inference_dir, f"length_{sample_length}", sample_pdb_name
+                    self.inference_dir,
+                    f"{sample_length}_{sample_pdb_name}_{batch_idx}",
                 )
             ]
         else:
@@ -840,8 +838,10 @@ class FlowModule(LightningModule):
         for i in range(aa_trajs.shape[0]):  # samples
             for j in range(aa_trajs.shape[2]):  # positions
                 if aa_trajs[i, -1, j] == MASK_TOKEN_INDEX:
-                    self._log.info("WARNING mask in predicted AA")
-                    aa_trajs[i, -1, j] = 0
+                    is_motif_pos = motif_mask[i, j] if motif_mask is not None else False
+                    if not is_motif_pos:
+                        self._log.info(f"WARNING mask in predicted AA pos={j}")
+                        aa_trajs[i, -1, j] = 0
 
         all_top_sample_metrics = []
         for i, sample_id in zip(range(num_batch), sample_ids):
@@ -875,6 +875,7 @@ class FlowModule(LightningModule):
                 write_animations=self.cfg.inference.write_animations,
                 animation_max_frames=self.cfg.inference.animation_max_frames,
                 animation_take_last_frames=self.cfg.inference.animation_take_last_frames,
+                bypass_assessment_entirely=self.cfg.inference.bypass_assessment,
             )
 
             all_top_sample_metrics.append(top_sample_metrics)
@@ -904,6 +905,7 @@ class FlowModule(LightningModule):
         animation_max_frames: int = 50,
         animation_take_last_frames: int = 1,
         n_inverse_folds: Optional[int] = None,
+        bypass_assessment_entirely: bool = False,
     ) -> Tuple[Dict[str, Any], SavedTrajectory, SavedFoldingValidation]:
         """
         Takes a single sample.
@@ -974,6 +976,15 @@ class FlowModule(LightningModule):
         )
         time_to_save_trajectory = time.time() - start_time
 
+        if bypass_assessment_entirely:
+            self._log.info(
+                f"save_trajectory={time_to_save_trajectory:.2f}s. Bypassing folding validation."
+            )
+            sample_metrics = {
+                "sample_id": sample_id,
+            }
+            return sample_metrics, saved_trajectory_files, None
+
         top_sample_metrics, folding_validation_paths = (
             self.folding_validator.assess_sample(
                 task=task,
@@ -996,7 +1007,7 @@ class FlowModule(LightningModule):
         time_to_assess_sample = time.time() - start_time
 
         self._log.info(
-            f"Sample Metric timing: save_trajectory={time_to_save_trajectory:.2f}s, assess_sample={time_to_assess_sample:.2f}s"
+            f"save_trajectory={time_to_save_trajectory:.2f}s, assess_sample={time_to_assess_sample:.2f}s"
         )
 
         return top_sample_metrics, saved_trajectory_files, folding_validation_paths
@@ -1032,7 +1043,9 @@ class FlowModule(LightningModule):
         all_json_paths = glob.glob(
             os.path.join(output_dir, json_file_glob), recursive=True
         )
-        assert len(all_json_paths) > 0, f"No top samples JSONs found in {output_dir}"
+        if len(all_json_paths) == 0:
+            self._log.error(f"No top samples JSONs found in {output_dir}")
+            return None, None
 
         def read_json(p):
             with open(p, "r") as f:

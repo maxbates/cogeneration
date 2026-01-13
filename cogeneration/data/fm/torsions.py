@@ -112,11 +112,12 @@ class FlowMatcherTorsions(FlowMatcher):
 
         # optionally add intermediate noise
         stochasticity_scale = stochasticity_scale.to(t.device).view(-1)  # (B,)
-        if (stochasticity_scale > 0).any():
+        if (stochasticity_scale > 0.0).any():
             # Brownian increment: sigma_t * sqrt(dt)
             sigma_t = self._compute_sigma_t(
                 tau,
                 scale=stochasticity_scale,
+                end_t=self.cfg.stochastic_end_t,
             )
             sqrt_dt = torch.sqrt(d_t.to(sigma_t.device))
             sigma_t = sigma_t * sqrt_dt

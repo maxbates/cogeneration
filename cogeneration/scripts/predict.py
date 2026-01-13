@@ -17,8 +17,15 @@ from cogeneration.scripts.utils_ddp import DDPInfo, setup_ddp
 from cogeneration.type.task import InferenceTask
 from cogeneration.util.log import rank_zero_logger
 
+logger = rank_zero_logger(__name__)
+
 torch.set_float32_matmul_precision("high")
-log = rank_zero_logger(__name__)
+torch.multiprocessing.set_sharing_strategy("file_system")
+
+# Enable memory-efficient attention backends in PyTorch when available
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 
 class EvalRunner:
@@ -42,14 +49,14 @@ class EvalRunner:
             raise ValueError(f"Unknown task {cfg.inference.task}")
 
         # Merge the checkpoint config into the current config
-        log.info(f"Loading checkpoint from {ckpt_path}")
+        logger.info(f"🚩 Loading checkpoint from {ckpt_path}")
         merged_cfg, merged_ckpt_path = self._input_cfg.merge_checkpoint_cfg(
             ckpt_path=ckpt_path,
             preserve_inference_cfg=True,
         )
         self.cfg = merged_cfg
         if merged_ckpt_path != ckpt_path:
-            log.info(f"Checkpoint path changed to {merged_ckpt_path}")
+            logger.info(f"Checkpoint path changed to {merged_ckpt_path}")
             ckpt_path = merged_ckpt_path
 
         local_rank = DDPInfo.from_env().local_rank
@@ -66,12 +73,12 @@ class EvalRunner:
         # Set-up output directory only on rank 0, including writing `config.yaml`
         if local_rank == 0:
             inference_dir = self.setup_inference_dir(ckpt_path)
-            log.info(f"Saving results to {inference_dir}")
+            logger.info(f"💾 Saving results to {inference_dir}")
             self.cfg.inference.predict_dir = inference_dir
             config_path = os.path.join(inference_dir, "config.yaml")
             with open(config_path, "w") as f:
                 OmegaConf.save(config=self.cfg, f=f)
-            log.info(f"Saving inference config to {config_path}")
+            logger.info(f"Saving inference config to {config_path}")
 
         # Read checkpoint and initialize module
         try:
@@ -80,10 +87,10 @@ class EvalRunner:
                 cfg=self.cfg,
             )
         except Exception as e:
-            log.error(f"Failed to load checkpoint {ckpt_path}: {e}")
+            logger.error(f"Failed to load checkpoint {ckpt_path}: {e}")
             raise e
         self._flow_module.folding_validator.set_device_id(0)
-        log.info("\n" + str(ModelSummary(self._flow_module, max_depth=2)))
+        logger.info("\n" + str(ModelSummary(self._flow_module, max_depth=2)))
         self._flow_module.eval()
 
     @property
@@ -132,7 +139,7 @@ class EvalRunner:
             return self._trainer
 
         devices = get_available_device(device_limit=self.cfg.experiment.num_devices)
-        log.info(f"Using devices: {devices}")
+        logger.info(f"Using devices: {devices}")
 
         self._trainer = Trainer(
             **self.cfg.experiment.trainer.asdict(),
@@ -143,7 +150,7 @@ class EvalRunner:
 
     @print_timing
     def run_sampling(self):
-        log.info(f"Evaluating {self.cfg.inference.task}")
+        logger.info(f"Evaluating {self.cfg.inference.task}")
 
         self.trainer.predict(
             model=self._flow_module,
@@ -152,12 +159,15 @@ class EvalRunner:
 
     @print_timing
     def compute_metrics(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        log.info(f"Calculating metrics for samples in {self.inference_dir}")
+        logger.info(f"Calculating metrics for samples in {self.inference_dir}")
 
         top_samples_df, top_samples_path = self._flow_module.concat_all_top_samples(
             output_dir=self.inference_dir,
             is_inference=True,
         )
+        if top_samples_df is None:
+            return None, None
+
         top_metrics_df, top_metrics_path = (
             self._flow_module.folding_validator.assess_all_top_samples(
                 task=self.cfg.inference.task,
@@ -171,7 +181,7 @@ class EvalRunner:
 
 @hydra.main(version_base=None, config_path="../config", config_name="base")
 def run(cfg: Config) -> None:
-    log.info(f"Starting inference, using {cfg.inference.num_gpus} GPUs")
+    logger.info(f"Starting inference, using {cfg.inference.num_gpus} GPUs")
 
     cfg = OmegaConf.to_object(cfg)
     cfg = cfg.interpolate()

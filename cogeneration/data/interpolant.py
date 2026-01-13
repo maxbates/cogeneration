@@ -867,7 +867,7 @@ class Interpolant:
         rotmats_1: Optional[torch.Tensor] = None,
         torsions_1: Optional[torch.Tensor] = None,
         aatypes_1: Optional[torch.Tensor] = None,
-        # optionally override stochasticity_scale, 0.0 to disable for this `sample()`.
+        # optionally override cfg.sampling.stochasticity_scale, 0.0 to disable for this `sample()`
         # stochasticity for each domain must be enabled in cfg; this scales those values
         stochastic_scale: Optional[Union[float, torch.Tensor]] = None,
         structure_method: StructureExperimentalMethod = StructureExperimentalMethod.XRAY_DIFFRACTION,
@@ -878,7 +878,7 @@ class Interpolant:
         # Optional override for FK steering particles; set to 0 to disable
         num_particles: Optional[int] = None,
         # progress bar
-        show_progress: bool = False,
+        show_progress: bool = True,
     ) -> Tuple[SamplingTrajectory, SamplingTrajectory, Optional[FKSteeringTrajectory]]:
         """
         Generate samples by interpolating towards model predictions.
@@ -968,8 +968,9 @@ class Interpolant:
 
         # Build per-sample stochasticity tensor (B,)
         if stochastic_scale is None:
-            stochastic_scale_tensor = torch.ones(num_batch, device=self._device)
-        elif isinstance(stochastic_scale, float):
+            stochastic_scale = self.cfg.sampling.stochastic_scale
+
+        if isinstance(stochastic_scale, float):
             stochastic_scale_tensor = (
                 torch.tensor([float(stochastic_scale)], device=self._device)
                 .expand(num_batch)
@@ -978,7 +979,9 @@ class Interpolant:
         elif isinstance(stochastic_scale, torch.Tensor):
             stochastic_scale_tensor = stochastic_scale.to(self._device).view(-1)
             if stochastic_scale_tensor.shape[0] != num_batch:
-                stochastic_scale_tensor = stochastic_scale_tensor.expand(num_batch)
+                stochastic_scale_tensor = stochastic_scale_tensor.expand(
+                    num_batch
+                ).float()
         else:
             raise ValueError(
                 f"Unknown stochasticity_scale type: {type(stochastic_scale)}"

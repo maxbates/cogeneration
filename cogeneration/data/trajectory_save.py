@@ -62,6 +62,8 @@ def _get_anim_writer() -> Tuple[str, matplotlib.animation.AbstractMovieWriter]:
             fps=10,
             codec="libx264",
             extra_args=[
+                "-vf",
+                "pad=ceil(iw/2)*2:ceil(ih/2)*2",  # libx264 yuv420p requires even dimensions
                 "-pix_fmt",
                 "yuv420p",
                 "-movflags",
@@ -765,7 +767,7 @@ def animate_trajectories(
     def update(timestep):
         # timestep in protein trajectory == timestep - 1 in model trajectory
         t = float(timestep) / (num_timesteps - 1)
-        title_text.set_text(f"t = {t:.2f}")
+        title_text.set_text(f"t = {t:.3f}")
 
         _update_seq_artists(
             sample_aa_traj[timestep],
@@ -1152,6 +1154,8 @@ def save_trajectory(
             fk_steering_traj=fk_steering_traj,
         )
         log_time("trajectory animation")
+
+    logger.info(f"💾 Saved trajectory to {output_dir}")
 
     return SavedTrajectory(
         sample_pdb_path=sample_pdb_path,

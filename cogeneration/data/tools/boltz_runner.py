@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 import uuid
+import warnings
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -52,6 +53,15 @@ from cogeneration.models.utils import get_model_size_str
 from cogeneration.type.dataset import DatasetProteinColumn, ProcessedFile
 from cogeneration.type.metrics import MetricName
 from cogeneration.util.log import rank_zero_logger
+
+# Suppress PyTorch Lightning dataloader warnings
+warnings.filterwarnings(
+    "ignore",
+    message=".*does not have many workers.*",
+    category=UserWarning,
+    module="pytorch_lightning",
+)
+
 
 logger = rank_zero_logger(__name__)
 
@@ -957,9 +967,7 @@ class BoltzRunner(FoldingTool):
         self.trainer.callbacks = [writer]
 
         # Run prediction
-        logger.debug(
-            f"Running Boltz (native) prediction for {len(manifest.records)} records..."
-        )
+        logger.info(f"Running Boltz-2: {len(manifest.records)} structure(s)")
         self.trainer.predict(
             self.model,
             datamodule=data_module,

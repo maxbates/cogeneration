@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Union
+from typing import Any, Callable
 
 import torch
 
@@ -52,14 +52,22 @@ class FlowMatcher(ABC):
         t: torch.Tensor,  # (B,)
         scale: torch.Tensor,  # (B,) per-domain scale * per-batch-item stochasticity scale
         min_sigma: float = 0.0,
+        end_t: float = 1.0,  # time at which sigma should reach zero
     ) -> torch.Tensor:
         """
         Compute the instantaneous standard deviation of the noise at time t.
 
-        The standard deviation follows a sqrt-parabolic schedule that is zero at t=0 and t=1:
-            sigma(t) = sqrt(scale^2 * t * (1 - t) + min_sigma^2)
+        The standard deviation follows a sqrt-parabolic schedule that is zero at t=0 and t=end_t:
+            sigma(t) = sqrt(scale^2 * t' * (1 - t') + min_sigma^2)
+
+        where t' = t / end_t (clamped to [0, 1]).
         """
-        return torch.sqrt(scale**2 * t * (1 - t) + min_sigma**2)
+        if end_t >= 1.0:
+            return torch.sqrt(scale**2 * t * (1 - t) + min_sigma**2)
+
+        # Compressed parabolic: zero at t=0 and t=end_t
+        t_normalized = (t / end_t).clamp(max=1.0)
+        return torch.sqrt(scale**2 * t_normalized * (1 - t_normalized) + min_sigma**2)
 
     def time_training(self, t: torch.Tensor) -> torch.Tensor:
         """
@@ -74,6 +82,38 @@ class FlowMatcher(ABC):
         Base implementation is identity.
         """
         return t
+
+    def stabilized_endpoint(
+        self,
+        t: torch.Tensor,
+        target_1: torch.Tensor,
+        fix_t: float,
+        change_cap: float,
+        change_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Optionally stabilize endpoint predictions after fix_t by caching the last stable target.
+        Returns the target_1 tensor that should be used for the Euler step.
+        """
+        if change_cap <= 0.0 or fix_t >= 1.0:
+            return target_1
+
+        if t.max().item() <= fix_t:
+            self._cached_target_1 = None
+            return target_1
+
+        prev_target = getattr(self, "_cached_target_1", None)
+        if prev_target is None:
+            self._cached_target_1 = target_1.detach().clone()
+            return target_1
+
+        delta = change_fn(prev_target, target_1)
+        max_change = delta.max().item()
+        if max_change > change_cap:
+            return prev_target
+
+        self._cached_target_1 = target_1.detach().clone()
+        return target_1
 
     @abstractmethod
     def sample_base(self, *args: Any, **kwargs: Any) -> torch.Tensor:

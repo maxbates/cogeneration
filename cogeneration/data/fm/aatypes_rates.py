@@ -413,6 +413,7 @@ class FlowMatcherAATypesCTMC(FlowMatcherAATypes):
         sigma = self._compute_sigma_t(
             t=t,
             scale=stochasticity_scale,
+            end_t=self.cfg.stochastic_end_t,
         )
         sigma = sigma.clamp_min(0.0)  # (B,)
 

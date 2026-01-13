@@ -68,8 +68,8 @@ class FlowMatcherRotations(FlowMatcher):
             raise ValueError(f"Invalid schedule: {schedule}")
 
     def _vf_scaling(self, t: torch.Tensor) -> torch.Tensor:
-        schedule = self.cfg.sample_schedule
         """Euler step scaling for vector field under sample schedule."""
+        schedule = self.cfg.sample_schedule
         if schedule == InterpolantRotationsScheduleEnum.linear:
             return (1 / (1 - t)).clamp(min=1e-4)
         elif schedule == InterpolantRotationsScheduleEnum.exp:
@@ -80,9 +80,15 @@ class FlowMatcherRotations(FlowMatcher):
             denom = 1.0 - torch.exp(-r * (1.0 - t))
             denom = torch.clamp(denom, min=1e-8)
             scale = r / denom
-            return scale.clamp(min=1e-4)
+            return scale.clamp(min=1e-4, max=10.0)
         else:
             raise ValueError(f"Unknown sample schedule {schedule}")
+
+    def _endpoint_change(
+        self, prev_rotmats_1: torch.Tensor, rotmats_1: torch.Tensor
+    ) -> torch.Tensor:
+        delta = so3_utils.calc_rot_vf(mat_t=prev_rotmats_1, mat_1=rotmats_1)
+        return delta.norm(dim=-1)
 
     def time_training(self, t: torch.Tensor) -> torch.Tensor:
         return self._so3_time(t, schedule=self.cfg.train_schedule)
@@ -163,6 +169,14 @@ class FlowMatcherRotations(FlowMatcher):
         # tau required for noise sigma_t
         tau = self.time_sampling(t)
 
+        rotmats_1 = self.stabilized_endpoint(
+            t=t,
+            target_1=rotmats_1,
+            fix_t=self.cfg.fix_t,
+            change_cap=self.cfg.endpoint_change_cap_rad,
+            change_fn=self._endpoint_change,
+        )
+
         rot_vf = so3_utils.calc_rot_vf(mat_t=rotmats_t, mat_1=rotmats_1)
 
         if potential is not None:
@@ -171,13 +185,24 @@ class FlowMatcherRotations(FlowMatcher):
             ), f"potential {potential.shape} != rot_vf {rot_vf.shape}"
             rot_vf += potential
 
-        # scaled time along geodesic `t` -> `1`, broadcast over (N,3)
-        geodesic_time = (scaling * d_t)[:, None, None]
+        # Compute the actual rotation step before capping
+        # rot_step = rot_vf * geodesic_time, where geodesic_time = scaling * d_t
+        rot_step = rot_vf * (scaling * d_t)[:, None, None]
+
+        # Cap per-residue rotation step magnitude to prevent large jumps
+        # from guidance or numerical instability at late times (when scaling is large)
+        drift_step_cap = self.cfg.drift_step_cap_rad
+        if drift_step_cap > 0.0:
+            step_norm = rot_step.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            rot_step = rot_step * (drift_step_cap / step_norm).clamp(max=1.0)
+
+        # Apply the (possibly capped) rotation step via geodesic
+        # geodesic_t(t=1, rot_vf=rot_step) means: step by rot_step radians
         rotmats_next = so3_utils.geodesic_t(
-            t=geodesic_time,
+            t=torch.ones_like(scaling)[:, None, None],
             mat=rotmats_1,
             base_mat=rotmats_t,
-            rot_vf=rot_vf,
+            rot_vf=rot_step,
         )
 
         # optionally add intermediate noise
@@ -190,6 +215,7 @@ class FlowMatcherRotations(FlowMatcher):
             sigma_t = self._compute_sigma_t(
                 tau,
                 scale=stochasticity_scale,
+                end_t=self.cfg.stochastic_end_t,
             )
             # Per-batch Brownian increment: scale sigma_t by sqrt(dt)
             sqrt_dt = torch.sqrt(d_t).to(sigma_t.device)

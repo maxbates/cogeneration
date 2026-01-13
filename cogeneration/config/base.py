@@ -1,4 +1,5 @@
 import datetime
+import math
 import os
 import re
 from collections import OrderedDict
@@ -766,6 +767,8 @@ class InterpolantDomainConfig(BaseClassConfig):
     # stochastic paths
     stochastic: bool = "${shared.stochastic}"
     stochastic_noise_intensity: float = 1.0
+    # taper stochastic noise > end_t
+    stochastic_end_t: float = 1.0
 
 
 class InterpolantRotationsScheduleEnum(StrEnum):
@@ -787,7 +790,7 @@ class InterpolantRotationsConfig(InterpolantDomainConfig):
     # and initial noise (~igso3_sigma). If stochastic scale is small, lower.
     # If sigma_t > the minimum value in the grid,
     # it will map to the min std dev value, and be too large.
-    igso3_sigma_min: float = 1e-4
+    igso3_sigma_min: float = 1e-5
     igso3_sigma: float = 1.5
     train_schedule: InterpolantRotationsScheduleEnum = (
         InterpolantRotationsScheduleEnum.linear
@@ -797,7 +800,16 @@ class InterpolantRotationsConfig(InterpolantDomainConfig):
         InterpolantRotationsScheduleEnum.exp
     )
     exp_rate: float = 1.5  # 10 in public multiflow code
-    stochastic_noise_intensity: float = 1.5  # minor boost
+    stochastic_noise_intensity: float = 1.0
+    # Cap per-residue rotation drift step (radians) during sampling. 0.0 = disabled.
+    # Prevents large rotation jumps from guidance or numerical instability at late times.
+    drift_step_cap_rad: float = 0.0
+    # Endpoint fixing, can be helpful with stochastic paths. see also stochastic_end_t.
+    # Time after which endpoint predictions are stabilized during sampling. 1.0 to disable.
+    fix_t: float = 1.0
+    # Cap on how much the predicted endpoint can change between steps (radians) at t > fix_t.
+    # reject predicted rotmats_1 if changes > cap and use previous. 0.0 to disable.
+    endpoint_change_cap_rad: float = math.pi / 36
 
 
 class InterpolantTranslationsNoiseTypeEnum(StrEnum):
@@ -842,6 +854,11 @@ class InterpolantTranslationsConfig(InterpolantDomainConfig):
     # vpsde_bmax: variance-preserving SDE maximum
     vpsde_bmax: float = 20.0
     stochastic_noise_intensity: float = 1.5  # minor boost
+    # Endpoint fixing, can be helpful with stochastic paths. see also stochastic_end_t.
+    # Time after which endpoint predictions are stabilized during sampling. 1.0 to disable.
+    fix_t: float = 1.0
+    # Cap on per-residue endpoint change (Å) when stabilizing at late timesteps.
+    endpoint_change_cap_ang: float = 1.0
 
 
 @dataclass
@@ -954,9 +971,9 @@ class MotifGuidanceConfig(BaseClassConfig):
     guidance_start_t: float = 0.15
     guidance_end_t: float = 1.0
     # Optional linear fade-out: decay to 0 as t -> guidance_end_t
-    var_decay: bool = False
+    guidance_decay: bool = False
     # Cap for variance-based scale (prevents blow-ups near t=0)
-    var_scale_cap: float = 50.0
+    var_scale_cap: float = 20.0
     # Observation noise floors to prevent blow-up as variance -> 0
     # Increase floor to reduce late time guidance, or enable var decay
     # Translation: ~0.5 Angstrom, slightly above typical atomic uncertainty
@@ -971,6 +988,8 @@ class MotifGuidanceConfig(BaseClassConfig):
 class InterpolantSamplingConfig(BaseClassConfig):
     # training takes a random t. Sampling runs over t timestemps.
     num_timesteps: int = 400
+    # global stochastic scale for sampling (scales all domain stochasticities)
+    stochastic_scale: float = 1.0
 
 
 @dataclass
@@ -1586,17 +1605,15 @@ class InferenceSamplesConfig(BaseClassConfig):
 
     # Unconditional (length + index sampling)
     # Number of backbone samples per sequence length.
-    samples_per_length: int = 10
+    samples_per_length: int = 5
     # Subset of lengths to sample. If empty, sample all targets between min_length and max_length
-    length_subset: Optional[List[int]] = field(
-        default_factory=lambda: [70, 100, 200, 300]
-    )
+    length_subset: Optional[List[int]] = None
     # Minimum sequence length to sample.
     min_length: int = "${dataset.filter.min_num_res}"
     # Maximum sequence length to sample.
     max_length: int = "${dataset.filter.max_num_res}"
     # gap between lengths to sample, `range(min_length, max_length, length_step)`
-    length_step: int = 16
+    length_step: int = 8
     # Multimers - set `chain_idx` for 2+ chains, where each chain must be `min_length`
     multimer_fraction: float = 0.5
     multimer_min_length: int = 100
@@ -1628,8 +1645,11 @@ class InferenceConfig(BaseClassConfig):
     inpainting_ckpt_path: Optional[str] = str(PATH_PUBLIC_WEIGHTS / "last.ckpt")
 
     # validation
+    # Just run inference without assessment / folding validation.
+    # Still saves pred + trajectory. Skip all folding validation outputs.
+    bypass_assessment: bool = False
     # whether to also fold the generated pmpnn seq for each structure
-    also_fold_pmpnn_seq: bool = True
+    also_fold_pmpnn_seq: bool = False
     # whether to also save generation trajectory artifacts when sampling
     write_sample_trajectories: bool = True
     # whether to include animations, which are slow to generate (~10-15s for 50 frames)

@@ -1,0 +1,22 @@
+python cogeneration/scripts/predict.py \
+ inference.inpainting_ckpt_path=ckpt/cogeneration/inpainting_20251215_234525/20251215_234525/last.ckpt \
+ inference.interpolant.steering.num_particles=0 \
+ inference.interpolant.sampling.stochastic_scale=0.2 \
+ inference.interpolant.rots.stochastic_end_t=0.85 \
+ inference.interpolant.trans.stochastic_end_t=0.85 \
+ inference.interpolant.motif_guidance.enabled=True \
+ inference.interpolant.motif_guidance.var_scale_type=ot \
+ inference.interpolant.motif_guidance.guidance_decay=True \
+ inference.interpolant.motif_guidance.guidance_start_t=0.02 \
+ inference.interpolant.motif_guidance.guidance_end_t=0.90 \
+ inference.interpolant.motif_guidance.obs_noise_rot_rad=0.5 \
+ inference.interpolant.inpainting_unconditional_prop=0 \
+ inference.interpolant.codesign_inverse_fold_prop=0 \
+ dataset.filter.max_non_residue_entities=0 \
+ dataset.filter.max_coil_percent=0.3 \
+ dataset.filter.max_percent_residues_unknown=0.05 \
+ dataset.filter.num_chains=[1] \
+ dataset.filter.max_num_res=384 \
+ dataset.inpainting.scaffold_length_scale=1.0 \
+ inference.bypass_assessment=True \
+ shared.seed=23238

@@ -110,6 +110,11 @@ class FlowMatcherTrans(FlowMatcher):
         else:
             raise ValueError(f"Invalid sample schedule: {self.cfg.sample_schedule}")
 
+    def _endpoint_change(
+        self, prev_trans_1: torch.Tensor, trans_1: torch.Tensor
+    ) -> torch.Tensor:
+        return (trans_1 - prev_trans_1).norm(dim=-1)
+
     def corrupt(
         self,
         trans_1: torch.Tensor,  # (B, N, 3)
@@ -170,6 +175,13 @@ class FlowMatcherTrans(FlowMatcher):
         potential: Optional[torch.Tensor] = None,  # (B, N, 3) VF
     ) -> torch.Tensor:
         tau = self.time_sampling(t)
+        trans_1 = self.stabilized_endpoint(
+            t=t,
+            target_1=trans_1,
+            fix_t=self.cfg.fix_t,
+            change_cap=self.cfg.endpoint_change_cap_ang,
+            change_fn=self._endpoint_change,
+        )
         trans_vf = self.vector_field(t=tau, trans_1=trans_1, trans_t=trans_t)
 
         # optionally add intermediate noise
@@ -182,6 +194,7 @@ class FlowMatcherTrans(FlowMatcher):
             sigma_t = self._compute_sigma_t(
                 tau,
                 scale=stochasticity_scale,
+                end_t=self.cfg.stochastic_end_t,
             )
             sigma_t = sigma_t.to(trans_t.device)
             # Per-batch Brownian increment scales with sqrt(dt)

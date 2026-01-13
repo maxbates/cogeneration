@@ -584,7 +584,7 @@ class SO3LookupCache:
             # Load data and convert to torch tensors.
             npz_data = np.load(self.cache_path)
             torch_dict = {f: torch.from_numpy(npz_data[f]) for f in npz_data.files}
-            logger.info(f"Data loaded from {self.cache_path}")
+            logger.debug(f"Data loaded from {self.cache_path}")
             return torch_dict
         else:
             raise ValueError(f"No cache data found at {self.cache_path}.")
