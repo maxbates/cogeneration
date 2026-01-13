@@ -48,4 +48,4 @@ Varco depends on the same environment setup as the main repository; follow `inst
 
 ## Attribution
 
-This subproject is inspired by Branching Flows https://arxiv.org/abs/2511.09465 (only available in Julia, and I don't believe it supported Multiflow-style discrete + euclidean + SO(3) process simultaneously)
+This subproject is inspired by Branching Flows https://arxiv.org/abs/2511.09465 (only available in Julia)

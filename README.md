@@ -9,7 +9,7 @@ Only a small model has been trained. Many features can be also exercised while u
 
 ## Variable length Cogeneration (varco)
 
-Note: see `/varco` which extends cogeneration (with a reduced feature set) to variable length motif scaffolding
+Note: see [/varco](varco) which extends cogeneration (with a reduced feature set) to variable length motif scaffolding
 
 ## Features
 

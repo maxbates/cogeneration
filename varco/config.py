@@ -70,11 +70,15 @@ class VarcoDatasetConfig(DatasetConfig):
             dist_noise_ang=0.25,
         )
     )
-    inpainting: DatasetInpaintingConfig = field(default_factory=lambda: DatasetInpaintingConfig(
-        strategy=DatasetInpaintingMotifStrategy.single_motif,
-        min_percent_motifs=0.40,
-        max_percent_motifs=0.80,
-    ))
+    inpainting: DatasetInpaintingConfig = field(
+        default_factory=lambda: DatasetInpaintingConfig(
+            strategy=DatasetInpaintingMotifStrategy.variable_motifs,
+            min_num_motifs=1,
+            max_num_motifs=3,
+            min_percent_motifs=0.40,
+            max_percent_motifs=0.80,
+        )
+    )
     tree_plan: VarcoTreePlanConfig = field(default_factory=VarcoTreePlanConfig)
 
 
@@ -147,7 +151,7 @@ class VarcoInterpolantRotationCouplerConfig(VarcoInterpolantCouplerConfig):
     """Configuration for rotation coupler (SO(3) geodesic bridge with IGSO3 noise)."""
 
     # IGSO3 sigma range for sampling
-    igso3_sigma_min: float = 1e-4
+    igso3_sigma_min: float = 1e-5
     igso3_sigma_max: float = 1.5
     # Cap per-residue rotation drift step (radians) during sampling.
     drift_step_cap_rad: float = math.pi / 3
@@ -276,8 +280,8 @@ class VarcoInferencePlotConfig(BaseClassConfig):
     max_frames: Optional[int] = 50
     max_samples: int = 2
     max_cols: int = 2
-    only_alpha_carbons: bool = True
-    show_residue_letters: bool = True
+    only_alpha_carbons: bool = False
+    show_residue_letters: bool = False
     color_by: VarcoPlotColorBy = VarcoPlotColorBy.auto
 
 

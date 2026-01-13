@@ -1,0 +1,24 @@
+python varco/predict.py \
+ inference.ckpt_path=ckpt/varco/inpainting_20260110_222619/20260110_222619/last.ckpt \
+ inference.folding_validation.enabled=False \
+ inference.folding_validation.max_batches=1000 \
+ interpolant.trans_coupler.noise_scale=0.2 \
+ interpolant.trans_coupler.noise_end_t=0.85 \
+ interpolant.rotation_coupler.noise_end_t=0.2 \
+ interpolant.rotation_coupler.noise_end_t=0.85 \
+ interpolant.motif_guidance.enabled=True \
+ interpolant.motif_guidance.var_scale_type=ot \
+ interpolant.motif_guidance.guidance_decay=True \
+ interpolant.motif_guidance.guidance_start_t=0.02 \
+ interpolant.motif_guidance.guidance_end_t=0.90 \
+ interpolant.motif_guidance.obs_noise_rot_rad=0.5 \
+ interpolant.sampling.indel_sharpness=1.0 \
+ dataset.filter.max_non_residue_entities=0 \
+ dataset.filter.min_plddt=0.9 \
+ dataset.filter.max_coil_percent=0.3 \
+ dataset.filter.max_percent_residues_unknown=0.05 \
+ dataset.filter.num_chains=[1] \
+ dataset.filter.max_num_res=384 \
+ dataset.inpainting.strategy=variable_motifs \
+ dataset.inpainting.scaffold_length_scale=1.0 \
+ shared.seed=2935
