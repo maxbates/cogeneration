@@ -1601,7 +1601,9 @@ class InferenceSamplesConfig(BaseClassConfig):
     # Batch size when sampling from the model
     num_batch: int = 1
 
-    # Conditional (partial PDB data)
+    # Override to use VHH-specific inpainting dataset with fixed CDR scaffolds.
+    use_vhh_dataset: bool = False
+    vhh_pdb_ids: Optional[List[str]] = None
 
     # Unconditional (length + index sampling)
     # Number of backbone samples per sequence length.

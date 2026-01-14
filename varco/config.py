@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 from hydra.core.config_store import ConfigStore
 
@@ -299,6 +299,7 @@ class VarcoInferenceConfig(BaseClassConfig):
     predict_dir: str = "varco/outputs/${shared.id}"
     ckpt_path: Optional[str] = None
     inference_subdir: str = "predict"
+    use_vhh_dataset: bool = False
     plot: VarcoInferencePlotConfig = field(default_factory=VarcoInferencePlotConfig)
     folding_validation: VarcoFoldingValidationConfig = field(
         default_factory=VarcoFoldingValidationConfig

@@ -1,3 +1,4 @@
+import pandas as pd
 import pytest
 import torch
 
@@ -23,6 +24,7 @@ from cogeneration.dataset.spec import (
     MultiflowSyntheticDatasetSpec,
 )
 from cogeneration.dataset.test_utils import create_pdb_batch, create_single_item_batch
+from cogeneration.dataset.vhh import VHH_CDR_SPANS_BY_PDB, VHHDataset
 from cogeneration.type.batch import METADATA_BATCH_PROPS
 from cogeneration.type.batch import BatchProp as bp
 from cogeneration.type.batch import NoisyBatchProp as nbp
@@ -218,6 +220,25 @@ class TestBaseDataset:
 
         # Check metadata fields are carried over
         assert new_feats[bp.pdb_name] == feats[bp.pdb_name]
+
+    def test_vhh_dataset_defaults(self):
+        expected = set(VHH_CDR_SPANS_BY_PDB.keys())
+        assert set(VHHDataset.default_pdb_ids()) == expected
+
+        metadata = pd.DataFrame(
+            {
+                mc.pdb_name: [
+                    "5VLV",
+                    "1ABC",
+                    "4KRL",
+                ]
+            }
+        )
+        filtered = VHHDataset.filter_metadata_pdb_ids(
+            metadata=metadata,
+            pdb_ids=VHHDataset.default_pdb_ids(),
+        )
+        assert set(filtered[mc.pdb_name]) == {"5VLV", "4KRL"}
 
     @pytest.mark.parametrize(
         "trans_noise",

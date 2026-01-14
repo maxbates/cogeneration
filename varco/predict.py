@@ -96,6 +96,7 @@ class VarcoEvaluator:
             cfg=self.cfg.dataset,
             eval=True,
             use_test=True,
+            use_vhh_dataset=self.cfg.inference.use_vhh_dataset,
         )
 
         self._dataloader = ProteinDataLoader(

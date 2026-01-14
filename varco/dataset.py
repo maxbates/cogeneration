@@ -1,9 +1,9 @@
 import os
-from typing import List
+from typing import List, Optional, Sequence
 
 import pytorch_lightning as pl
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from cogeneration.config.base import DataConfig
 from cogeneration.dataset.datasets import BaseDataset
@@ -15,7 +15,7 @@ from varco.data import DataBatch, DataSample
 from varco.tree_plan import BatchedTreePlan, TreePlan
 
 
-class ProteinDataset(BaseDataset):
+class ProteinDataset(Dataset):
     """Wrapper to simplify BaseDataset and extract relevant features"""
 
     def __init__(
@@ -23,16 +23,36 @@ class ProteinDataset(BaseDataset):
         cfg: VarcoDatasetConfig,
         eval: bool = False,
         use_test: bool = False,
+        use_vhh_dataset: bool = False,
     ):
-        super().__init__(
-            cfg=cfg,
-            task=DataTask.inpainting,
-            eval=eval,
-            use_test=use_test,
-        )
+        self.cfg = cfg
+        self.is_eval = eval
+        self.use_test = use_test
+
+        if use_vhh_dataset:
+            # lazy import for circular dep avoidance
+            from cogeneration.dataset.vhh import VHHDataset
+
+            self.dataset = VHHDataset(
+                cfg=cfg,
+                task=DataTask.inpainting,
+                pdb_ids=None,  # use defaults
+            )
+        else:
+            self.dataset = BaseDataset(
+                cfg=cfg,
+                task=DataTask.inpainting,
+                eval=eval,
+                use_test=use_test,
+            )
+
+        self.csv = self.dataset.csv
+
+    def __len__(self) -> int:
+        return len(self.dataset)
 
     def __getitem__(self, idx) -> DataSample:
-        feats = super().__getitem__(idx)
+        feats = self.dataset[idx]
 
         motif_mask = feats[bp.motif_mask].bool()
         res_mask = feats[bp.res_mask].int()
@@ -48,6 +68,7 @@ class ProteinDataset(BaseDataset):
         res_bfactor = feats[bp.res_bfactor]
         res_plddt = feats[bp.res_plddt]
 
+        # TODO - tree plan disabled for sampling (not used but cleaner)
         # Generate tree plan with timing parameters from config
         tree_cfg = self.cfg.tree_plan
         tree_plan = TreePlan.generate(

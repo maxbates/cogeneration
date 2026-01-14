@@ -562,6 +562,20 @@ class BatchFeaturizer:
 
         return feats
 
+    def get_motif_mask(self, feats: BatchFeatures) -> torch.Tensor:
+        """
+        Generate a motif mask for inpainting tasks.
+        """
+        return self.motif_factory.generate_motif_mask(
+            res_mask=feats[bp.res_mask],
+            plddt_mask=feats[bp.plddt_mask],
+            chain_idx=feats[bp.chain_idx],
+            res_idx=feats[bp.res_idx],
+            trans_1=feats[bp.trans_1],
+            rotmats_1=feats[bp.rotmats_1],
+            aatypes_1=feats[bp.aatypes_1],
+        )
+
     def featurize_processed_file(
         self,
         processed_file: ProcessedFile,
@@ -625,16 +639,7 @@ class BatchFeaturizer:
             # feats[bp.motif_mask] = None  # avoid defining motif_mask batch prop
             pass
         elif self.task == DataTask.inpainting:
-            # Generate motif_mask from MotifFactory
-            motif_mask = self.motif_factory.generate_motif_mask(
-                res_mask=feats[bp.res_mask],
-                plddt_mask=feats[bp.plddt_mask],
-                chain_idx=feats[bp.chain_idx],
-                res_idx=feats[bp.res_idx],
-                trans_1=feats[bp.trans_1],
-                rotmats_1=feats[bp.rotmats_1],
-                aatypes_1=feats[bp.aatypes_1],
-            )
+            motif_mask = self.get_motif_mask(feats=feats)
             feats[bp.motif_mask] = motif_mask.int()
 
             # `diffuse_mask` for inpainting with guidance is all ones; whole structure is modeled.

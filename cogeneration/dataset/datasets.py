@@ -648,6 +648,18 @@ class EvalDatasetConstructor:
 
     def create_dataset(self) -> Union[LengthSamplingDataset, BaseDataset]:
         """generate eval dataset"""
+        if self.cfg.use_vhh_dataset:
+            if self.task != InferenceTask.inpainting:
+                raise ValueError("VHH dataset requires inpainting inference task.")
+
+            # lazy import to avoid circular dependency
+            from cogeneration.dataset.vhh import VHHDataset
+
+            return VHHDataset(
+                cfg=self.dataset_cfg,
+                task=InferenceTask.to_data_task(self.task),
+                pdb_ids=self.cfg.vhh_pdb_ids,
+            )
         if self.task == InferenceTask.unconditional:
             return LengthSamplingDataset(cfg=self.cfg)
         elif (

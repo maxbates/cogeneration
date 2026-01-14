@@ -56,6 +56,7 @@ class MotifFactory:
     cfg: DatasetInpaintingConfig
     rng: np.random.Generator
 
+    @staticmethod
     def segments_from_contigmap(self, contigmap: str) -> List[Segment]:
         # Parse a contigmap like "5-15/A1-20/20/0 A39-50" into a list of segment objects.
 
