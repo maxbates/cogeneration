@@ -73,6 +73,7 @@ class ProteinDataset(Dataset):
         tree_cfg = self.cfg.tree_plan
         tree_plan = TreePlan.generate(
             motif_mask=motif_mask,
+            chain_idx=chain_idx,
             split_time_beta=(
                 tree_cfg.split_time_beta_alpha,
                 tree_cfg.split_time_beta_beta,

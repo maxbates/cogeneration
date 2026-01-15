@@ -194,9 +194,7 @@ class RotationCoupler(Coupler[RotationCoupling]):
         dt: float,
         birth_time: torch.Tensor,  # (B, P)
         motif_mask: torch.Tensor,  # (B, P)
-        potential: Optional[
-            torch.Tensor
-        ] = None,  # (B, P, 3) rotation tangent vector field
+        potential: Optional[torch.Tensor] = None,  # (B, P, 3) rotation tangent VF
     ) -> torch.Tensor:
         """
         Single Euler step for rotation sampling using geodesic flow.
@@ -225,14 +223,18 @@ class RotationCoupler(Coupler[RotationCoupling]):
             (birth_time <= t[:, None]).unsqueeze(-1).unsqueeze(-1)
         )  # (B, P, 1, 1)
 
-        # VF scaling: 1 / (1 - t), clamped
-        # Using exponential schedule if configured
+        # Optional `t` exponential scaling for sampling
         if self.cfg.exp_rate > 0:
             r = self.cfg.exp_rate
-            denom = 1.0 - torch.exp(-r * (1.0 - t))
-            scaling = (r / denom.clamp_min(1e-8)).clamp_min(1e-4)
+            exp_tail = 1.0 - torch.exp(-r * (1.0 - t))
+            drift_gain = (r / exp_tail.clamp_min(1e-8)).clamp_min(1e-4)
+            # scale t to tau for sigma_t calculation
+            sched_norm = 1.0 - math.exp(-r)
+            if sched_norm > 1e-6:
+                tau = (1.0 - torch.exp(-r * t)) / sched_norm
         else:
-            scaling = (1.0 / (1.0 - t).clamp_min(1e-4)).clamp_min(1e-4)
+            drift_gain = (1.0 / (1.0 - t).clamp_min(1e-4)).clamp_min(1e-4)
+            tau = t
 
         # Compute rotation vector field: Log_{x_t}(x1_pred)
         rot_vf = so3_utils.calc_rot_vf(mat_t=x_t, mat_1=x1_pred)  # (B, P, 3)
@@ -244,13 +246,13 @@ class RotationCoupler(Coupler[RotationCoupling]):
         # Clamp per-residue rotation step.
         drift_step_cap = float(self.cfg.drift_step_cap_rad)
         if drift_step_cap > 0.0:
-            rot_step = rot_vf * (scaling.view(B, 1, 1) * float(dt))
+            rot_step = rot_vf * (drift_gain.view(B, 1, 1) * float(dt))
             step_norm = rot_step.norm(dim=-1, keepdim=True).clamp_min(1e-6)
             rot_step = rot_step * (drift_step_cap / step_norm).clamp(max=1.0)
-            rot_vf = rot_step / (scaling.view(B, 1, 1) * float(dt) + 1e-8)
+            rot_vf = rot_step / (drift_gain.view(B, 1, 1) * float(dt) + 1e-8)
 
         # Geodesic step: geodesic_t(scaling * dt, x1_pred, x_t, rot_vf)
-        geodesic_time = (scaling * dt)[:, None, None]  # (B, 1, 1)
+        geodesic_time = (drift_gain * dt)[:, None, None]  # (B, 1, 1)
         x_next = so3_utils.geodesic_t(
             t=geodesic_time,
             mat=x1_pred,
@@ -264,7 +266,7 @@ class RotationCoupler(Coupler[RotationCoupling]):
 
             # Compute sigma_t scaled by sqrt(dt)
             sigma_t = self._compute_sigma_t(
-                t=t,
+                t=tau,
                 scale=torch.full_like(t, float(self.cfg.noise_scale)),
                 min_sigma=0.0,
                 noise_end_t=float(self.cfg.noise_end_t),

@@ -80,7 +80,7 @@ class FlowMatcherRotations(FlowMatcher):
             denom = 1.0 - torch.exp(-r * (1.0 - t))
             denom = torch.clamp(denom, min=1e-8)
             scale = r / denom
-            return scale.clamp(min=1e-4, max=10.0)
+            return scale.clamp(min=1e-4)
         else:
             raise ValueError(f"Unknown sample schedule {schedule}")
 

@@ -35,8 +35,10 @@ class BranchFlowLosses:
 
 @dataclass
 class BranchFlowMetrics:
-    base_seq_ce: torch.Tensor  # unweighted token CE (nats)
-    base_seq_acc: torch.Tensor  # unweighted top-1 accuracy on anchor tokens
+    base_seq_ce: torch.Tensor  # token CE (nats), motif-weighted if configured
+    base_seq_acc: torch.Tensor  # top-1 accuracy on anchor tokens, motif-weighted
+    base_seq_ce_scaffold: torch.Tensor  # CE on scaffold tokens only (nats)
+    base_seq_acc_scaffold: torch.Tensor  # top-1 accuracy on scaffold tokens only
     insertion_seq_ce: torch.Tensor  # unweighted soft CE on insertion logits (nats)
     insertion_target_entropy: (
         torch.Tensor
@@ -138,11 +140,28 @@ class BranchFlowLossCalculator:
         """
         return torch.where(x > threshold, threshold + torch.log1p(x - threshold), x)
 
+    @staticmethod
+    def _apply_motif_weight(
+        mask_f: torch.Tensor,
+        motif_mask: Optional[torch.Tensor],
+        motif_weight: float,
+    ) -> torch.Tensor:
+        if motif_mask is None:
+            return mask_f
+        weights = torch.where(
+            motif_mask,
+            torch.full_like(mask_f, float(motif_weight)),
+            torch.ones_like(mask_f),
+        )
+        return mask_f * weights
+
     def _soft_ce_from_probs(
         self,
         pred_logits: torch.Tensor,  # (B, P, K)
         target_probs: torch.Tensor,  # (B, P, K)
         mask: torch.Tensor,  # (B, P)
+        motif_mask: Optional[torch.Tensor] = None,  # (B, P)
+        motif_weight: float = 0.1,
         t: Optional[torch.Tensor] = None,  # (B,)
         apply_time_norm: bool = False,
         time_norm_divisor: float = 2.0,
@@ -175,6 +194,7 @@ class BranchFlowLossCalculator:
         mask_f = mask.float() * (~is_mostly_mask).float()
         if require_mass:
             mask_f = mask_f * has_mass.float()
+        mask_f = self._apply_motif_weight(mask_f, motif_mask, motif_weight)
 
         if per_example:
             denom = mask_f.sum(dim=1).clamp_min(1.0)  # (B,)
@@ -339,6 +359,8 @@ class BranchFlowLossCalculator:
         target_anchor_tokens: torch.Tensor,  # (B, P) long
         t: torch.Tensor,  # (B,)
         mask: torch.Tensor,  # (B, P)
+        motif_mask: Optional[torch.Tensor] = None,  # (B, P)
+        motif_weight: float = 0.1,
     ) -> torch.Tensor:
         """Sequence loss: cross-entropy on amino acid logits vs sampled anchor tokens."""
         B, P, K = pred_aatype_logits.shape
@@ -361,6 +383,7 @@ class BranchFlowLossCalculator:
         # Mask out unknown residues
         mask_f = mask.float()  # (B, P)
         mask_f = mask_f * (target_anchor_tokens != MASK_TOKEN_INDEX).float()
+        mask_f = self._apply_motif_weight(mask_f, motif_mask, motif_weight)
         # Masked mean per batch, then average over batch
         denom = mask_f.sum(dim=1).clamp_min(1.0)  # (B,)
         loss_per_batch = (ce * mask_f).sum(dim=1) / denom  # (B,)
@@ -378,12 +401,16 @@ class BranchFlowLossCalculator:
         target_anchor_probs: torch.Tensor,  # (B, P, K)
         t: torch.Tensor,  # (B,)
         mask: torch.Tensor,  # (B, P)
+        motif_mask: Optional[torch.Tensor] = None,  # (B, P)
+        motif_weight: float = 0.1,
     ) -> torch.Tensor:
         """Sequence loss: soft cross-entropy on amino acid logits vs anchor probability targets."""
         seq_loss = self._soft_ce_from_probs(
             pred_logits=pred_aatype_logits,
             target_probs=target_anchor_probs,
             mask=mask,
+            motif_mask=motif_mask,
+            motif_weight=motif_weight,
             t=t,
             apply_time_norm=True,
             time_norm_divisor=2.0,
@@ -403,8 +430,10 @@ class BranchFlowLossCalculator:
         pred_aatype_logits: torch.Tensor,  # (B, P, K)
         target_anchor_tokens: torch.Tensor,  # (B, P) long
         mask: torch.Tensor,  # (B, P)
+        motif_mask: Optional[torch.Tensor] = None,  # (B, P)
+        motif_weight: float = 0.1,
     ) -> torch.Tensor:
-        """Aux metric: unweighted per-token CE on amino acids (nats)."""
+        """Aux metric: per-token CE on amino acids (nats), motif-weighted if provided."""
         with torch.no_grad():
             B, P, K = pred_aatype_logits.shape
             ce = F.cross_entropy(
@@ -413,7 +442,7 @@ class BranchFlowLossCalculator:
                 reduction="none",
             ).view(B, P)
             valid = mask & (target_anchor_tokens != MASK_TOKEN_INDEX)
-            valid_f = valid.float()
+            valid_f = self._apply_motif_weight(valid.float(), motif_mask, motif_weight)
             return (ce * valid_f).sum() / valid_f.sum().clamp_min(1.0)
 
     @staticmethod
@@ -421,14 +450,19 @@ class BranchFlowLossCalculator:
         pred_aatype_logits: torch.Tensor,  # (B, P, K)
         target_anchor_tokens: torch.Tensor,  # (B, P) long
         mask: torch.Tensor,  # (B, P)
+        motif_mask: Optional[torch.Tensor] = None,  # (B, P)
+        motif_weight: float = 0.1,
     ) -> torch.Tensor:
-        """Aux metric: unweighted per-token top-1 accuracy on amino acids."""
+        """Aux metric: per-token top-1 accuracy on amino acids, motif-weighted."""
         with torch.no_grad():
             pred_tokens = pred_aatype_logits.argmax(dim=-1)  # (B, P)
             valid = mask & (target_anchor_tokens != MASK_TOKEN_INDEX)
-            denom = valid.float().sum().clamp_min(1.0)
             correct = (pred_tokens == target_anchor_tokens) & valid
-            return correct.float().sum() / denom
+            weight = BranchFlowLossCalculator._apply_motif_weight(
+                valid.float(), motif_mask, motif_weight
+            )
+            denom = weight.sum().clamp_min(1.0)
+            return (correct.float() * weight).sum() / denom
 
     def _insertion_seq_loss(
         self,
@@ -1086,23 +1120,42 @@ class BranchFlowLossCalculator:
             target_anchor_tokens=aatype_anchors_pack,
             t=batch.t,
             mask=valid_mask,
+            motif_mask=batch.motif_mask,
+            motif_weight=self.cfg.seq_motif_weight,
         )
         base_seq_prob_loss = self._seq_prob_loss(
             pred_aatype_logits=pred.pred_aatype_logits,
             target_anchor_probs=aatype_anchor_probs_pack,
             t=batch.t,
             mask=valid_mask,
+            motif_mask=batch.motif_mask,
+            motif_weight=self.cfg.seq_motif_weight,
         )
         base_seq_loss = base_seq_token_loss + base_seq_prob_loss
         base_seq_ce = self._seq_ce_metric(
             pred_aatype_logits=pred.pred_aatype_logits,
             target_anchor_tokens=aatype_anchors_pack,
             mask=valid_mask,
+            motif_mask=batch.motif_mask,
+            motif_weight=self.cfg.seq_motif_weight,
         )
         base_seq_acc = self._seq_acc_metric(
             pred_aatype_logits=pred.pred_aatype_logits,
             target_anchor_tokens=aatype_anchors_pack,
             mask=valid_mask,
+            motif_mask=batch.motif_mask,
+            motif_weight=self.cfg.seq_motif_weight,
+        )
+        scaffold_mask = valid_mask & ~batch.motif_mask
+        base_seq_ce_scaffold = self._seq_ce_metric(
+            pred_aatype_logits=pred.pred_aatype_logits,
+            target_anchor_tokens=aatype_anchors_pack,
+            mask=scaffold_mask,
+        )
+        base_seq_acc_scaffold = self._seq_acc_metric(
+            pred_aatype_logits=pred.pred_aatype_logits,
+            target_anchor_tokens=aatype_anchors_pack,
+            mask=scaffold_mask,
         )
 
         # Insertion sequence loss
@@ -1233,6 +1286,8 @@ class BranchFlowLossCalculator:
         metrics = BranchFlowMetrics(
             base_seq_ce=base_seq_ce,
             base_seq_acc=base_seq_acc,
+            base_seq_ce_scaffold=base_seq_ce_scaffold,
+            base_seq_acc_scaffold=base_seq_acc_scaffold,
             insertion_seq_ce=insertion_seq_ce,
             insertion_target_entropy=insertion_target_entropy,
             insertion_ce_over_entropy=insertion_ce_over_entropy,

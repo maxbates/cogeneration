@@ -90,9 +90,7 @@ class TreeInterpolant:
         res_mask = tree.broadcast_to_leaves(
             x=batch.res_mask.to(self.device), fill_value=0
         )
-        chain_idx = tree.broadcast_to_leaves(
-            x=batch.chain_idx.to(self.device), fill_value=0
-        )
+        chain_idx = tree.chain_idx
         res_bfactor = tree.broadcast_to_leaves(
             x=batch.res_bfactor.to(self.device), fill_value=0.0
         )
@@ -365,10 +363,11 @@ class TreeInterpolant:
     @staticmethod
     def _sample_initial_positions(
         motif_mask: torch.Tensor,  # (B, N)
+        chain_idx: Optional[torch.Tensor] = None,  # (B, N)
         min_scaffold_nuclei: int = 1,
         max_scaffold_nuclei: int = 10,
         seed: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample initial positions for branching flow sampling.
 
@@ -381,10 +380,16 @@ class TreeInterpolant:
             init_length: (B,) long - number of initial positions per batch element
             motif_idx: (B, P_max) long - source index in original (N,) data for motif positions,
                        -1 for scaffold root positions. Padding is implicit: positions >= init_length.
+            source_idx: (B, P_max) long - source index in original (N,) data for all valid
+                        positions. Scaffold roots use the span start index; padding is -1.
         """
         device = motif_mask.device
         B, N = motif_mask.shape
         motif_mask = motif_mask.bool()
+        if chain_idx is None:
+            chain_idx = torch.ones_like(motif_mask, dtype=torch.long, device=device)
+        else:
+            chain_idx = chain_idx.to(device=device)
 
         # Use SeededRNG for determinism
         rng = SeededRNG(seed=seed, device="cpu")
@@ -392,22 +397,31 @@ class TreeInterpolant:
         # For each batch element, compute indices and whether they map to original data
         # motif_idx_val >= 0 means motif (value is source index), -1 means scaffold root
         init_indices_list: List[List[int]] = []
+        source_indices_list: List[List[int]] = []
 
         for b in range(B):
             mask_b = motif_mask[b]  # (N,)
+            chain_b = chain_idx[b]  # (N,)
             # indices stores: source index for motifs, -1 for scaffold roots
             indices: List[int] = []
+            source_indices: List[int] = []
 
             i = 0
             while i < N:
                 if mask_b[i].item():
                     # Motif position - include with source index
                     indices.append(i)
+                    source_indices.append(i)
                     i += 1
                 else:
                     # Scaffold span - find extent
                     span_start = i
-                    while i < N and not mask_b[i].item():
+                    span_chain = chain_b[i].item()
+                    while (
+                        i < N
+                        and not mask_b[i].item()
+                        and chain_b[i].item() == span_chain
+                    ):
                         i += 1
                     span_len = i - span_start
 
@@ -421,8 +435,10 @@ class TreeInterpolant:
                     # Add -1 for each scaffold root (they don't map to original data)
                     for _ in range(target_k):
                         indices.append(-1)
+                        source_indices.append(span_start)
 
             init_indices_list.append(indices)
+            source_indices_list.append(source_indices)
 
         # Compute init_length and P_max
         init_lengths = [len(indices) for indices in init_indices_list]
@@ -434,14 +450,18 @@ class TreeInterpolant:
         )  # (B,)
         # Padding value is -1, same as scaffold roots, but distinguished by position >= init_length
         motif_idx = torch.full((B, P_max), -1, dtype=torch.long, device=device)
+        source_idx = torch.full((B, P_max), -1, dtype=torch.long, device=device)
 
         for b in range(B):
             L = init_lengths[b]
             motif_idx[b, :L] = torch.tensor(
                 init_indices_list[b], dtype=torch.long, device=device
             )
+            source_idx[b, :L] = torch.tensor(
+                source_indices_list[b], dtype=torch.long, device=device
+            )
 
-        return init_length, motif_idx
+        return init_length, motif_idx, source_idx
 
     def _init_sampling_batch(
         self,
@@ -461,8 +481,9 @@ class TreeInterpolant:
         B, N = data.motif_mask.shape
 
         # Get initial position layout
-        init_length, motif_idx = self._sample_initial_positions(
+        init_length, motif_idx, source_idx = self._sample_initial_positions(
             motif_mask=data.motif_mask.to(device),
+            chain_idx=data.chain_idx.to(device),
             min_scaffold_nuclei=min_scaffold_nuclei,
             max_scaffold_nuclei=max_scaffold_nuclei,
             seed=seed,
@@ -485,8 +506,13 @@ class TreeInterpolant:
         res_mask = gather_and_pad(
             data.res_mask.to(device), gather_idx, is_motif, fill_value=0
         )
+        # ensure scaffolds have res_index marking them valid
+        res_mask = torch.where(
+            valid_mask & ~is_motif, torch.ones_like(res_mask), res_mask
+        )
+        # chain_idx must use source_idx so scaffolds inherit correct chain_idx as motif
         chain_idx = gather_and_pad(
-            data.chain_idx.to(device), gather_idx, is_motif, fill_value=0
+            data.chain_idx.to(device), source_idx.clamp(min=0), valid_mask, fill_value=0
         )
 
         # contact_conditioning: (B, N, N) -> (B, P_max, P_max), zeros for scaffolds

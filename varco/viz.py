@@ -3,6 +3,7 @@ import math
 import os
 import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, List, Literal, Optional, Tuple
 
 import numpy as np
@@ -721,7 +722,7 @@ class BranchingFlowVisualizer:
 
         # Save animation
         ext, writer = self._get_anim_writer()
-        anim_path = os.path.join(out_dir, f"{filename}.{ext}")
+        anim_path = str(Path(os.path.join(out_dir, f"{filename}.{ext}")).absolute())
         logger.info(f"💾 Saving trajectory animation to {anim_path}")
 
         with writer.saving(fig, anim_path, dpi=100):

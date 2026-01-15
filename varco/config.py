@@ -155,8 +155,8 @@ class VarcoInterpolantRotationCouplerConfig(VarcoInterpolantCouplerConfig):
     igso3_sigma_max: float = 1.5
     # Cap per-residue rotation drift step (radians) during sampling.
     drift_step_cap_rad: float = math.pi / 3
-    # Exponential schedule rate (higher = faster settling)
-    exp_rate: float = 3
+    # sampling exponential schedule rate (higher = faster settling)
+    exp_rate: float = 5.0  # Multiflow uses 10
 
 
 class VarcoHazardKind(StrEnum):
@@ -258,6 +258,7 @@ class VarcoLossConfig(BaseClassConfig):
     seq_loss_weight: float = 1.0
     seq_prob_loss_weight: float = 1.0  # anchor probs
     seq_token_loss_weight: float = 0.5  # sampled anchor token
+    seq_motif_weight: float = 0.1  # downweight motif positions for base sequence loss
     seq_ins_loss_weight: float = 0.2
     split_loss_weight: float = 0.3
     split_mass_entropy_weight: float = 0.1
@@ -296,8 +297,8 @@ class VarcoFoldingValidationConfig(BaseClassConfig):
 
 @dataclass
 class VarcoInferenceConfig(BaseClassConfig):
+    ckpt_path: Optional[str] = None  # required!
     predict_dir: str = "varco/outputs/${shared.id}"
-    ckpt_path: Optional[str] = None
     inference_subdir: str = "predict"
     use_vhh_dataset: bool = False
     plot: VarcoInferencePlotConfig = field(default_factory=VarcoInferencePlotConfig)

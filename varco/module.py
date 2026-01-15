@@ -11,6 +11,7 @@ from torch import distributed as dist
 
 from cogeneration.data.folding_validation import FoldingValidator
 from cogeneration.data.protein import write_prot_to_pdb
+from cogeneration.dataset.featurizer import BatchFeaturizer
 from cogeneration.models.esm_ckpt_loading import plan_esm_warm_start_state_dict_load
 from cogeneration.scripts.utils_ddp import DDPInfo
 from cogeneration.type.metrics import MetricName, OutputFileName
@@ -217,6 +218,8 @@ class BranchFlowModule(pl.LightningModule):
         self.log("A/base_seq_ce", metrics.base_seq_ce)
         self.log("A/base_seq_acc", metrics.base_seq_acc)
         self.log("A/base_seq_ppl", torch.exp(metrics.base_seq_ce))
+        self.log("A/base_seq_ce_scaffold", metrics.base_seq_ce_scaffold)
+        self.log("A/base_seq_acc_scaffold", metrics.base_seq_acc_scaffold)
         self.log("A/insertion_seq_ce", metrics.insertion_seq_ce)
         self.log("A/insertion_target_entropy", metrics.insertion_target_entropy)
         self.log("A/insertion_ce_over_entropy", metrics.insertion_ce_over_entropy)
@@ -293,6 +296,7 @@ class BranchFlowModule(pl.LightningModule):
         val_dir = os.path.join(
             self.cfg.inference.predict_dir, "val", f"epoch{self.current_epoch:03d}"
         )
+        os.makedirs(val_dir, exist_ok=True)
 
         # Motif guidance uses autograd during sampling (inference tensors break backward).
         with torch.inference_mode(False):
@@ -306,7 +310,16 @@ class BranchFlowModule(pl.LightningModule):
         pred_atom37 = final_sample.to_atom37()[0].detach().cpu().numpy()
         pred_aa = final_sample.aatypes_t[0].detach().cpu().numpy()
         chain_idx = final_sample.chain_idx[0].detach().cpu().numpy()
-        res_idx = np.arange(pred_aa.shape[0], dtype=np.int32)
+        res_idx = (
+            BatchFeaturizer.infer_res_index(
+                chain_idx=final_sample.chain_idx,
+                valid_mask=final_sample.valid_mask,
+            )[0]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.int32)
+        )
 
         # Save PDB
         pred_pdb_path = os.path.join(val_dir, OutputFileName.sample_pdb)
@@ -393,7 +406,23 @@ class BranchFlowModule(pl.LightningModule):
         pred_atom37 = final_sample.to_atom37()[0].detach().cpu().numpy()
         pred_aa = final_sample.aatypes_t[0].detach().cpu().numpy()
         chain_idx = final_sample.chain_idx[0].detach().cpu().numpy()
-        res_idx = np.arange(pred_aa.shape[0], dtype=np.int32)
+        res_idx = (
+            BatchFeaturizer.infer_res_index(
+                chain_idx=final_sample.chain_idx,
+                valid_mask=final_sample.valid_mask,
+            )[0]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.int32)
+        )
+        motif_mask = final_sample.motif_mask[0]
+        b_factors = (
+            (100 * motif_mask.unsqueeze(-1).expand(-1, 37).float())
+            .detach()
+            .cpu()
+            .numpy()
+        )  # (N, 37)
 
         # Save PDB
         pred_pdb_path = os.path.join(sample_dir, OutputFileName.sample_pdb)
@@ -403,6 +432,7 @@ class BranchFlowModule(pl.LightningModule):
             aatype=pred_aa,
             chain_idx=chain_idx,
             res_idx=res_idx,
+            b_factors=b_factors,
             no_indexing=True,
             overwrite=True,
         )

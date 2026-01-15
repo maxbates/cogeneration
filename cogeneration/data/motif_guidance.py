@@ -276,8 +276,6 @@ def compute_motif_potential(
 
     # Check gradient connectivity
     if not log_p.requires_grad:
-        if allow_none:
-            return PotentialField(), None
         raise ValueError(
             "log_p does not require grad. Ensure pred_trans_1/pred_rotmats_1 "
             "are differentiably connected to trans_t/rotmats_t through the model."

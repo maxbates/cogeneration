@@ -57,12 +57,10 @@ class VarcoEvaluator:
             world_size=str(self.cfg.experiment.num_devices),
         )
 
-        # Compute output directory deterministically on all ranks; write config only on rank 0.
-        inference_dir = self._setup_inference_dir(ckpt_path=ckpt_path)
-        self.cfg.inference.predict_dir = inference_dir
+        # write config only on rank 0
         if DDPInfo.from_env().local_rank == 0:
-            os.makedirs(inference_dir, exist_ok=True)
-            config_path = os.path.join(inference_dir, "config.yaml")
+            os.makedirs(self.cfg.inference.predict_dir, exist_ok=True)
+            config_path = os.path.join(self.cfg.inference.predict_dir, "config.yaml")
             with open(config_path, "w") as f:
                 OmegaConf.save(config=self.cfg, f=f)
             logger.info(f"💾 Saving inference config to {config_path}")
@@ -79,13 +77,6 @@ class VarcoEvaluator:
 
         self._module.eval()
         logger.info("\n" + str(ModelSummary(self._module, max_depth=2)))
-
-    def _setup_inference_dir(self, ckpt_path: str) -> str:
-        ckpt_name = "/".join(Path(ckpt_path).with_suffix("").parts[-3:])
-        predict_root = Path(self.cfg.inference.predict_dir)
-        if not predict_root.is_absolute():
-            predict_root = Path(self.cfg.shared.project_root) / predict_root
-        return str(predict_root / ckpt_name / self.cfg.inference.inference_subdir)
 
     @property
     def dataloader(self) -> torch.utils.data.DataLoader:

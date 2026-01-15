@@ -577,7 +577,10 @@ def create_synthetic_databatch(
     for b in range(B):
         plan_seed = None if seed is None else int(seed) + int(b)
         plan = TreePlan.generate(
-            motif_mask=motif_mask[b].cpu(), seed=plan_seed, **tree_kwargs
+            motif_mask=motif_mask[b].cpu(),
+            chain_idx=chain_idx[b].cpu(),
+            seed=plan_seed,
+            **tree_kwargs,
         )
         tree_plans.append(plan)
 
@@ -1256,8 +1259,14 @@ def analyze_sampling_trajectory(
             )
 
             if float(cfg.interpolant.rotation_coupler.noise_scale) > 0.0:
+                t_noise = batch.t
+                if float(cfg.interpolant.rotation_coupler.exp_rate) > 0.0:
+                    r = float(cfg.interpolant.rotation_coupler.exp_rate)
+                    denom = 1.0 - math.exp(-r)
+                    if denom > 1e-8:
+                        t_noise = (1.0 - torch.exp(-r * batch.t)) / denom
                 sigma_t = interpolant.rotation_coupler._compute_sigma_t(
-                    t=batch.t,
+                    t=t_noise,
                     scale=torch.full_like(
                         batch.t, float(cfg.interpolant.rotation_coupler.noise_scale)
                     ),

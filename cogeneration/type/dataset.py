@@ -18,7 +18,7 @@ class MetadataColumn(StrEnum):
     raw_path = "raw_path"
     # pkl file for processed structure/sequence
     processed_path = "processed_path"
-    quaternary_category = "quaternary_category"
+    quaternary_category = "quaternary_category"  # homomer, heteromer
     # num non-unique sequences
     oligomeric_count = "oligomeric_count"
     # per-unique seq details

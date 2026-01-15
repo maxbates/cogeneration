@@ -574,6 +574,7 @@ class BatchFeaturizer:
             trans_1=feats[bp.trans_1],
             rotmats_1=feats[bp.rotmats_1],
             aatypes_1=feats[bp.aatypes_1],
+            pdb_name=feats[bp.pdb_name],
         )
 
     def featurize_processed_file(

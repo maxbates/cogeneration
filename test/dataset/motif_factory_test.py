@@ -47,6 +47,7 @@ class TestMotifFactory:
             trans_1=pdb_batch_features[bp.trans_1],
             rotmats_1=pdb_batch_features[bp.rotmats_1],
             aatypes_1=pdb_batch_features[bp.aatypes_1],
+            pdb_name=pdb_batch_features[bp.pdb_name],
         )
         assert motif_mask.shape == pdb_batch_features[bp.res_mask].shape
         assert isinstance(motif_mask, torch.Tensor)

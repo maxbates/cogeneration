@@ -21,7 +21,7 @@ def main(cfg: VarcoConfig):
 
     experiment = Experiment(cfg=cfg)
     experiment.setup()
-    experiment.debug(n=5)
+    experiment.debug(n=1)
     experiment.train()
 
 

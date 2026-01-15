@@ -84,6 +84,12 @@ class DatasetFilterer:
             df = df[~df[mc.num_chains].isin(self.cfg.num_chains_skip)]
         return df
 
+    @_log_filter("num_unique_seqs filter")
+    def _num_unique_seqs_filter(self, df: MetadataDataFrame) -> MetadataDataFrame:
+        if self.cfg.num_unique_seqs is None:
+            return df
+        return df[df[mc.num_unique_seqs].isin(self.cfg.num_unique_seqs)]
+
     @_log_filter("length filter")
     def _length_filter(self, df: MetadataDataFrame) -> MetadataDataFrame:
         return df[
@@ -214,6 +220,7 @@ class DatasetFilterer:
             "date": self._date_filter,
             "oligomeric": self._oligomeric_filter,
             "num_chains": self._num_chains_filter,
+            "num_unique_seqs": self._num_unique_seqs_filter,
             "length": self._length_filter,
             "max_percent_unknown": self._max_percent_unknown_filter,
             "max_coil": self._max_coil_filter,

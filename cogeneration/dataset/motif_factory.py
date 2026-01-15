@@ -11,6 +11,9 @@ from cogeneration.config.base import (
     DatasetInpaintingConfig,
     DatasetInpaintingMotifStrategy,
 )
+from cogeneration.util.log import rank_zero_logger
+
+logger = rank_zero_logger(__name__)
 
 
 @dataclass
@@ -771,10 +774,12 @@ class MotifFactory:
         trans_1: torch.Tensor,
         rotmats_1: torch.Tensor,
         aatypes_1: torch.Tensor,
+        pdb_name: str,
     ) -> torch.Tensor:
         """
         Get a `diffuse_mask` for a specified `strategy`.
         """
+        # Monomer / multimer strategies
         if strategy == DatasetInpaintingMotifStrategy.single_motif:
             return self.generate_single_motif_diffuse_mask(
                 res_mask=res_mask,
@@ -800,8 +805,21 @@ class MotifFactory:
             return self.generate_densest_neighbors_diffuse_mask(
                 res_mask=res_mask, plddt_mask=plddt_mask, trans_1=trans_1
             )
-        elif strategy == DatasetInpaintingMotifStrategy.binding_interface_single_chain:
-            assert self._is_multimeric(chain_idx=chain_idx)
+
+        # Ensure have a multimer for multimeric strategies,
+        # otherwise fallback in case poorly classified.
+        if not self._is_multimeric(chain_idx=chain_idx):
+            logger.warning(
+                f"⚠️ PDB {pdb_name} is not a multimer. Falling back to single_motif."
+            )
+            return self.generate_single_motif_diffuse_mask(
+                res_mask=res_mask,
+                plddt_mask=plddt_mask,
+                chain_idx=chain_idx,
+            )
+
+        # Multimer strategies
+        if strategy == DatasetInpaintingMotifStrategy.binding_interface_single_chain:
             return self.generate_binding_interface_single_chain_diffuse_mask(
                 chain_idx=chain_idx,
                 trans_1=trans_1,
@@ -830,6 +848,7 @@ class MotifFactory:
         trans_1: torch.Tensor,
         rotmats_1: torch.Tensor,
         aatypes_1: torch.Tensor,
+        pdb_name: str,
     ) -> torch.Tensor:
         """
         Entrypoint to get a `motif_mask` [int tensor] specified by `DatasetInpaintingConfig`
@@ -856,6 +875,7 @@ class MotifFactory:
             trans_1=trans_1,
             rotmats_1=rotmats_1,
             aatypes_1=aatypes_1,
+            pdb_name=pdb_name,
         )
         diffuse_mask = diffuse_mask.int()
         motif_mask = 1 - diffuse_mask

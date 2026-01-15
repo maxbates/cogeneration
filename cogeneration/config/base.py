@@ -799,7 +799,7 @@ class InterpolantRotationsConfig(InterpolantDomainConfig):
     sample_schedule: InterpolantRotationsScheduleEnum = (
         InterpolantRotationsScheduleEnum.exp
     )
-    exp_rate: float = 1.5  # 10 in public multiflow code
+    exp_rate: float = 5.0  # 10 in public multiflow code
     stochastic_noise_intensity: float = 1.0
     # Cap per-residue rotation drift step (radians) during sampling. 0.0 = disabled.
     # Prevents large rotation jumps from guidance or numerical instability at late times.
@@ -1165,10 +1165,12 @@ class DatasetFilterConfig(BaseClassConfig):
     min_date: Optional[str] = None
     max_date: Optional[str] = None
     # oligmers / multimers
+    # note num_chains includes homomers / asym units. may prefer num_unique_seqs.
     oligomeric: Optional[List[str]] = None
     oligomeric_skip: Optional[List[str]] = None
     num_chains: Optional[List[int]] = None
     num_chains_skip: Optional[List[int]] = None
+    num_unique_seqs: Optional[List[int]] = None
     # non-residue entities (requires information in metadata CSV)
     max_non_residue_entities: Optional[int] = None
     max_metal_ions: Optional[int] = None
@@ -1616,7 +1618,7 @@ class InferenceSamplesConfig(BaseClassConfig):
     max_length: int = "${dataset.filter.max_num_res}"
     # gap between lengths to sample, `range(min_length, max_length, length_step)`
     length_step: int = 8
-    # Multimers - set `chain_idx` for 2+ chains, where each chain must be `min_length`
+    # unconditional: multimers - set `chain_idx` for 2+ chains; each chain > `min_length`
     multimer_fraction: float = 0.5
     multimer_min_length: int = 100
 

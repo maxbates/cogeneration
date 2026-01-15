@@ -83,9 +83,17 @@ class BranchFlowModel(nn.Module):
         )
 
         # Insertions and deletions
-        self.split_rate_pred = nn.Linear(self.node_dim, 1)
+        self.split_rate_pred = nn.Sequential(
+            nn.Linear(self.node_dim, self.node_dim),
+            nn.ReLU(),
+            nn.Linear(self.node_dim, 1),
+        )
         self.split_pooled_log1p_rate_pred = nn.Linear(self.node_dim, 1)
-        self.del_logits_pred = nn.Linear(self.node_dim, 1)
+        self.del_logits_pred = nn.Sequential(
+            nn.Linear(self.node_dim, self.node_dim),
+            nn.ReLU(),
+            nn.Linear(self.node_dim, 1),
+        )
 
         # Confidence prediction modules (from cogeneration)
         if self.cfg.bfactor.enabled:

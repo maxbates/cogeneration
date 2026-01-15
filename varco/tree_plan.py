@@ -34,6 +34,7 @@ class TreePlan:
     # topology
     topo_order: torch.Tensor  # (A,) long, structural topo (parent-before-child)
     motif_mask: torch.Tensor  # (A,) bool; True only for motif leaves (not anchors)
+    chain_idx: torch.Tensor  # (A,) long; chain id per node
     roots: torch.Tensor  # (R,) long, root node ids
     parent_idx: torch.Tensor  # (A,) long, -1 for roots
     children_idx: torch.Tensor  # (A, 2) long, -1 for leaves
@@ -55,6 +56,7 @@ class TreePlan:
     def generate(
         cls,
         motif_mask: torch.Tensor,  # (N,)
+        chain_idx: Optional[torch.Tensor] = None,  # (N,) assume monomer if not provided
         seed: Optional[int] = None,
         min_t: float = 0.005,
         min_scaffold_nuclei: int = 1,
@@ -127,6 +129,15 @@ class TreePlan:
         device = motif_mask.device
         N_data = motif_mask.shape[0]
         motif_mask_b = motif_mask.to(torch.bool)
+        if chain_idx is None:
+            chain_idx_b = torch.ones(N_data, dtype=torch.long, device=device)
+        else:
+            chain_idx_b = chain_idx.to(device=device).long()
+        if chain_idx_b.shape != motif_mask_b.shape:
+            raise ValueError(
+                "chain_idx must have the same shape as motif_mask; "
+                f"got {tuple(chain_idx_b.shape)} vs {tuple(motif_mask_b.shape)}"
+            )
 
         scaffold_idx = torch.where(~motif_mask_b)[0]
         n_scaffold = int(scaffold_idx.numel())
@@ -200,12 +211,21 @@ class TreePlan:
         # Each motif position gets its own singleton group id after scaffold-span ids.
 
         leaf_is_motif = motif_mask_b[leaf_map_leaves]  # (num_leaves,)
+        leaf_chain_idx = chain_idx_b[leaf_map_leaves]  # (num_leaves,)
         is_scaffold = ~leaf_is_motif
 
-        # scaffold_start marks the first position of each scaffold span
-        scaffold_start = is_scaffold & torch.cat(
-            [torch.tensor([True], device=device), ~is_scaffold[:-1]]
+        # scaffold_start marks the first position of each scaffold span,
+        # splitting spans on chain breaks even when motif_mask is all False.
+        prev_is_scaffold = torch.cat(
+            [torch.tensor([False], device=device), is_scaffold[:-1]]
         )
+        chain_break = torch.cat(
+            [
+                torch.tensor([False], device=device),
+                leaf_chain_idx[1:] != leaf_chain_idx[:-1],
+            ]
+        )
+        scaffold_start = is_scaffold & (~prev_is_scaffold | chain_break)
         span_id = (
             torch.cumsum(scaffold_start.long(), dim=0) - 1
         )  # (-1 for non-scaffold)
@@ -242,6 +262,7 @@ class TreePlan:
         extra_root_spans: List[Tuple[int, int]] = (
             []
         )  # (span_start, span_end) for planar positioning
+        extra_root_chain_idx: List[int] = []
         scaffold_K: Dict[int, int] = {}  # gid -> K_scaffold
 
         for gid, active in groups.items():
@@ -251,6 +272,7 @@ class TreePlan:
                 span_len = len(active)
                 span_start_leaf = min(active)
                 span_end_leaf = max(active)
+                span_chain_idx = int(leaf_chain_idx[span_start_leaf].item())
                 k_hi = max_scaffold_nuclei
                 k_lo = min(min_scaffold_nuclei, k_hi)
                 K_scaffold = (
@@ -268,6 +290,7 @@ class TreePlan:
                         weight.append(1)
                         extra_deleted_roots.append(new_id)
                         extra_root_spans.append((span_start_leaf, span_end_leaf))
+                        extra_root_chain_idx.append(span_chain_idx)
                         # Insert into active list at random position for planar ordering
                         insert_pos = rng.rand_int(len(active) + 1)
                         active.insert(insert_pos, new_id)
@@ -361,6 +384,40 @@ class TreePlan:
         if extra_deleted_roots:
             extra_t = torch.tensor(extra_deleted_roots, dtype=torch.long, device=device)
             leaf_deleted[extra_t] = True
+
+        # --- Chain index propagation
+        chain_idx_aligned = torch.zeros((A,), dtype=torch.long, device=device)
+        if num_leaves_original > 0:
+            chain_idx_aligned[:num_leaves_original] = leaf_chain_idx[
+                :num_leaves_original
+            ]
+        if extra_deleted_roots:
+            extra_chain = torch.tensor(
+                extra_root_chain_idx, dtype=torch.long, device=device
+            )
+            chain_idx_aligned[extra_t] = extra_chain
+
+        # Internal nodes inherit chain id from children.
+        for node in topo_order.flip(0).tolist():
+            c0, c1 = children[node][0], children[node][1]
+            if c0 < 0 and c1 < 0:
+                continue
+            c0_val = int(chain_idx_aligned[c0].item()) if c0 >= 0 else 0
+            c1_val = int(chain_idx_aligned[c1].item()) if c1 >= 0 else 0
+            if c0_val == c1_val:
+                chain_idx_aligned[node] = c0_val
+            elif c0_val == 0:
+                chain_idx_aligned[node] = c1_val
+            elif c1_val == 0:
+                chain_idx_aligned[node] = c0_val
+            else:
+                logger.warning(
+                    "Conflicting chain_idx in TreePlan.generate: node=%d child0=%d child1=%d",
+                    int(node),
+                    c0_val,
+                    c1_val,
+                )
+                chain_idx_aligned[node] = c0_val
 
         # --- Sample birth/split times
 
@@ -536,6 +593,7 @@ class TreePlan:
             num_nodes=A,
             topo_order=topo_order,
             motif_mask=motif_mask_aligned,
+            chain_idx=chain_idx_aligned,
             parent_idx=parent_idx,
             roots=roots_t,
             children_idx=children_idx,
@@ -575,6 +633,8 @@ class TreePlan:
             raise ValueError("leaf_deleted shape mismatch")
         if self.motif_mask.shape != (A,):
             raise ValueError(f"motif_mask shape mismatch")
+        if self.chain_idx.shape != (A,):
+            raise ValueError("chain_idx shape mismatch")
 
         # Internal nodes (total_leaves > 1) must never be marked as motif.
         if bool(((self.total_leaves > 1) & self.motif_mask).any().item()):
@@ -872,6 +932,7 @@ class BatchedTreePlan:
     # topology
     topo_order: torch.Tensor  # (B, A_max) long
     motif_mask: torch.Tensor  # (B, A_max) bool (aligned tree-space motif mask)
+    chain_idx: torch.Tensor  # (B, A_max) long
     roots: torch.Tensor  # (B, R_max) long, -1 padded
     roots_mask: torch.Tensor  # (B, R_max) bool
     parent_idx: torch.Tensor  # (B, A_max) long
@@ -894,6 +955,7 @@ class BatchedTreePlan:
         return BatchedTreePlan(
             topo_order=to_device(self.topo_order, device),
             motif_mask=to_device(self.motif_mask, device),
+            chain_idx=to_device(self.chain_idx, device),
             roots=to_device(self.roots, device),
             roots_mask=to_device(self.roots_mask, device),
             parent_idx=to_device(self.parent_idx, device),
@@ -1065,6 +1127,9 @@ class BatchedTreePlan:
             ),
             motif_mask=pad_and_stack(
                 [p.motif_mask for p in plans], A_max, fill_value=0, dtype=torch.bool
+            ),
+            chain_idx=pad_and_stack(
+                [p.chain_idx for p in plans], A_max, fill_value=0, dtype=torch.long
             ),
             roots=pad_and_stack(
                 [p.roots for p in plans], R_max, fill_value=-1, dtype=torch.long
