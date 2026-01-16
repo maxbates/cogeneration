@@ -11,6 +11,12 @@ Only a small model has been trained. Many features can be also exercised while u
 
 Note: see [/varco](varco) which extends cogeneration (with a reduced feature set) to variable length motif scaffolding
 
+## Example
+
+![Example trajectory: inpainting VHH CDRs](media/5M2J_VHH_traj_panel.gif)
+
+See an [unconditional trajectory](media/example_uncond_172_traj_panel.mp4).
+
 ## Features
 
 This project collects several ideas from other work and includes several extensions over MultiFlow:
@@ -46,8 +52,6 @@ This project collects several ideas from other work and includes several extensi
 - many improvements to code base: typing, enums, documentation, tests, etc.
 - Many of these **new features and modules are optional**
   - everything is easily **reverse compatible with MultiFlow, i.e. can use public Multiflow weights** with a config preset
-
-See an [example trajectory](media/example_uncond_172_traj_panel.mp4).
 
 ## Future Work
 
