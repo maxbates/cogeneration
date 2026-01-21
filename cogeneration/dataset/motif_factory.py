@@ -556,30 +556,64 @@ class MotifFactory:
                 leftover = 0
             lengths.append(length)
 
-        # Pick start positions
-        # Count remaining residues after motifs + minimal padding
+        # Distribute leftover_space across (num_motifs + 1) scaffold gaps
+        # Gaps: [before first motif, between motif pairs..., after last motif]
         total_padding = (num_motifs - 1) * self.cfg.min_padding
         leftover_space = max(num_res - (total_motif_length + total_padding), 0)
-        # Pick num_motifs random positions within [0, leftover_space] to use as starts
+        num_gaps = num_motifs + 1
+
+        # Bias toward motifs at sequence boundaries
+        force_start_boundary = self.rng.random() < self.cfg.p_boundary_motif
+        force_end_boundary = self.rng.random() < self.cfg.p_boundary_motif
+
+        # Generate random weights for each gap, then scale to sum to leftover_space
         if leftover_space > 0:
-            offset_options = [0] * (num_motifs - 1) + list(range(leftover_space + 1))
-            offsets = self.rng.choice(offset_options, size=num_motifs, replace=False)
+            weights = self.rng.exponential(scale=1.0, size=num_gaps)
+            # Zero out boundary gaps if forcing motif at boundary
+            if force_start_boundary:
+                weights[0] = 0.0
+            if force_end_boundary:
+                weights[-1] = 0.0
+            # Normalize (handle case where all weights are 0)
+            if weights.sum() > 0:
+                weights = weights / weights.sum()
+            else:
+                # All boundary, distribute to interior gaps
+                weights = np.ones(num_gaps) / num_gaps
+                weights[0] = 0.0
+                weights[-1] = 0.0
+                if weights.sum() > 0:
+                    weights = weights / weights.sum()
+            gaps = (weights * leftover_space).astype(int)
+            # Distribute any rounding remainder to non-zero-weight gaps
+            remainder = leftover_space - gaps.sum()
+            if remainder > 0:
+                eligible = np.where(weights > 0)[0]
+                if len(eligible) > 0:
+                    bonus_indices = self.rng.choice(
+                        eligible, size=min(remainder, len(eligible)), replace=False
+                    )
+                    gaps[bonus_indices] += 1
+                    remainder -= len(bonus_indices)
+                # If still remainder, distribute with replacement to any interior gap
+                while remainder > 0:
+                    idx = self.rng.integers(0, num_gaps)
+                    gaps[idx] += 1
+                    remainder -= 1
         else:
-            offsets = [0] * num_motifs
-        offsets.sort()
-        # Get actual motif starts by incorporating motif lengths + padding
-        motif_starts = [offsets[0]]
-        for i in range(1, num_motifs):
-            previous_start = motif_starts[i - 1]
-            previous_motif_length = lengths[i - 1]
-            position_gap = offsets[i] - offsets[i - 1]
-            next_start = (
-                previous_start
-                + previous_motif_length
-                + self.cfg.min_padding
-                + position_gap
-            )
-            motif_starts.append(next_start)
+            gaps = np.zeros(num_gaps, dtype=int)
+
+        # Build motif starts from gaps
+        # gaps[0] = scaffold before first motif
+        # gaps[i] for i in 1..num_motifs-1 = extra scaffold between motif i-1 and i
+        # gaps[num_motifs] = scaffold after last motif (implicit, not used)
+        motif_starts = []
+        current_pos = int(gaps[0])
+        for i in range(num_motifs):
+            motif_starts.append(current_pos)
+            current_pos += lengths[i]
+            if i < num_motifs - 1:
+                current_pos += self.cfg.min_padding + int(gaps[i + 1])
 
         # Build motif_mask
         motif_mask = torch.zeros(num_res, dtype=torch.float32)

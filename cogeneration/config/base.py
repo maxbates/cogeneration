@@ -1300,9 +1300,11 @@ class DatasetInpaintingConfig(BaseClassConfig):
     max_motif_len: int = 768
     # minimal spacing between motifs (i.e. min scaffold length)
     min_padding: int = 3
-    # for variable number of motifs
+    # variable_motifs: number of motifs range
     min_num_motifs: int = 1
     max_num_motifs: int = 5
+    # variable_motifs: probability of forcing motif to start/end at boundary
+    p_boundary_motif: float = 0.25
     # for multimers, determining interacting residues
     interaction_dist_threshold_ang: float = 6.0
     proximity_dist_threshold_ang: float = 10.0
@@ -1409,6 +1411,8 @@ class DatasetConfig(BaseClassConfig):
     max_eval_length: Optional[int] = "${dataset.filter.max_num_res}"
     samples_per_eval_length: int = 4
     num_eval_lengths: int = 8
+    # randomize which proteins are selected per eval length (for inference variety)
+    randomize_eval_selection: bool = True
 
     # Performance and debugging
     seed: int = "${shared.seed}"

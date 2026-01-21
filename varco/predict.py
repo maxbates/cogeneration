@@ -57,9 +57,11 @@ class VarcoEvaluator:
             world_size=str(self.cfg.experiment.num_devices),
         )
 
-        # write config only on rank 0
+        # write config only on rank 0 - don't allow overwriting predictions
         if DDPInfo.from_env().local_rank == 0:
-            os.makedirs(self.cfg.inference.predict_dir, exist_ok=True)
+            if os.path.exists(self.cfg.inference.predict_dir):
+                raise Exception(f"predict_dir exists: {self.cfg.inference.predict_dir}")
+            os.makedirs(self.cfg.inference.predict_dir)
             config_path = os.path.join(self.cfg.inference.predict_dir, "config.yaml")
             with open(config_path, "w") as f:
                 OmegaConf.save(config=self.cfg, f=f)

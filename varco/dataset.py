@@ -24,10 +24,10 @@ class ProteinDataset(Dataset):
         eval: bool = False,
         use_test: bool = False,
         use_vhh_dataset: bool = False,
+        eval_uses_fixed_seed: bool = False,  # e.g. whether motifs vary per draw
     ):
         self.cfg = cfg
         self.is_eval = eval
-        self.use_test = use_test
 
         if use_vhh_dataset:
             # lazy import for circular dep avoidance
@@ -44,6 +44,7 @@ class ProteinDataset(Dataset):
                 task=DataTask.inpainting,
                 eval=eval,
                 use_test=use_test,
+                eval_uses_fixed_seed=eval_uses_fixed_seed,
             )
 
         self.csv = self.dataset.csv

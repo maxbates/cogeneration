@@ -32,7 +32,7 @@ VHH_CDR_SPANS_BY_PDB: Dict[str, Dict[str, Tuple[Tuple[int, int], ...]]] = {
         "B": ((27, 38), (56, 65), (105, 117)),
         "D": ((27, 38), (56, 65), (105, 117)),
     },
-    "8PII": {"A": ((27, 38), (56, 65), (105, 117))},
+    "8PII": {"A": ((27, 38), (56, 65), (105, 117))},  # w/ peptide
 }
 
 
@@ -136,6 +136,7 @@ class VHHDataset(BaseDataset):
             task=task,
             eval=False,  # avoid length subset filtering
             use_test=False,  # PDBs not in test set
+            eval_uses_fixed_seed=False,
         )
         self.featurizer = VHHBatchFeaturizer(cfg=cfg, task=task, eval=self.is_eval)
 

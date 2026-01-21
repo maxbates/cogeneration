@@ -43,30 +43,68 @@ def t_stratified_loss(
 def calc_ca_ca_metrics(
     ca_pos: npt.NDArray,  # (N, 3)
     residue_index: Optional[npt.NDArray] = None,  # (N,)
-    bond_tol=0.1,
+    chain_idx: Optional[npt.NDArray] = None,  # (N,)
+    motif_mask: Optional[npt.NDArray] = None,  # (N,) bool, True for motif residues
+    ca_ca_dist_tol=0.25,
     clash_tol=1.0,  # angstrom, 1.5 in AF2 multimer
 ) -> Dict[MetricName, float]:
     """
     Calculate metrics for the backbone CA-CA distances of a protein structure.
+
+    If motif_mask is provided, also computes scaffold-only breaks (excluding motif
+    residues and the motif-scaffold boundary by extending the motif mask one residue
+    in each direction).
     """
-    ca_bond_dists = np.linalg.norm(ca_pos - np.roll(ca_pos, 1, axis=0), axis=-1)[1:]
+    ca_ca_dists2d = np.linalg.norm(ca_pos[:, None, :] - ca_pos[None, :, :], axis=-1)
+    ca_bond_dists = np.diag(ca_ca_dists2d, k=1)
+
+    # mask for same-chain consecutive residues
+    same_chain_mask = np.ones(len(ca_bond_dists), dtype=bool)
+    if chain_idx is not None:
+        same_chain_mask = chain_idx[1:] == chain_idx[:-1]
 
     # mask out non-neighboring residues, handle chain gaps
+    has_no_gap_mask = np.ones(len(ca_bond_dists), dtype=bool)
     if residue_index is not None:
-        has_no_gap_mask = (residue_index[1:] - residue_index[:-1]) == 1
-        ca_bond_dists = ca_bond_dists[has_no_gap_mask]
+        residue_step = residue_index[1:] - residue_index[:-1]
+        has_no_gap_mask = residue_step == 1
 
-    ca_ca_dev = np.mean(np.abs(ca_bond_dists - residue_constants.ca_ca))
-    ca_ca_valid = np.mean(ca_bond_dists < (residue_constants.ca_ca + bond_tol))
+    # ca-ca averages
+    # only consider bonds within same chain and consecutive residue indices
+    valid_bond_mask = same_chain_mask & has_no_gap_mask
+    ca_bond_dists_filtered = ca_bond_dists[valid_bond_mask]
+    ca_ca_dev = np.mean(np.abs(ca_bond_dists_filtered - residue_constants.ca_ca))
+    ca_ca_valid = np.mean(
+        ca_bond_dists_filtered < (residue_constants.ca_ca + ca_ca_dist_tol)
+    )
 
-    ca_ca_dists2d = np.linalg.norm(ca_pos[:, None, :] - ca_pos[None, :, :], axis=-1)
-    inter_dists = ca_ca_dists2d[np.where(np.triu(ca_ca_dists2d, k=0) > 0)]
+    # clashes
+    upper_tri = np.triu(ca_ca_dists2d, k=1)
+    inter_dists = upper_tri[upper_tri > 0]
     clashes = inter_dists < clash_tol
+
+    # count chain breaks: long bonds within same chain and consecutive indices
+    is_break = valid_bond_mask & (
+        ca_bond_dists > (residue_constants.ca_ca + ca_ca_dist_tol)
+    )
+    ca_ca_breaks = int(np.sum(is_break))
+
+    # Compute scaffold-only breaks (excluding motif interior, but including motif-scaffold boundary)
+    # The break mask is over bonds (length N-1), where bond i connects residue i to i+1.
+    if motif_mask is not None:
+        motif_mask = motif_mask.astype(bool)
+        # Exclude motif interior bonds only; keep motif-scaffold boundary bonds.
+        bond_in_motif = motif_mask[:-1] & motif_mask[1:]
+        scaffold_breaks = int(np.sum(is_break & ~bond_in_motif))
+    else:
+        scaffold_breaks = ca_ca_breaks
 
     return {
         MetricName.ca_ca_deviation: ca_ca_dev,
         MetricName.ca_ca_valid_percent: ca_ca_valid,
         MetricName.num_ca_ca_clashes: np.sum(clashes),
+        MetricName.num_ca_ca_breaks: ca_ca_breaks,
+        MetricName.num_scaffold_ca_ca_breaks: scaffold_breaks,
     }
 
 

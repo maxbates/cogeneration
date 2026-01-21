@@ -54,12 +54,16 @@ from cogeneration.type.dataset import DatasetProteinColumn, ProcessedFile
 from cogeneration.type.metrics import MetricName
 from cogeneration.util.log import rank_zero_logger
 
-# Suppress PyTorch Lightning dataloader warnings
-warnings.filterwarnings(
-    "ignore",
-    message=".*does not have many workers.*",
-    category=UserWarning,
-    module="pytorch_lightning",
+
+# Suppress dataloader warnings (PL uses logging, not warnings)
+# since we use usually only one predict dataloader (for single predictions)
+class _DataloaderWorkerWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "does not have many workers" not in record.getMessage()
+
+
+logging.getLogger("pytorch_lightning.trainer.connectors.data_connector").addFilter(
+    _DataloaderWorkerWarningFilter()
 )
 
 

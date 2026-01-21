@@ -182,6 +182,9 @@ class VarcoInterpolantSamplingConfig(BaseClassConfig):
     # Maximum sequence length during sampling (to prevent GPU OOM)
     # If exceeded, further insertions are blocked
     max_length: int = 512
+    # Scaffold nuclei sampling range per span (defaults match dataset tree_plan)
+    min_scaffold_nuclei: int = "${dataset.tree_plan.min_scaffold_nuclei}"
+    max_scaffold_nuclei: int = "${dataset.tree_plan.max_scaffold_nuclei}"
     # Hazard distributions controlling insertion (split) and deletion time bias during sampling.
     # TreePlan.generate() defaults: splits early (Beta(1,2)), deletions late (Beta(2,1))
     split_hazard: VarcoHazardConfig = field(
@@ -288,11 +291,11 @@ class VarcoInferencePlotConfig(BaseClassConfig):
 
 @dataclass
 class VarcoFoldingValidationConfig(BaseClassConfig):
-    enabled: bool = False
+    enabled: bool = True
     # Fold predicted sequence with Boltz, or designability with ProteinMPNN -> Boltz
     assess_designability: bool = False
     # max validation batches per epoch (should be reduced by eval dataset)
-    max_batches: int = 50
+    max_batches: int = 1000
 
 
 @dataclass

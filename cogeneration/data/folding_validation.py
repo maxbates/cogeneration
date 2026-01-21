@@ -428,6 +428,8 @@ class FoldingValidator:
             calc_ca_ca_metrics(
                 ca_pos=pred_bb_positions[:, CA_IDX],
                 residue_index=res_idx,
+                chain_idx=chain_idx,
+                motif_mask=motif_mask,
             )
         )
 

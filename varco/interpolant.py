@@ -466,8 +466,8 @@ class TreeInterpolant:
     def _init_sampling_batch(
         self,
         data: DataBatch,
-        min_scaffold_nuclei: int = 1,
-        max_scaffold_nuclei: int = 10,
+        min_scaffold_nuclei: Optional[int] = None,
+        max_scaffold_nuclei: Optional[int] = None,
         seed: Optional[int] = None,
     ) -> DataCorrupted:
         """
@@ -479,6 +479,12 @@ class TreeInterpolant:
         """
         device = self.device
         B, N = data.motif_mask.shape
+
+        # Use config defaults if not specified
+        if min_scaffold_nuclei is None:
+            min_scaffold_nuclei = self.cfg.sampling.min_scaffold_nuclei
+        if max_scaffold_nuclei is None:
+            max_scaffold_nuclei = self.cfg.sampling.max_scaffold_nuclei
 
         # Get initial position layout
         init_length, motif_idx, source_idx = self._sample_initial_positions(
@@ -751,7 +757,9 @@ class TreeInterpolant:
 
         # Create initial batch, which we edit in-place through the trajectory
         num_batch, _ = data.motif_mask.shape
-        batch = self._init_sampling_batch(data=data)
+        batch = self._init_sampling_batch(
+            data=data,
+        )
 
         traj = SampleTrajectory()
         traj.samples.append(batch.detach_clone(device=torch.device("cpu")))

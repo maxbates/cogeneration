@@ -41,16 +41,23 @@ class BatchFeaturizer:
     cfg: DatasetConfig
     task: DataTask
     eval: bool
+    eval_uses_fixed_seed: bool = True
     motif_factory: Optional[MotifFactory] = None
 
     def __post_init__(self):
+        # TODO - use consistently throughout featurizing
         self._rng = np.random.default_rng(seed=self.cfg.seed)
         self._rng_fixed = np.random.default_rng(seed=42069)
 
         if self.motif_factory is None:
+            rng = (
+                self._rng
+                if self.is_training or not self.eval_uses_fixed_seed
+                else self._rng_fixed
+            )
             self.motif_factory = MotifFactory(
                 cfg=self.cfg.inpainting,
-                rng=self._rng if self.is_training else self._rng_fixed,
+                rng=rng,
             )
 
     @property

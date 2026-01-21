@@ -15,6 +15,8 @@ class MetricName(StrEnum):
     ca_ca_deviation = "ca_ca_deviation"
     ca_ca_valid_percent = "ca_ca_valid_percent"
     num_ca_ca_clashes = "num_ca_ca_clashes"
+    num_ca_ca_breaks = "num_ca_ca_breaks"
+    num_scaffold_ca_ca_breaks = "num_scaffold_ca_ca_breaks"
 
     # aatype metrics
     aatype_histogram_dist = "aatype_histogram_dist"

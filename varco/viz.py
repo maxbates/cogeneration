@@ -324,15 +324,15 @@ class PlotPanel:
 
     @staticmethod
     def _create_sequence_artists(
-        ax: plt.Axes, max_len: int, positions_per_row: int = 175
+        ax: plt.Axes, max_len: int, positions_per_row: int = 85
     ):
         """Pre-create all artists needed for sequence visualization."""
         letters, colors = PlotPanel._aa_letters_and_colors()
         num_rows = math.ceil(max_len / positions_per_row)
 
         box_width = 1.0
-        box_height = 1.0
-        row_spacing = 0.3
+        box_height = 1.4
+        row_spacing = 0.6
         row_height = box_height + row_spacing
 
         ax.set_xlim(-0.1, positions_per_row + 0.1)
@@ -368,15 +368,15 @@ class PlotPanel:
                 letters[0],
                 ha="center",
                 va="center",
-                fontsize=8,
+                fontsize=10,
                 color="k",
             )
             texts.append(text)
 
             motif_rect = plt.Rectangle(
-                (x_pos, y_base - box_height - 0.25),
+                (x_pos, y_base - box_height - 0.05),
                 box_width,
-                0.15,
+                0.3,
                 facecolor="black",
                 lw=0,
             )
@@ -686,11 +686,11 @@ class BranchingFlowVisualizer:
         num_cols = min(num_panels, max_cols)
         num_rows = math.ceil(num_panels / num_cols)
 
-        fig = plt.figure(figsize=(10 * num_cols, 12 * num_rows))
+        fig = plt.figure(figsize=(10 * num_cols, 10 * num_rows))
         gs = fig.add_gridspec(
             num_rows * 2,
             num_cols,
-            height_ratios=[2, 10] * num_rows,
+            height_ratios=[4, 8] * num_rows,
             hspace=0.02,
             wspace=0.05,
         )

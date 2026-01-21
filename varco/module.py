@@ -9,6 +9,7 @@ import pytorch_lightning as pl
 import torch
 from torch import distributed as dist
 
+from cogeneration.data.const import MASK_TOKEN_INDEX
 from cogeneration.data.folding_validation import FoldingValidator
 from cogeneration.data.protein import write_prot_to_pdb
 from cogeneration.dataset.featurizer import BatchFeaturizer
@@ -309,6 +310,7 @@ class BranchFlowModule(pl.LightningModule):
         final_sample = sample_traj.samples[-1]
         pred_atom37 = final_sample.to_atom37()[0].detach().cpu().numpy()
         pred_aa = final_sample.aatypes_t[0].detach().cpu().numpy()
+        motif_mask = final_sample.motif_mask[0].detach().cpu().numpy()
         chain_idx = final_sample.chain_idx[0].detach().cpu().numpy()
         res_idx = (
             BatchFeaturizer.infer_res_index(
@@ -320,6 +322,7 @@ class BranchFlowModule(pl.LightningModule):
             .numpy()
             .astype(np.int32)
         )
+        motifs_1_atom37 = final_sample.motifs_to_atom37()[0].detach().cpu().numpy()
 
         # Save PDB
         pred_pdb_path = os.path.join(val_dir, OutputFileName.sample_pdb)
@@ -348,28 +351,27 @@ class BranchFlowModule(pl.LightningModule):
 
         # run folding validation (refold/designability)for max_batches samples
         fold_val_cfg = self.cfg.inference.folding_validation
-        if (
-            fold_val_cfg.enabled
-            and batch_idx < fold_val_cfg.max_batches
-            and DDPInfo.from_env().local_rank == 0
-        ):
+        if fold_val_cfg.enabled and batch_idx < fold_val_cfg.max_batches:
             sample_dir = os.path.join(val_dir, sample_name)
             os.makedirs(sample_dir, exist_ok=True)
 
+            # True AA: motif positions have true sequence, scaffold positions masked
+            true_aa = np.where(motif_mask, pred_aa, MASK_TOKEN_INDEX)
+
             top_sample_metrics, _ = self._get_folding_validator().assess_sample(
-                task=InferenceTask.unconditional,
+                task=InferenceTask.inpainting,
                 sample_name=sample_name,
                 sample_dir=sample_dir,
                 pred_pdb_path=pred_pdb_path,
                 pred_bb_positions=pred_atom37,
                 pred_aa=pred_aa,
-                sample_aa_traj=np.expand_dims(pred_aa, axis=0),
-                diffuse_mask=np.ones_like(pred_aa, dtype=np.int8),
-                motif_mask=None,
+                sample_aa_traj=pred_aa[np.newaxis, :],
+                diffuse_mask=np.ones_like(pred_aa),
+                motif_mask=motif_mask,
                 chain_idx=chain_idx,
                 res_idx=res_idx,
-                true_bb_positions=None,
-                true_aa=None,
+                true_bb_positions=motifs_1_atom37,
+                true_aa=true_aa,
                 inverse_fold=fold_val_cfg.assess_designability,
                 also_fold_pmpnn_seq=fold_val_cfg.assess_designability,
                 n_inverse_folds=self.cfg.folding.protein_mpnn.seq_per_sample,
@@ -384,16 +386,7 @@ class BranchFlowModule(pl.LightningModule):
     def predict_step(self, batch: DataBatch, batch_idx: int, dataloader_idx: int = 0):
         self.interpolant.set_device(self.device)
 
-        rank = DDPInfo.from_env().rank
-        sample_name = f"predict_rank{rank:03d}_idx{batch_idx:05d}"
-
-        sample_dir = os.path.join(
-            self.cfg.inference.predict_dir,
-            self.cfg.inference.inference_subdir,
-            sample_name,
-        )
-        os.makedirs(sample_dir, exist_ok=True)
-
+        # Sample
         # Motif guidance uses autograd during sampling (inference tensors break backward).
         with torch.inference_mode(False):
             sample_traj = self.interpolant.sample(
@@ -401,10 +394,27 @@ class BranchFlowModule(pl.LightningModule):
                 data=batch,
             )
 
-        # Generate atom37 rep
+        # pull out first and final steps of sample trajectory, and get sequences
+        init_sample = sample_traj.samples[0]
+        init_aa = init_sample.aatypes_t[0].detach().cpu().numpy()
         final_sample = sample_traj.samples[-1]
-        pred_atom37 = final_sample.to_atom37()[0].detach().cpu().numpy()
         pred_aa = final_sample.aatypes_t[0].detach().cpu().numpy()
+
+        # name it TODO would be nice to pass through pdb_name
+        rank = DDPInfo.from_env().rank
+        sample_name = (
+            f"idx{batch_idx:04d}_flen{len(pred_aa)}_slen{len(init_aa)}_r{rank:02d}"
+        )
+
+        sample_dir = os.path.join(
+            self.cfg.inference.predict_dir,
+            self.cfg.inference.inference_subdir,
+            sample_name,
+        )
+        os.makedirs(sample_dir, exist_ok=False)
+
+        # Generate atom37 rep
+        pred_atom37 = final_sample.to_atom37()[0].detach().cpu().numpy()
         chain_idx = final_sample.chain_idx[0].detach().cpu().numpy()
         res_idx = (
             BatchFeaturizer.infer_res_index(
@@ -416,9 +426,10 @@ class BranchFlowModule(pl.LightningModule):
             .numpy()
             .astype(np.int32)
         )
-        motif_mask = final_sample.motif_mask[0]
+        motif_mask = final_sample.motif_mask[0].detach().cpu().numpy()
+        motifs_1_atom37 = final_sample.motifs_to_atom37()[0].detach().cpu().numpy()
         b_factors = (
-            (100 * motif_mask.unsqueeze(-1).expand(-1, 37).float())
+            (100 * final_sample.motif_mask[0].unsqueeze(-1).expand(-1, 37).float())
             .detach()
             .cpu()
             .numpy()
@@ -458,20 +469,23 @@ class BranchFlowModule(pl.LightningModule):
         # folding validation - either refolding, or designability
         fold_val_cfg = self.cfg.inference.folding_validation
         if fold_val_cfg.enabled and batch_idx < fold_val_cfg.max_batches:
+            # True AA: motif positions have true sequence, scaffold positions masked
+            true_aa = np.where(motif_mask, pred_aa, MASK_TOKEN_INDEX)
+
             top_sample_metrics, _ = self._get_folding_validator().assess_sample(
-                task=InferenceTask.unconditional,
+                task=InferenceTask.inpainting,
                 sample_name=sample_name,
                 sample_dir=sample_dir,
                 pred_pdb_path=pred_pdb_path,
                 pred_bb_positions=pred_atom37,
                 pred_aa=pred_aa,
-                sample_aa_traj=np.expand_dims(pred_aa, axis=0),
-                diffuse_mask=np.ones_like(pred_aa, dtype=np.int8),
-                motif_mask=None,
+                sample_aa_traj=pred_aa[np.newaxis, :],
+                diffuse_mask=np.ones_like(pred_aa),
+                motif_mask=motif_mask,
                 chain_idx=chain_idx,
                 res_idx=res_idx,
-                true_bb_positions=None,
-                true_aa=None,
+                true_bb_positions=motifs_1_atom37,
+                true_aa=true_aa,
                 inverse_fold=fold_val_cfg.assess_designability,
                 also_fold_pmpnn_seq=fold_val_cfg.assess_designability,
                 n_inverse_folds=self.cfg.folding.protein_mpnn.seq_per_sample,

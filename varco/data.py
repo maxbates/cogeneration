@@ -295,6 +295,26 @@ class DataCorrupted:
             unknown_to_alanine=True,
         )
 
+    def motifs_to_atom37(self) -> torch.Tensor:
+        """
+        Convert true motif positions (trans_1_motifs, rotmats_1_motifs) to atom37.
+        Non-motif positions are zeroed out.
+
+        Returns:
+            atom37: (B, P, 37, 3) atom positions, zeroed for non-motif residues
+        """
+        atom37 = all_atom.atom37_from_trans_rot(
+            trans=self.trans_1_motifs,
+            rots=self.rotmats_1_motifs,
+            torsions=None,
+            aatype=self.aatypes_t,
+            res_mask=self.motif_mask.float(),
+            unknown_to_alanine=True,
+        )
+        # Zero out non-motif positions
+        motif_mask_expanded = self.motif_mask[:, :, None, None]  # (B, P, 1, 1)
+        return atom37 * motif_mask_expanded
+
 
 @dataclass
 class DataBridged:

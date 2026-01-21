@@ -54,6 +54,7 @@ class BaseDataset(Dataset):
         task: DataTask,
         eval: bool,  # process for evaluation
         use_test: bool,  # use date-based split if True
+        eval_uses_fixed_seed: bool = True,  # featurizer uses fixed seed
     ):
         """
         BaseDataset collects all dataset files into a single Dataset, and yields samples.
@@ -74,11 +75,17 @@ class BaseDataset(Dataset):
         self.task = task
         self.is_eval = eval
         self.use_test = use_test
+        self.eval_uses_fixed_seed = eval_uses_fixed_seed
 
         self._log = logging.getLogger(__name__)
         self._cache = {}
 
-        self.featurizer = BatchFeaturizer(cfg=cfg, task=task, eval=self.is_eval)
+        self.featurizer = BatchFeaturizer(
+            cfg=cfg,
+            task=task,
+            eval=self.is_eval,
+            eval_uses_fixed_seed=self.eval_uses_fixed_seed,
+        )
 
         # Load specs as metadata DF
         metadata = BaseDataset.load_datasets(
@@ -317,8 +324,9 @@ class BaseDataset(Dataset):
         eval_csv = metadata[metadata[length_column].isin(eval_lengths)]
 
         # Pick subset per length, sort shorter first
+        random_state = None if cfg.randomize_eval_selection else cfg.seed
         eval_csv = eval_csv.groupby(length_column).sample(
-            cfg.samples_per_eval_length, replace=True, random_state=cfg.seed
+            cfg.samples_per_eval_length, replace=True, random_state=random_state
         )
         eval_csv = eval_csv.sort_values(length_column, ascending=True)
 
