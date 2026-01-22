@@ -2,6 +2,10 @@
 
 This repository's README contains the canonical overview of the project, including the detailed file tree and additional documentation links. Please refer to [README.md](README.md) for the complete context when exploring the codebase.
 
+## Virtual Environment
+
+use `venv_312` for testing, one-off scripts, etc.
+
 ## Key conventions
 - Code is formatted with **black** and **isort**.
 - Prefer dataclasses for structs and other classes, and keep related logic inside classes instead of free functions when practical.

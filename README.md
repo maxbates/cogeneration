@@ -1,25 +1,29 @@
 # Cogeneration
 
-Cogeneration is a protein generative model that simultaneously generates protein sequences and structures based on MultiFlow. 
-
-It uses the AlphaFold2 style frame representation, and applies flow matching across several domains:
-Translations + torsions are interpolated in Euclidean space, rotations are interpolated in SO(3), and the sequence with discrete flow matching.
-
-Only a small model has been trained. Many features can be also exercised while using the public Multiflow weights (a config is available to recreate its model architecture).
+Cogeneration is a protein generative model that simultaneously generates protein sequences and structures, based on MultiFlow. 
 
 ## Variable length Cogeneration (varco)
 
-Note: see [/varco](varco) which extends cogeneration (with a reduced feature set) to variable length motif scaffolding
+Note: see also [/varco](varco) which fine-tunes cogeneration (with a reduced feature set) to variable length motif scaffolding
 
-## Example
+## Examples
+
+Example `varco` trajectory, in-filling VHH CDRs but through insertions and deletions. More information about how varco works is available in [/varco](varco).
+
+![Example varo trajectory](media/9MDZ_VHH_varco_trajectory.gif)
+
+Example `cogeneration` trajectory, inpainting VHH CDRs (using motif guidance):
 
 ![Example trajectory: inpainting VHH CDRs](media/5M2J_VHH_traj_panel.gif)
 
-See an [unconditional trajectory](media/example_uncond_172_traj_panel.mp4).
+See an [unconditional cogeneration trajectory](media/example_uncond_172_traj_panel.mp4).
 
 ## Features
 
-This project collects several ideas from other work and includes several extensions over MultiFlow:
+Cogeneration uses the AlphaFold2 style frame representation, and applies flow matching across several domains:
+Translations + torsions are interpolated in Euclidean space, rotations are interpolated in SO(3), and the sequence with discrete flow matching.
+
+Cogeneration collects several ideas from other work and includes several extensions over MultiFlow:
 - **Inpainting (conditional generation)** given partial sequences / structures using guidance
   - MultiFlow only supports per-domain conditioning via seperate t (i.e. folding and inverse folding)
 - **Multimer** support
@@ -52,6 +56,8 @@ This project collects several ideas from other work and includes several extensi
 - many improvements to code base: typing, enums, documentation, tests, etc.
 - Many of these **new features and modules are optional**
   - everything is easily **reverse compatible with MultiFlow, i.e. can use public Multiflow weights** with a config preset
+
+Many features can be also exercised while using the public Multiflow weights (a config is available to recreate its model architecture).
 
 ## Future Work
 
